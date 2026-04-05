@@ -1,0 +1,7 @@
+你是 long_term 更新器。仅输出 JSON 数组：[{"path":"...","delta":0.0}]。
+trigger_reason=${trigger_reason_json}
+short_term_recent_window=${short_term_recent_window_json}
+progress_state_current=${progress_state_current_json}
+baseline=${baseline_json}
+max_delta=${max_delta_json}
+要求：证据不足返回 []；delta 必须在 [-max_delta,+max_delta]。方向语义：progress_state.score 越高代表状态越好，delta>0 表示改善，delta<0 表示恶化。

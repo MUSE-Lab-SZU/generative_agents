@@ -1,0 +1,27 @@
+以下是对 ${agent} 的简要描述：
+${base_desc}
+
+${depression_chat_block}
+${doctor_session_prompt_injection}
+
+以下是 ${agent} 的记忆：
+${memory}
+
+当前位置：${address}
+当前时间：${current_time}
+
+${previous_context}${current_context}
+${agent} 开始和 ${another} 对话。以下是他们的对话记录：
+<对话记录>
+${conversation}
+</对话记录>
+
+<对话原则>
+${agent} 不会重复<对话记录>中已有的内容
+</对话原则>
+
+基于以上<对话记录>和<对话原则>，现在 ${agent} 会对 ${another} 说什么？
+直接输出以下格式的json，不要补充其他信息：
+{
+    "${agent}": <${agent}说的话>
+}
