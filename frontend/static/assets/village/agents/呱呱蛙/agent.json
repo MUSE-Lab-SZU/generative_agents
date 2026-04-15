@@ -6,6 +6,9 @@
     43
   ],
   "currently": "呱呱蛙是卡布达的邻居，正在杂货店工作。",
+  "external_memory": {
+    "user_id": "agent_guaguawa"
+  },
   "scratch": {
     "age": 36,
     "innate": "随和、朴实、关心他人",

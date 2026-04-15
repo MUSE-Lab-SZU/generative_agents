@@ -157,8 +157,17 @@ class AssociateRetriever(BaseRetriever):
         if retrieve_max != -1:
             retrieve_max = max(1, retrieve_max)
             nodes = nodes[: retrieve_max]
-        for n in nodes:
-            n.metadata["access"] = utils.get_timer().get_date("%Y%m%d-%H:%M:%S")
+        access_ts = utils.get_timer().get_date("%Y%m%d-%H:%M:%S")
+        update_ok = True
+        on_access_update = self._config.get("on_access_update")
+        if callable(on_access_update):
+            try:
+                update_ok = bool(on_access_update([n.id_ for n in nodes], access_ts))
+            except Exception:
+                update_ok = False
+        if update_ok:
+            for n in nodes:
+                n.metadata["access"] = access_ts
         return nodes
 
     def _normalize(self, data, factor=1, t_min=0, t_max=1):
@@ -183,8 +192,12 @@ class Associate:
         importance_weight=2,
         memory=None,
         chat_retrieve=None,
+        logger=None,
+        external_write_hook=None,
     ):
         self._index = LlamaIndex(embedding, path)
+        self.logger = logger
+        self._external_write_hook = external_write_hook
         base_memory = {"event": [], "thought": [], "chat": []}
         if isinstance(memory, dict):
             for key in base_memory.keys():
@@ -288,10 +301,143 @@ class Associate:
             if overflow:
                 self._index.remove_nodes(overflow)
             self.memory[node_type] = memory[: self.max_memory]
+        if callable(self._external_write_hook):
+            try:
+                self._external_write_hook(
+                    {
+                        "node_id": node.id_,
+                        "node_type": node_type,
+                        "event": event,
+                        "create": create,
+                        "expire": expire,
+                    }
+                )
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning(
+                        "[EXT_MEMORY_INGEST_FAIL] node_id={} node_type={} error={}".format(
+                            node.id_,
+                            node_type,
+                            exc,
+                        )
+                    )
         return self.to_concept(node)
 
     def to_concept(self, node):
         return Concept.from_node(node)
+
+    def _log_access_sync(self, level, message):
+        logger = getattr(self, "logger", None)
+        if not logger:
+            return
+        fn = getattr(logger, level, None)
+        if not callable(fn):
+            fn = getattr(logger, "info", None)
+        if callable(fn):
+            fn(message)
+
+    def _touch_access_in_store(self, node_ids, access_ts):
+        if not isinstance(access_ts, str) or not access_ts:
+            self._log_access_sync("warning", "[ACCESS_SYNC_FAIL] reason=invalid_access_ts")
+            return False
+        ordered_ids, seen = [], set()
+        for node_id in node_ids or []:
+            if not isinstance(node_id, str) or not node_id:
+                continue
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            ordered_ids.append(node_id)
+        if not ordered_ids:
+            self._log_access_sync("warning", "[ACCESS_SYNC_FAIL] reason=empty_node_ids")
+            return False
+
+        doc_targets = []
+        for node_id in ordered_ids:
+            try:
+                node = self._index.find_node(node_id)
+            except Exception as e:
+                self._log_access_sync(
+                    "warning",
+                    "[ACCESS_SYNC_FAIL] reason=docstore_node_not_found node_id={} detail={}".format(
+                        node_id,
+                        e,
+                    ),
+                )
+                return False
+            metadata = getattr(node, "metadata", None)
+            if not isinstance(metadata, dict):
+                self._log_access_sync(
+                    "warning",
+                    "[ACCESS_SYNC_FAIL] reason=docstore_metadata_invalid node_id={}".format(node_id),
+                )
+                return False
+            doc_targets.append((metadata, metadata.get("access")))
+
+        try:
+            vector_store = getattr(getattr(self._index, "_index", None), "vector_store", None)
+            metadata_dict = None
+            if vector_store is not None:
+                data_obj = getattr(vector_store, "data", None)
+                if data_obj is None:
+                    data_obj = getattr(vector_store, "_data", None)
+                if data_obj is not None:
+                    metadata_dict = getattr(data_obj, "metadata_dict", None)
+                if metadata_dict is None:
+                    metadata_dict = getattr(vector_store, "metadata_dict", None)
+        except Exception as e:
+            self._log_access_sync(
+                "warning",
+                "[ACCESS_SYNC_FAIL] reason=vector_store_resolve_error detail={}".format(e),
+            )
+            return False
+        if not isinstance(metadata_dict, dict):
+            self._log_access_sync("warning", "[ACCESS_SYNC_FAIL] reason=vector_store_metadata_unavailable")
+            return False
+
+        vector_targets = []
+        for node_id in ordered_ids:
+            v_meta = metadata_dict.get(node_id)
+            if not isinstance(v_meta, dict):
+                self._log_access_sync(
+                    "warning",
+                    "[ACCESS_SYNC_FAIL] reason=vector_store_node_missing node_id={}".format(node_id),
+                )
+                return False
+            vector_targets.append((v_meta, v_meta.get("access")))
+
+        try:
+            for v_meta, _old in vector_targets:
+                v_meta["access"] = access_ts
+        except Exception as e:
+            self._log_access_sync(
+                "warning",
+                "[ACCESS_SYNC_FAIL] reason=vector_apply_failed detail={}".format(e),
+            )
+            return False
+
+        try:
+            for meta, _old in doc_targets:
+                meta["access"] = access_ts
+        except Exception as e:
+            self._log_access_sync(
+                "warning",
+                "[ACCESS_SYNC_PARTIAL] reason=docstore_apply_failed_no_rollback node_count={} access_ts={} detail={}".format(
+                    len(ordered_ids),
+                    access_ts,
+                    e,
+                ),
+            )
+            return True
+
+        self._log_access_sync(
+            "info",
+            "[ACCESS_SYNC_SUCCESS] node_count={} access_ts={}".format(
+                len(ordered_ids),
+                access_ts,
+            ),
+        )
+        return True
 
     def find_concept(self, node_id):
         self._prune_missing_memory_refs()
@@ -396,6 +542,7 @@ class Associate:
             retrieve_cfg = dict(self._retrieve_config)
             retrieve_cfg["retrieve_max"] = retrieve_max
             retrieve_cfg["profile"] = retrieval_profile or {}
+            retrieve_cfg["on_access_update"] = self._touch_access_in_store
             return AssociateRetriever(retrieve_cfg, *args, **kwargs)
 
         retrieved = {}

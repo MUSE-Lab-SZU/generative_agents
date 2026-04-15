@@ -425,7 +425,12 @@ def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg
     ensured = ensure_profile(profile)
     runtime = ensured["runtime"]
     switches = _resolve_feature_switch(update_cfg or {})
-    short_term = runtime["active_overrides"]["short_term"] if switches["short_term_enabled"] else {}
+    view_enabled = bool(ensured.get("enabled", False)) and bool(switches.get("enabled", True))
+    short_term = (
+        runtime["active_overrides"]["short_term"]
+        if view_enabled and bool(switches.get("short_term_enabled", True))
+        else {}
+    )
     merged_payload = merge_case_and_runtime(ensured["case_config"], short_term)
     merged_case = merged_payload.get("case_config", {})
     source_map = merged_payload.get("source_map", {})
@@ -437,7 +442,11 @@ def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg
     case_lines = [item for item in merged_lines if item.get("source") == "case"]
     short_term_lines = [item for item in merged_lines if item.get("source") == "short_term"]
 
-    current_event = runtime.get("current_event", {}) or {}
+    current_event = (
+        runtime.get("current_event", {}) or {}
+        if view_enabled and bool(switches.get("current_event_update_enabled", True))
+        else {}
+    )
     current_event_text = current_event.get("wording", "")
     current_event_topic = current_event.get("topic", "")
     if not current_event_text:
@@ -446,7 +455,7 @@ def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg
     view = {
         "stage": stage,
         "now_step": int(now_step),
-        "enabled": bool(ensured.get("enabled", False)),
+        "enabled": view_enabled,
         "current_event_topic": current_event_topic,
         "current_event_text": current_event_text,
         "current_event_source": current_event.get("source", "fallback"),
@@ -2158,10 +2167,12 @@ def _derive_missing_strategy(input_contract: dict) -> dict:
 
 def _resolve_feature_switch(update_cfg: Optional[dict]) -> dict:
     cfg, _ = _normalize_update_cfg_for_acceptance(update_cfg if isinstance(update_cfg, dict) else {})
+    enabled = bool(cfg.get("enabled", True))
     return {
-        "short_term_enabled": bool(cfg.get("short_term_enabled", True)),
-        "progress_state_enabled": bool(cfg.get("progress_state_enabled", True)),
-        "current_event_update_enabled": bool(cfg.get("current_event_update_enabled", True)),
+        "enabled": enabled,
+        "short_term_enabled": bool(enabled and cfg.get("short_term_enabled", True)),
+        "progress_state_enabled": bool(enabled and cfg.get("progress_state_enabled", True)),
+        "current_event_update_enabled": bool(enabled and cfg.get("current_event_update_enabled", True)),
     }
 
 

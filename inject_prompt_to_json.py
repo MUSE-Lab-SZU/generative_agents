@@ -19,6 +19,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+DEFAULT_TXT_PATH = "./PST_Session.txt"
+DEFAULT_JSON_PATH = "./data/prompts/intervention_prompts.json"
+DEFAULT_KEY_PATH = ["PST", "session1"]
+
 
 def set_nested_value(data: dict[str, Any], keys: list[str], value: str) -> None:
     """按 keys 路径设置嵌套值，不存在的中间层会自动创建为 dict。"""
@@ -39,24 +43,32 @@ def set_nested_value(data: dict[str, Any], keys: list[str], value: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="将 txt 内容写入 JSON 的指定字段")
-    parser.add_argument("--txt", required=True, help="txt 文件路径")
+    parser.add_argument(
+        "--txt",
+        default=DEFAULT_TXT_PATH,
+        help=f"源 txt 文件路径（默认: {DEFAULT_TXT_PATH}）。用于读取待写入 JSON 的完整文本。",
+    )
     parser.add_argument(
         "--json",
-        default="./data/prompts/intervention_prompts.json",
-        help="目标 JSON 文件路径（默认: ./data/prompts/intervention_prompts.json）",
+        default=DEFAULT_JSON_PATH,
+        help=f"目标 JSON 文件路径（默认: {DEFAULT_JSON_PATH}）。用于定位要更新的 JSON 文件。",
     )
     parser.add_argument(
         "--key",
         action="append",
-        required=True,
-        help="目标字段路径，可重复传入。例：--key CBT --key session001",
+        default=None,
+        help=(
+            f"目标字段路径，可重复传入；不传时默认等效为："
+            f"--key {DEFAULT_KEY_PATH[0]} --key {DEFAULT_KEY_PATH[1]}。"
+            "用于按层级写入 JSON。"
+        ),
     )
 
     args = parser.parse_args()
 
     txt_path = Path(args.txt)
     json_path = Path(args.json)
-    keys: list[str] = args.key
+    keys: list[str] = args.key if args.key else DEFAULT_KEY_PATH.copy()
 
     if not txt_path.exists():
         raise FileNotFoundError(f"txt 文件不存在: {txt_path}")

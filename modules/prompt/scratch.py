@@ -3,6 +3,7 @@
 import random
 import datetime
 import re
+import os
 from string import Template
 
 from modules import utils
@@ -21,6 +22,30 @@ class Scratch:
         file_content = ""
         try:
             with open(f"{self.template_path}/{template}.txt", "r", encoding="utf-8") as file:
+                file_content = file.read()
+        except FileNotFoundError:
+            return ""
+        except UnicodeDecodeError:
+            return ""
+        except OSError:
+            return ""
+
+        try:
+            template_obj = Template(file_content)
+            filled_content = template_obj.safe_substitute(data if isinstance(data, dict) else {})
+            return filled_content
+        except Exception:
+            return file_content
+
+    def build_prompt_by_file(self, prompt_file, data):
+        path = str(prompt_file or "").strip()
+        if not path:
+            return ""
+        if not os.path.isabs(path):
+            path = os.path.normpath(path)
+        file_content = ""
+        try:
+            with open(path, "r", encoding="utf-8") as file:
                 file_content = file.read()
         except FileNotFoundError:
             return ""
@@ -756,6 +781,50 @@ class Scratch:
                 "current_time": utils.get_timer().get_date("%H:%M"),
                 "previous_context": prev_context,
                 "current_context": curr_context,
+                "another": other.name,
+                "conversation": conversation,
+            }
+        )
+
+        def _callback(response):
+            assert "{" in response and "}" in response
+            json_content = utils.load_dict(
+                "{" + response.split("{")[1].split("}")[0] + "}"
+            )
+            text = json_content[agent.name].replace("\n\n", "\n").strip(" \n\"'“”‘’")
+            return text
+
+        return {
+            "prompt": prompt,
+            "callback": _callback,
+            "failsafe": "嗯",
+        }
+
+    def prompt_generate_chat_external(
+        self,
+        agent,
+        other,
+        relation,
+        chats,
+        external_memory_context="",
+        depression_chat_block="",
+        doctor_session_prompt_injection="",
+        chat_prompt_file="",
+    ):
+        address = agent.get_tile().get_address()
+        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
+        conversation = conversation or "[对话尚未开始]"
+
+        prompt = self.build_prompt_by_file(
+            chat_prompt_file,
+            {
+                "agent": agent.name,
+                "base_desc": self._base_desc(),
+                "depression_chat_block": depression_chat_block or "",
+                "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
+                "external_memory_context": external_memory_context or "",
+                "address": f"{address[-2]}，{address[-1]}",
+                "current_time": utils.get_timer().get_date("%H:%M"),
                 "another": other.name,
                 "conversation": conversation,
             }

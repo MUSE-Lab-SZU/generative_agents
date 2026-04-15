@@ -1,0 +1,4 @@
+create=${create_time}
+type=${memory_type}
+address=${address}
+${describe}

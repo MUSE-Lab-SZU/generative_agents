@@ -11,6 +11,7 @@ from modules import depression_runtime_manager as drm
 from modules import depression_dynamic_adapter as dda
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
+from modules.external_memory_bridge import ExternalMemoryBridge
 
 
 class Agent:
@@ -79,12 +80,31 @@ class Agent:
                 self.chat_memory_write_mode,
             )
         )
+        global_external_memory = config.get("external_memory", {}) or {}
+        local_external_memory = (config.get("_raw", {}) or {}).get("external_memory", {})
+        if not isinstance(local_external_memory, dict):
+            local_external_memory = {}
+        self.external_memory_config = {}
+        if isinstance(global_external_memory, dict):
+            self.external_memory_config.update(global_external_memory)
+        self.external_memory_config.update(local_external_memory)
+        associate_storage_dir = os.path.join(config["storage_root"], "associate")
+        self.external_memory_bridge = ExternalMemoryBridge.from_agent_config(
+            agent_name=self.name,
+            global_cfg=global_external_memory,
+            local_cfg=local_external_memory,
+            storage_dir=associate_storage_dir,
+            logger=self.logger,
+        )
 
         # memory
         self.spatial = memory.Spatial(**config["spatial"])
         self.schedule = memory.Schedule(**config["schedule"])
         self.associate = memory.Associate(
-            os.path.join(config["storage_root"], "associate"), **config["associate"]
+            associate_storage_dir,
+            logger=self.logger,
+            external_write_hook=self._external_memory_ingest_hook,
+            **config["associate"]
         )
         self.concepts, self.chats = [], config.get("chats", [])
 
@@ -1067,15 +1087,15 @@ class Agent:
                     else {}
                 ),
             )
-            text = self.completion(
-                "generate_chat",
-                self,
-                other,
-                relations[0],
-                chats,
+            text = self._completion_generate_chat_with_external_route(
+                other=other,
+                relation=relations[0],
+                chats=chats,
                 depression_chat_block=chat_view.get("chat_block", ""),
                 doctor_session_prompt_injection=doctor_session_prompt_injection,
                 retrieval_profile=retrieval_profile,
+                is_initiator=True,
+                turn_no=turn_no,
             )
 
             if self._is_question_text(text):
@@ -1189,12 +1209,10 @@ class Agent:
                     self,
                     forced,
                 )
-            text = other.completion(
-                "generate_chat",
-                other,
-                self,
-                relations[1],
-                chats,
+            text = other._completion_generate_chat_with_external_route(
+                other=self,
+                relation=relations[1],
+                chats=chats,
                 depression_chat_block=drm.build_intermediate_view(
                     other.depression_profile,
                     utils.get_timer().daily_duration(),
@@ -1207,6 +1225,8 @@ class Agent:
                 ).get("chat_block", ""),
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 retrieval_profile=retrieval_profile,
+                is_initiator=False,
+                turn_no=turn_no,
             )
 
             if self._is_question_text(text):
@@ -1394,6 +1414,109 @@ class Agent:
         if self.intervention:
             self.intervention.after_chat(self, other, chats, chat_summary, start)
         return True
+
+    def _external_memory_ingest_hook(self, payload):
+        bridge = getattr(self, "external_memory_bridge", None)
+        if bridge is None or not isinstance(payload, dict):
+            return
+        try:
+            bridge.ingest_from_local_node(
+                node_id=payload.get("node_id", ""),
+                node_type=payload.get("node_type", ""),
+                event=payload.get("event"),
+                create_time=payload.get("create"),
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "[EXT_MEMORY_INGEST_FAIL] agent={} node_id={} error={}".format(
+                    self.name,
+                    payload.get("node_id", ""),
+                    exc,
+                )
+            )
+
+    def _completion_generate_chat_with_external_route(
+        self,
+        other,
+        relation,
+        chats,
+        depression_chat_block="",
+        doctor_session_prompt_injection="",
+        retrieval_profile=None,
+        is_initiator=False,
+        turn_no=1,
+    ):
+        bridge = getattr(self, "external_memory_bridge", None)
+        if bridge and bridge.enabled_for_chat_read():
+            prompt_file = str(bridge.resolve_chat_prompt_file() or "").strip()
+            if prompt_file and os.path.isfile(prompt_file):
+                retrieval = bridge.retrieve_chat_context(
+                    chats=chats,
+                    other_name=getattr(other, "name", ""),
+                    is_initiator=is_initiator,
+                    turn_no=turn_no,
+                )
+                query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
+                if len(query) > 120:
+                    query = query[:120] + "..."
+                retrieval_ok = bool(retrieval.get("ok", False))
+                route_reason = str(retrieval.get("reason", "") or "")
+                if retrieval_ok or (not bridge.fallback_to_local):
+                    external_memory_context = str(retrieval.get("context", "") or "")
+                    if retrieval_ok:
+                        route_reason = "retrieve_ok"
+                    elif not route_reason:
+                        route_reason = "retrieve_failed_no_fallback"
+                    self.logger.info(
+                        "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=external reason={} turn_no={} is_initiator={} query={} context_len={}".format(
+                            self.name,
+                            getattr(other, "name", ""),
+                            route_reason,
+                            turn_no,
+                            bool(is_initiator),
+                            query,
+                            len(external_memory_context),
+                        )
+                    )
+                    return self.completion(
+                        "generate_chat_external",
+                        self,
+                        other,
+                        relation,
+                        chats,
+                        external_memory_context=external_memory_context,
+                        depression_chat_block=depression_chat_block,
+                        doctor_session_prompt_injection=doctor_session_prompt_injection,
+                        chat_prompt_file=prompt_file,
+                    )
+                self.logger.info(
+                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
+                        self.name,
+                        getattr(other, "name", ""),
+                        route_reason or "retrieve_failed_fallback",
+                        turn_no,
+                        bool(is_initiator),
+                        query,
+                    )
+                )
+            else:
+                self.logger.warning(
+                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason=chat_prompt_missing path={}".format(
+                        self.name,
+                        getattr(other, "name", ""),
+                        prompt_file,
+                    )
+                )
+        return self.completion(
+            "generate_chat",
+            self,
+            other,
+            relation,
+            chats,
+            depression_chat_block=depression_chat_block,
+            doctor_session_prompt_injection=doctor_session_prompt_injection,
+            retrieval_profile=retrieval_profile,
+        )
 
     def _wait_other(self, other, focus):
         if self._skip_react(other):

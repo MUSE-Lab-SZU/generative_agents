@@ -17,7 +17,7 @@
                 "api_key": ""
             },
             "interval": 1000,
-            "poignancy_max": 150
+            "poignancy_max": 75
         },
         "chat_iter": 4,
         "associate": {
@@ -29,8 +29,8 @@
             },
             "retention": 32,
             "chat_retrieve": {
-                "mode": "direct",
-                "similarity_top_k": -1
+                "mode": "semantic",
+                "similarity_top_k": 6
             }
         },
         "chat_history": {
@@ -41,6 +41,15 @@
         },
         "chat_memory": {
             "write_mode": "hybrid"
+        },
+        "external_memory": {
+            "enabled": false,
+            "base_url": "http://localhost:8031",
+            "timeout": 10.0,
+            "read_mode": "chat_only",
+            "fallback_to_local": true,
+            "ingest_template_file": "data/prompts/external_memory_ingest.txt",
+            "chat_prompt_file": "data/prompts/generate_chat_external_memory.txt"
         }
     },
     "intervention": {
@@ -247,6 +256,51 @@
             ],
             "on_missing_agent_config": "warn_and_disable",
             "log_enabled": true
+        },
+        "memory_injection": {
+            "enabled": true,
+            "content_file": "data/intervention/memory_injections.json",
+            "rules": {
+                "init_kabuda_depression_stress": {
+                    "enabled": true,
+                    "target_agent": "卡布达",
+                    "source": "初始化规则注入_卡布达抑郁压力事件",
+                    "options": {
+                        "allow_partial_success": true,
+                        "dedup_mode": "global"
+                    }
+                },
+                "session_completed_memory_rule_kbd": {
+                    "enabled": true,
+                    "target_agent": "卡布达",
+                    "source": "会诊完成注入_多Session记忆_卡布达",
+                    "trigger": {
+                        "sessions": [
+                            "session1",
+                            "session2.1",
+                            "session4.4"
+                        ]
+                    },
+                    "options": {
+                        "allow_partial_success": true,
+                        "dedup_mode": "global",
+                        "max_items_per_session": 3
+                    }
+                }
+            },
+            "defaults": {
+                "poignancy": 5,
+                "expire_days": 30,
+                "address_mode": "current_tile",
+                "allow_partial_success": true,
+                "dedup_mode": "global"
+            },
+            "limits": {
+                "max_items_per_request": 20,
+                "max_describe_chars": 1000,
+                "max_audit_entries": 2000,
+                "max_fingerprints": 20000
+            }
         },
         "memory_policy": {
             "enabled": true,

@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "kbd_stress_event_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "感到持续压力上升",
+          "describe": "卡布达大四时因无法完成毕业设计而被迫休学，此时感到压力上升，并担心自己无法恢复到正常节奏。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    },
+    {
+      "rule": "session_completed_memory_rule_kbd",
+      "items": [
+        {
+          "item_id": "kbd_s1_recovery_signal_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "感到羞耻",
+          "describe": "在回家的路上，卡布达被亲戚的同学询问休学原因，并如实回答了自己无法完成毕业设计。",
+          "poignancy": 7,
+          "expire_days": 30,
+          "sessions": [
+            "session1"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "session1"
+          ]
+        },
+        {
+          "item_id": "kbd_s21_relapse_warning_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "感受到了安慰",
+          "describe": "在回家的路上，卡布达能遇到了小时候的邻居，她对卡布达感到惋惜并安慰了卡布达。",
+          "poignancy": 8,
+          "expire_days": 30,
+          "sessions": [
+            "session2.1"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "session2.1"
+          ]
+        },
+        {
+          "item_id": "kbd_s44_self_therapist_identity_001",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我可以成为自己的支持者",
+          "describe": "在结束最后一次的会谈后，卡布达形成了“我可以使用工具自助应对起伏”的新认知。",
+          "poignancy": 8,
+          "expire_days": 30,
+          "sessions": [
+            "session4.4"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "self_efficacy",
+            "session4.4"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,9 @@
     9
   ],
   "currently": "田德莉娜正在准备面试，同时定期陪卡布达散步并记录对方的状态变化。",
+  "external_memory": {
+    "user_id": "agent_tiandelina"
+  },
   "scratch": {
     "age": 24,
     "innate": "体贴、乐观、细致",

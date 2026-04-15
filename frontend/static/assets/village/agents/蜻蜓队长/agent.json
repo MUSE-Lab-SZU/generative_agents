@@ -7,6 +7,9 @@
   ],
   "currently": "蜻蜓队长今天主要安排随访与简短病例记录，保持机动出诊状态。",
   "chat_iter": 18,
+  "external_memory": {
+    "user_id": "agent_qingtingduizhang"
+  },
   "scratch": {
     "age": 41,
     "innate": "沉稳、专业、温和",

@@ -50,3 +50,6 @@ results/checkpoints/
 results/compressed/
 sim-dym-severe-kbd-0404/
 sim-dym-severe-kbd-0404-2/
+
+# Root markdown docs
+/*.md

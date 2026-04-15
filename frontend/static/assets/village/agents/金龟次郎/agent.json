@@ -7,6 +7,9 @@
   ],
   "currently": "金龟次郎担心卡布达的状态，但更倾向于强调“振作”，经常回家查看。现在独自在公园锻炼身体",
   "chat_iter": 18,
+  "external_memory": {
+    "user_id": "agent_jinguicilang"
+  },
   "scratch": {
     "age": 50,
     "innate": "固执、务实、控制欲强",

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 
 from modules import depression_runtime_manager as drm
+from modules.memory_injection_manager import MemoryInjectionManager
 from modules.intervention_consult_record import (
     ConsultRecordError,
     ConsultRecordPromptError,
@@ -93,6 +94,11 @@ class InterventionManager:
             },
         )
         self._ensure_state_schema()
+        self.memory_injection = MemoryInjectionManager(
+            config=self.config,
+            state=self.state,
+            logger=self.logger,
+        )
         self.session_prompt_injection = SessionPromptInjectionManager(
             config=self.config,
             state=self.state,
@@ -122,10 +128,25 @@ class InterventionManager:
                 step_no, self._fmt_dt(now), self.enabled, len(self.meeting_rules)
             )
         )
+        game_agents = getattr(game, "agents", {}) if isinstance(getattr(game, "agents", {}), dict) else {}
+        if self.memory_injection:
+            try:
+                self.memory_injection.apply_rules_once(
+                    agents=game_agents,
+                    now=now,
+                    step_no=step_no,
+                )
+            except Exception as exc:
+                self._log_highlight(
+                    "MEMORY_INJECTION_APPLY_ERROR step={} detail={}".format(
+                        step_no,
+                        str(exc),
+                    )
+                )
         if not self.enabled:
             return
 
-        self._agents_ref = getattr(game, "agents", {}) if isinstance(getattr(game, "agents", {}), dict) else {}
+        self._agents_ref = game_agents
         self._refresh_meeting_queue_cfg()
         self._ensure_state_schema()
         self._log_queue_event(
@@ -310,6 +331,15 @@ class InterventionManager:
         )
         self._extract_and_queue_orders(speaker, other, chats)
 
+        self._handle_consult_record_after_chat(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            summary=summary,
+            start_time=start_time,
+            meeting_id=closed_meeting_id,
+        )
+
         if self.session_prompt_injection and self.enabled:
             doctor_for_session, patient_for_session = self._resolve_doctor_patient_pair(speaker, other)
             if doctor_for_session and patient_for_session:
@@ -333,6 +363,28 @@ class InterventionManager:
                             bool(audit.get("completed", False)),
                         )
                     )
+                    if self.memory_injection:
+                        try:
+                            agents_map = dict(self._agents_ref) if isinstance(self._agents_ref, dict) else {}
+                            speaker_name = str(getattr(speaker, "name", "") or "")
+                            other_name = str(getattr(other, "name", "") or "")
+                            if speaker_name and (speaker_name not in agents_map):
+                                agents_map[speaker_name] = speaker
+                            if other_name and (other_name not in agents_map):
+                                agents_map[other_name] = other
+                            self.memory_injection.apply_rules_on_session_completed(
+                                agents=agents_map,
+                                doctor_name=doctor_for_session.name,
+                                patient_name=patient_for_session.name,
+                                audit=audit if isinstance(audit, dict) else {},
+                                meeting_id=meeting_id_for_session,
+                                now=start_time,
+                                step_no=int(self.config.get("step", 0) or 0),
+                            )
+                        except Exception as exc:
+                            self._log_highlight(
+                                "MEMORY_INJECTION_SESSION_APPLY_ERROR detail={}".format(str(exc))
+                            )
                     if self.stop_rule_scheduling_on_session_completed and bool(audit.get("completed", False)):
                         purged = self._purge_patient_meetings(
                             patient_name=patient_for_session.name,
@@ -346,15 +398,6 @@ class InterventionManager:
                                 purged,
                             )
                         )
-
-        self._handle_consult_record_after_chat(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            summary=summary,
-            start_time=start_time,
-            meeting_id=closed_meeting_id,
-        )
 
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
         if not doctor or not patient:

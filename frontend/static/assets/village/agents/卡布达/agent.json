@@ -7,6 +7,9 @@
   ],
   "currently": "卡布达在尝试恢复规律作息，今天只安排少量家务与短时散步。",
   "chat_iter": 18,
+  "external_memory": {
+    "user_id": "agent_kabuda"
+  },
   "scratch": {
     "age": 23,
     "innate": "敏感、内省、善良",
