@@ -1418,14 +1418,6 @@ class Agent:
             emoji=f"⌛",
         )
         self.revise_schedule(event, start, duration)
-        dda.commit_event(
-            self,
-            event_key="wait_event",
-            forced=False,
-            fallback_hint="decide_wait",
-            other_agent=getattr(other, "name", ""),
-            conversation_content=dda.build_wait_content(self, other, focus),
-        )
 
     def schedule_chat(
         self,

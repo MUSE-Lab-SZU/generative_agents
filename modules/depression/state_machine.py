@@ -2,6 +2,7 @@
 症状状态机 - 管理抑郁症状的动态状态转换
 """
 import random
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -13,6 +14,17 @@ class DepressionState:
     MILD_EPISODE = "mild_episode"          # 轻度发作期
     REMISSION = "remission"                # 缓解期
     CRISIS = "crisis"                      # 危机状态
+
+
+@dataclass
+class TransitionCandidate:
+    """单个目标状态的转换候选。"""
+
+    next_state: str
+    rule_probability: float
+    llm_probability: float
+    combined_probability: float
+    matched_rule_triggers: List[str]
 
 
 class SymptomStateMachine:
@@ -103,6 +115,34 @@ class SymptomStateMachine:
             DepressionState.SEVERE_EPISODE: {"triggers": ["intervention", "support", "time"], "probability": 0.3},
         },
     }
+
+    STATE_SEVERITY = {
+        DepressionState.REMISSION: 0,
+        DepressionState.MILD_EPISODE: 1,
+        DepressionState.MODERATE_EPISODE: 2,
+        DepressionState.SEVERE_EPISODE: 3,
+        DepressionState.CRISIS: 4,
+    }
+    DECAY_FACTOR = 0.90
+    TRIGGER_PRUNE_THRESHOLD = 0.20
+    RECOVERY_BOOST = 1.20
+    MAX_ADJUSTED_PROBABILITY = 0.95
+    LLM_MIN_CONFIDENCE = 0.60
+    LLM_SIGNAL_WEIGHT = 0.25
+    LLM_INDEPENDENT_PATH_SCALE = 2.0
+    LLM_INDEPENDENT_PATH_BASELINE = 0.05
+    LLM_ALLOWED_TRIGGERS = {
+        "positive_interaction",
+        "positive_event",
+        "therapy",
+        "therapy_progress",
+        "sustained_support",
+        "stress",
+        "extreme_stress",
+        "negative_event",
+        "isolation",
+        "trigger_event",
+    }
     
     def __init__(
         self,
@@ -156,12 +196,17 @@ class SymptomStateMachine:
             state = DepressionState.SEVERE_EPISODE
         return self.STATE_CHARACTERISTICS[state].copy()
     
-    def update_state(self, context_analysis: Dict) -> bool:
+    def update_state(
+        self,
+        context_analysis: Dict,
+        llm_transition_signal: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """
         根据情境分析更新状态
         
         Args:
             context_analysis: 情境分析结果
+            llm_transition_signal: LLM辅助判定信号（可选）
             
         Returns:
             是否发生了状态转换
@@ -170,37 +215,302 @@ class SymptomStateMachine:
         time_in_state = (self._now() - self.state_start_time).total_seconds() / 60
         if time_in_state < self.minimum_state_duration:
             return False
-        
-        # 累积触发因子
-        triggers = context_analysis.get("triggers", [])
+
+        # 历史触发衰减，防止负向触发无限累积。
+        self._decay_accumulated_triggers()
+
+        # 累积当前轮触发因子。
+        triggers = self._normalize_trigger_list(context_analysis.get("triggers", []))
         for trigger in triggers:
-            self.accumulated_triggers[trigger] = self.accumulated_triggers.get(trigger, 0) + 1
-        
-        # 检查可能的状态转换
+            self.accumulated_triggers[trigger] = (
+                self.accumulated_triggers.get(trigger, 0.0) + 1.0
+            )
+
+        # 时间触发用于缓慢恢复路径。
+        self._inject_time_trigger(time_in_state)
+
+        # 规则路径与LLM路径独立评估，再做概率并联融合。
+        llm_signal = self._normalize_llm_transition_signal(llm_transition_signal)
         possible_transitions = self.TRANSITION_RULES.get(self.current_state, {})
-        
+        candidates = self._build_transition_candidates(
+            possible_transitions=possible_transitions,
+            llm_signal=llm_signal,
+        )
+
+        if not candidates:
+            return False
+
+        selected = max(candidates, key=lambda item: item.combined_probability)
+        selected_probability = selected.combined_probability
+        if random.random() >= selected_probability:
+            return False
+
+        transition_triggers = self._build_transition_trigger_log(
+            current_triggers=triggers,
+            rule_triggers=selected.matched_rule_triggers,
+            llm_signal=llm_signal,
+        )
+        self._transition_to(selected.next_state, transition_triggers)
+        return True
+
+    def _build_transition_candidates(
+        self,
+        possible_transitions: Dict[str, Dict[str, Any]],
+        llm_signal: Optional[Dict[str, Any]],
+    ) -> List[TransitionCandidate]:
+        candidates: List[TransitionCandidate] = []
         for next_state, rule in possible_transitions.items():
-            # 检查触发条件
-            trigger_match = any(t in self.accumulated_triggers for t in rule["triggers"])
-            
-            if trigger_match:
-                # 计算转换概率
-                base_probability = rule["probability"]
-                adjusted_probability = base_probability * self.transition_sensitivity
-                
-                # 根据触发强度调整概率
-                trigger_strength = sum(
-                    self.accumulated_triggers.get(t, 0) 
-                    for t in rule["triggers"]
-                ) / len(rule["triggers"])
-                adjusted_probability *= (1 + trigger_strength * 0.1)
-                
-                # 随机决定是否转换
-                if random.random() < adjusted_probability:
-                    self._transition_to(next_state, triggers)
-                    return True
-        
-        return False
+            rule_payload = rule if isinstance(rule, dict) else {}
+            rule_triggers = self._normalize_trigger_list(rule_payload.get("triggers", []))
+            matched_rule_triggers = self._match_rule_triggers(rule_triggers)
+            base_probability = self._extract_base_probability(rule_payload)
+
+            rule_probability = self._estimate_rule_path_probability(
+                next_state=next_state,
+                base_probability=base_probability,
+                rule_triggers=rule_triggers,
+                matched_rule_triggers=matched_rule_triggers,
+            )
+            llm_probability = self._estimate_llm_path_probability(
+                next_state=next_state,
+                base_probability=base_probability,
+                llm_signal=llm_signal,
+            )
+            combined_probability = self._combine_independent_probabilities(
+                rule_probability=rule_probability,
+                llm_probability=llm_probability,
+            )
+            if combined_probability <= 0.0:
+                continue
+            candidates.append(
+                TransitionCandidate(
+                    next_state=str(next_state),
+                    rule_probability=rule_probability,
+                    llm_probability=llm_probability,
+                    combined_probability=combined_probability,
+                    matched_rule_triggers=matched_rule_triggers,
+                )
+            )
+        return candidates
+
+    def _extract_base_probability(self, rule: Dict[str, Any]) -> float:
+        try:
+            probability = float(rule.get("probability", 0.0) or 0.0)
+        except Exception:
+            probability = 0.0
+        return self._clamp_probability(probability)
+
+    def _match_rule_triggers(self, rule_triggers: List[str]) -> List[str]:
+        if not rule_triggers:
+            return []
+        return [
+            item
+            for item in rule_triggers
+            if self.accumulated_triggers.get(item, 0.0) > 0.0
+        ]
+
+    def _estimate_rule_path_probability(
+        self,
+        next_state: str,
+        base_probability: float,
+        rule_triggers: List[str],
+        matched_rule_triggers: List[str],
+    ) -> float:
+        if not rule_triggers or not matched_rule_triggers:
+            return 0.0
+
+        probability = max(0.0, base_probability * self.transition_sensitivity)
+        trigger_strength = (
+            sum(self.accumulated_triggers.get(item, 0.0) for item in rule_triggers)
+            / len(rule_triggers)
+        )
+        probability *= (1 + trigger_strength * 0.1)
+
+        if self._is_recovery_transition(next_state):
+            probability *= self.RECOVERY_BOOST
+
+        return self._clamp_probability(probability)
+
+    def _estimate_llm_path_probability(
+        self,
+        next_state: str,
+        base_probability: float,
+        llm_signal: Optional[Dict[str, Any]],
+    ) -> float:
+        if not llm_signal:
+            return 0.0
+
+        directional_score = self._get_llm_direction_score(next_state, llm_signal)
+        if directional_score <= 0.0:
+            return 0.0
+
+        llm_weight = self._clamp_score(
+            llm_signal.get("signal_weight", self.LLM_SIGNAL_WEIGHT)
+        )
+        baseline = max(
+            base_probability * self.transition_sensitivity,
+            self.LLM_INDEPENDENT_PATH_BASELINE,
+        )
+        probability = (
+            baseline
+            * llm_weight
+            * directional_score
+            * self.LLM_INDEPENDENT_PATH_SCALE
+        )
+        if self._is_recovery_transition(next_state):
+            probability *= self.RECOVERY_BOOST
+        return self._clamp_probability(probability)
+
+    def _get_llm_direction_score(
+        self,
+        next_state: str,
+        llm_signal: Dict[str, Any],
+    ) -> float:
+        if self._is_recovery_transition(next_state):
+            return self._clamp_score(llm_signal.get("positive_score", 0.0))
+        if self._is_worsening_transition(next_state):
+            return self._clamp_score(llm_signal.get("negative_score", 0.0))
+        return 0.0
+
+    def _combine_independent_probabilities(
+        self,
+        rule_probability: float,
+        llm_probability: float,
+    ) -> float:
+        rule_path = self._clamp_probability(rule_probability)
+        llm_path = self._clamp_probability(llm_probability)
+        combined = 1.0 - ((1.0 - rule_path) * (1.0 - llm_path))
+        return self._clamp_probability(combined)
+
+    def _clamp_probability(self, probability: Any) -> float:
+        try:
+            value = float(probability)
+        except Exception:
+            value = 0.0
+        value = max(0.0, value)
+        return min(self.MAX_ADJUSTED_PROBABILITY, value)
+
+    def _normalize_trigger_list(self, raw_triggers: Any) -> List[str]:
+        if raw_triggers is None:
+            return []
+        if isinstance(raw_triggers, list):
+            items = raw_triggers
+        else:
+            items = [raw_triggers]
+        normalized: List[str] = []
+        seen = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    def _decay_accumulated_triggers(self) -> None:
+        if not isinstance(self.accumulated_triggers, dict):
+            self.accumulated_triggers = {}
+            return
+        decayed: Dict[str, float] = {}
+        for trigger, value in self.accumulated_triggers.items():
+            try:
+                current = float(value)
+            except Exception:
+                continue
+            next_value = current * self.DECAY_FACTOR
+            if next_value >= self.TRIGGER_PRUNE_THRESHOLD:
+                decayed[str(trigger)] = next_value
+        self.accumulated_triggers = decayed
+
+    def _inject_time_trigger(self, time_in_state: float) -> None:
+        time_trigger_min_minutes = max(self.minimum_state_duration * 2, 60)
+        if time_in_state < time_trigger_min_minutes:
+            return
+        self.accumulated_triggers["time"] = self.accumulated_triggers.get("time", 0.0) + 1.0
+
+    def _normalize_llm_transition_signal(
+        self,
+        llm_transition_signal: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(llm_transition_signal, dict):
+            return None
+        confidence = self._clamp_score(llm_transition_signal.get("confidence", 0.0))
+        min_confidence = self._clamp_score(
+            llm_transition_signal.get("min_confidence", self.LLM_MIN_CONFIDENCE)
+        )
+        if confidence < min_confidence:
+            return None
+
+        positive_score = self._clamp_score(llm_transition_signal.get("positive_score", 0.0))
+        negative_score = self._clamp_score(llm_transition_signal.get("negative_score", 0.0))
+        signal_weight = self._clamp_score(
+            llm_transition_signal.get("signal_weight", self.LLM_SIGNAL_WEIGHT)
+        )
+
+        raw_triggers = llm_transition_signal.get("matched_triggers", [])
+        matched_triggers: List[str] = []
+        for trigger in self._normalize_trigger_list(raw_triggers):
+            if trigger in self.LLM_ALLOWED_TRIGGERS:
+                matched_triggers.append(trigger)
+
+        return {
+            "confidence": confidence,
+            "positive_score": positive_score,
+            "negative_score": negative_score,
+            "matched_triggers": matched_triggers,
+            "min_confidence": min_confidence,
+            "signal_weight": signal_weight,
+        }
+
+    def _build_transition_trigger_log(
+        self,
+        current_triggers: List[str],
+        rule_triggers: List[str],
+        llm_signal: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for item in current_triggers + rule_triggers:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+
+        if isinstance(llm_signal, dict):
+            llm_triggers = self._normalize_trigger_list(llm_signal.get("matched_triggers", []))
+            for trigger in llm_triggers:
+                if trigger in seen:
+                    continue
+                seen.add(trigger)
+                merged.append(trigger)
+            if not llm_triggers:
+                positive_score = self._clamp_score(llm_signal.get("positive_score", 0.0))
+                negative_score = self._clamp_score(llm_signal.get("negative_score", 0.0))
+                if positive_score > 0.0 or negative_score > 0.0:
+                    marker = "llm_signal"
+                    if marker not in seen:
+                        seen.add(marker)
+                        merged.append(marker)
+        return merged
+
+    def _is_recovery_transition(self, next_state: str) -> bool:
+        current = self.STATE_SEVERITY.get(self.current_state, 3)
+        target = self.STATE_SEVERITY.get(next_state, current)
+        return target < current
+
+    def _is_worsening_transition(self, next_state: str) -> bool:
+        current = self.STATE_SEVERITY.get(self.current_state, 3)
+        target = self.STATE_SEVERITY.get(next_state, current)
+        return target > current
+
+    @staticmethod
+    def _clamp_score(value: Any) -> float:
+        try:
+            score = float(value)
+        except Exception:
+            score = 0.0
+        return max(0.0, min(1.0, score))
     
     def _transition_to(self, new_state: str, triggers: List[str]):
         """执行状态转换"""

@@ -237,7 +237,6 @@
                 "generate_chat",
                 "decide_chat",
                 "decide_chat_terminate",
-                "decide_wait",
                 "summarize_relation",
                 "summarize_chats",
                 "determine_sector",
