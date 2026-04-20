@@ -130,9 +130,11 @@ class DepressionSimulationEngine:
                            other_agent: Optional[str] = None,
                            relationship: Optional[str] = None,
                            interaction_type: Optional[str] = None,
-                           conversation_content: str = "") -> Dict:
+                           conversation_content: str = "",
+                           llm_transition_signal: Optional[Dict[str, Any]] = None) -> Dict:
         """
         提交一次真实互动，更新症状状态与运行时统计，不构建prompt文本。
+        llm_transition_signal 为可选辅助评分信号，缺省时走纯规则状态机。
         """
         if not self.enabled:
             return {
@@ -150,7 +152,10 @@ class DepressionSimulationEngine:
             conversation_content=conversation_content,
         )
         self.interaction_count += 1
-        transitioned = self.state_machine.update_state(context)
+        transitioned = self.state_machine.update_state(
+            context,
+            llm_transition_signal=llm_transition_signal,
+        )
         current_state = self.state_machine.get_current_state()
 
         activated_memories = self.memory_system.check_memory_activation(

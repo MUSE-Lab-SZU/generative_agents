@@ -10,7 +10,6 @@
       "decide_chat",
       "generate_chat",
       "decide_chat_terminate",
-      "decide_wait",
       "summarize_relation",
       "summarize_chats",
       "determine_sector",
@@ -22,7 +21,6 @@
       "decide_chat": "闲聊",
       "generate_chat": "深度交流",
       "decide_chat_terminate": "深度交流",
-      "decide_wait": "资源等待",
       "summarize_relation": "关系回顾",
       "summarize_chats": "深度交流",
       "determine_sector": "日常活动",
@@ -31,8 +29,7 @@
       "describe_object": "日常活动"
     },
     "event_interaction_mapping": {
-      "chat_event": "深度交流",
-      "wait_event": "资源等待"
+      "chat_event": "深度交流"
     },
     "relationship_mapping": {
       "田德莉娜": "亲密朋友",
@@ -122,6 +119,13 @@
         "physical_reactions": ["麻木感", "解离感", "情感空洞"],
         "activation_threshold": 0.7
       }
-    ]
+    ],
+    "llm_transition_judge": {
+      "enabled": true,
+      "min_confidence": 0.60,
+      "max_text_length": 1600,
+      "signal_weight": 0.25,
+      "allowed_event_keys": ["chat_event"]
+    }
   }
 }

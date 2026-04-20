@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from modules import utils
@@ -14,7 +15,6 @@ DEFAULT_DEPRESSION_TARGET_HINTS = {
     "decide_chat",
     "generate_chat",
     "decide_chat_terminate",
-    "decide_wait",
     "summarize_relation",
     "summarize_chats",
     "determine_sector",
@@ -27,7 +27,6 @@ DEFAULT_DEPRESSION_PROMPT_CONTEXT_MAPPING = {
     "decide_chat": "闲聊",
     "generate_chat": "深度交流",
     "decide_chat_terminate": "深度交流",
-    "decide_wait": "资源等待",
     "summarize_relation": "关系回顾",
     "summarize_chats": "深度交流",
     "determine_sector": "日常活动",
@@ -38,7 +37,6 @@ DEFAULT_DEPRESSION_PROMPT_CONTEXT_MAPPING = {
 
 DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING = {
     "chat_event": "深度交流",
-    "wait_event": "资源等待",
 }
 
 KNOWN_DEPRESSION_RELATIONSHIPS = {
@@ -61,6 +59,28 @@ DEFAULT_GLOBAL_CFG = {
     "persist_enabled": True,
 }
 
+DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
+    "enabled": False,
+    "timeout_ms": 1200,
+    "min_confidence": 0.60,
+    "max_text_length": 1600,
+    "signal_weight": 0.25,
+    "allowed_event_keys": ["chat_event"],
+}
+
+LLM_TRANSITION_TRIGGER_WHITELIST = {
+    "positive_interaction",
+    "positive_event",
+    "therapy",
+    "therapy_progress",
+    "sustained_support",
+    "stress",
+    "extreme_stress",
+    "negative_event",
+    "isolation",
+    "trigger_event",
+}
+
 
 def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     """Initialize dynamic depression runtime for one agent."""
@@ -75,6 +95,9 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     )
     agent.depression_dynamic_event_interaction_mapping = dict(
         DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING
+    )
+    agent.depression_dynamic_llm_transition_judge_cfg = dict(
+        DEFAULT_LLM_TRANSITION_JUDGE_CFG
     )
 
     if not cfg.get("enabled", False):
@@ -133,6 +156,9 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     prompt_map, event_map = _build_interaction_mappings(simulation_config)
     relationship_mapping = _build_relationship_mapping(simulation_config.get("relationship_mapping", {}))
     target_hints = _resolve_target_hints(cfg, simulation_config)
+    llm_transition_cfg = _normalize_llm_transition_judge_cfg(
+        simulation_config.get("llm_transition_judge", {})
+    )
 
     agent.depression_dynamic_engine = engine
     agent.depression_dynamic_enabled = True
@@ -140,6 +166,7 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     agent.depression_dynamic_relationship_mapping = relationship_mapping
     agent.depression_dynamic_prompt_interaction_mapping = prompt_map
     agent.depression_dynamic_event_interaction_mapping = event_map
+    agent.depression_dynamic_llm_transition_judge_cfg = llm_transition_cfg
 
     load_result = {"loaded": False, "reason": "persist_disabled_or_empty"}
     if cfg.get("persist_enabled", True):
@@ -152,12 +179,14 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     _log(
         agent,
         "info",
-        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={}".format(
+        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={} llm_transition_enabled={} llm_allowed_events={}".format(
             agent.name,
             config_path,
             len(target_hints),
             bool(load_result.get("loaded", False)),
             load_result.get("reason", ""),
+            bool(llm_transition_cfg.get("enabled", False)),
+            ",".join(list(llm_transition_cfg.get("allowed_event_keys", []))),
         ),
     )
 
@@ -266,8 +295,21 @@ def commit_event(
 
     if other_agent and not relationship:
         relationship = _resolve_relationship(agent, "commit_interaction", (), other_agent)
+    if (
+        event_key == "chat_event"
+        and str(relationship or "").strip() == "治疗师"
+        and interaction_type in {"深度交流", "闲聊", "日常活动"}
+    ):
+        interaction_type = "治疗对话"
 
     try:
+        llm_transition_signal = _build_llm_transition_signal(
+            agent=agent,
+            event_key=event_key,
+            interaction_type=interaction_type,
+            relationship=relationship,
+            conversation_content=conversation_content or "",
+        )
         result = agent.depression_dynamic_engine.commit_interaction(
             location=_resolve_current_location(agent),
             time_of_day=_resolve_time_of_day(agent),
@@ -275,16 +317,18 @@ def commit_event(
             relationship=relationship,
             interaction_type=interaction_type,
             conversation_content=conversation_content or "",
+            llm_transition_signal=llm_transition_signal,
         )
         _log(
             agent,
             "info",
-            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true transitioned={} state={}".format(
+            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true transitioned={} state={} llm_signal={}".format(
                 agent.name,
                 event_key,
                 bool(forced),
                 bool((result or {}).get("transitioned", False)),
                 (result or {}).get("current_state", ""),
+                bool(llm_transition_signal),
             ),
         )
         return result
@@ -358,29 +402,6 @@ def serialize_focus(focus: Any, max_items: int = 6) -> str:
     return "\n".join([line for line in lines if line])
 
 
-def build_wait_content(agent: Any, other: Any, focus: Any) -> str:
-    other_name = getattr(other, "name", "")
-    other_event_desc = ""
-    try:
-        other_event_desc = other.get_event().get_describe(False)
-    except Exception:
-        other_event_desc = ""
-    return "\n".join(
-        [
-            item
-            for item in [
-                serialize_focus(focus),
-                "{} 在等待 {} 完成 {}".format(
-                    getattr(agent, "name", ""),
-                    other_name,
-                    other_event_desc,
-                ),
-            ]
-            if item
-        ]
-    )
-
-
 def _runtime_ready(agent: Any) -> bool:
     return bool(
         getattr(agent, "depression_dynamic_enabled", False)
@@ -424,6 +445,45 @@ def _normalize_global_cfg(raw_cfg: Any) -> Dict[str, Any]:
     return cfg
 
 
+def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_LLM_TRANSITION_JUDGE_CFG)
+    if not isinstance(raw_cfg, dict):
+        return cfg
+
+    if "enabled" in raw_cfg:
+        cfg["enabled"] = bool(raw_cfg.get("enabled"))
+    cfg["timeout_ms"] = _bounded_int(raw_cfg.get("timeout_ms"), cfg["timeout_ms"], 200, 30000)
+    cfg["min_confidence"] = _bounded_float(
+        raw_cfg.get("min_confidence"),
+        cfg["min_confidence"],
+        0.0,
+        1.0,
+    )
+    cfg["max_text_length"] = _bounded_int(
+        raw_cfg.get("max_text_length"),
+        cfg["max_text_length"],
+        200,
+        8000,
+    )
+    cfg["signal_weight"] = _bounded_float(
+        raw_cfg.get("signal_weight"),
+        cfg["signal_weight"],
+        0.0,
+        1.0,
+    )
+
+    allowed = raw_cfg.get("allowed_event_keys", cfg["allowed_event_keys"])
+    cleaned_allowed: List[str] = []
+    if isinstance(allowed, list):
+        for item in allowed:
+            text = str(item or "").strip()
+            if text:
+                cleaned_allowed.append(text)
+    if cleaned_allowed:
+        cfg["allowed_event_keys"] = cleaned_allowed
+    return cfg
+
+
 def _resolve_target_hints(cfg: Dict[str, Any], simulation_config: Dict[str, Any]) -> Set[str]:
     simulation_hints_raw = simulation_config.get("target_hints", [])
     simulation_hints = []
@@ -453,9 +513,6 @@ def _build_interaction_mappings(simulation_config: Dict[str, Any]) -> (Dict[str,
     derived_chat_interaction = prompt_mapping.get("generate_chat")
     if derived_chat_interaction:
         event_mapping["chat_event"] = derived_chat_interaction
-    derived_wait_interaction = prompt_mapping.get("decide_wait")
-    if derived_wait_interaction:
-        event_mapping["wait_event"] = derived_wait_interaction
     return prompt_mapping, event_mapping
 
 
@@ -553,7 +610,7 @@ def _get_event_interaction_type(agent: Any, event_key: str, fallback_hint: Optio
 def _extract_other_agent(agent: Any, func_hint: str, args: Iterable[Any], kwargs: Dict[str, Any]) -> Optional[str]:
     del kwargs
     args = list(args)
-    if func_hint in {"generate_chat", "decide_chat", "decide_chat_terminate", "decide_wait"}:
+    if func_hint in {"generate_chat", "decide_chat", "decide_chat_terminate"}:
         if len(args) >= 2:
             return getattr(args[1], "name", str(args[1]))
         return None
@@ -675,6 +732,235 @@ def _resolve_time_of_day(agent: Any) -> str:
     return "night"
 
 
+def _build_llm_transition_signal(
+    agent: Any,
+    event_key: str,
+    interaction_type: str,
+    relationship: Optional[str],
+    conversation_content: str,
+) -> Optional[Dict[str, Any]]:
+    raw_cfg = getattr(agent, "depression_dynamic_llm_transition_judge_cfg", {})
+    cfg = raw_cfg if isinstance(raw_cfg, dict) else dict(DEFAULT_LLM_TRANSITION_JUDGE_CFG)
+    if not bool(cfg.get("enabled", False)):
+        return None
+
+    allowed_event_keys = cfg.get("allowed_event_keys", [])
+    if isinstance(allowed_event_keys, list) and allowed_event_keys:
+        if event_key not in allowed_event_keys:
+            return None
+
+    llm = getattr(agent, "_llm", None)
+    if llm is None:
+        _log(
+            agent,
+            "debug",
+            "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} enabled=true ready=false reason=llm_unavailable".format(
+                getattr(agent, "name", ""),
+                event_key,
+            ),
+        )
+        return None
+    if callable(getattr(llm, "is_available", None)):
+        try:
+            if not bool(llm.is_available()):
+                return None
+        except Exception:
+            pass
+
+    clipped_text = _trim_text(
+        text=conversation_content,
+        max_text_length=_bounded_int(
+            cfg.get("max_text_length"),
+            DEFAULT_LLM_TRANSITION_JUDGE_CFG["max_text_length"],
+            200,
+            8000,
+        ),
+    )
+    if not clipped_text:
+        return None
+
+    prompt = _build_llm_transition_prompt(
+        interaction_type=interaction_type,
+        relationship=relationship,
+        conversation_content=clipped_text,
+    )
+
+    try:
+        raw = llm.completion(
+            prompt=prompt,
+            retry=1,
+            caller="depr_transition_judge",
+            failsafe="",
+        )
+    except Exception as e:
+        _log(
+            agent,
+            "warning",
+            "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=false reason=completion_error error={}".format(
+                getattr(agent, "name", ""),
+                event_key,
+                e,
+            ),
+        )
+        return None
+
+    parsed = _parse_json_object(raw)
+    if not isinstance(parsed, dict):
+        _log(
+            agent,
+            "debug",
+            "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=false reason=invalid_json".format(
+                getattr(agent, "name", ""),
+                event_key,
+            ),
+        )
+        return None
+
+    signal = _sanitize_llm_transition_signal(parsed, cfg)
+    if signal is None:
+        _log(
+            agent,
+            "debug",
+            "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=false reason=below_threshold_or_empty".format(
+                getattr(agent, "name", ""),
+                event_key,
+            ),
+        )
+        return None
+
+    _log(
+        agent,
+        "debug",
+        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} matched={}".format(
+            getattr(agent, "name", ""),
+            event_key,
+            signal.get("confidence", 0.0),
+            ",".join(signal.get("matched_triggers", [])),
+        ),
+    )
+    return signal
+
+
+def _build_llm_transition_prompt(
+    interaction_type: str,
+    relationship: Optional[str],
+    conversation_content: str,
+) -> str:
+    whitelist = ", ".join(sorted(list(LLM_TRANSITION_TRIGGER_WHITELIST)))
+    return (
+        "你是抑郁状态转换信号抽取器。仅输出一个 JSON 对象，不要输出其他文字。\n"
+        "任务：基于对话内容判断可匹配触发词，并给出正负向分数与置信度。\n"
+        "必须遵循字段：\n"
+        "{\n"
+        '  "matched_triggers": ["..."],\n'
+        '  "positive_score": 0.0,\n'
+        '  "negative_score": 0.0,\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+        "字段约束：\n"
+        "- matched_triggers 只能从白名单中选择。\n"
+        "- positive_score / negative_score / confidence 必须在 0 到 1 之间。\n"
+        "- 如果无法判断，返回低置信度和空触发词。\n"
+        "触发词白名单：{}\n\n"
+        "互动类型：{}\n"
+        "关系类型：{}\n"
+        "对话内容：\n{}\n"
+    ).format(
+        whitelist,
+        str(interaction_type or ""),
+        str(relationship or ""),
+        conversation_content,
+    )
+
+
+def _sanitize_llm_transition_signal(
+    payload: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    min_confidence = _bounded_float(
+        cfg.get("min_confidence"),
+        DEFAULT_LLM_TRANSITION_JUDGE_CFG["min_confidence"],
+        0.0,
+        1.0,
+    )
+    signal_weight = _bounded_float(
+        cfg.get("signal_weight"),
+        DEFAULT_LLM_TRANSITION_JUDGE_CFG["signal_weight"],
+        0.0,
+        1.0,
+    )
+
+    confidence = _bounded_float(payload.get("confidence"), 0.0, 0.0, 1.0)
+    if confidence < min_confidence:
+        return None
+
+    positive_score = _bounded_float(payload.get("positive_score"), 0.0, 0.0, 1.0)
+    negative_score = _bounded_float(payload.get("negative_score"), 0.0, 0.0, 1.0)
+
+    matched_triggers: List[str] = []
+    seen = set()
+    raw_matched = payload.get("matched_triggers", [])
+    if isinstance(raw_matched, list):
+        for trigger in raw_matched:
+            text = str(trigger or "").strip()
+            if not text or text in seen:
+                continue
+            if text not in LLM_TRANSITION_TRIGGER_WHITELIST:
+                continue
+            seen.add(text)
+            matched_triggers.append(text)
+
+    if not matched_triggers and positive_score <= 0.0 and negative_score <= 0.0:
+        return None
+
+    return {
+        "matched_triggers": matched_triggers,
+        "positive_score": positive_score,
+        "negative_score": negative_score,
+        "confidence": confidence,
+        "min_confidence": min_confidence,
+        "signal_weight": signal_weight,
+    }
+
+
+def _parse_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    for chunk in [text] + fenced:
+        data = str(chunk or "").strip()
+        if not data:
+            continue
+        try:
+            parsed = json.loads(data)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+
+    left = text.find("{")
+    right = text.rfind("}")
+    if left >= 0 and right > left:
+        snippet = text[left:right + 1]
+        try:
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _trim_text(text: Any, max_text_length: int) -> str:
+    normalized = str(text or "").replace("\x00", " ").strip()
+    if not normalized:
+        return ""
+    max_len = _bounded_int(max_text_length, 1600, 200, 8000)
+    return normalized[:max_len]
+
+
 def _is_forced_chain(agent: Any) -> bool:
     ctx = getattr(agent, "_chat_route_ctx", None)
     return bool(isinstance(ctx, dict) and ctx.get("forced", False))
@@ -694,6 +980,26 @@ def _now_from_timer() -> datetime.datetime:
     except Exception:
         pass
     return datetime.datetime.now()
+
+
+def _bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
+    try:
+        num = int(value)
+    except Exception:
+        num = int(default)
+    num = max(lower, num)
+    num = min(upper, num)
+    return num
+
+
+def _bounded_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        num = float(value)
+    except Exception:
+        num = float(default)
+    num = max(lower, num)
+    num = min(upper, num)
+    return num
 
 
 def _log(agent: Any, level: str, message: str) -> None:

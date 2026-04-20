@@ -39,7 +39,6 @@ class ContextAnalyzer:
     INTERACTION_TYPE_IMPACT = {
         "日常活动": {"stress": 0.3, "trigger_potential": 0.2},
         "闲聊": {"stress": 0.4, "trigger_potential": 0.2},
-        "资源等待": {"stress": 0.45, "trigger_potential": 0.3},
         "关系回顾": {"stress": 0.35, "trigger_potential": 0.3},
         "深度交流": {"stress": 0.6, "trigger_potential": 0.5},
         "寻求帮助": {"stress": 0.7, "trigger_potential": 0.6},
@@ -180,6 +179,14 @@ class ContextAnalyzer:
         if social_analysis and social_analysis.get("emotional_support", 0) > 0.7:
             all_triggers.append("support")
 
+        all_triggers = self._normalize_transition_triggers(
+            all_triggers=all_triggers,
+            social_analysis=social_analysis,
+            interaction_type=interaction_type,
+            conversation_content=conversation_content,
+            overall_stress=overall_stress,
+        )
+
         if all_triggers:
             self.trigger_history.extend([str(item) for item in all_triggers])
             # 仅保留最近触发，避免无界增长
@@ -195,6 +202,73 @@ class ContextAnalyzer:
         }
         
         return self.current_context
+
+    def _normalize_transition_triggers(
+        self,
+        all_triggers: List[str],
+        social_analysis: Dict[str, Any],
+        interaction_type: Optional[str],
+        conversation_content: str,
+        overall_stress: float,
+    ) -> List[str]:
+        """
+        将上下文触发词归一化到状态机可识别词表，尽量保持最小侵入。
+        """
+        del conversation_content  # 预留语义增强入口，当前版本不直接使用。
+        normalized: List[str] = []
+        seen = set()
+
+        def _append(trigger: str) -> None:
+            text = str(trigger or "").strip()
+            if not text or text in seen:
+                return
+            seen.add(text)
+            normalized.append(text)
+
+        for trigger in all_triggers or []:
+            _append(str(trigger))
+
+        negative_hints = {"学业失败", "自我价值", "社交压力"}
+        if any(trigger in negative_hints for trigger in normalized):
+            _append("negative_event")
+
+        support_level = 0.0
+        social_pressure = 0.0
+        relationship = ""
+        analyzed_interaction_type = ""
+        if isinstance(social_analysis, dict):
+            relationship = str(social_analysis.get("relationship", "") or "").strip()
+            analyzed_interaction_type = str(
+                social_analysis.get("interaction_type", "") or ""
+            ).strip()
+            try:
+                support_level = float(social_analysis.get("emotional_support", 0.0) or 0.0)
+            except Exception:
+                support_level = 0.0
+            try:
+                social_pressure = float(social_analysis.get("social_pressure", 0.0) or 0.0)
+            except Exception:
+                social_pressure = 0.0
+
+        if social_pressure >= 0.75:
+            _append("isolation")
+
+        if support_level >= 0.7:
+            _append("support")
+            _append("positive_interaction")
+
+        resolved_interaction_type = str(interaction_type or analyzed_interaction_type).strip()
+        has_therapy_context = relationship == "治疗师" or resolved_interaction_type == "治疗对话"
+        if has_therapy_context:
+            _append("therapy")
+
+        if has_therapy_context and overall_stress <= 0.55:
+            _append("therapy_progress")
+
+        if support_level >= 0.8 and overall_stress <= 0.45:
+            _append("sustained_support")
+
+        return normalized
     
     def _calculate_location_stress(self, location: str) -> float:
         """计算位置压力"""
