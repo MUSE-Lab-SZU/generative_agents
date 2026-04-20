@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from modules import utils
 
@@ -121,13 +121,17 @@ class SessionPromptInjectionManager:
         chats: List[Any],
         meeting_id: str,
         now_str: str,
+        session_eval_end: Optional[bool] = None,
     ) -> Dict[str, Any]:
         if not self.enabled:
             return {"applied": False, "reason": "disabled"}
 
         state = self.resolve_current_session(doctor_name, patient_name)
         session_before = str(state.get("current_session", "") or "")
-        detected_end = self.detect_session_end(chats or [], doctor_name)
+        if session_eval_end is None:
+            detected_end = self.detect_session_end(chats or [], doctor_name)
+        else:
+            detected_end = bool(session_eval_end is True)
         pair_key = self._pair_key(doctor_name, patient_name)
         audit = self.advance_session_if_needed(pair_key, detected_end, meeting_id, now_str)
         audit["applied"] = True

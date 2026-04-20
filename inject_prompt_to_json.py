@@ -19,9 +19,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-DEFAULT_TXT_PATH = "./PST_Session.txt"
+DEFAULT_TXT_PATH = "./CBT_session.txt"
 DEFAULT_JSON_PATH = "./data/prompts/intervention_prompts.json"
-DEFAULT_KEY_PATH = ["PST", "session1"]
+DEFAULT_KEY_PATH = ["CBT", "session4.3"]
 
 
 def set_nested_value(data: dict[str, Any], keys: list[str], value: str) -> None:

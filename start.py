@@ -104,6 +104,27 @@ class SimulateServer:
             # 保存对话数据
             with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
                 f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
+            judge_trace_dir = os.path.join(self.checkpoints_folder, "judge_traces")
+            os.makedirs(judge_trace_dir, exist_ok=True)
+            judge_trace_payload = {"sessions": []}
+            if self.intervention and hasattr(self.intervention, "export_dialog_judge_trace_payload"):
+                try:
+                    payload = self.intervention.export_dialog_judge_trace_payload()
+                    if isinstance(payload, dict):
+                        judge_trace_payload = payload
+                except Exception:
+                    judge_trace_payload = {"sessions": []}
+            with open(os.path.join(judge_trace_dir, "judge_conversation.json"), "w", encoding="utf-8") as f:
+                f.write(json.dumps(judge_trace_payload, indent=2, ensure_ascii=False))
+            if self.logger:
+                sessions = judge_trace_payload.get("sessions", []) if isinstance(judge_trace_payload, dict) else []
+                session_count = len(sessions) if isinstance(sessions, list) else 0
+                self.logger.info(
+                    "[DIALOG_JUDGE_TRACE_WRITE] path={} sessions_count={}".format(
+                        os.path.join(judge_trace_dir, "judge_conversation.json"),
+                        session_count,
+                    )
+                )
 
             if stride > 0:
                 timer.forward(stride)

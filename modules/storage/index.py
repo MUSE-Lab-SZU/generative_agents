@@ -2,9 +2,12 @@
 
 import os
 import time
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
 from llama_index.core.schema import TextNode
 from llama_index import core as index_core
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import Settings
 
@@ -15,20 +18,14 @@ class LlamaIndex:
     def __init__(self, embedding_config, path=None):
         self._config = {"max_nodes": 0}
         if embedding_config["provider"] == "hugging_face":
-            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
             embed_model = HuggingFaceEmbedding(model_name=embedding_config["model"])
         elif embedding_config["provider"] == "ollama":
-            from llama_index.embeddings.ollama import OllamaEmbedding
-
             embed_model = OllamaEmbedding(
                 model_name=embedding_config["model"],
                 base_url=embedding_config["base_url"],
                 ollama_additional_kwargs={"mirostat": 0},
             )
         elif embedding_config["provider"] == "openai":
-            from llama_index.embeddings.openai import OpenAIEmbedding
-
             embed_model = OpenAIEmbedding(
                 model_name=embedding_config["model"],
                 api_base=embedding_config["base_url"],

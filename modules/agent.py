@@ -1053,6 +1053,37 @@ class Agent:
             )
         )
 
+        dialog_judge_enabled = False
+        if forced and self.intervention and hasattr(self.intervention, "get_dialog_judge_runtime_policy"):
+            try:
+                policy_payload = self.intervention.get_dialog_judge_runtime_policy()
+                if isinstance(policy_payload, dict):
+                    dialog_judge_enabled = bool(policy_payload.get("enabled", False))
+            except Exception as e:
+                dialog_judge_enabled = False
+                self.logger.warning(
+                    "[DIALOG_JUDGE_POLICY_ERROR] agent={} other={} error={}".format(
+                        self.name,
+                        other.name,
+                        e,
+                    )
+                )
+        self.logger.info(
+            "[DIALOG_JUDGE_SWITCH] agent={} other={} forced={} enabled={}".format(
+                self.name,
+                other.name,
+                forced,
+                dialog_judge_enabled,
+            )
+        )
+        doctor_turn_judge_cache = {
+            "valid": False,
+            "speaker": "",
+            "turn_no": -1,
+            "terminate": False,
+            "advice": "",
+        }
+
         for i in range(chat_iter_budget):
             turn_no = i + 1
             terminate_check_enabled_this_turn = True
@@ -1071,12 +1102,62 @@ class Agent:
                 )
             )
             doctor_session_prompt_injection = ""
+            doctor_consult_record_injection = ""
+            judge_session_prompt_injection = ""
             if self.intervention:
-                doctor_session_prompt_injection = self.intervention.get_doctor_session_prompt_injection(
+                doctor_consult_record_injection = self.intervention.get_doctor_consult_record_injection(
                     self,
                     other,
                     forced,
                 )
+                judge_session_prompt_injection = self.intervention.get_session_prompt_for_judge(
+                    self,
+                    other,
+                    forced,
+                )
+            self_is_doctor_turn = bool(
+                self.intervention
+                and str(self.name or "") == str(getattr(self.intervention, "doctor", "") or "")
+            )
+            if (
+                dialog_judge_enabled
+                and self_is_doctor_turn
+                and self.intervention
+                and hasattr(self.intervention, "judge_forced_dialog_before_doctor_speak")
+            ):
+                doctor_turn_judge_cache["valid"] = False
+                judge = self.intervention.judge_forced_dialog_before_doctor_speak(
+                    speaker=self,
+                    other=other,
+                    chats=chats,
+                    forced=forced,
+                    turn_no=turn_no,
+                    session_prompt_text=judge_session_prompt_injection,
+                )
+                judge_valid = True if (isinstance(judge, dict) and judge.get("valid") is True) else False
+                terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
+                advice_text = ""
+                if isinstance(judge, dict):
+                    advice_text = str(judge.get("advice", "") or "")
+                doctor_turn_judge_cache = {
+                    "valid": judge_valid,
+                    "speaker": self.name,
+                    "turn_no": int(turn_no),
+                    "terminate": terminate_flag,
+                    "advice": advice_text,
+                }
+                self.logger.info(
+                    "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
+                        turn_no,
+                        terminate_flag,
+                    )
+                )
+                if advice_text:
+                    doctor_session_prompt_injection += (
+                        "\n<医生回复建议>\n"
+                        + advice_text
+                        + "\n</医生回复建议>"
+                    )
             chat_view = drm.build_intermediate_view(
                 self.depression_profile,
                 utils.get_timer().daily_duration(),
@@ -1093,6 +1174,7 @@ class Agent:
                 chats=chats,
                 depression_chat_block=chat_view.get("chat_block", ""),
                 doctor_session_prompt_injection=doctor_session_prompt_injection,
+                doctor_consult_record_injection=doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
                 is_initiator=True,
                 turn_no=turn_no,
@@ -1148,67 +1230,152 @@ class Agent:
 
                 # 对于发起对话的Agent，从第2轮对话开始，检查话题是否结束
                 chats.append((self.name, text))
-                terminate_end = False
-                if terminate_check_enabled_this_turn:
-                    end = self.completion(
-                        "decide_chat_terminate", self, other, chats
-                    )
-                    terminate_end = bool(end)
-                else:
-                    marker_hit = False
-                    if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
-                        marker_hit = bool(
-                            self.intervention.is_forced_chat_advance_marker_hit(
-                                self,
-                                other,
-                                text,
-                                forced=forced,
+                if not dialog_judge_enabled:
+                    terminate_end = False
+                    if terminate_check_enabled_this_turn:
+                        end = self.completion(
+                            "decide_chat_terminate", self, other, chats
+                        )
+                        terminate_end = bool(end)
+                    else:
+                        marker_hit = False
+                        if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
+                            marker_hit = bool(
+                                self.intervention.is_forced_chat_advance_marker_hit(
+                                    self,
+                                    other,
+                                    text,
+                                    forced=forced,
+                                )
+                            )
+                        self.logger.info(
+                            "========== [{}][CHAT_TERMINATE_SKIP] role=initiator i={} reason=tail_window_not_reached marker_hit={} ==========".format(
+                                trace_scope,
+                                i,
+                                marker_hit,
                             )
                         )
+                        if marker_hit:
+                            self.logger.info(
+                                "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=initiator i={} ==========".format(
+                                    trace_scope,
+                                    i,
+                                )
+                            )
+                            break
                     self.logger.info(
-                        "========== [{}][CHAT_TERMINATE_SKIP] role=initiator i={} reason=tail_window_not_reached marker_hit={} ==========".format(
+                        "========== [{}][CHAT_TERMINATE] role=initiator i={} terminate_end={} ==========".format(
                             trace_scope,
                             i,
-                            marker_hit,
+                            terminate_end,
                         )
                     )
-                    if marker_hit:
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=initiator i={} ==========".format(
-                                trace_scope,
-                                i,
+                    if terminate_end:
+                        can_break = True
+                        if enhanced:
+                            can_break = turn_no >= min_gate_turn
+                        if can_break:
+                            self.logger.info(
+                                "========== [{}][CHAT_BREAK] reason=terminate role=initiator i={} ==========".format(
+                                    trace_scope,
+                                    i,
+                                )
                             )
-                        )
-                        break
-                self.logger.info(
-                    "========== [{}][CHAT_TERMINATE] role=initiator i={} terminate_end={} ==========".format(
-                        trace_scope,
-                        i,
-                        terminate_end,
-                    )
-                )
-                if terminate_end:
-                    can_break = True
-                    if enhanced:
-                        can_break = turn_no >= min_gate_turn
-                    if can_break:
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=terminate role=initiator i={} ==========".format(
-                                trace_scope,
-                                i,
-                            )
-                        )
-                        break
+                            break
             else:
                 chats.append((self.name, text))
 
+            if dialog_judge_enabled and self_is_doctor_turn:
+                judge_cache_hit = (
+                    str(doctor_turn_judge_cache.get("speaker", "") or "") == str(self.name or "")
+                    and int(doctor_turn_judge_cache.get("turn_no", -1) or -1) == int(turn_no)
+                )
+                cache_hit = bool(judge_cache_hit and doctor_turn_judge_cache.get("valid", False))
+                terminate_eval = False
+                if cache_hit:
+                    terminate_eval = bool(doctor_turn_judge_cache.get("terminate", False))
+                    if enhanced:
+                        terminate_eval = bool(terminate_eval and (turn_no >= min_gate_turn))
+                self.logger.info(
+                    "[DIALOG_JUDGE_POST] turn={} terminate_eval={}".format(
+                        turn_no,
+                        terminate_eval,
+                    )
+                )
+                if judge_cache_hit and self.intervention and hasattr(self.intervention, "append_dialog_judge_trace_record"):
+                    self.intervention.append_dialog_judge_trace_record(
+                        speaker=self,
+                        other=other,
+                        chats=chats,
+                        doctor_turn_judge_cache=doctor_turn_judge_cache,
+                        doctor_utterance=text,
+                    )
+                doctor_turn_judge_cache["valid"] = False
+                if terminate_eval:
+                    self.logger.info(
+                        "[DIALOG_JUDGE_BREAK] turn={} reason=doctor_terminate_after_utterance".format(
+                            turn_no
+                        )
+                    )
+                    break
+
             other_doctor_session_prompt_injection = ""
+            other_doctor_consult_record_injection = ""
+            other_judge_session_prompt_injection = ""
             if self.intervention:
-                other_doctor_session_prompt_injection = self.intervention.get_doctor_session_prompt_injection(
+                other_doctor_consult_record_injection = self.intervention.get_doctor_consult_record_injection(
                     other,
                     self,
                     forced,
                 )
+                other_judge_session_prompt_injection = self.intervention.get_session_prompt_for_judge(
+                    other,
+                    self,
+                    forced,
+                )
+            other_is_doctor_turn = bool(
+                self.intervention
+                and str(other.name or "") == str(getattr(self.intervention, "doctor", "") or "")
+            )
+            if (
+                dialog_judge_enabled
+                and other_is_doctor_turn
+                and self.intervention
+                and hasattr(self.intervention, "judge_forced_dialog_before_doctor_speak")
+            ):
+                doctor_turn_judge_cache["valid"] = False
+                judge = self.intervention.judge_forced_dialog_before_doctor_speak(
+                    speaker=other,
+                    other=self,
+                    chats=chats,
+                    forced=forced,
+                    turn_no=turn_no,
+                    session_prompt_text=other_judge_session_prompt_injection,
+                )
+                judge_valid = True if (isinstance(judge, dict) and judge.get("valid") is True) else False
+                terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
+                advice_text = ""
+                if isinstance(judge, dict):
+                    advice_text = str(judge.get("advice", "") or "")
+                doctor_turn_judge_cache = {
+                    "valid": judge_valid,
+                    "speaker": other.name,
+                    "turn_no": int(turn_no),
+                    "terminate": terminate_flag,
+                    "advice": advice_text,
+                }
+                self.logger.info(
+                    "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
+                        turn_no,
+                        terminate_flag,
+                    )
+                )
+                if advice_text:
+                    other_doctor_session_prompt_injection += (
+                        "\n<医生回复建议>\n"
+                        + advice_text
+                        + "\n</医生回复建议>"
+                    )
             text = other._completion_generate_chat_with_external_route(
                 other=self,
                 relation=relations[1],
@@ -1224,6 +1391,7 @@ class Agent:
                     ),
                 ).get("chat_block", ""),
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
+                doctor_consult_record_injection=other_doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
                 is_initiator=False,
                 turn_no=turn_no,
@@ -1280,57 +1448,91 @@ class Agent:
             chats.append((other.name, text))
 
             # 对于响应对话的Agent，从第1轮开始，检查话题是否结束
-            terminate_end = False
-            if terminate_check_enabled_this_turn:
-                end = other.completion(
-                    "decide_chat_terminate", other, self, chats
+            if dialog_judge_enabled and other_is_doctor_turn:
+                judge_cache_hit = (
+                    str(doctor_turn_judge_cache.get("speaker", "") or "") == str(other.name or "")
+                    and int(doctor_turn_judge_cache.get("turn_no", -1) or -1) == int(turn_no)
                 )
-                terminate_end = bool(end)
-            else:
-                marker_hit = False
-                if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
-                    marker_hit = bool(
-                        self.intervention.is_forced_chat_advance_marker_hit(
-                            other,
-                            self,
-                            text,
-                            forced=forced,
+                cache_hit = bool(judge_cache_hit and doctor_turn_judge_cache.get("valid", False))
+                terminate_eval = False
+                if cache_hit:
+                    terminate_eval = bool(doctor_turn_judge_cache.get("terminate", False))
+                    if enhanced:
+                        terminate_eval = bool(terminate_eval and (turn_no >= min_gate_turn))
+                self.logger.info(
+                    "[DIALOG_JUDGE_POST] turn={} terminate_eval={}".format(
+                        turn_no,
+                        terminate_eval,
+                    )
+                )
+                if judge_cache_hit and self.intervention and hasattr(self.intervention, "append_dialog_judge_trace_record"):
+                    self.intervention.append_dialog_judge_trace_record(
+                        speaker=other,
+                        other=self,
+                        chats=chats,
+                        doctor_turn_judge_cache=doctor_turn_judge_cache,
+                        doctor_utterance=text,
+                    )
+                doctor_turn_judge_cache["valid"] = False
+                if terminate_eval:
+                    self.logger.info(
+                        "[DIALOG_JUDGE_BREAK] turn={} reason=doctor_terminate_after_utterance".format(
+                            turn_no
                         )
                     )
+                    break
+            elif not dialog_judge_enabled:
+                terminate_end = False
+                if terminate_check_enabled_this_turn:
+                    end = other.completion(
+                        "decide_chat_terminate", other, self, chats
+                    )
+                    terminate_end = bool(end)
+                else:
+                    marker_hit = False
+                    if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
+                        marker_hit = bool(
+                            self.intervention.is_forced_chat_advance_marker_hit(
+                                other,
+                                self,
+                                text,
+                                forced=forced,
+                            )
+                        )
+                    self.logger.info(
+                        "========== [{}][CHAT_TERMINATE_SKIP] role=responder i={} reason=tail_window_not_reached marker_hit={} ==========".format(
+                            trace_scope,
+                            i,
+                            marker_hit,
+                        )
+                    )
+                    if marker_hit:
+                        self.logger.info(
+                            "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=responder i={} ==========".format(
+                                trace_scope,
+                                i,
+                            )
+                        )
+                        break
                 self.logger.info(
-                    "========== [{}][CHAT_TERMINATE_SKIP] role=responder i={} reason=tail_window_not_reached marker_hit={} ==========".format(
+                    "========== [{}][CHAT_TERMINATE] role=responder i={} terminate_end={} ==========".format(
                         trace_scope,
                         i,
-                        marker_hit,
+                        terminate_end,
                     )
                 )
-                if marker_hit:
-                    self.logger.info(
-                        "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=responder i={} ==========".format(
-                            trace_scope,
-                            i,
+                if terminate_end:
+                    can_break = True
+                    if enhanced:
+                        can_break = turn_no >= min_gate_turn
+                    if can_break:
+                        self.logger.info(
+                            "========== [{}][CHAT_BREAK] reason=terminate role=responder i={} ==========".format(
+                                trace_scope,
+                                i,
+                            )
                         )
-                    )
-                    break
-            self.logger.info(
-                "========== [{}][CHAT_TERMINATE] role=responder i={} terminate_end={} ==========".format(
-                    trace_scope,
-                    i,
-                    terminate_end,
-                )
-            )
-            if terminate_end:
-                can_break = True
-                if enhanced:
-                    can_break = turn_no >= min_gate_turn
-                if can_break:
-                    self.logger.info(
-                        "========== [{}][CHAT_BREAK] reason=terminate role=responder i={} ==========".format(
-                            trace_scope,
-                            i,
-                        )
-                    )
-                    break
+                        break
 
             if enhanced and turn_no >= max_cap_turn:
                 self.logger.info(
@@ -1412,7 +1614,13 @@ class Agent:
         )
         self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
         if self.intervention:
-            self.intervention.after_chat(self, other, chats, chat_summary, start)
+            self.intervention.after_chat(
+                self,
+                other,
+                chats,
+                chat_summary,
+                start,
+            )
         return True
 
     def _external_memory_ingest_hook(self, payload):
@@ -1442,6 +1650,7 @@ class Agent:
         chats,
         depression_chat_block="",
         doctor_session_prompt_injection="",
+        doctor_consult_record_injection="",
         retrieval_profile=None,
         is_initiator=False,
         turn_no=1,
@@ -1487,6 +1696,7 @@ class Agent:
                         external_memory_context=external_memory_context,
                         depression_chat_block=depression_chat_block,
                         doctor_session_prompt_injection=doctor_session_prompt_injection,
+                        doctor_consult_record_injection=doctor_consult_record_injection,
                         chat_prompt_file=prompt_file,
                     )
                 self.logger.info(
@@ -1515,6 +1725,7 @@ class Agent:
             chats,
             depression_chat_block=depression_chat_block,
             doctor_session_prompt_injection=doctor_session_prompt_injection,
+            doctor_consult_record_injection=doctor_consult_record_injection,
             retrieval_profile=retrieval_profile,
         )
 

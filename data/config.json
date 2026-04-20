@@ -206,6 +206,19 @@
             "decide_chat_terminate_retry": 5,
             "decide_chat_terminate_force_forced_llm": true
         },
+        "dialog_judge": {
+            "enabled": true,
+            "prompt_file": "data/prompts/intervention/dialog_judge.txt",
+            "retry": 3,
+            "force_forced_llm": true
+        },
+        "session_eval": {
+            "enabled": true,
+            "route": "forced_llm",
+            "prompt_file": "data/prompts/intervention/session_eval.txt",
+            "retry": 3,
+            "history_recent_n": 3
+        },
         "consult_record": {
             "enabled": true,
             "prompt_generate_file": "data/prompts/intervention/consult_record_generate.txt",

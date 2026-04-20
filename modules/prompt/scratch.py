@@ -696,6 +696,7 @@ class Scratch:
         chats,
         depression_chat_block="",
         doctor_session_prompt_injection="",
+        doctor_consult_record_injection="",
         retrieval_profile=None,
         chat_history_target_name=None,
     ):
@@ -776,6 +777,7 @@ class Scratch:
                 "base_desc": self._base_desc(),
                 "depression_chat_block": depression_chat_block or "",
                 "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
+                "doctor_consult_record_injection": doctor_consult_record_injection or "",
                 "memory": memory,
                 "address": f"{address[-2]}，{address[-1]}",
                 "current_time": utils.get_timer().get_date("%H:%M"),
@@ -809,6 +811,7 @@ class Scratch:
         external_memory_context="",
         depression_chat_block="",
         doctor_session_prompt_injection="",
+        doctor_consult_record_injection="",
         chat_prompt_file="",
     ):
         address = agent.get_tile().get_address()
@@ -822,6 +825,7 @@ class Scratch:
                 "base_desc": self._base_desc(),
                 "depression_chat_block": depression_chat_block or "",
                 "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
+                "doctor_consult_record_injection": doctor_consult_record_injection or "",
                 "external_memory_context": external_memory_context or "",
                 "address": f"{address[-2]}，{address[-1]}",
                 "current_time": utils.get_timer().get_date("%H:%M"),

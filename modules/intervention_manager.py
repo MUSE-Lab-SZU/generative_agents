@@ -80,6 +80,8 @@ class InterventionManager:
         self.consult_record_cfg = intervention_cfg.get("consult_record", {}) or {}
         self._consult_record_llm = None
         self._consult_record_llm_key = ""
+        self._session_eval_think_llm = None
+        self._session_eval_think_llm_key = ""
 
         # 全局运行时状态（随 config 落盘）
         self.state = config.setdefault(
@@ -275,7 +277,14 @@ class InterventionManager:
                 )
             )
 
-    def after_chat(self, speaker: Any, other: Any, chats: Any, summary: str, start_time: Any) -> None:
+    def after_chat(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        summary: str,
+        start_time: Any,
+    ) -> None:
         """会话后回调：若命中锁定关系，清理 lock 并抽取医嘱。"""
         if not self.enabled:
             return
@@ -345,15 +354,59 @@ class InterventionManager:
             if doctor_for_session and patient_for_session:
                 lock_s_meeting_id = str(lock_s.get("meeting_id", "") or "")
                 lock_o_meeting_id = str(lock_o.get("meeting_id", "") or "")
-                meeting_id_for_session = lock_s_meeting_id or lock_o_meeting_id
+                meeting_id_for_session = lock_s_meeting_id or lock_o_meeting_id or str(closed_meeting_id or "")
                 if meeting_id_for_session:
+                    session_eval_payload = self.evaluate_session_after_chat(
+                        doctor=doctor_for_session,
+                        patient=patient_for_session,
+                        chats=chats or [],
+                        summary=str(summary or ""),
+                        meeting_id=meeting_id_for_session,
+                        start_time=start_time,
+                    )
+                    session_eval_end: Optional[bool] = None
+                    if isinstance(session_eval_payload, dict):
+                        current_session = ""
+                        try:
+                            state_for_session = self.session_prompt_injection.resolve_current_session(
+                                doctor_for_session.name,
+                                patient_for_session.name,
+                            )
+                            if isinstance(state_for_session, dict):
+                                current_session = str(state_for_session.get("current_session", "") or "")
+                        except Exception:
+                            current_session = ""
+                        pair_key_for_session = build_pair_key(doctor_for_session.name, patient_for_session.name)
+                        reason_text = str(session_eval_payload.get("reason", "") or "")
+                        self._store_session_eval_reason(
+                            pair_key=pair_key_for_session,
+                            current_session=current_session,
+                            meeting_id=meeting_id_for_session,
+                            reason=reason_text,
+                        )
+                        self.append_dialog_judge_trace_eval(
+                            meeting_id=meeting_id_for_session,
+                            pair_key=pair_key_for_session,
+                            step_time=self._resolve_trace_step_time(),
+                            normalized_eval_payload=session_eval_payload,
+                        )
+                        session_eval_end = bool(session_eval_payload.get("session_end", False))
                     audit = self.session_prompt_injection.on_chat_finished(
                         doctor_name=doctor_for_session.name,
                         patient_name=patient_for_session.name,
                         chats=chats or [],
                         meeting_id=meeting_id_for_session,
                         now_str=self._fmt_dt(start_time),
+                        session_eval_end=session_eval_end,
                     )
+                    if session_eval_end is not None:
+                        self._log_highlight(
+                            "[SESSION_PROMPT_EVAL_END] meeting_id={} session_eval_end={} action={}".format(
+                                meeting_id_for_session,
+                                bool(session_eval_end),
+                                audit.get("action", ""),
+                            )
+                        )
                     self._log_highlight(
                         "SESSION_PROMPT_AFTER_CHAT pair={}<->{} action={} current_session={} completed={}".format(
                             doctor_for_session.name,
@@ -476,7 +529,7 @@ class InterventionManager:
             )
         )
 
-    def get_doctor_session_prompt_injection(self, speaker: Any, other: Any, forced: bool) -> str:
+    def get_session_prompt_for_judge(self, speaker: Any, other: Any, forced: bool) -> str:
         if not self.enabled:
             return ""
         if not bool(forced):
@@ -494,14 +547,32 @@ class InterventionManager:
         if isinstance(lock, dict):
             meeting_id = str(lock.get("meeting_id", "") or "")
 
-        base_block = ""
         if self.session_prompt_injection:
-            base_block = self.session_prompt_injection.get_doctor_injection_block(
+            return self.session_prompt_injection.get_doctor_injection_block(
                 doctor_name=doctor.name,
                 patient_name=patient.name,
                 forced=bool(forced),
                 meeting_id=meeting_id,
             )
+        return ""
+
+    def get_doctor_consult_record_injection(self, speaker: Any, other: Any, forced: bool) -> str:
+        if not self.enabled:
+            return ""
+        if not bool(forced):
+            return ""
+
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return ""
+        if getattr(speaker, "name", "") != doctor.name:
+            return ""
+
+        self._ensure_agent_state(doctor)
+        lock = doctor.status.get("intervention", {}).get("lock", {})
+        meeting_id = ""
+        if isinstance(lock, dict):
+            meeting_id = str(lock.get("meeting_id", "") or "")
 
         consult_block = ""
         if self._consult_record_enabled():
@@ -541,7 +612,7 @@ class InterventionManager:
                         )
                     )
 
-        return self._join_prompt_blocks(base_block, consult_block)
+        return consult_block
 
     def get_forced_chat_advance_marker(self, speaker: Any, other: Any, forced: bool = False) -> str:
         if not self.enabled:
@@ -921,6 +992,297 @@ class InterventionManager:
         )
         return policy
 
+    def get_dialog_judge_runtime_policy(self) -> Dict[str, Any]:
+        default_policy = {
+            "enabled": False,
+            "prompt_file": "data/prompts/intervention/dialog_judge.txt",
+            "retry": 2,
+            "force_forced_llm": True,
+            "source": "defaults",
+        }
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw_cfg = intervention_cfg.get("dialog_judge", {}) or {}
+        if not isinstance(raw_cfg, dict):
+            self._log_highlight(
+                "[DIALOG_JUDGE_POLICY] source=defaults enabled={} retry={} force_forced_llm={} prompt_file={}".format(
+                    bool(default_policy["enabled"]),
+                    int(default_policy["retry"]),
+                    bool(default_policy["force_forced_llm"]),
+                    default_policy["prompt_file"],
+                )
+            )
+            return default_policy
+
+        policy = dict(default_policy)
+        policy["source"] = "dialog_judge_config"
+        policy["enabled"] = self._safe_bool(raw_cfg.get("enabled", False), False)
+        prompt_file = str(raw_cfg.get("prompt_file", default_policy["prompt_file"]) or "").strip()
+        policy["prompt_file"] = prompt_file or default_policy["prompt_file"]
+        retry = self._safe_int(raw_cfg.get("retry", default_policy["retry"]), default_policy["retry"])
+        policy["retry"] = retry if retry >= 1 else default_policy["retry"]
+        policy["force_forced_llm"] = self._safe_bool(
+            raw_cfg.get("force_forced_llm", default_policy["force_forced_llm"]),
+            default_policy["force_forced_llm"],
+        )
+        self._log_highlight(
+            "[DIALOG_JUDGE_POLICY] source={} enabled={} retry={} force_forced_llm={} prompt_file={}".format(
+                policy["source"],
+                bool(policy["enabled"]),
+                int(policy["retry"]),
+                bool(policy["force_forced_llm"]),
+                policy["prompt_file"],
+            )
+        )
+        return policy
+
+    def get_session_eval_runtime_policy(self) -> Dict[str, Any]:
+        default_policy = {
+            "enabled": False,
+            "route": "forced_llm",
+            "prompt_file": "data/prompts/intervention/session_eval.txt",
+            "retry": 2,
+            "history_recent_n": 3,
+            "source": "defaults",
+        }
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw_cfg = intervention_cfg.get("session_eval", {}) or {}
+        if not isinstance(raw_cfg, dict):
+            self._log_highlight(
+                "[SESSION_EVAL_POLICY] source=defaults enabled={} route={} retry={} prompt_file={}".format(
+                    bool(default_policy["enabled"]),
+                    default_policy["route"],
+                    int(default_policy["retry"]),
+                    default_policy["prompt_file"],
+                )
+            )
+            return default_policy
+
+        policy = dict(default_policy)
+        policy["source"] = "session_eval_config"
+        policy["enabled"] = self._safe_bool(raw_cfg.get("enabled", False), False)
+        route = str(raw_cfg.get("route", default_policy["route"]) or default_policy["route"]).strip().lower()
+        if route not in ("forced_llm", "think_llm"):
+            route = default_policy["route"]
+        policy["route"] = route
+        prompt_file = str(raw_cfg.get("prompt_file", default_policy["prompt_file"]) or "").strip()
+        policy["prompt_file"] = prompt_file or default_policy["prompt_file"]
+        retry = self._safe_int(raw_cfg.get("retry", default_policy["retry"]), default_policy["retry"])
+        policy["retry"] = retry if retry >= 1 else default_policy["retry"]
+        history_recent_n = self._safe_int(
+            raw_cfg.get("history_recent_n", default_policy["history_recent_n"]),
+            default_policy["history_recent_n"],
+        )
+        policy["history_recent_n"] = history_recent_n if history_recent_n >= 0 else default_policy["history_recent_n"]
+        self._log_highlight(
+            "[SESSION_EVAL_POLICY] source={} enabled={} route={} retry={} prompt_file={} history_recent_n={}".format(
+                policy["source"],
+                bool(policy["enabled"]),
+                policy["route"],
+                int(policy["retry"]),
+                policy["prompt_file"],
+                int(policy["history_recent_n"]),
+            )
+        )
+        return policy
+
+    def evaluate_session_after_chat(
+        self,
+        doctor: Any,
+        patient: Any,
+        chats: Any,
+        summary: str,
+        meeting_id: str,
+        start_time: Any,
+    ) -> Optional[Dict[str, Any]]:
+        policy = self.get_session_eval_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            return None
+
+        pair_key = build_pair_key(getattr(doctor, "name", ""), getattr(patient, "name", ""))
+        current_session = ""
+        if self.session_prompt_injection:
+            try:
+                session_state = self.session_prompt_injection.resolve_current_session(
+                    str(getattr(doctor, "name", "") or ""),
+                    str(getattr(patient, "name", "") or ""),
+                )
+                if isinstance(session_state, dict):
+                    current_session = str(session_state.get("current_session", "") or "")
+            except Exception:
+                current_session = ""
+        history_items = self._collect_session_eval_history_for_eval(
+            pair_key=pair_key,
+            current_session=current_session,
+            history_recent_n=int(policy.get("history_recent_n", 3) or 3),
+        )
+        history_text = self._format_session_eval_history_reasons_for_prompt(history_items)
+        fallback_levels = 0
+        for item in history_items:
+            sid = str((item or {}).get("session_id", "") or "")
+            if current_session and sid and sid != current_session:
+                fallback_levels += 1
+        self._log_highlight(
+            "[SESSION_EVAL_HISTORY_BUILD] pair_key={} current_session={} picked={} requested={} fallback_levels={} text_len={}".format(
+                str(pair_key or ""),
+                str(current_session or ""),
+                len(history_items),
+                int(policy.get("history_recent_n", 3) or 3),
+                int(fallback_levels),
+                len(str(history_text or "")),
+            )
+        )
+        conversation_text = to_conversation_text(chats or [])
+        session_prompt_text = self.get_session_prompt_for_judge(
+            speaker=doctor,
+            other=patient,
+            forced=True,
+        )
+        self._log_highlight(
+            "[SESSION_EVAL_CALL] meeting_id={} pair_key={} route={} retry={} prompt_file={}".format(
+                str(meeting_id or ""),
+                str(pair_key or ""),
+                policy.get("route", "forced_llm"),
+                int(policy.get("retry", 2) or 2),
+                policy.get("prompt_file", ""),
+            )
+        )
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("prompt_file", "") or ""))
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {
+                    "doctor": str(getattr(doctor, "name", "") or ""),
+                    "patient": str(getattr(patient, "name", "") or ""),
+                    "session_prompt": str(session_prompt_text or ""),
+                    "session_eval_history_reasons": str(history_text or ""),
+                    "conversation": conversation_text,
+                },
+            )
+            route = str(policy.get("route", "forced_llm") or "forced_llm").strip().lower()
+            if route == "think_llm":
+                raw = self._call_think_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("retry", 2) or 2),
+                    doctor_agent=doctor,
+                )
+            else:
+                raw = self._call_forced_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("retry", 2) or 2),
+                )
+            normalized = self._normalize_session_eval_output(raw)
+            self._log_highlight(
+                "[SESSION_EVAL_NORM] meeting_id={} efficacy_score={} session_end={} reason_len={}".format(
+                    str(meeting_id or ""),
+                    normalized.get("efficacy_score", 0),
+                    bool(normalized.get("session_end", False)),
+                    len(str(normalized.get("reason", "") or "")),
+                )
+            )
+            return normalized
+        except Exception as exc:
+            fallback = self._normalize_session_eval_output({})
+            fallback["reason"] = "session_eval_error:{}".format(str(exc))
+            self._log_highlight(
+                "[SESSION_EVAL_NORM] meeting_id={} efficacy_score={} session_end={} reason_len={}".format(
+                    str(meeting_id or ""),
+                    fallback.get("efficacy_score", 0),
+                    bool(fallback.get("session_end", False)),
+                    len(str(fallback.get("reason", "") or "")),
+                )
+            )
+            return fallback
+
+    def judge_forced_dialog_before_doctor_speak(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        forced: bool,
+        turn_no: int,
+        session_prompt_text: str = "",
+    ) -> Dict[str, Any]:
+        default_output = {
+            "valid": False,
+            "terminate": False,
+            "advice": "",
+        }
+        if not self.enabled:
+            return default_output
+
+        policy = self.get_dialog_judge_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            return default_output
+        if not bool(forced):
+            return default_output
+
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return default_output
+        if str(getattr(speaker, "name", "") or "") != str(getattr(doctor, "name", "") or ""):
+            return default_output
+
+        pair_key = build_pair_key(doctor.name, patient.name)
+        current_session = ""
+        if self.session_prompt_injection:
+            try:
+                session_state = self.session_prompt_injection.resolve_current_session(
+                    doctor.name,
+                    patient.name,
+                )
+                if isinstance(session_state, dict):
+                    current_session = str(session_state.get("current_session", "") or "")
+            except Exception:
+                current_session = ""
+        prev_session_eval_reason = self._get_session_eval_reason_for_judge(
+            pair_key=pair_key,
+            current_session=current_session,
+        )
+        if not bool(policy.get("force_forced_llm", True)):
+            self._log_highlight(
+                "[DIALOG_JUDGE_FALLBACK] turn={} reason=force_forced_llm_disabled".format(
+                    int(turn_no or 0)
+                )
+            )
+            return default_output
+
+        try:
+            self._log_highlight(
+                "[DIALOG_JUDGE_CALL] turn={} retry={} prompt_file={}".format(
+                    int(turn_no or 0),
+                    int(policy.get("retry", 2) or 2),
+                    policy.get("prompt_file", ""),
+                )
+            )
+            prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("prompt_file", "") or ""))
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {
+                    "patient_state": self._build_patient_dynamic_state_text(patient),
+                    "conversation": to_conversation_text(chats or []),
+                    "session_prompt": str(session_prompt_text or ""),
+                    "prev_session_eval_reason": str(prev_session_eval_reason or ""),
+                },
+            )
+            raw = self._call_forced_llm_json(prompt_text, retry=int(policy.get("retry", 2) or 2))
+            normalized = self._normalize_dialog_judge_output(raw)
+            normalized["valid"] = True
+            self._log_highlight(
+                "[DIALOG_JUDGE_NORM] turn={} terminate={}".format(
+                    int(turn_no or 0),
+                    bool(normalized.get("terminate", False)),
+                )
+            )
+            return normalized
+        except Exception as exc:
+            self._log_highlight(
+                "[DIALOG_JUDGE_FALLBACK] turn={} reason={}".format(
+                    int(turn_no or 0),
+                    str(exc),
+                )
+            )
+            return default_output
+
     def get_depr_short_term_runtime_policy(self) -> Dict[str, Any]:
         default_retry = 2
         default_force_forced_llm = True
@@ -1252,6 +1614,463 @@ class InterventionManager:
         except Exception:
             return int(default)
 
+    def _build_patient_dynamic_state_text(self, patient_agent: Any) -> str:
+        payload = {
+            "agent": str(getattr(patient_agent, "name", "") or ""),
+            "depression_dynamic": {
+                "enabled": bool(getattr(patient_agent, "depression_dynamic_enabled", False)),
+                "cfg": {},
+                "runtime": {},
+            },
+        }
+        cfg = getattr(patient_agent, "depression_dynamic_cfg", {})
+        if isinstance(cfg, dict):
+            payload["depression_dynamic"]["cfg"] = copy.deepcopy(cfg)
+
+        engine = getattr(patient_agent, "depression_dynamic_engine", None)
+        if engine is not None and hasattr(engine, "to_dict"):
+            try:
+                runtime = engine.to_dict()
+                if isinstance(runtime, dict):
+                    payload["depression_dynamic"]["runtime"] = runtime
+            except Exception as exc:
+                self._log_highlight(
+                    "[DIALOG_JUDGE_DYNAMIC_STATE] patient={} runtime_export_failed={}".format(
+                        str(getattr(patient_agent, "name", "") or ""),
+                        str(exc),
+                    )
+                )
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _normalize_dialog_judge_output(self, payload: Any) -> Dict[str, Any]:
+        raw = payload if isinstance(payload, dict) else {}
+        normalized = {
+            "terminate": False,
+            "advice": "",
+        }
+
+        def _parse_bool_strict(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered == "true":
+                    return True
+                if lowered == "false":
+                    return False
+            return False
+
+        normalized["terminate"] = _parse_bool_strict(raw.get("terminate"))
+        advice = raw.get("advice")
+        normalized["advice"] = advice if isinstance(advice, str) else ""
+        return normalized
+
+    def _call_think_llm_json(self, prompt_text: str, retry: int, doctor_agent: Any) -> Dict[str, Any]:
+        llm_cfg = {}
+        if doctor_agent is not None:
+            think_cfg = getattr(doctor_agent, "think_config", {}) or {}
+            if isinstance(think_cfg, dict):
+                llm_cfg = think_cfg.get("llm", {}) or {}
+        if not isinstance(llm_cfg, dict) or not llm_cfg:
+            raise ConsultRecordError(reason="think_llm_config_missing", retryable=False)
+
+        cache_key = "{}/{}/{}".format(
+            llm_cfg.get("provider", ""),
+            llm_cfg.get("model", ""),
+            llm_cfg.get("base_url", ""),
+        )
+        if self._session_eval_think_llm is None or self._session_eval_think_llm_key != cache_key:
+            self._session_eval_think_llm = create_llm_model(llm_cfg)
+            self._session_eval_think_llm_key = cache_key
+
+        retry_count = max(1, int(retry or llm_cfg.get("retry", 2) or 2))
+        payload = self._session_eval_think_llm.completion(
+            prompt_text,
+            retry=retry_count,
+            callback=self._json_loads_loose,
+            failsafe=None,
+            caller="session_eval_think_llm",
+        )
+        if not isinstance(payload, dict):
+            raise ConsultRecordError(reason="json_parse_failed", retryable=False)
+        return payload
+
+    def _normalize_session_eval_output(self, payload: Any) -> Dict[str, Any]:
+        raw = payload if isinstance(payload, dict) else {}
+        normalized = {
+            "efficacy_score": 0,
+            "session_end": False,
+            "reason": "",
+        }
+
+        def _parse_bool_strict(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered == "true":
+                    return True
+                if lowered == "false":
+                    return False
+            return False
+
+        score = raw.get("efficacy_score")
+        if isinstance(score, bool):
+            normalized["efficacy_score"] = 0
+        elif isinstance(score, (int, float)):
+            normalized["efficacy_score"] = score
+        elif isinstance(score, str):
+            try:
+                normalized["efficacy_score"] = float(score.strip())
+            except Exception:
+                normalized["efficacy_score"] = 0
+        normalized["session_end"] = _parse_bool_strict(raw.get("session_end"))
+        reason = raw.get("reason")
+        normalized["reason"] = reason if isinstance(reason, str) else ""
+        return normalized
+
+    def _store_session_eval_reason(
+        self,
+        pair_key: str,
+        current_session: str,
+        meeting_id: str,
+        reason: str,
+    ) -> None:
+        self._ensure_session_eval_state_schema()
+        state = self.state.setdefault("session_eval_state", {})
+        latest = state.setdefault("latest_reason_by_pair", {})
+        history_by_pair = state.setdefault("history_by_pair", {})
+
+        pair_key_text = str(pair_key or "")
+        current_session_text = str(current_session or "")
+        reason_text = str(reason or "")
+        now_text = self._fmt_dt(self._now())
+
+        latest[pair_key_text] = {
+            "reason": reason_text,
+            "current_session": current_session_text,
+            "updated_at": now_text,
+        }
+
+        history = history_by_pair.setdefault(pair_key_text, [])
+        if not isinstance(history, list):
+            history = []
+            history_by_pair[pair_key_text] = history
+
+        round_no = 0
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("session_id", "") or "") == current_session_text:
+                round_no += 1
+
+        history.append(
+            {
+                "session_id": current_session_text,
+                "session_round": int(round_no + 1),
+                "meeting_id": str(meeting_id or ""),
+                "reason": reason_text,
+                "updated_at": now_text,
+            }
+        )
+
+        self._log_highlight(
+            "[SESSION_EVAL_STORE] pair_key={} current_session={} session_round={} reason_len={}".format(
+                pair_key_text,
+                current_session_text,
+                int(round_no + 1),
+                len(reason_text),
+            )
+        )
+
+    def _get_session_eval_reason_for_judge(self, pair_key: str, current_session: str) -> str:
+        self._ensure_session_eval_state_schema()
+        state = self.state.setdefault("session_eval_state", {})
+        latest = state.setdefault("latest_reason_by_pair", {})
+        item = latest.get(str(pair_key or ""))
+        if not isinstance(item, dict):
+            return ""
+        if str(item.get("current_session", "") or "") != str(current_session or ""):
+            return ""
+        return str(item.get("reason", "") or "")
+
+    def _get_session_prompt_order(self) -> List[str]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        injection_cfg = intervention_cfg.get("session_prompt_injection", {}) or {}
+        raw_order = injection_cfg.get("order", []) or []
+        if not isinstance(raw_order, list):
+            return []
+        result = []
+        seen = set()
+        for item in raw_order:
+            session_id = str(item or "").strip()
+            if (not session_id) or (session_id in seen):
+                continue
+            seen.add(session_id)
+            result.append(session_id)
+        return result
+
+    def _collect_session_eval_history_for_eval(
+        self,
+        pair_key: str,
+        current_session: str,
+        history_recent_n: int,
+    ) -> List[Dict[str, Any]]:
+        self._ensure_session_eval_state_schema()
+        if int(history_recent_n or 0) <= 0:
+            return []
+        state = self.state.setdefault("session_eval_state", {})
+        history_by_pair = state.setdefault("history_by_pair", {})
+        items = history_by_pair.get(str(pair_key or ""))
+        if not isinstance(items, list) or (not items):
+            return []
+
+        normalized = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            reason_text = str(item.get("reason", "") or "").strip()
+            if not reason_text:
+                continue
+            normalized.append(
+                {
+                    "session_id": str(item.get("session_id", "") or ""),
+                    "session_round": self._safe_int(item.get("session_round", 0), 0),
+                    "meeting_id": str(item.get("meeting_id", "") or ""),
+                    "reason": reason_text,
+                    "updated_at": str(item.get("updated_at", "") or ""),
+                    "_idx": idx,
+                }
+            )
+        if not normalized:
+            return []
+
+        remaining = int(history_recent_n or 0)
+        picked = []
+        picked_idx = set()
+        current_session_text = str(current_session or "")
+
+        def _pick_session(session_id: str):
+            nonlocal remaining
+            if remaining <= 0:
+                return
+            session_id_text = str(session_id or "")
+            if not session_id_text:
+                return
+            for entry in reversed(normalized):
+                if remaining <= 0:
+                    break
+                entry_idx = int(entry.get("_idx", -1))
+                if entry_idx in picked_idx:
+                    continue
+                if str(entry.get("session_id", "") or "") != session_id_text:
+                    continue
+                picked_idx.add(entry_idx)
+                picked.append(entry)
+                remaining -= 1
+
+        if current_session_text:
+            _pick_session(current_session_text)
+
+        if remaining > 0:
+            order = self._get_session_prompt_order()
+            if current_session_text and current_session_text in order:
+                current_index = order.index(current_session_text)
+                for idx in range(current_index - 1, -1, -1):
+                    if remaining <= 0:
+                        break
+                    _pick_session(order[idx])
+            if remaining > 0:
+                for entry in reversed(normalized):
+                    if remaining <= 0:
+                        break
+                    entry_idx = int(entry.get("_idx", -1))
+                    if entry_idx in picked_idx:
+                        continue
+                    picked_idx.add(entry_idx)
+                    picked.append(entry)
+                    remaining -= 1
+
+        picked.sort(key=lambda x: int(x.get("_idx", -1)))
+        output = []
+        for entry in picked:
+            session_id = str(entry.get("session_id", "") or "")
+            tag = "当前阶段" if (current_session_text and session_id == current_session_text) else "历史阶段，仅供背景"
+            output.append(
+                {
+                    "session_id": session_id,
+                    "session_round": self._safe_int(entry.get("session_round", 0), 0),
+                    "meeting_id": str(entry.get("meeting_id", "") or ""),
+                    "reason": str(entry.get("reason", "") or ""),
+                    "updated_at": str(entry.get("updated_at", "") or ""),
+                    "tag": tag,
+                }
+            )
+        return output
+
+    def _format_session_eval_history_reasons_for_prompt(self, items: List[Dict[str, Any]]) -> str:
+        if not isinstance(items, list) or (not items):
+            return "- （无历史评估结论）"
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            reason_text = str(item.get("reason", "") or "").strip()
+            if not reason_text:
+                continue
+            session_id = str(item.get("session_id", "") or "").strip() or "unknown"
+            round_no = self._safe_int(item.get("session_round", 0), 0)
+            round_text = str(round_no) if round_no > 0 else "?"
+            meeting_id = str(item.get("meeting_id", "") or "").strip()
+            tag = str(item.get("tag", "") or "").strip() or "历史阶段，仅供背景"
+            line = "- [阶段={}][第{}次会后评估]".format(session_id, round_text)
+            if meeting_id:
+                line += "[meeting_id={}]".format(meeting_id)
+            line += "[标记={}] {}".format(tag, reason_text)
+            lines.append(line)
+        if not lines:
+            return "- （无历史评估结论）"
+        return "\n".join(lines)
+
+    def append_dialog_judge_trace_record(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        doctor_turn_judge_cache: Dict[str, Any],
+        doctor_utterance: str,
+    ) -> None:
+        self._ensure_dialog_judge_trace_state_schema()
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return
+        meeting_id, pair_key, step_time = self._resolve_trace_session_context(doctor, patient)
+        state = self.state.setdefault("dialog_judge_trace_state", {})
+        sessions = state.setdefault("sessions", [])
+        session_item = self._ensure_trace_session(sessions, meeting_id, pair_key, step_time)
+        turns = session_item.setdefault("turns", [])
+        patient_text = self._extract_latest_patient_utterance(chats or [], patient.name)
+        turns.append(
+            {
+                "patient": str(patient_text or ""),
+                "judge": {
+                    "doctor_turn_judge_cache": copy.deepcopy(
+                        doctor_turn_judge_cache if isinstance(doctor_turn_judge_cache, dict) else {}
+                    )
+                },
+                "doctor": str(doctor_utterance or ""),
+            }
+        )
+        self._log_highlight(
+            "[DIALOG_JUDGE_TRACE_APPEND] meeting_id={} pair_key={} valid={} terminate={} advice_len={} patient_len={} doctor_len={}".format(
+                str(meeting_id or ""),
+                str(pair_key or ""),
+                bool((doctor_turn_judge_cache or {}).get("valid", False)),
+                bool((doctor_turn_judge_cache or {}).get("terminate", False)),
+                len(str((doctor_turn_judge_cache or {}).get("advice", "") or "")),
+                len(str(patient_text or "")),
+                len(str(doctor_utterance or "")),
+            )
+        )
+
+    def append_dialog_judge_trace_eval(
+        self,
+        meeting_id: str,
+        pair_key: str,
+        step_time: str,
+        normalized_eval_payload: Dict[str, Any],
+    ) -> None:
+        self._ensure_dialog_judge_trace_state_schema()
+        state = self.state.setdefault("dialog_judge_trace_state", {})
+        sessions = state.setdefault("sessions", [])
+        session_item = self._ensure_trace_session(
+            sessions,
+            str(meeting_id or ""),
+            str(pair_key or ""),
+            str(step_time or self._resolve_trace_step_time()),
+        )
+        session_item["session_eval"] = copy.deepcopy(
+            normalized_eval_payload if isinstance(normalized_eval_payload, dict) else {}
+        )
+        self._log_highlight(
+            "[DIALOG_JUDGE_TRACE_EVAL_APPEND] meeting_id={} pair_key={} session_end={} efficacy_score={} reason_len={}".format(
+                str(meeting_id or ""),
+                str(pair_key or ""),
+                bool((normalized_eval_payload or {}).get("session_end", False)),
+                (normalized_eval_payload or {}).get("efficacy_score", 0),
+                len(str((normalized_eval_payload or {}).get("reason", "") or "")),
+            )
+        )
+
+    def export_dialog_judge_trace_payload(self) -> Dict[str, Any]:
+        self._ensure_dialog_judge_trace_state_schema()
+        state = self.state.setdefault("dialog_judge_trace_state", {})
+        sessions = state.get("sessions", [])
+        if not isinstance(sessions, list):
+            sessions = []
+        return {"sessions": copy.deepcopy(sessions)}
+
+    def _resolve_trace_session_context(self, doctor: Any, patient: Any):
+        meeting_id = ""
+        pair_key = build_pair_key(str(getattr(doctor, "name", "") or ""), str(getattr(patient, "name", "") or ""))
+        self._ensure_agent_state(doctor)
+        self._ensure_agent_state(patient)
+        lock_d = doctor.status.get("intervention", {}).get("lock", {})
+        lock_p = patient.status.get("intervention", {}).get("lock", {})
+        if isinstance(lock_d, dict):
+            meeting_id = str(lock_d.get("meeting_id", "") or "")
+        if (not meeting_id) and isinstance(lock_p, dict):
+            meeting_id = str(lock_p.get("meeting_id", "") or "")
+        return str(meeting_id or ""), str(pair_key or ""), self._resolve_trace_step_time()
+
+    def _ensure_trace_session(self, sessions: list, meeting_id: str, pair_key: str, step_time: str) -> Dict[str, Any]:
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            meeting = item.get("meeting", {}) or {}
+            if (
+                str(meeting.get("meeting_id", "") or "") == str(meeting_id or "")
+                and str(meeting.get("pair_key", "") or "") == str(pair_key or "")
+            ):
+                if not str(meeting.get("step_time", "") or ""):
+                    meeting["step_time"] = str(step_time or "")
+                    item["meeting"] = meeting
+                return item
+
+        session_item = {
+            "meeting": {
+                "meeting_id": str(meeting_id or ""),
+                "pair_key": str(pair_key or ""),
+                "step_time": str(step_time or ""),
+            },
+            "turns": [],
+        }
+        sessions.append(session_item)
+        return session_item
+
+    def _resolve_trace_step_time(self) -> str:
+        raw = self.config.get("time", "")
+        if isinstance(raw, str):
+            text = str(raw or "").strip()
+            if text:
+                return text
+        if isinstance(raw, dict):
+            start = str(raw.get("start", "") or "").strip()
+            if start:
+                return start
+        return self._fmt_dt(self._now())
+
+    def _extract_latest_patient_utterance(self, chats: Any, patient_name: str) -> str:
+        items = chats if isinstance(chats, list) else []
+        for item in reversed(items):
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            speaker = str(item[0] or "")
+            text = str(item[1] or "")
+            if speaker == str(patient_name or ""):
+                return text
+        return ""
+
     def _ensure_depression_runtime_initialized(
         self,
         agent: Any,
@@ -1523,6 +2342,8 @@ class InterventionManager:
             meeting_seq = 0
         self.state["meeting_seq"] = meeting_seq
         self._ensure_consult_record_state_schema()
+        self._ensure_dialog_judge_trace_state_schema()
+        self._ensure_session_eval_state_schema()
 
     def _ensure_consult_record_state_schema(self) -> None:
         state = self.state.setdefault("consult_record_state", {})
@@ -1539,6 +2360,24 @@ class InterventionManager:
             state["dedup_keys"] = {}
         if not isinstance(state.get("write_audit"), list):
             state["write_audit"] = []
+
+    def _ensure_dialog_judge_trace_state_schema(self) -> None:
+        state = self.state.setdefault("dialog_judge_trace_state", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.state["dialog_judge_trace_state"] = state
+        if not isinstance(state.get("sessions"), list):
+            state["sessions"] = []
+
+    def _ensure_session_eval_state_schema(self) -> None:
+        state = self.state.setdefault("session_eval_state", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.state["session_eval_state"] = state
+        if not isinstance(state.get("latest_reason_by_pair"), dict):
+            state["latest_reason_by_pair"] = {}
+        if not isinstance(state.get("history_by_pair"), dict):
+            state["history_by_pair"] = {}
 
     def _build_rule_patients(self, rule: Dict[str, Any]) -> List[str]:
         patient = str(rule.get("patient", "") or "").strip()

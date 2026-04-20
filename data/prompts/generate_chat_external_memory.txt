@@ -3,8 +3,9 @@ ${base_desc}
 
 ${depression_chat_block}
 ${doctor_session_prompt_injection}
+${doctor_consult_record_injection}
 
-以下是 ${agent} 的外置检索记忆上下文：
+以下是 ${agent} 的记忆：
 ${external_memory_context}
 
 当前位置：${address}

@@ -352,17 +352,27 @@ class Associate:
             self._log_access_sync("warning", "[ACCESS_SYNC_FAIL] reason=empty_node_ids")
             return False
 
+        try:
+            index_obj = getattr(self._index, "_index", None)
+            docstore = getattr(index_obj, "docstore", None)
+            docstore_docs = getattr(docstore, "docs", None) if docstore is not None else None
+        except Exception as e:
+            self._log_access_sync(
+                "warning",
+                "[ACCESS_SYNC_FAIL] reason=docstore_resolve_error detail={}".format(e),
+            )
+            return False
+        if not isinstance(docstore_docs, dict):
+            self._log_access_sync("warning", "[ACCESS_SYNC_FAIL] reason=docstore_unavailable")
+            return False
+
         doc_targets = []
         for node_id in ordered_ids:
-            try:
-                node = self._index.find_node(node_id)
-            except Exception as e:
+            node = docstore_docs.get(node_id)
+            if node is None:
                 self._log_access_sync(
                     "warning",
-                    "[ACCESS_SYNC_FAIL] reason=docstore_node_not_found node_id={} detail={}".format(
-                        node_id,
-                        e,
-                    ),
+                    "[ACCESS_SYNC_FAIL] reason=docstore_node_not_found node_id={}".format(node_id),
                 )
                 return False
             metadata = getattr(node, "metadata", None)
@@ -372,7 +382,7 @@ class Associate:
                     "[ACCESS_SYNC_FAIL] reason=docstore_metadata_invalid node_id={}".format(node_id),
                 )
                 return False
-            doc_targets.append((metadata, metadata.get("access")))
+            doc_targets.append((node_id, node, metadata.get("access")))
 
         try:
             vector_store = getattr(getattr(self._index, "_index", None), "vector_store", None)
@@ -417,8 +427,11 @@ class Associate:
             return False
 
         try:
-            for meta, _old in doc_targets:
-                meta["access"] = access_ts
+            for _node_id, node, _old in doc_targets:
+                metadata = getattr(node, "metadata", None)
+                if not isinstance(metadata, dict):
+                    raise TypeError("docstore metadata is not dict")
+                metadata["access"] = access_ts
         except Exception as e:
             self._log_access_sync(
                 "warning",
@@ -426,6 +439,29 @@ class Associate:
                     len(ordered_ids),
                     access_ts,
                     e,
+                ),
+            )
+            return True
+
+        mismatch_ids = []
+        for node_id, _node, _old in doc_targets:
+            verify_node = docstore_docs.get(node_id)
+            verify_meta = getattr(verify_node, "metadata", None)
+            if not isinstance(verify_meta, dict):
+                mismatch_ids.append(node_id)
+                continue
+            if verify_meta.get("access") != access_ts:
+                mismatch_ids.append(node_id)
+
+        if mismatch_ids:
+            sample_ids = ",".join(mismatch_ids[:5])
+            self._log_access_sync(
+                "warning",
+                "[ACCESS_SYNC_PARTIAL] reason=docstore_verify_mismatch node_count={} mismatch_count={} access_ts={} sample_node_ids={}".format(
+                    len(ordered_ids),
+                    len(mismatch_ids),
+                    access_ts,
+                    sample_ids,
                 ),
             )
             return True
