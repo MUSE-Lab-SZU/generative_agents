@@ -131,18 +131,6 @@ class SymptomStateMachine:
     LLM_SIGNAL_WEIGHT = 0.25
     LLM_INDEPENDENT_PATH_SCALE = 2.0
     LLM_INDEPENDENT_PATH_BASELINE = 0.05
-    LLM_ALLOWED_TRIGGERS = {
-        "positive_interaction",
-        "positive_event",
-        "therapy",
-        "therapy_progress",
-        "sustained_support",
-        "stress",
-        "extreme_stress",
-        "negative_event",
-        "isolation",
-        "trigger_event",
-    }
     
     def __init__(
         self,
@@ -446,18 +434,13 @@ class SymptomStateMachine:
         signal_weight = self._clamp_score(
             llm_transition_signal.get("signal_weight", self.LLM_SIGNAL_WEIGHT)
         )
-
-        raw_triggers = llm_transition_signal.get("matched_triggers", [])
-        matched_triggers: List[str] = []
-        for trigger in self._normalize_trigger_list(raw_triggers):
-            if trigger in self.LLM_ALLOWED_TRIGGERS:
-                matched_triggers.append(trigger)
+        if positive_score <= 0.0 and negative_score <= 0.0:
+            return None
 
         return {
             "confidence": confidence,
             "positive_score": positive_score,
             "negative_score": negative_score,
-            "matched_triggers": matched_triggers,
             "min_confidence": min_confidence,
             "signal_weight": signal_weight,
         }
@@ -478,20 +461,13 @@ class SymptomStateMachine:
             merged.append(text)
 
         if isinstance(llm_signal, dict):
-            llm_triggers = self._normalize_trigger_list(llm_signal.get("matched_triggers", []))
-            for trigger in llm_triggers:
-                if trigger in seen:
-                    continue
-                seen.add(trigger)
-                merged.append(trigger)
-            if not llm_triggers:
-                positive_score = self._clamp_score(llm_signal.get("positive_score", 0.0))
-                negative_score = self._clamp_score(llm_signal.get("negative_score", 0.0))
-                if positive_score > 0.0 or negative_score > 0.0:
-                    marker = "llm_signal"
-                    if marker not in seen:
-                        seen.add(marker)
-                        merged.append(marker)
+            positive_score = self._clamp_score(llm_signal.get("positive_score", 0.0))
+            negative_score = self._clamp_score(llm_signal.get("negative_score", 0.0))
+            if positive_score > 0.0 or negative_score > 0.0:
+                marker = "llm_signal"
+                if marker not in seen:
+                    seen.add(marker)
+                    merged.append(marker)
         return merged
 
     def _is_recovery_transition(self, next_state: str) -> bool:

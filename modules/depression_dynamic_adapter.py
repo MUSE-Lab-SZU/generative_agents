@@ -68,19 +68,6 @@ DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
     "allowed_event_keys": ["chat_event"],
 }
 
-LLM_TRANSITION_TRIGGER_WHITELIST = {
-    "positive_interaction",
-    "positive_event",
-    "therapy",
-    "therapy_progress",
-    "sustained_support",
-    "stress",
-    "extreme_stress",
-    "negative_event",
-    "isolation",
-    "trigger_event",
-}
-
 
 def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     """Initialize dynamic depression runtime for one agent."""
@@ -776,10 +763,20 @@ def _build_llm_transition_signal(
             8000,
         ),
     )
-    if not clipped_text:
-        return None
+    current_state = "unknown"
+    try:
+        runtime_engine = getattr(agent, "depression_dynamic_engine", None)
+        state_machine = getattr(runtime_engine, "state_machine", None)
+        if callable(getattr(state_machine, "get_current_state", None)):
+            current_state = str(state_machine.get_current_state() or "unknown")
+    except Exception:
+        current_state = "unknown"
 
     prompt = _build_llm_transition_prompt(
+        event_key=event_key,
+        current_state=current_state,
+        location=_resolve_current_location(agent),
+        time_of_day=_resolve_time_of_day(agent),
         interaction_type=interaction_type,
         relationship=relationship,
         conversation_content=clipped_text,
@@ -831,45 +828,57 @@ def _build_llm_transition_signal(
     _log(
         agent,
         "debug",
-        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} matched={}".format(
+        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} positive={} negative={}".format(
             getattr(agent, "name", ""),
             event_key,
             signal.get("confidence", 0.0),
-            ",".join(signal.get("matched_triggers", [])),
+            signal.get("positive_score", 0.0),
+            signal.get("negative_score", 0.0),
         ),
     )
     return signal
 
 
 def _build_llm_transition_prompt(
+    event_key: str,
+    current_state: str,
+    location: str,
+    time_of_day: str,
     interaction_type: str,
     relationship: Optional[str],
     conversation_content: str,
 ) -> str:
-    whitelist = ", ".join(sorted(list(LLM_TRANSITION_TRIGGER_WHITELIST)))
+    content = str(conversation_content or "").strip()
+    content = content if content else "（无明确对话文本，仅依据情境推断）"
     return (
-        "你是抑郁状态转换信号抽取器。仅输出一个 JSON 对象，不要输出其他文字。\n"
-        "任务：基于对话内容判断可匹配触发词，并给出正负向分数与置信度。\n"
-        "必须遵循字段：\n"
+        "你是抑郁状态转换语义评估器。仅输出一个 JSON 对象，不要输出其他文字。\n"
+        "任务：根据当前情境与可能的对话语义，评估对抑郁状态转移的恢复/恶化信号。\n"
+        "输出必须遵循字段：\n"
         "{\n"
-        '  "matched_triggers": ["..."],\n'
         '  "positive_score": 0.0,\n'
         '  "negative_score": 0.0,\n'
         '  "confidence": 0.0\n'
         "}\n"
         "字段约束：\n"
-        "- matched_triggers 只能从白名单中选择。\n"
         "- positive_score / negative_score / confidence 必须在 0 到 1 之间。\n"
-        "- 如果无法判断，返回低置信度和空触发词。\n"
-        "触发词白名单：{}\n\n"
+        "- positive_score 表示恢复方向信号强度，negative_score 表示恶化方向信号强度。\n"
+        "- 如果信息不足，请降低 confidence。\n\n"
+        "当前情境：\n"
+        "event_key: {}\n"
+        "current_state: {}\n"
+        "location: {}\n"
+        "time_of_day: {}\n"
         "互动类型：{}\n"
         "关系类型：{}\n"
         "对话内容：\n{}\n"
     ).format(
-        whitelist,
+        str(event_key or ""),
+        str(current_state or ""),
+        str(location or ""),
+        str(time_of_day or ""),
         str(interaction_type or ""),
         str(relationship or ""),
-        conversation_content,
+        content,
     )
 
 
@@ -896,25 +905,10 @@ def _sanitize_llm_transition_signal(
 
     positive_score = _bounded_float(payload.get("positive_score"), 0.0, 0.0, 1.0)
     negative_score = _bounded_float(payload.get("negative_score"), 0.0, 0.0, 1.0)
-
-    matched_triggers: List[str] = []
-    seen = set()
-    raw_matched = payload.get("matched_triggers", [])
-    if isinstance(raw_matched, list):
-        for trigger in raw_matched:
-            text = str(trigger or "").strip()
-            if not text or text in seen:
-                continue
-            if text not in LLM_TRANSITION_TRIGGER_WHITELIST:
-                continue
-            seen.add(text)
-            matched_triggers.append(text)
-
-    if not matched_triggers and positive_score <= 0.0 and negative_score <= 0.0:
+    if positive_score <= 0.0 and negative_score <= 0.0:
         return None
 
     return {
-        "matched_triggers": matched_triggers,
         "positive_score": positive_score,
         "negative_score": negative_score,
         "confidence": confidence,
