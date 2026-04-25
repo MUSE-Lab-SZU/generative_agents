@@ -1,0 +1,201 @@
+{
+  "depression_simulation": {
+    "enabled": true,
+    "state_machine": {
+      "initial_state": "moderate_episode",
+      "transition_sensitivity": 0.62,
+      "minimum_state_duration": 45
+    },
+    "target_hints": [
+      "decide_chat",
+      "generate_chat",
+      "decide_chat_terminate",
+      "summarize_relation",
+      "summarize_chats",
+      "determine_sector",
+      "determine_arena",
+      "determine_object",
+      "describe_object"
+    ],
+    "prompt_context_mapping": {
+      "decide_chat": "闲聊",
+      "generate_chat": "深度交流",
+      "decide_chat_terminate": "深度交流",
+      "summarize_relation": "关系回顾",
+      "summarize_chats": "深度交流",
+      "determine_sector": "日常活动",
+      "determine_arena": "日常活动",
+      "determine_object": "日常活动",
+      "describe_object": "日常活动"
+    },
+    "event_interaction_mapping": {
+      "chat_event": "深度交流"
+    },
+    "relationship_mapping": {
+      "田德莉娜": "亲密朋友",
+      "蜻蜓队长": "治疗师",
+      "金龟次郎": "普通朋友",
+      "呱呱蛙": "普通朋友",
+      "蟑螂恶霸": "冲突关系"
+    },
+    "trauma_memories": [
+      {
+        "id": "academic_failure",
+        "event": "学业失败",
+        "description": "大二时因无法完成毕业设计而被迫休学，感到极度羞耻和失败",
+        "emotional_charge": 0.78,
+        "triggers": [
+          "学习",
+          "评价",
+          "比较",
+          "期望",
+          "成绩",
+          "作业",
+          "设计",
+          "学业",
+          "大学",
+          "专业"
+        ],
+        "associated_thoughts": [
+          "我又要让所有人失望了",
+          "我永远都不够好",
+          "我注定是个失败者",
+          "我连最基本的事情都做不好",
+          "我的人生已经毁了"
+        ],
+        "physical_reactions": [
+          "心跳加速",
+          "呼吸困难",
+          "胸闷",
+          "手心出汗"
+        ],
+        "activation_threshold": 0.62
+      },
+      {
+        "id": "social_rejection",
+        "event": "社交被拒",
+        "description": "因抑郁症状被朋友疏远，感到被抛弃和孤立",
+        "emotional_charge": 0.72,
+        "triggers": [
+          "朋友",
+          "聚会",
+          "社交",
+          "孤独",
+          "被排斥",
+          "不理解",
+          "疏远",
+          "关系"
+        ],
+        "associated_thoughts": [
+          "没有人真正关心我",
+          "我是个负担",
+          "我不配拥有朋友",
+          "最终所有人都会离开我",
+          "我让每个人都感到厌烦"
+        ],
+        "physical_reactions": [
+          "胸口发紧",
+          "想哭",
+          "喉咙哽咽"
+        ],
+        "activation_threshold": 0.58
+      },
+      {
+        "id": "perfectionism_trauma",
+        "event": "完美主义创伤",
+        "description": "从小被要求完美，任何失误都会受到严厉批评",
+        "emotional_charge": 0.76,
+        "triggers": [
+          "完美",
+          "错误",
+          "批评",
+          "标准",
+          "要求",
+          "失误",
+          "不够好",
+          "应该"
+        ],
+        "associated_thoughts": [
+          "我必须做到完美",
+          "一个错误就证明我是失败的",
+          "我不能让任何人看到我的弱点",
+          "不完美就等于失败",
+          "我永远达不到标准"
+        ],
+        "physical_reactions": [
+          "肌肉紧张",
+          "头痛",
+          "胃部不适"
+        ],
+        "activation_threshold": 0.68
+      },
+      {
+        "id": "hopelessness_experience",
+        "event": "绝望体验",
+        "description": "多次治疗失败后产生的深刻绝望感",
+        "emotional_charge": 0.8,
+        "triggers": [
+          "治疗",
+          "希望",
+          "未来",
+          "改变",
+          "好转",
+          "康复",
+          "医生",
+          "心理咨询"
+        ],
+        "associated_thoughts": [
+          "我永远不会好起来",
+          "治疗没有用",
+          "我的情况是无药可救的",
+          "活着只是在受苦",
+          "没有什么能帮到我"
+        ],
+        "physical_reactions": [
+          "极度疲惫",
+          "身体沉重",
+          "四肢无力"
+        ],
+        "activation_threshold": 0.65
+      },
+      {
+        "id": "self_harm_ideation",
+        "event": "自伤意念",
+        "description": "在最痛苦时出现的自伤和自杀想法",
+        "emotional_charge": 0.7,
+        "triggers": [
+          "痛苦",
+          "解脱",
+          "结束",
+          "死",
+          "自杀",
+          "活着",
+          "意义",
+          "价值"
+        ],
+        "associated_thoughts": [
+          "也许结束一切是唯一的解脱",
+          "我的存在只会给别人带来痛苦",
+          "死亡可能比活着更好",
+          "我太累了，不想再坚持了",
+          "世界没有我会更好"
+        ],
+        "physical_reactions": [
+          "麻木感",
+          "解离感",
+          "情感空洞"
+        ],
+        "activation_threshold": 0.78
+      }
+    ],
+    "llm_transition_judge": {
+      "enabled": true,
+      "min_confidence": 0.65,
+      "max_text_length": 1800,
+      "signal_weight": 0.18,
+      "allowed_event_keys": [
+        "chat_event"
+      ]
+    }
+  }
+}

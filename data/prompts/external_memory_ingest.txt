@@ -1,4 +1,4 @@
-create=${create_time}
-type=${memory_type}
-address=${address}
-${describe}
+记忆时间：${create_time}
+记忆类型：${memory_type}
+地点：${address}
+内容：${describe}

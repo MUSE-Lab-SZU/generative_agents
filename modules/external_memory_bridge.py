@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import time
 from string import Template
 from typing import Any, Dict, Optional
 
@@ -35,6 +36,8 @@ class ExternalMemoryBridge:
         self.read_mode = str(self.cfg.get("read_mode", "chat_only") or "chat_only").strip().lower()
         self.fallback_to_local = self._safe_bool(self.cfg.get("fallback_to_local", True), True)
         self.user_id = str(self.cfg.get("user_id", "") or "").strip()
+        self.save_name = self.resolve_save_name_from_storage_dir()
+        self.scoped_user_id = self.build_scoped_user_id(self.user_id, self.save_name)
         self.ingest_template_file = self._resolve_path(self.cfg.get("ingest_template_file", ""))
         self.chat_prompt_file = self._resolve_path(self.cfg.get("chat_prompt_file", ""))
         self.map_path = os.path.join(self.storage_dir, self.MAP_FILENAME)
@@ -44,10 +47,12 @@ class ExternalMemoryBridge:
 
         self._log(
             "info",
-            "[EXT_MEMORY_CFG] agent={} enabled={} user_id={} read_mode={} fallback_to_local={} base_url={} timeout={} ingest_template_file={} chat_prompt_file={}".format(
+            "[EXT_MEMORY_CFG] agent={} enabled={} user_id={} scoped_user_id={} save_name={} read_mode={} fallback_to_local={} base_url={} timeout={} ingest_template_file={} chat_prompt_file={}".format(
                 self.agent_name,
                 self.enabled,
                 self.user_id,
+                self.scoped_user_id,
+                self.save_name,
                 self.read_mode,
                 self.fallback_to_local,
                 self.base_url,
@@ -102,15 +107,46 @@ class ExternalMemoryBridge:
         )
 
     def enabled_for_ingest(self) -> bool:
-        return bool(self.enabled and self.client and self.user_id)
+        return bool(self.enabled and self.client and self.get_scoped_user_id())
 
     def enabled_for_chat_read(self) -> bool:
-        if not (self.enabled and self.client and self.user_id):
+        if not (self.enabled and self.client and self.get_scoped_user_id()):
             return False
         return self.read_mode == "chat_only"
 
     def resolve_chat_prompt_file(self) -> str:
         return self.chat_prompt_file
+
+    def resolve_save_name_from_storage_dir(self) -> str:
+        normalized = os.path.normpath(str(self.storage_dir or ""))
+        if not normalized:
+            return ""
+        parts = [part for part in normalized.split(os.sep) if part]
+        for idx, part in enumerate(parts):
+            if str(part).strip().lower() == "checkpoints" and idx + 1 < len(parts):
+                return str(parts[idx + 1]).strip()
+        return ""
+
+    @staticmethod
+    def build_scoped_user_id(raw_user_id: str, save_name: str, sep: str = "+") -> str:
+        base_id = str(raw_user_id or "").strip()
+        archive_name = str(save_name or "").strip()
+        if not base_id:
+            return ""
+        if not archive_name:
+            return base_id
+        return "{}{}{}".format(base_id, sep, archive_name)
+
+    def get_scoped_user_id(self) -> str:
+        scoped_user_id = str(getattr(self, "scoped_user_id", "") or "").strip()
+        if scoped_user_id:
+            return scoped_user_id
+        scoped_user_id = self.build_scoped_user_id(
+            str(getattr(self, "user_id", "") or ""),
+            self.resolve_save_name_from_storage_dir(),
+        )
+        self.scoped_user_id = scoped_user_id
+        return scoped_user_id
 
     def render_ingest_text(
         self,
@@ -172,6 +208,13 @@ class ExternalMemoryBridge:
             "node_id": str(node_id or ""),
             "remote_id": "",
             "reason": "",
+            "status": "",
+            "message": "",
+            "long_term_pending": None,
+            "analysis_ok": None,
+            "mws_score": None,
+            "stored_raw_fallback": None,
+            "scoped_user_id": self.get_scoped_user_id(),
         }
         if not self.enabled_for_ingest():
             result["reason"] = "disabled_or_not_ready"
@@ -189,51 +232,104 @@ class ExternalMemoryBridge:
             )
             return result
 
+        scoped_user_id = self.get_scoped_user_id()
+        start_ts = time.perf_counter()
         try:
             response = self.client.ingest_memory(  # type: ignore[union-attr]
                 content=content,
-                user_id=self.user_id,
+                user_id=scoped_user_id,
                 remote_id=None,
             )
-            remote_id = str((response or {}).get("remote_id", "") or "").strip()
-            result["ok"] = True
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+            response = response if isinstance(response, dict) else {}
+            remote_id = str(response.get("remote_id", "") or "").strip()
+            status = str(response.get("status", "") or "").strip()
+            message = str(response.get("message", "") or "")
             result["remote_id"] = remote_id
+            result["status"] = status
+            result["message"] = message
+            result["long_term_pending"] = response.get("long_term_pending")
+            result["analysis_ok"] = response.get("analysis_ok")
+            result["mws_score"] = response.get("mws_score")
+            result["stored_raw_fallback"] = response.get("stored_raw_fallback")
+
+            if status not in {"completed", "stored_raw"}:
+                if status == "error":
+                    result["reason"] = "ingest_status_error"
+                elif status:
+                    result["reason"] = "unexpected_status"
+                else:
+                    result["reason"] = "missing_status"
+                self._log(
+                    "warning",
+                    "[EXT_MEMORY_INGEST_FAIL] agent={} user_id={} node_id={} node_type={} status={} reason={} message={} long_term_pending={} stored_raw_fallback={} elapsed_ms={}".format(
+                        self.agent_name,
+                        scoped_user_id,
+                        node_id,
+                        node_type,
+                        status,
+                        result["reason"],
+                        self._trim_for_log(message, max_len=200),
+                        result["long_term_pending"],
+                        result["stored_raw_fallback"],
+                        elapsed_ms,
+                    ),
+                )
+                return result
+
+            if not remote_id:
+                result["reason"] = "missing_remote_id"
+                self._log(
+                    "warning",
+                    "[EXT_MEMORY_INGEST_FAIL] agent={} user_id={} node_id={} node_type={} status={} reason=missing_remote_id message={} long_term_pending={} stored_raw_fallback={} elapsed_ms={}".format(
+                        self.agent_name,
+                        scoped_user_id,
+                        node_id,
+                        node_type,
+                        status,
+                        self._trim_for_log(message, max_len=200),
+                        result["long_term_pending"],
+                        result["stored_raw_fallback"],
+                        elapsed_ms,
+                    ),
+                )
+                return result
+
+            result["ok"] = True
             result["reason"] = "ok"
             self._log(
                 "info",
-                "[EXT_MEMORY_INGEST] agent={} user_id={} node_id={} node_type={} remote_id={} content_len={}".format(
+                "[EXT_MEMORY_INGEST] agent={} user_id={} node_id={} node_type={} remote_id={} status={} content_len={} message={} long_term_pending={} stored_raw_fallback={} elapsed_ms={}".format(
                     self.agent_name,
-                    self.user_id,
+                    scoped_user_id,
                     node_id,
                     node_type,
                     remote_id,
+                    status,
                     len(content),
+                    self._trim_for_log(message, max_len=200),
+                    result["long_term_pending"],
+                    result["stored_raw_fallback"],
+                    elapsed_ms,
                 ),
             )
-            if remote_id:
-                self._bind_remote_map(
-                    node_id=node_id,
-                    remote_id=remote_id,
-                    node_type=node_type,
-                    create_time=create_time,
-                )
-            else:
-                self._log(
-                    "warning",
-                    "[EXT_MEMORY_INGEST] agent={} node_id={} reason=missing_remote_id".format(
-                        self.agent_name,
-                        node_id,
-                    ),
-                )
+            self._bind_remote_map(
+                node_id=node_id,
+                remote_id=remote_id,
+                node_type=node_type,
+                create_time=create_time,
+            )
             return result
         except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
             result["reason"] = "request_failed"
             self._log(
                 "warning",
-                "[EXT_MEMORY_INGEST_FAIL] agent={} node_id={} error={}".format(
+                "[EXT_MEMORY_INGEST_FAIL] agent={} node_id={} error={} elapsed_ms={}".format(
                     self.agent_name,
                     node_id,
                     exc,
+                    elapsed_ms,
                 ),
             )
             return result
@@ -270,6 +366,8 @@ class ExternalMemoryBridge:
             "query": "",
             "context": "",
             "reason": "",
+            "details": {},
+            "scoped_user_id": self.get_scoped_user_id(),
         }
         if not self.enabled_for_chat_read():
             result["reason"] = "disabled_or_not_ready"
@@ -295,11 +393,21 @@ class ExternalMemoryBridge:
             )
             return result
 
+        scoped_user_id = self.get_scoped_user_id()
+        start_ts = time.perf_counter()
         try:
             response = self.client.retrieve_memory_context(  # type: ignore[union-attr]
                 query=query,
-                user_id=self.user_id,
+                user_id=scoped_user_id,
             )
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+            response = response if isinstance(response, dict) else {}
+            details = response.get("details", {})
+            if not isinstance(details, dict):
+                details = {}
+            result["details"] = details
+            hit_remote_ids = self._extract_ranked_memory_remote_ids(details=details)
+            hit_remote_ids_text = ",".join(hit_remote_ids) if hit_remote_ids else "-"
             context = str((response or {}).get("formatted_prompt", "") or "").strip()
             if context:
                 result["ok"] = True
@@ -307,12 +415,16 @@ class ExternalMemoryBridge:
                 result["context"] = context
                 self._log(
                     "info",
-                    "[EXT_MEMORY_RETRIEVE] agent={} user_id={} other={} query={} context_len={}".format(
+                    "[EXT_MEMORY_RETRIEVE] agent={} user_id={} other={} query={} context_len={} hit_remote_count={} hit_remote_ids={} elapsed_ms={} details_keys={}".format(
                         self.agent_name,
-                        self.user_id,
+                        scoped_user_id,
                         other_name,
                         self._trim_for_log(query),
                         len(context),
+                        len(hit_remote_ids),
+                        hit_remote_ids_text,
+                        elapsed_ms,
+                        ",".join(sorted(details.keys())) if details else "",
                     ),
                 )
                 return result
@@ -320,22 +432,27 @@ class ExternalMemoryBridge:
             result["reason"] = "empty_formatted_prompt"
             self._log(
                 "warning",
-                "[EXT_MEMORY_RETRIEVE_FAIL] agent={} other={} query={} reason=empty_formatted_prompt".format(
+                "[EXT_MEMORY_RETRIEVE_FAIL] agent={} other={} query={} reason=empty_formatted_prompt hit_remote_count={} hit_remote_ids={} elapsed_ms={}".format(
                     self.agent_name,
                     other_name,
                     self._trim_for_log(query),
+                    len(hit_remote_ids),
+                    hit_remote_ids_text,
+                    elapsed_ms,
                 ),
             )
             return result
         except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
             result["reason"] = "request_failed"
             self._log(
                 "warning",
-                "[EXT_MEMORY_RETRIEVE_FAIL] agent={} other={} query={} error={}".format(
+                "[EXT_MEMORY_RETRIEVE_FAIL] agent={} other={} query={} error={} elapsed_ms={}".format(
                     self.agent_name,
                     other_name,
                     self._trim_for_log(query),
                     exc,
+                    elapsed_ms,
                 ),
             )
             return result
@@ -537,6 +654,27 @@ class ExternalMemoryBridge:
         if len(text) <= max_len:
             return text
         return text[:max_len] + "..."
+
+    @staticmethod
+    def _extract_ranked_memory_remote_ids(details: Dict[str, Any], max_items: int = 10):
+        if not isinstance(details, dict):
+            return []
+        ranked_memories = details.get("ranked_memories", [])
+        if not isinstance(ranked_memories, list):
+            return []
+        out = []
+        seen = set()
+        for item in ranked_memories:
+            if not isinstance(item, dict):
+                continue
+            remote_id = str(item.get("remote_id", "") or "").strip()
+            if not remote_id or remote_id in seen:
+                continue
+            seen.add(remote_id)
+            out.append(remote_id)
+            if len(out) >= int(max_items):
+                break
+        return out
 
     def _log(self, level: str, message: str):
         logger = self.logger

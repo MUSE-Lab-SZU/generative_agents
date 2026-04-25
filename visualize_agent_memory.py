@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 可视化某存档中某角色的全部记忆（event/thought/chat）。
@@ -26,8 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # =========================
 # 配置区（按需修改）
 # =========================
-CHECKPOINT_DIR = Path("results/checkpoints/sim-m-inject-kbd-0408")
-SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20260410-0830.json"
+CHECKPOINT_DIR = Path("results/checkpoints/sim-test-memory-0424-3")
+SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20260424-1630.json"
 AGENT_NAME = "卡布达"  # 设为 None 则自动取快照里的第一个角色
 
 OUTPUT_DIR = CHECKPOINT_DIR / "memory_visualization"

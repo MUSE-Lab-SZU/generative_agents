@@ -2,9 +2,9 @@
   "depression_simulation": {
     "enabled": true,
     "state_machine": {
-      "initial_state": "severe_episode",
-      "transition_sensitivity": 0.7,
-      "minimum_state_duration": 30
+      "initial_state": "moderate_episode",
+      "transition_sensitivity": 0.58,
+      "minimum_state_duration": 45
     },
     "target_hints": [
       "decide_chat",
@@ -40,92 +40,119 @@
     },
     "trauma_memories": [
       {
-        "id": "academic_failure",
-        "event": "学业失败",
-        "description": "大二时因无法完成毕业设计而被迫休学，感到极度羞耻和失败",
-        "emotional_charge": 0.95,
-        "triggers": ["学习", "评价", "比较", "期望", "成绩", "作业", "设计", "学业", "大学", "专业"],
-        "associated_thoughts": [
-          "我又要让所有人失望了",
-          "我永远都不够好",
-          "我注定是个失败者",
-          "我连最基本的事情都做不好",
-          "我的人生已经毁了"
+        "id": "academic_setback",
+        "event": "学业受挫",
+        "description": "大三阶段一次重要课程项目延期后，连续被比较和催促，开始把“做不好”理解成“我这个人不行”。",
+        "emotional_charge": 0.68,
+        "triggers": [
+          "成绩",
+          "项目",
+          "延期",
+          "比较",
+          "评估",
+          "老师",
+          "同学",
+          "学业"
         ],
-        "physical_reactions": ["心跳加速", "呼吸困难", "胸闷", "手心出汗"],
-        "activation_threshold": 0.5
+        "associated_thoughts": [
+          "我是不是又要让人失望了",
+          "一旦表现不好，别人就会否定我",
+          "我很难稳定地把事情做好"
+        ],
+        "physical_reactions": [
+          "肩颈发紧",
+          "胃口下降",
+          "入睡困难"
+        ],
+        "activation_threshold": 0.66
       },
       {
-        "id": "social_rejection",
-        "event": "社交被拒",
-        "description": "因抑郁症状被朋友疏远，感到被抛弃和孤立",
-        "emotional_charge": 0.85,
-        "triggers": ["朋友", "聚会", "社交", "孤独", "被排斥", "不理解", "疏远", "关系"],
-        "associated_thoughts": [
-          "没有人真正关心我",
-          "我是个负担",
-          "我不配拥有朋友",
-          "最终所有人都会离开我",
-          "我让每个人都感到厌烦"
+        "id": "relationship_withdrawal",
+        "event": "被误解后的退缩",
+        "description": "情绪低落时曾减少联系，被朋友解读为冷淡，关系变疏后形成“说了也没人懂”的预期。",
+        "emotional_charge": 0.65,
+        "triggers": [
+          "朋友",
+          "回消息",
+          "聚会",
+          "疏远",
+          "误解",
+          "社交",
+          "冷淡"
         ],
-        "physical_reactions": ["胸口发紧", "想哭", "喉咙哽咽"],
-        "activation_threshold": 0.45
+        "associated_thoughts": [
+          "我现在开口可能只会让气氛更糟",
+          "别人愿意靠近我只是暂时的",
+          "我是不是不值得被认真对待"
+        ],
+        "physical_reactions": [
+          "胸口发闷",
+          "喉咙发紧",
+          "容易疲惫"
+        ],
+        "activation_threshold": 0.64
       },
       {
-        "id": "perfectionism_trauma",
-        "event": "完美主义创伤",
-        "description": "从小被要求完美，任何失误都会受到严厉批评",
-        "emotional_charge": 0.9,
-        "triggers": ["完美", "错误", "批评", "标准", "要求", "失误", "不够好", "应该"],
-        "associated_thoughts": [
-          "我必须做到完美",
-          "一个错误就证明我是失败的",
-          "我不能让任何人看到我的弱点",
-          "不完美就等于失败",
-          "我永远达不到标准"
+        "id": "family_expectation_pressure",
+        "event": "家庭期待压力",
+        "description": "长期被鼓励“要更努力更稳定”，在状态下滑时会把关心听成指责，产生持续内疚。",
+        "emotional_charge": 0.71,
+        "triggers": [
+          "家人",
+          "稳定",
+          "努力",
+          "工作",
+          "前途",
+          "比较",
+          "责任"
         ],
-        "physical_reactions": ["肌肉紧张", "头痛", "胃部不适"],
-        "activation_threshold": 0.6
-      },
-      {
-        "id": "hopelessness_experience",
-        "event": "绝望体验",
-        "description": "多次治疗失败后产生的深刻绝望感",
-        "emotional_charge": 0.95,
-        "triggers": ["治疗", "希望", "未来", "改变", "好转", "康复", "医生", "心理咨询"],
         "associated_thoughts": [
-          "我永远不会好起来",
-          "治疗没有用",
-          "我的情况是无药可救的",
-          "活着只是在受苦",
-          "没有什么能帮到我"
+          "我可能又没达到他们期待",
+          "我需要先把自己修好，才配谈未来",
+          "我不想再让家里担心"
         ],
-        "physical_reactions": ["极度疲惫", "身体沉重", "四肢无力"],
-        "activation_threshold": 0.55
-      },
-      {
-        "id": "self_harm_ideation",
-        "event": "自伤意念",
-        "description": "在最痛苦时出现的自伤和自杀想法",
-        "emotional_charge": 1.0,
-        "triggers": ["痛苦", "解脱", "结束", "死", "自杀", "活着", "意义", "价值"],
-        "associated_thoughts": [
-          "也许结束一切是唯一的解脱",
-          "我的存在只会给别人带来痛苦",
-          "死亡可能比活着更好",
-          "我太累了，不想再坚持了",
-          "世界没有我会更好"
+        "physical_reactions": [
+          "心慌",
+          "头部胀痛",
+          "食欲波动"
         ],
-        "physical_reactions": ["麻木感", "解离感", "情感空洞"],
         "activation_threshold": 0.7
+      },
+      {
+        "id": "relapse_fear",
+        "event": "反复后的无力感",
+        "description": "曾有短暂好转又回落的经历，因此在情绪波动时容易提前预期“这次也不会维持太久”。",
+        "emotional_charge": 0.78,
+        "triggers": [
+          "好转",
+          "反复",
+          "坚持",
+          "恢复",
+          "治疗",
+          "复发",
+          "状态"
+        ],
+        "associated_thoughts": [
+          "也许我只能短暂变好",
+          "我担心努力到最后还是回到原点",
+          "现在的轻松感可能很快就会消失"
+        ],
+        "physical_reactions": [
+          "身体发沉",
+          "反应变慢",
+          "晨起乏力"
+        ],
+        "activation_threshold": 0.68
       }
     ],
     "llm_transition_judge": {
       "enabled": true,
-      "min_confidence": 0.60,
-      "max_text_length": 1600,
-      "signal_weight": 0.25,
-      "allowed_event_keys": ["chat_event"]
+      "min_confidence": 0.68,
+      "max_text_length": 1800,
+      "signal_weight": 0.16,
+      "allowed_event_keys": [
+        "chat_event"
+      ]
     }
   }
 }

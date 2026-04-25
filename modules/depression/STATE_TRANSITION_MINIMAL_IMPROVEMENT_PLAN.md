@@ -47,20 +47,27 @@
 
 ## 5. LLM API 配置
 
-### 5.1 配置主 LLM（影响 `llm_transition_signal` 生成）
+### 5.1 优先使用 forced_llm（影响 `llm_transition_signal` 生成）
 
-编辑 `data/config.json` 的 `agent.think.llm`：
+`llm_transition_judge` 采用“forced_llm 优先，_llm 回退”的调用策略。
+
+编辑 `data/config.json` 的 `intervention.forced_llm`：
 
 ```json
-"llm": {
+"forced_llm": {
+  "enabled": true,
   "provider": "openai",
   "model": "deepseek-chat",
   "base_url": "https://api.deepseek.com",
-  "api_key": "YOUR_API_KEY"
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "retry": 2,
+  "temperature": 0.5
 }
 ```
 
-注意：本工程主 `think.llm` 当前读取的是 `api_key` 字段本身，不会自动从 `api_key_env` 注入。
+说明：
+- 优先读取 `forced_llm` 运行时配置并创建 `agent._forced_llm`。
+- 若 `forced_llm` 配置缺失或不可用，自动回退到 `agent._llm`，不阻断链路。
 
 ### 5.2 开启 LLM 转换判定
 
@@ -85,7 +92,7 @@
 
 1. 在 `data/config.json` 打开 `intervention.depression_dynamic.enabled=true`。
 2. 在 agent 的 `depression_config.json` 打开 `depression_simulation.enabled=true`。
-3. 按 5.1 配好主 LLM。
+3. 按 5.1 配好 `forced_llm`（建议 DeepSeek）。
 4. 按 5.2 开启 `llm_transition_judge`。
 5. 运行：
 
@@ -125,7 +132,7 @@ python start.py --name sim_dual_path --step 30 --stride 10 --verbose debug
 
 1. 模型输出不稳定时，LLM 路径会带来额外波动。
 2. 如果对话文本很短或信息密度低，LLM 路径贡献可能长期偏弱。
-3. 当前 `llm_transition_judge.timeout_ms` 配置项已保留，但尚未接入实际调用超时控制。
+3. `llm_transition_judge` 已移除 `timeout_ms` 参数，当前不再维护该配置项。
 
 ## 10. 建议的实验方案
 

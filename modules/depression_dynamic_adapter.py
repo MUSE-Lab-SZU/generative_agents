@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from modules import utils
 from modules.depression import DepressionSimulationEngine
 from modules import depression_dynamic_codec as dynamic_codec
+from modules.model.llm_model import create_llm_model
 
 
 DEFAULT_DEPRESSION_TARGET_HINTS = {
@@ -61,7 +62,6 @@ DEFAULT_GLOBAL_CFG = {
 
 DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
     "enabled": False,
-    "timeout_ms": 1200,
     "min_confidence": 0.60,
     "max_text_length": 1600,
     "signal_weight": 0.25,
@@ -452,7 +452,6 @@ def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
 
     if "enabled" in raw_cfg:
         cfg["enabled"] = bool(raw_cfg.get("enabled"))
-    cfg["timeout_ms"] = _bounded_int(raw_cfg.get("timeout_ms"), cfg["timeout_ms"], 200, 30000)
     cfg["min_confidence"] = _bounded_float(
         raw_cfg.get("min_confidence"),
         cfg["min_confidence"],
@@ -732,6 +731,42 @@ def _resolve_time_of_day(agent: Any) -> str:
     return "night"
 
 
+def _resolve_transition_judge_llm(agent: Any) -> (Optional[Any], str):
+    intervention = getattr(agent, "intervention", None)
+    if intervention is not None and hasattr(intervention, "get_forced_llm_runtime_config"):
+        forced_cfg = None
+        try:
+            forced_cfg = intervention.get_forced_llm_runtime_config()
+        except Exception as e:
+            _log(
+                agent,
+                "debug",
+                "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_cfg_error={}".format(
+                    getattr(agent, "name", ""),
+                    e,
+                ),
+            )
+            forced_cfg = None
+        if isinstance(forced_cfg, dict) and forced_cfg:
+            try:
+                forced_llm = getattr(agent, "_forced_llm", None)
+                if forced_llm is None:
+                    forced_llm = create_llm_model(forced_cfg)
+                    setattr(agent, "_forced_llm", forced_llm)
+                if forced_llm is not None:
+                    return forced_llm, "depr_transition_judge_forced"
+            except Exception as e:
+                _log(
+                    agent,
+                    "debug",
+                    "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_llm_init_error={}".format(
+                        getattr(agent, "name", ""),
+                        e,
+                    ),
+                )
+    return getattr(agent, "_llm", None), "depr_transition_judge"
+
+
 def _build_llm_transition_signal(
     agent: Any,
     event_key: str,
@@ -749,7 +784,7 @@ def _build_llm_transition_signal(
         if event_key not in allowed_event_keys:
             return None
 
-    llm = getattr(agent, "_llm", None)
+    llm, caller_name = _resolve_transition_judge_llm(agent)
     if llm is None:
         _log(
             agent,
@@ -789,7 +824,7 @@ def _build_llm_transition_signal(
         raw = llm.completion(
             prompt=prompt,
             retry=1,
-            caller="depr_transition_judge",
+            caller=caller_name,
             failsafe="",
         )
     except Exception as e:
@@ -847,6 +882,28 @@ def _build_llm_transition_prompt(
     conversation_content: str,
 ) -> str:
     whitelist = ", ".join(sorted(list(LLM_TRANSITION_TRIGGER_WHITELIST)))
+    # Use f-string composition to avoid brace-format collision in JSON template.
+    return (
+        "You are a depression-state transition signal extractor. "
+        "Output exactly one JSON object and nothing else.\n"
+        "Task: infer matched transition triggers and directional scores from dialogue.\n"
+        "Required schema:\n"
+        "{\n"
+        '  "matched_triggers": ["..."],\n'
+        '  "positive_score": 0.0,\n'
+        '  "negative_score": 0.0,\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+        "Constraints:\n"
+        "- matched_triggers must be selected from whitelist only.\n"
+        "- positive_score / negative_score / confidence must be in [0, 1].\n"
+        "- If uncertain, return low confidence with empty matched_triggers.\n"
+        f"Trigger whitelist: {whitelist}\n\n"
+        f"Interaction type: {str(interaction_type or '')}\n"
+        f"Relationship: {str(relationship or '')}\n"
+        f"Conversation:\n{conversation_content}\n"
+    )
+
     return (
         "你是抑郁状态转换信号抽取器。仅输出一个 JSON 对象，不要输出其他文字。\n"
         "任务：基于对话内容判断可匹配触发词，并给出正负向分数与置信度。\n"

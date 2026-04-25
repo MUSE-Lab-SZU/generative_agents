@@ -478,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint-dir",
-        default="results/checkpoints/sim0408",
+        default="results/checkpoints/sim-test-kbd-0421-2",
         help="包含 simulate-*.json 的目录",
     )
     parser.add_argument(
@@ -488,12 +488,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--csv",
-        default=None,
+        default="results/checkpoints/sim-test-kbd-0421-2/judge_traces/depression_state_summary.csv",
         help="可选：输出 CSV 路径",
     )
     parser.add_argument(
         "--json",
-        default=None,
+        default="results/checkpoints/sim-test-kbd-0421-2/judge_traces/depression_state_summary.json",
         help="可选：输出 JSON 路径",
     )
     parser.add_argument(

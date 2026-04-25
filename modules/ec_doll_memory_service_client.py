@@ -1,7 +1,8 @@
-"""EC-Doll 记忆框架微服务接口聚合封装（V2 - 0413 文档版）。"""
+"""EC-Doll 记忆服务 HTTP 客户端（对齐 MEMORY_SERVICE.md）。"""
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Optional, TypedDict, Union
 
 import requests
@@ -12,7 +13,7 @@ JsonData = Union[JsonDict, JsonList]
 
 
 class CognitiveSchema(TypedDict):
-    """`/api/cognitive/schemas` 返回的图式对象。"""
+    """`/api/cognitive/schemas` 返回的图式对象（已弃用接口）。"""
 
     schema_id: str
     name: str
@@ -22,7 +23,7 @@ class CognitiveSchema(TypedDict):
 
 
 class CognitiveHistoryItem(TypedDict):
-    """认知接口 history 列表中的单条对话记录。"""
+    """认知接口 history 列表中的单条对话记录（已弃用接口）。"""
 
     user_input: str
     ai_response: str
@@ -30,10 +31,9 @@ class CognitiveHistoryItem(TypedDict):
 
 
 class ECDollMemoryServiceClient:
-    """EC-Doll 记忆微服务 HTTP 客户端。"""
+    """EC-Doll 记忆微服务客户端。"""
 
     ENDPOINT_INDEX: Dict[str, str] = {
-        "emotion_timeline": "GET /api/v1/visual/emotion_timeline",
         "ingest": "POST /ingest",
         "retrieve": "POST /retrieve",
         "milestones": "GET /api/milestones",
@@ -45,11 +45,8 @@ class ECDollMemoryServiceClient:
         "memory_toggle_lock": "POST /api/memories/{id}/toggle_lock",
         "memory_milestone": "POST /api/memories/{id}/milestone",
         "memory_settings": "POST /api/settings/memory",
-        "cognitive_schemas": "GET /api/cognitive/schemas",
-        "cognitive_workflow": "POST /api/cognitive/workflow",
-        "cognitive_interpret": "POST /api/cognitive/interpret",
-        "cognitive_reflect": "POST /api/cognitive/reflect",
         "health": "GET /health",
+        "ready": "GET /ready",
     }
 
     def __init__(
@@ -88,23 +85,32 @@ class ECDollMemoryServiceClient:
             return None
         return {key: value for key, value in data.items() if value is not None}
 
+    @staticmethod
+    def _warn_deprecated(name: str, replacement: str = "") -> None:
+        tip = f"`{name}` 已弃用，不在最新 MEMORY_SERVICE.md 接口清单中。"
+        if replacement:
+            tip += f" 建议改用 `{replacement}`。"
+        warnings.warn(tip, DeprecationWarning, stacklevel=2)
+
     def get_emotion_timeline(
         self,
         limit: int = 50,
         user_id: Optional[str] = None,
     ) -> JsonList:
         """
-        作用:
-        获取情绪时间线数据，用于前端绘制实时情绪折线图。
+        已弃用接口：
+        - 对应旧版路径：`GET /api/v1/visual/emotion_timeline`
+        - 最新文档 `MEMORY_SERVICE.md` 已不再定义该接口
 
-        输入:
-        - limit(int): 最近数据点数量，默认 50。
-        - user_id(str|None): 用户 ID。文档总则说明所有接口支持 user_id。
+        输入：
+        - `limit`(int): 返回最近情绪点数量。
+        - `user_id`(str|None): 旧接口中的用户 ID 过滤参数。
 
-        输出:
-        - List[dict]: 按时间正序返回的情绪点数组，每项包含
-          timestamp、intensity、tag、related_msg_id 等字段。
+        输出：
+        - List[dict]：旧接口情绪点数组。常见字段：
+          `timestamp`, `intensity`, `tag`, `related_msg_id`。
         """
+        self._warn_deprecated("get_emotion_timeline")
         data = self._request(
             "GET",
             "/api/v1/visual/emotion_timeline",
@@ -119,16 +125,21 @@ class ECDollMemoryServiceClient:
         remote_id: Optional[str] = None,
     ) -> JsonDict:
         """
-        作用:
-        向记忆系统写入一条用户消息，触发后端分析与存储流程。
+        写入一条用户消息：`POST /ingest`。
 
-        输入:
-        - content(str): 用户输入文本。
-        - user_id(str): 用户 ID（V2 必填）。
-        - remote_id(str|None): 可选消息 ID，不传则由系统生成。
+        输入（JSON）：
+        - `user_id`(str, 必填): 用户唯一 ID。
+        - `content`(str, 必填): 本条消息原文。
+        - `remote_id`(str|None, 可选): 外部消息 ID；不传由服务生成。
 
-        输出:
-        - dict: 通常包含 status、message、remote_id。
+        输出（JSON）：
+        - `status`(str): 例如 `completed` / `stored_raw` / `error`。
+        - `message`(str): 人类可读说明。
+        - `remote_id`(str): 本条消息最终 ID。
+        - `long_term_pending`(bool): 是否已进入长期分析后台队列。
+        - `analysis_ok`(bool|None): 分析结果是否可用。
+        - `mws_score`(float|None): 消息 MWS 分数。
+        - `stored_raw_fallback`(bool): LLM 不可用时是否退化为仅存原文。
         """
         data = self._request(
             "POST",
@@ -148,16 +159,22 @@ class ECDollMemoryServiceClient:
         active_project: Optional[str] = None,
     ) -> JsonDict:
         """
-        作用:
-        在回复生成前检索记忆上下文，返回可直接拼接到 Prompt 的背景信息。
+        组装记忆上下文：`POST /retrieve`。
 
-        输入:
-        - query(str): 当前用户输入。
-        - user_id(str): 用户 ID（V2 必填）。
-        - active_project(str|None): 可选项目/话题名。
+        输入（JSON）：
+        - `user_id`(str, 必填): 用户唯一 ID。
+        - `query`(str, 必填): 当前轮查询文本，用于向量检索。
+        - `active_project`(str|None, 可选): 预留字段，暂未使用。
 
-        输出:
-        - dict: 典型包含 formatted_prompt 与 details。
+        输出（JSON）：
+        - `formatted_prompt`(str): 可直接拼接到系统提示词的完整上下文。
+        - `details`(dict): 结构化上下文，常见字段：
+          - `l0_history`(list): 外部原文历史。
+          - `ranked_memories`(list): 长期召回与重排后的记忆。
+          - `profile_data`(dict): 用户画像键值。
+          - `recent_emotion`(list): 最近情绪记录。
+          - `milestones`(list): 里程碑列表。
+          - `short_term_recent`(list): 近期原文短期记忆。
         """
         data = self._request(
             "POST",
@@ -172,15 +189,14 @@ class ECDollMemoryServiceClient:
 
     def list_milestones(self, user_id: str) -> JsonList:
         """
-        作用:
-        查询用户的里程碑事件列表（按发生时间倒序）。
+        查询里程碑列表：`GET /api/milestones`。
 
-        输入:
-        - user_id(str): 用户 ID。
+        输入（Query）：
+        - `user_id`(str, 必填): 用户唯一 ID。
 
-        输出:
-        - List[dict]: 里程碑数组，常见字段包括 id、title、level、
-          happened_at、description、remote_id、created_at。
+        输出（JSON List）：
+        - 每项常见字段：`id`, `user_id`, `title`, `level`, `happened_at`,
+          `description`, `remote_id`, `created_at`。
         """
         data = self._request("GET", "/api/milestones", params={"user_id": user_id})
         return data if isinstance(data, list) else []
@@ -194,19 +210,18 @@ class ECDollMemoryServiceClient:
         page_size: Optional[int] = None,
     ) -> JsonData:
         """
-        作用:
-        获取记忆列表，支持按层级/锁定状态/用户过滤，并支持分页。
+        查询记忆列表：`GET /api/memories`。
 
-        输入:
-        - level(str|None): 记忆层级过滤，文档示例值为 L1/L2。
-        - locked(bool|None): 锁定状态过滤。
-        - user_id(str|None): 用户 ID 过滤。
-        - page(int|None): 页码（从 1 开始）。
-        - page_size(int|None): 每页数量（文档约束 1-100）。
+        输入（Query）：
+        - `user_id`(str|None): 用户 ID 过滤。
+        - `level`(str|None): 记忆层级过滤（`L1`/`L2`）。
+        - `locked`(bool|None): 锁定状态过滤。
+        - `page`(int|None): 分页页码（从 1 开始）。
+        - `page_size`(int|None): 分页大小。
 
-        输出:
-        - 非分页模式: List[dict]，直接返回记忆对象数组。
-        - 分页模式: dict，包含 items/total/page/page_size/total_pages。
+        输出（JSON）：
+        - 非分页：`List[dict]`。
+        - 分页：`dict`，固定字段为 `items`, `total`, `page`, `page_size`。
         """
         return self._request(
             "GET",
@@ -223,160 +238,128 @@ class ECDollMemoryServiceClient:
     def update_memory(
         self,
         memory_id: str,
-        content: str,
+        content: Optional[str] = None,
         mws_score: Optional[float] = None,
-        user_id: Optional[str] = None,
     ) -> JsonDict:
         """
-        作用:
-        更新指定记忆内容，并触发存储与向量索引更新。
+        更新记忆：`PUT /api/memories/{id}`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - content(str): 新的记忆内容或摘要。
-        - mws_score(float|None): 文档标注为已弃用，客户端保留该参数仅为兼容旧调用，传入会被忽略。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path + JSON）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
+        - `content`(str|None): 新内容摘要。
+        - `mws_score`(float|None): 新 MWS 分数。
+        - 约束：`content` 与 `mws_score` 至少传一个。
 
-        输出:
-        - dict: 通常包含 status 与 id。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `id`, `message`。
         """
+        if content is None and mws_score is None:
+            raise ValueError("update_memory requires at least one of content or mws_score")
         data = self._request(
             "PUT",
             f"/api/memories/{memory_id}",
-            params={"user_id": user_id},
-            json_body={"content": content},
+            json_body={"content": content, "mws_score": mws_score},
         )
         return data if isinstance(data, dict) else {}
 
-    def delete_memory(self, memory_id: str, user_id: Optional[str] = None) -> JsonDict:
+    def delete_memory(self, memory_id: str) -> JsonDict:
         """
-        作用:
-        删除指定记忆，并清理相关存储记录。
+        删除记忆：`DELETE /api/memories/{id}`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
 
-        输出:
-        - dict: 通常包含 status、message、id。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `message`, `id`。
         """
-        data = self._request("DELETE", f"/api/memories/{memory_id}", params={"user_id": user_id})
+        data = self._request("DELETE", f"/api/memories/{memory_id}")
         return data if isinstance(data, dict) else {}
 
-    def promote_memory(self, memory_id: str, user_id: Optional[str] = None) -> JsonDict:
+    def promote_memory(self, memory_id: str) -> JsonDict:
         """
-        作用:
-        强制升级记忆（提高 MWS 概念分并锁定）。
+        强制升级记忆：`POST /api/memories/{id}/promote`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
 
-        输出:
-        - dict: 通常包含 status、message。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `message`。
         """
-        data = self._request("POST", f"/api/memories/{memory_id}/promote", params={"user_id": user_id})
+        data = self._request("POST", f"/api/memories/{memory_id}/promote")
         return data if isinstance(data, dict) else {}
 
-    def demote_memory(self, memory_id: str, user_id: Optional[str] = None) -> JsonDict:
+    def demote_memory(self, memory_id: str) -> JsonDict:
         """
-        作用:
-        强制降级记忆（降低 MWS 概念分并解锁，同时取消里程碑标记）。
+        强制降级记忆：`POST /api/memories/{id}/demote`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
 
-        输出:
-        - dict: 通常包含 status、message。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `message`。
         """
-        data = self._request("POST", f"/api/memories/{memory_id}/demote", params={"user_id": user_id})
+        data = self._request("POST", f"/api/memories/{memory_id}/demote")
         return data if isinstance(data, dict) else {}
 
-    def toggle_memory_lock(
-        self,
-        memory_id: str,
-        locked: bool,
-        user_id: Optional[str] = None,
-    ) -> JsonDict:
+    def toggle_memory_lock(self, memory_id: str) -> JsonDict:
         """
-        作用:
-        设置记忆锁定状态，防止或允许被自动清理/迁移流程处理。
+        切换锁定状态：`POST /api/memories/{id}/toggle_lock`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - locked(bool): True=锁定，False=解锁。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
 
-        输出:
-        - dict: 通常包含 status、locked。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `locked`。
         """
-        data = self._request(
-            "POST",
-            f"/api/memories/{memory_id}/toggle_lock",
-            params={"user_id": user_id},
-            json_body={"locked": locked},
-        )
+        data = self._request("POST", f"/api/memories/{memory_id}/toggle_lock")
         return data if isinstance(data, dict) else {}
 
-    def set_memory_milestone(
-        self,
-        memory_id: str,
-        is_milestone: bool,
-        user_id: Optional[str] = None,
-    ) -> JsonDict:
+    def set_memory_milestone(self, memory_id: str, is_milestone: bool) -> JsonDict:
         """
-        作用:
-        设置或取消记忆的里程碑标记。
+        设置里程碑标记：`POST /api/memories/{id}/milestone`。
 
-        输入:
-        - memory_id(str): 记忆 ID（路径参数，对应 {id}）。
-        - is_milestone(bool): True=设为里程碑，False=取消里程碑。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（Path + JSON）：
+        - `memory_id`(str, 必填): 目标记忆 ID。
+        - `is_milestone`(bool, 必填): 是否设为里程碑。
 
-        输出:
-        - dict: 通常包含 status、is_milestone。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `is_milestone`。
         """
         data = self._request(
             "POST",
             f"/api/memories/{memory_id}/milestone",
-            params={"user_id": user_id},
             json_body={"is_milestone": is_milestone},
         )
         return data if isinstance(data, dict) else {}
 
-    def update_memory_settings(self, l2_threshold: float, user_id: Optional[str] = None) -> JsonDict:
+    def update_memory_settings(self, l2_threshold: float) -> JsonDict:
         """
-        作用:
-        更新全局记忆阈值配置（V2 中为概念阈值更新，不触发物理迁移）。
+        更新记忆阈值配置：`POST /api/settings/memory`。
 
-        输入:
-        - l2_threshold(float): 新的 L2 阈值，文档范围为 0.0-1.0。
-        - user_id(str|None): 用户 ID（可选；用于多用户隔离）。
+        输入（JSON）：
+        - `l2_threshold`(float, 必填): 新的 L2 阈值。
 
-        输出:
-        - dict: 通常包含 status、message。
+        输出（JSON）：
+        - 透传服务端返回，常见字段：`status`, `message`。
         """
         data = self._request(
             "POST",
             "/api/settings/memory",
-            params={"user_id": user_id},
             json_body={"l2_threshold": l2_threshold},
         )
         return data if isinstance(data, dict) else {}
 
     def get_cognitive_schemas(self, user_id: str) -> List[CognitiveSchema]:
         """
-        作用:
-        获取用户当前全部认知图式及其激活状态（Layer 2）。
+        已弃用接口：`GET /api/cognitive/schemas`（最新文档不再定义）。
 
-        输入:
-        - user_id(str): 目标用户 ID（必填，query 参数）。
+        输入：
+        - `user_id`(str): 用户 ID。
 
-        输出:
-        - List[dict]: 图式对象数组。单个对象字段与文档一致：
-          schema_id, name, activation_score, definition, associated_thoughts。
+        输出：
+        - List[dict]：认知图式数组。
         """
+        self._warn_deprecated("get_cognitive_schemas")
         data = self._request(
             "GET",
             "/api/cognitive/schemas",
@@ -391,21 +374,17 @@ class ECDollMemoryServiceClient:
         history: Optional[List[CognitiveHistoryItem]] = None,
     ) -> JsonDict:
         """
-        作用:
-        执行完整认知工作流：图式检索 -> 内心独白 -> 条件反思更新。
+        已弃用接口：`POST /api/cognitive/workflow`（最新文档不再定义）。
 
-        输入:
-        - user_id(str): 用户 ID。
-        - content(str): 当前输入文本。
-        - history(list[dict]|None): 最近对话历史（可选），格式为
-          [{"user_input": "...", "ai_response": "...", "active_schemas": [...]}]。
+        输入：
+        - `user_id`(str): 用户 ID。
+        - `content`(str): 当前输入文本。
+        - `history`(list|None): 历史对话记录。
 
-        输出:
-        - dict: 返回字段与文档一致：
-          inner_monologue(str),
-          active_schemas(List[Dict]),
-          reflection_result(Dict|null)。
+        输出：
+        - dict：常见字段 `inner_monologue`, `active_schemas`, `reflection_result`。
         """
+        self._warn_deprecated("run_cognitive_workflow")
         data = self._request(
             "POST",
             "/api/cognitive/workflow",
@@ -415,18 +394,16 @@ class ECDollMemoryServiceClient:
 
     def interpret_cognitive(self, user_id: str, content: str) -> JsonDict:
         """
-        作用:
-        执行认知解读原子能力（仅图式检索 + 内心独白，不触发反思）。
+        已弃用接口：`POST /api/cognitive/interpret`（最新文档不再定义）。
 
-        输入:
-        - user_id(str): 用户 ID。
-        - content(str): 当前输入文本。
+        输入：
+        - `user_id`(str): 用户 ID。
+        - `content`(str): 当前输入文本。
 
-        输出:
-        - dict: 返回字段与文档一致：
-          inner_monologue(str),
-          active_schemas(List[Dict])。
+        输出：
+        - dict：常见字段 `inner_monologue`, `active_schemas`。
         """
+        self._warn_deprecated("interpret_cognitive")
         data = self._request(
             "POST",
             "/api/cognitive/interpret",
@@ -440,19 +417,16 @@ class ECDollMemoryServiceClient:
         history: List[CognitiveHistoryItem],
     ) -> JsonDict:
         """
-        作用:
-        手动触发认知反思流程，根据历史记录更新图式分数。
+        已弃用接口：`POST /api/cognitive/reflect`（最新文档不再定义）。
 
-        输入:
-        - user_id(str): 用户 ID。
-        - history(list[dict]): 待分析的对话历史记录（必填）。
+        输入：
+        - `user_id`(str): 用户 ID。
+        - `history`(list): 历史对话记录。
 
-        输出:
-        - dict: 返回字段与文档一致：
-          status("success"|"error"),
-          insights(List[str]),
-          updates(List[Dict])。
+        输出：
+        - dict：常见字段 `status`, `insights`, `updates`。
         """
+        self._warn_deprecated("reflect_cognitive")
         data = self._request(
             "POST",
             "/api/cognitive/reflect",
@@ -462,14 +436,35 @@ class ECDollMemoryServiceClient:
 
     def health_check(self) -> JsonDict:
         """
-        作用:
-        执行服务健康检查。
+        健康检查：`GET /health`。
 
-        输入:
-        - 无。
-
-        输出:
-        - dict: 典型包含 status("ok")、version("v2")。
+        输出（JSON）：
+        - `status`(str): 典型值 `ok`。
+        - `version`(str): 服务版本，文档示例为 `v2`。
         """
         data = self._request("GET", "/health")
         return data if isinstance(data, dict) else {}
+
+    def ready_check(self) -> JsonDict:
+        """
+        依赖就绪检查：`GET /ready`。
+
+        输出（JSON）：
+        - `status`(str): 典型值 `ready`。
+        - `redis`(bool): Redis 依赖是否可用。
+        - `postgres`(bool): PostgreSQL 依赖是否可用。
+        - `chroma`(bool): Chroma 依赖是否可用。
+        - 语义：任一依赖不可用时，服务应返回 HTTP 503。
+        """
+        try:
+            data = self._request("GET", "/ready")
+            return data if isinstance(data, dict) else {}
+        except requests.HTTPError as exc:
+            response = exc.response
+            if response is not None and response.status_code == 503 and response.content:
+                try:
+                    data = response.json()
+                except ValueError:
+                    return {}
+                return data if isinstance(data, dict) else {}
+            raise

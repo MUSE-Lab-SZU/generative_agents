@@ -865,6 +865,54 @@ class Agent:
         if hasattr(other, "_chat_route_ctx"):
             other._chat_route_ctx = prev_other_ctx
 
+    def _normalize_address_list(self, raw):
+        if isinstance(raw, list):
+            return [str(seg).strip() for seg in raw if str(seg).strip()]
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            if ":" in text:
+                return [seg.strip() for seg in text.split(":") if seg.strip()]
+            return [text]
+        return []
+
+    def _clone_event_with_address(self, event, address):
+        if not event or not hasattr(event, "to_dict"):
+            return event
+        try:
+            payload = event.to_dict()
+            payload["address"] = self._normalize_address_list(address)
+            return memory.Event.from_dict(payload)
+        except Exception:
+            return event
+
+    def _resolve_forced_chat_memory_address(self, other, forced=False):
+        if not bool(forced):
+            return []
+        mgr = getattr(self, "intervention", None)
+        doctor_name = str(getattr(mgr, "doctor", "") or "")
+        if not doctor_name:
+            return []
+        if str(self.name or "") == doctor_name:
+            return self._normalize_address_list(self.get_tile().get_address())
+        if str(getattr(other, "name", "") or "") == doctor_name and hasattr(other, "get_tile"):
+            return self._normalize_address_list(other.get_tile().get_address())
+        return []
+
+    def _should_normalize_forced_persona_event(self, event):
+        if not event:
+            return False
+        if str(getattr(event, "subject", "") or "") != str(self.name or ""):
+            return False
+        address = self._normalize_address_list(getattr(event, "address", []))
+        if (not address) or address[0] != "<persona>":
+            return False
+        lock = self.status.get("intervention", {}).get("lock", {})
+        if not isinstance(lock, dict):
+            return False
+        return bool(lock.get("enabled", False))
+
     def _chat_with(self, other, focus, forced=False):
         trace_scope = "INTERVENTION" if forced else "CHAT_CORE"
         self.logger.info(
@@ -1584,6 +1632,21 @@ class Agent:
             )
         )
 
+        doctor_memory_address = self._resolve_forced_chat_memory_address(
+            other,
+            forced=forced,
+        )
+        chat_meta_common = {
+            "forced": bool(forced),
+            "expire_days": forced_chat_expire_days,
+            "retrieval_profile_enabled": bool(
+                retrieval_profile_meta.get("enabled", False)
+            ),
+            "retrieval_scope": retrieval_profile_meta.get("scope", ""),
+        }
+        if doctor_memory_address:
+            chat_meta_common["memory_address_override"] = doctor_memory_address
+
         self.schedule_chat(
             chats,
             chat_summary,
@@ -1591,12 +1654,7 @@ class Agent:
             duration,
             other,
             chat_expire=chat_expire,
-            chat_meta={
-                "forced": bool(forced),
-                "expire_days": forced_chat_expire_days,
-                "retrieval_profile_enabled": bool(retrieval_profile_meta.get("enabled", False)),
-                "retrieval_scope": retrieval_profile_meta.get("scope", ""),
-            },
+            chat_meta=copy.deepcopy(chat_meta_common),
         )
         other.schedule_chat(
             chats,
@@ -1605,12 +1663,7 @@ class Agent:
             duration,
             self,
             chat_expire=chat_expire,
-            chat_meta={
-                "forced": bool(forced),
-                "expire_days": forced_chat_expire_days,
-                "retrieval_profile_enabled": bool(retrieval_profile_meta.get("enabled", False)),
-                "retrieval_scope": retrieval_profile_meta.get("scope", ""),
-            },
+            chat_meta=copy.deepcopy(chat_meta_common),
         )
         self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
         if self.intervention:
@@ -1873,12 +1926,22 @@ class Agent:
         else:
             poignancy = self.completion("poignancy_event", event)
         self.logger.debug("{} add associate {}".format(self.name, event))
+        event_for_memory = event
         if e_type == "chat":
             pending = getattr(self, "_pending_chat_memory_meta", None)
             if isinstance(pending, dict) and pending:
                 pending_expire = pending.get("expire")
                 if isinstance(pending_expire, datetime.datetime):
                     expire = pending_expire
+                meta = pending.get("meta", {}) if isinstance(pending.get("meta"), dict) else {}
+                override_address = self._normalize_address_list(
+                    meta.get("memory_address_override", [])
+                )
+                if override_address:
+                    event_for_memory = self._clone_event_with_address(
+                        event,
+                        override_address,
+                    )
                 self.logger.info(
                     "[CHAT_MEMORY_WRITE] agent={} other={} create={} expire={} meta={}".format(
                         self.name,
@@ -1889,9 +1952,19 @@ class Agent:
                     )
                 )
                 self._pending_chat_memory_meta = None
+        elif e_type == "event":
+            if self._should_normalize_forced_persona_event(event):
+                current_tile_address = self._normalize_address_list(
+                    self.get_tile().get_address()
+                )
+                if current_tile_address:
+                    event_for_memory = self._clone_event_with_address(
+                        event,
+                        current_tile_address,
+                    )
         return self.associate.add_node(
             e_type,
-            event,
+            event_for_memory,
             poignancy,
             create=create,
             expire=expire,
