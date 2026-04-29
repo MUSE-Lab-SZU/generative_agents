@@ -17,6 +17,7 @@ from string import Template
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from modules.model.llm_model import create_llm_model
+from modules.depression.emotion_inferencer import EmotionInferencer
 
 
 _PROFILE_TOP_KEYS = {
@@ -47,6 +48,7 @@ _PROMPT_FILE_MAP = {
     "depr_reflect_block_shell": "depr_reflect_block_shell.txt",
 }
 _PROMPT_CACHE: Dict[str, Dict[str, Any]] = {}
+_EMOTION_INFERENCER = EmotionInferencer()
 _PROMPT_DEFAULTS = {
     "depr_init_current_event": (
         "你是抑郁运行态初始化器。仅输出 JSON：{\"wording\":\"...\"}。\n"
@@ -87,10 +89,12 @@ _PROMPT_DEFAULTS = {
     ),
     "depr_chat_block_shell": (
         "<抑郁中间态视图>\n"
+        "${static_profile_section}"
         "【病例要点】\n"
         "${merged_case_config_block}\n\n"
         "【当前主导事件】\n"
         "- ${current_event_text}\n\n"
+        "${emotion_section}"
         "【对话约束】\n"
         "${dialogue_protocol_block}\n"
         "- 干预可能有效，但变化应缓慢、可反复、非线性\n"
@@ -135,6 +139,17 @@ def default_profile() -> dict:
                 "wording": "",
                 "updated_step": -1,
                 "source": "fallback",
+            },
+            "emotion": {
+                "label": "",
+                "style": "",
+                "intensity": 0.0,
+                "volatility_note": "",
+                "updated_step": -1,
+                "source": "",
+                "other_agent": "",
+                "relationship": "",
+                "applies_to": "chat_only",
             },
             "active_overrides": {
                 "short_term": {},
@@ -265,6 +280,28 @@ def validate_profile_or_raise(profile: dict, source: str = "") -> None:
         _raise(source, "runtime.current_event.updated_step must be int")
     if not isinstance(current_event.get("source", "fallback"), str):
         _raise(source, "runtime.current_event.source must be string")
+
+    emotion = runtime.get("emotion", {})
+    if not isinstance(emotion, dict):
+        _raise(source, "runtime.emotion must be dict")
+    if not isinstance(emotion.get("label", ""), str):
+        _raise(source, "runtime.emotion.label must be string")
+    if not isinstance(emotion.get("style", ""), str):
+        _raise(source, "runtime.emotion.style must be string")
+    if not isinstance(emotion.get("intensity", 0.0), (int, float)):
+        _raise(source, "runtime.emotion.intensity must be number")
+    if not isinstance(emotion.get("volatility_note", ""), str):
+        _raise(source, "runtime.emotion.volatility_note must be string")
+    if not isinstance(emotion.get("updated_step", -1), int):
+        _raise(source, "runtime.emotion.updated_step must be int")
+    if not isinstance(emotion.get("source", ""), str):
+        _raise(source, "runtime.emotion.source must be string")
+    if not isinstance(emotion.get("other_agent", ""), str):
+        _raise(source, "runtime.emotion.other_agent must be string")
+    if not isinstance(emotion.get("relationship", ""), str):
+        _raise(source, "runtime.emotion.relationship must be string")
+    if not isinstance(emotion.get("applies_to", "chat_only"), str):
+        _raise(source, "runtime.emotion.applies_to must be string")
 
     active_overrides = runtime.get("active_overrides")
     if not isinstance(active_overrides, dict):
@@ -420,7 +457,13 @@ def merge_case_and_runtime(case_config: dict, short_term: dict) -> dict:
     }
 
 
-def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg: Optional[dict] = None) -> dict:
+def build_intermediate_view(
+    profile: dict,
+    now_step: int,
+    stage: str,
+    update_cfg: Optional[dict] = None,
+    static_profile: Optional[dict] = None,
+) -> dict:
     """构建 prompt 注入所需中间态视图。"""
     ensured = ensure_profile(profile)
     runtime = ensured["runtime"]
@@ -451,6 +494,7 @@ def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg
     current_event_topic = current_event.get("topic", "")
     if not current_event_text:
         current_event_text = "暂无显著主导事件"
+    current_emotion = runtime.get("emotion", {}) if isinstance(runtime.get("emotion", {}), dict) else {}
 
     view = {
         "stage": stage,
@@ -465,6 +509,8 @@ def build_intermediate_view(profile: dict, now_step: int, stage: str, update_cfg
         "short_term_lines": short_term_lines,
         "dialogue_protocol": list(ensured.get("dialogue_protocol", []) or []),
         "important_notice": ensured.get("important_notice", "") or "",
+        "static_profile": static_profile if isinstance(static_profile, dict) else {},
+        "current_emotion": current_emotion,
         "guardrails": {
             "keep_json_protocol": True,
             "no_severity_in_prompt": True,
@@ -485,6 +531,8 @@ def render_chat_prompt_block(view: dict) -> str:
     if not isinstance(merged_case_config, dict):
         merged_case_config = {}
     merged_case_config_block = json.dumps(merged_case_config, ensure_ascii=False)
+    static_profile_section = _render_static_profile_section(view.get("static_profile", {}))
+    emotion_section = _render_emotion_section(view.get("current_emotion", {}))
 
     dialogue_rows: List[str] = []
     for rule in view.get("dialogue_protocol", []) or []:
@@ -500,8 +548,10 @@ def render_chat_prompt_block(view: dict) -> str:
     prompt = _render_prompt_template(
         "depr_chat_block_shell",
         {
+            "static_profile_section": static_profile_section,
             "merged_case_config_block": merged_case_config_block,
             "current_event_text": str(view.get("current_event_text", "暂无显著主导事件") or "暂无显著主导事件"),
+            "emotion_section": emotion_section,
             "dialogue_protocol_block": dialogue_protocol_block,
             "important_notice_section": important_notice_section,
         },
@@ -510,6 +560,61 @@ def render_chat_prompt_block(view: dict) -> str:
     if not content:
         return ""
     return content
+
+
+def infer_chat_emotion(
+    patient_agent: Any,
+    profile: dict,
+    now_step: int,
+    static_profile: Optional[dict] = None,
+    other_agent: str = "",
+    relationship: str = "",
+    conversation_content: str = "",
+) -> dict:
+    """推断当前对话轮次的说话情绪，并写回 runtime.emotion。"""
+    ensured = ensure_profile(profile)
+    if not bool(ensured.get("enabled", False)):
+        return ensured
+
+    runtime = ensured.get("runtime", {}) if isinstance(ensured.get("runtime", {}), dict) else {}
+    short_term = (
+        runtime.get("active_overrides", {}).get("short_term", {})
+        if isinstance(runtime.get("active_overrides", {}), dict)
+        else {}
+    )
+    if not isinstance(short_term, dict):
+        short_term = {}
+    merged_case_payload = merge_case_and_runtime(ensured.get("case_config", {}), short_term)
+    previous_emotion = runtime.get("emotion", {}) if isinstance(runtime.get("emotion", {}), dict) else {}
+
+    payload = {
+        "static_profile": static_profile if isinstance(static_profile, dict) else {},
+        "current_event": runtime.get("current_event", {}) if isinstance(runtime.get("current_event", {}), dict) else {},
+        "merged_case_config": merged_case_payload.get("case_config", {}),
+        "previous_emotion": previous_emotion,
+        "other_agent": str(other_agent or ""),
+        "relationship": str(relationship or ""),
+        "conversation_content": str(conversation_content or ""),
+        "now_step": int(now_step),
+    }
+
+    inferred = _EMOTION_INFERENCER.infer(
+        payload,
+        completion_func=lambda prompt: _safe_llm_completion(
+            patient_agent,
+            {"prompt": prompt},
+            caller="depr_emotion_infer",
+        ),
+    )
+    emotion = _normalize_runtime_emotion(inferred)
+    emotion["updated_step"] = int(now_step)
+    emotion["other_agent"] = str(other_agent or "")
+    emotion["relationship"] = str(relationship or "")
+    emotion["applies_to"] = "chat_only"
+
+    runtime["emotion"] = emotion
+    ensured["runtime"] = runtime
+    return ensured
 
 
 def render_reflect_prompt_block(view: dict) -> str:
@@ -1620,6 +1725,11 @@ def _normalize_profile(profile: dict) -> None:
     current_event.pop("dominance", None)
     current_event.pop("confidence", None)
 
+    emotion = runtime.setdefault("emotion", {})
+    normalized_emotion = _normalize_runtime_emotion(emotion)
+    emotion.clear()
+    emotion.update(normalized_emotion)
+
     active_overrides = runtime.setdefault("active_overrides", {})
     short_term = active_overrides.setdefault("short_term", {})
     progress_state = active_overrides.setdefault("progress_state", {})
@@ -1741,6 +1851,12 @@ def _safe_llm_completion(patient_agent: Any, prompt_payload: dict, caller: str =
             "default_retry": 2,
             "default_force_forced_llm": False,
             "route_log_tag": "CURRENT_EVENT",
+        },
+        "depr_emotion_infer": {
+            "policy_getter": "",
+            "default_retry": 1,
+            "default_force_forced_llm": False,
+            "route_log_tag": "EMOTION",
         },
     }
     route_policy = route_policy_map.get(caller)
@@ -2261,6 +2377,96 @@ def _format_chats(chats: list) -> str:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             lines.append(f"{item[0]}: {item[1]}")
     return "\n".join(lines)
+
+
+def _stringify_profile_value(value: Any) -> str:
+    if isinstance(value, list):
+        return "、".join([str(v).strip() for v in value if str(v).strip()])
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _render_static_profile_section(static_profile: Any) -> str:
+    profile = static_profile if isinstance(static_profile, dict) else {}
+    if not profile:
+        return ""
+
+    preferred_keys = [
+        ("age", "年龄"),
+        ("gender", "性别"),
+        ("occupation", "职业/身份"),
+        ("education", "教育状态"),
+        ("residence", "居住情况"),
+        ("personality", "性格特征"),
+        ("speaking_habit", "说话习惯"),
+    ]
+    lines: List[str] = []
+    for key, label in preferred_keys:
+        value = profile.get(key, "")
+        if key == "age" and isinstance(value, (int, float)):
+            text = "{}岁".format(int(value))
+        else:
+            text = _stringify_profile_value(value)
+        if text:
+            lines.append(f"- {label}：{text}")
+
+    if not lines:
+        for key, value in profile.items():
+            text = _stringify_profile_value(value)
+            if text:
+                lines.append(f"- {str(key)}：{text}")
+
+    if not lines:
+        return ""
+    return "【Profile（静态）】\n" + "\n".join(lines) + "\n\n"
+
+
+def _normalize_runtime_emotion(raw: Any) -> Dict[str, Any]:
+    emotion = raw if isinstance(raw, dict) else {}
+    intensity = emotion.get("intensity", 0.0)
+    try:
+        intensity_val = float(intensity)
+    except Exception:
+        intensity_val = 0.0
+    intensity_val = max(0.0, min(1.0, intensity_val))
+
+    return {
+        "label": str(emotion.get("label", "") or "").strip(),
+        "style": str(emotion.get("style", "") or "").strip(),
+        "intensity": round(float(intensity_val), 4),
+        "volatility_note": str(emotion.get("volatility_note", "") or "").strip(),
+        "updated_step": int(emotion.get("updated_step", -1) or -1),
+        "source": str(emotion.get("source", "") or "").strip(),
+        "other_agent": str(emotion.get("other_agent", "") or "").strip(),
+        "relationship": str(emotion.get("relationship", "") or "").strip(),
+        "applies_to": str(emotion.get("applies_to", "chat_only") or "chat_only").strip(),
+    }
+
+
+def _render_emotion_section(raw_emotion: Any) -> str:
+    emotion = _normalize_runtime_emotion(raw_emotion)
+    if not any(
+        [
+            emotion.get("label"),
+            emotion.get("style"),
+            emotion.get("volatility_note"),
+        ]
+    ):
+        return ""
+
+    lines = ["【Emotion（当前说话）】"]
+    if emotion.get("label", ""):
+        lines.append(f"- 当前情绪：{emotion['label']}")
+    if emotion.get("style", ""):
+        lines.append(f"- 说话风格：{emotion['style']}")
+    lines.append(f"- 情绪强度：{emotion.get('intensity', 0.0):.2f}")
+    if emotion.get("volatility_note", ""):
+        lines.append(f"- 波动说明：{emotion['volatility_note']}")
+    lines.append("- 该 Emotion 只用于当前这轮交流，不代表永久性人格变化。")
+    return "\n".join(lines) + "\n\n"
 
 
 def _deep_merge(dst: Any, src: Any) -> Any:

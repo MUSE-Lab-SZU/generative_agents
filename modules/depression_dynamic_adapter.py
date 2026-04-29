@@ -9,7 +9,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from modules import utils
 from modules.depression import DepressionSimulationEngine
 from modules import depression_dynamic_codec as dynamic_codec
-from modules.model.llm_model import create_llm_model
 
 
 DEFAULT_DEPRESSION_TARGET_HINTS = {
@@ -25,27 +24,27 @@ DEFAULT_DEPRESSION_TARGET_HINTS = {
 }
 
 DEFAULT_DEPRESSION_PROMPT_CONTEXT_MAPPING = {
-    "decide_chat": "闲聊",
-    "generate_chat": "深度交流",
-    "decide_chat_terminate": "深度交流",
-    "summarize_relation": "关系回顾",
-    "summarize_chats": "深度交流",
-    "determine_sector": "日常活动",
-    "determine_arena": "日常活动",
-    "determine_object": "日常活动",
-    "describe_object": "日常活动",
+    "decide_chat": "闂傝尪浜?,
+    "generate_chat": "濞ｅ崬瀹虫禍銈嗙ウ",
+    "decide_chat_terminate": "濞ｅ崬瀹虫禍銈嗙ウ",
+    "summarize_relation": "閸忓磭閮撮崶鐐恒€?,
+    "summarize_chats": "濞ｅ崬瀹虫禍銈嗙ウ",
+    "determine_sector": "閺冦儱鐖跺ú璇插З",
+    "determine_arena": "閺冦儱鐖跺ú璇插З",
+    "determine_object": "閺冦儱鐖跺ú璇插З",
+    "describe_object": "閺冦儱鐖跺ú璇插З",
 }
 
 DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING = {
-    "chat_event": "深度交流",
+    "chat_event": "濞ｅ崬瀹虫禍銈嗙ウ",
 }
 
 KNOWN_DEPRESSION_RELATIONSHIPS = {
-    "亲密朋友",
-    "普通朋友",
-    "治疗师",
-    "陌生人",
-    "冲突关系",
+    "娴滄彃鐦戦張瀣几",
+    "閺咁噣鈧碍婀呴崣?,
+    "濞岃崵鏋熺敮?,
+    "闂勫瞼鏁撴禍?,
+    "閸愯尙鐛婇崗宕囬兇",
 }
 
 DEFAULT_GLOBAL_CFG = {
@@ -62,23 +61,11 @@ DEFAULT_GLOBAL_CFG = {
 
 DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
     "enabled": False,
+    "timeout_ms": 1200,
     "min_confidence": 0.60,
     "max_text_length": 1600,
     "signal_weight": 0.25,
     "allowed_event_keys": ["chat_event"],
-}
-
-LLM_TRANSITION_TRIGGER_WHITELIST = {
-    "positive_interaction",
-    "positive_event",
-    "therapy",
-    "therapy_progress",
-    "sustained_support",
-    "stress",
-    "extreme_stress",
-    "negative_event",
-    "isolation",
-    "trigger_event",
 }
 
 
@@ -243,7 +230,7 @@ def patch_prompt(
         patched_prompt["prompt"] = (
             f"{layer_text}\n\n"
             f"{'=' * 50}\n\n"
-            f"=== 当前任务指令层 ===\n{original_prompt}"
+            f"=== 瑜版挸澧犳禒璇插閹稿洣鎶ょ仦?===\n{original_prompt}"
         )
         _log(
             agent,
@@ -297,10 +284,10 @@ def commit_event(
         relationship = _resolve_relationship(agent, "commit_interaction", (), other_agent)
     if (
         event_key == "chat_event"
-        and str(relationship or "").strip() == "治疗师"
-        and interaction_type in {"深度交流", "闲聊", "日常活动"}
+        and str(relationship or "").strip() == "濞岃崵鏋熺敮?
+        and interaction_type in {"濞ｅ崬瀹虫禍銈嗙ウ", "闂傝尪浜?, "閺冦儱鐖跺ú璇插З"}
     ):
-        interaction_type = "治疗对话"
+        interaction_type = "濞岃崵鏋熺€电鐦?
 
     try:
         llm_transition_signal = _build_llm_transition_signal(
@@ -452,6 +439,7 @@ def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
 
     if "enabled" in raw_cfg:
         cfg["enabled"] = bool(raw_cfg.get("enabled"))
+    cfg["timeout_ms"] = _bounded_int(raw_cfg.get("timeout_ms"), cfg["timeout_ms"], 200, 30000)
     cfg["min_confidence"] = _bounded_float(
         raw_cfg.get("min_confidence"),
         cfg["min_confidence"],
@@ -554,23 +542,23 @@ def _handle_missing_config(agent: Any, cfg: Dict[str, Any], config_path: str) ->
 
 
 def _build_base_prompt(agent: Any) -> str:
-    parts = [f"你是{getattr(agent, 'name', '')}"]
+    parts = [f"娴ｇ姵妲竰getattr(agent, 'name', '')}"]
     scratch = getattr(agent, "scratch", None)
     if scratch is None:
         return "".join(parts)
 
     age = getattr(scratch, "age", None)
     if age is not None:
-        parts.append(f"，{age}岁")
+        parts.append(f"閿涘瘚age}瀹€?)
     innate = getattr(scratch, "innate", "")
     if innate:
-        parts.append(f"。性格特征：{innate}")
+        parts.append(f"閵嗗倹鈧勭壐閻楃懓绶涢敍姝縤nnate}")
     learned = getattr(scratch, "learned", "")
     if learned:
-        parts.append(f"\n背景经历：{learned}")
+        parts.append(f"\n閼冲本娅欑紒蹇撳坊閿涙learned}")
     lifestyle = getattr(scratch, "lifestyle", "")
     if lifestyle:
-        parts.append(f"\n生活方式：{lifestyle}")
+        parts.append(f"\n閻㈢喐妞块弬鐟扮础閿涙lifestyle}")
     return "".join(parts)
 
 
@@ -592,7 +580,7 @@ def _get_prompt_interaction_type(agent: Any, func_hint: str) -> str:
         text = str(mapping.get(func_hint, "") or "").strip()
         if text:
             return text
-    return "日常活动"
+    return "閺冦儱鐖跺ú璇插З"
 
 
 def _get_event_interaction_type(agent: Any, event_key: str, fallback_hint: Optional[str]) -> str:
@@ -603,7 +591,7 @@ def _get_event_interaction_type(agent: Any, event_key: str, fallback_hint: Optio
             return text
     if fallback_hint:
         return _get_prompt_interaction_type(agent, fallback_hint)
-    return "日常活动"
+    return "閺冦儱鐖跺ú璇插З"
 
 
 def _extract_other_agent(agent: Any, func_hint: str, args: Iterable[Any], kwargs: Dict[str, Any]) -> Optional[str]:
@@ -652,7 +640,7 @@ def _extract_content(agent: Any, func_hint: str, args: Iterable[Any], kwargs: Di
             descriptions = args[0]
         elif isinstance(kwargs.get("describes"), list):
             descriptions = kwargs.get("describes", [])
-        return "；".join([str(item) for item in descriptions if item])
+        return "閿?.join([str(item) for item in descriptions if item])
     if func_hint == "describe_object":
         if len(args) >= 2:
             return str(args[1])
@@ -673,7 +661,7 @@ def _resolve_relationship(agent: Any, func_hint: str, args: Iterable[Any], other
         mapped = _normalize_relationship(mapping.get(other_agent))
         if mapped:
             return mapped
-    return "普通朋友"
+    return "閺咁噣鈧碍婀呴崣?
 
 
 def _normalize_relationship(relationship: Any) -> Optional[str]:
@@ -709,14 +697,14 @@ def _resolve_current_location(agent: Any) -> str:
     except Exception:
         tile = None
     if tile is None:
-        return "未知"
+        return "閺堫亞鐓?
     try:
         address = tile.get_address()
         if isinstance(address, list) and address:
             return str(address[-1])
     except Exception:
         pass
-    return "未知"
+    return "閺堫亞鐓?
 
 
 def _resolve_time_of_day(agent: Any) -> str:
@@ -729,42 +717,6 @@ def _resolve_time_of_day(agent: Any) -> str:
     if 18 <= hour < 22:
         return "evening"
     return "night"
-
-
-def _resolve_transition_judge_llm(agent: Any) -> (Optional[Any], str):
-    intervention = getattr(agent, "intervention", None)
-    if intervention is not None and hasattr(intervention, "get_forced_llm_runtime_config"):
-        forced_cfg = None
-        try:
-            forced_cfg = intervention.get_forced_llm_runtime_config()
-        except Exception as e:
-            _log(
-                agent,
-                "debug",
-                "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_cfg_error={}".format(
-                    getattr(agent, "name", ""),
-                    e,
-                ),
-            )
-            forced_cfg = None
-        if isinstance(forced_cfg, dict) and forced_cfg:
-            try:
-                forced_llm = getattr(agent, "_forced_llm", None)
-                if forced_llm is None:
-                    forced_llm = create_llm_model(forced_cfg)
-                    setattr(agent, "_forced_llm", forced_llm)
-                if forced_llm is not None:
-                    return forced_llm, "depr_transition_judge_forced"
-            except Exception as e:
-                _log(
-                    agent,
-                    "debug",
-                    "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_llm_init_error={}".format(
-                        getattr(agent, "name", ""),
-                        e,
-                    ),
-                )
-    return getattr(agent, "_llm", None), "depr_transition_judge"
 
 
 def _build_llm_transition_signal(
@@ -784,7 +736,7 @@ def _build_llm_transition_signal(
         if event_key not in allowed_event_keys:
             return None
 
-    llm, caller_name = _resolve_transition_judge_llm(agent)
+    llm = getattr(agent, "_llm", None)
     if llm is None:
         _log(
             agent,
@@ -811,10 +763,20 @@ def _build_llm_transition_signal(
             8000,
         ),
     )
-    if not clipped_text:
-        return None
+    current_state = "unknown"
+    try:
+        runtime_engine = getattr(agent, "depression_dynamic_engine", None)
+        state_machine = getattr(runtime_engine, "state_machine", None)
+        if callable(getattr(state_machine, "get_current_state", None)):
+            current_state = str(state_machine.get_current_state() or "unknown")
+    except Exception:
+        current_state = "unknown"
 
     prompt = _build_llm_transition_prompt(
+        event_key=event_key,
+        current_state=current_state,
+        location=_resolve_current_location(agent),
+        time_of_day=_resolve_time_of_day(agent),
         interaction_type=interaction_type,
         relationship=relationship,
         conversation_content=clipped_text,
@@ -824,7 +786,7 @@ def _build_llm_transition_signal(
         raw = llm.completion(
             prompt=prompt,
             retry=1,
-            caller=caller_name,
+            caller="depr_transition_judge",
             failsafe="",
         )
     except Exception as e:
@@ -866,69 +828,53 @@ def _build_llm_transition_signal(
     _log(
         agent,
         "debug",
-        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} matched={}".format(
+        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} positive={} negative={}".format(
             getattr(agent, "name", ""),
             event_key,
             signal.get("confidence", 0.0),
-            ",".join(signal.get("matched_triggers", [])),
+            signal.get("positive_score", 0.0),
+            signal.get("negative_score", 0.0),
         ),
     )
     return signal
 
 
 def _build_llm_transition_prompt(
+    event_key: str,
+    current_state: str,
+    location: str,
+    time_of_day: str,
     interaction_type: str,
     relationship: Optional[str],
     conversation_content: str,
 ) -> str:
-    whitelist = ", ".join(sorted(list(LLM_TRANSITION_TRIGGER_WHITELIST)))
-    # Use f-string composition to avoid brace-format collision in JSON template.
+    content = str(conversation_content or "").strip()
+    if not content:
+        content = "(no explicit conversation text; infer from context only)"
     return (
-        "You are a depression-state transition signal extractor. "
+        "You are a depression-state transition semantic evaluator. "
         "Output exactly one JSON object and nothing else.\n"
-        "Task: infer matched transition triggers and directional scores from dialogue.\n"
-        "Required schema:\n"
+        "Task: infer recovery/worsening directional signals from context and dialogue.\n"
+        "Output schema:\n"
         "{\n"
-        '  "matched_triggers": ["..."],\n'
         '  "positive_score": 0.0,\n'
         '  "negative_score": 0.0,\n'
         '  "confidence": 0.0\n'
         "}\n"
         "Constraints:\n"
-        "- matched_triggers must be selected from whitelist only.\n"
         "- positive_score / negative_score / confidence must be in [0, 1].\n"
-        "- If uncertain, return low confidence with empty matched_triggers.\n"
-        f"Trigger whitelist: {whitelist}\n\n"
-        f"Interaction type: {str(interaction_type or '')}\n"
-        f"Relationship: {str(relationship or '')}\n"
-        f"Conversation:\n{conversation_content}\n"
+        "- positive_score means recovery-direction signal strength.\n"
+        "- negative_score means worsening-direction signal strength.\n"
+        "- If information is insufficient, lower confidence.\n\n"
+        "Context:\n"
+        f"event_key: {str(event_key or '')}\n"
+        f"current_state: {str(current_state or '')}\n"
+        f"location: {str(location or '')}\n"
+        f"time_of_day: {str(time_of_day or '')}\n"
+        f"interaction_type: {str(interaction_type or '')}\n"
+        f"relationship: {str(relationship or '')}\n"
+        f"conversation:\n{content}\n"
     )
-
-    return (
-        "你是抑郁状态转换信号抽取器。仅输出一个 JSON 对象，不要输出其他文字。\n"
-        "任务：基于对话内容判断可匹配触发词，并给出正负向分数与置信度。\n"
-        "必须遵循字段：\n"
-        "{\n"
-        '  "matched_triggers": ["..."],\n'
-        '  "positive_score": 0.0,\n'
-        '  "negative_score": 0.0,\n'
-        '  "confidence": 0.0\n'
-        "}\n"
-        "字段约束：\n"
-        "- matched_triggers 只能从白名单中选择。\n"
-        "- positive_score / negative_score / confidence 必须在 0 到 1 之间。\n"
-        "- 如果无法判断，返回低置信度和空触发词。\n"
-        "触发词白名单：{}\n\n"
-        "互动类型：{}\n"
-        "关系类型：{}\n"
-        "对话内容：\n{}\n"
-    ).format(
-        whitelist,
-        str(interaction_type or ""),
-        str(relationship or ""),
-        conversation_content,
-    )
-
 
 def _sanitize_llm_transition_signal(
     payload: Dict[str, Any],
@@ -953,25 +899,10 @@ def _sanitize_llm_transition_signal(
 
     positive_score = _bounded_float(payload.get("positive_score"), 0.0, 0.0, 1.0)
     negative_score = _bounded_float(payload.get("negative_score"), 0.0, 0.0, 1.0)
-
-    matched_triggers: List[str] = []
-    seen = set()
-    raw_matched = payload.get("matched_triggers", [])
-    if isinstance(raw_matched, list):
-        for trigger in raw_matched:
-            text = str(trigger or "").strip()
-            if not text or text in seen:
-                continue
-            if text not in LLM_TRANSITION_TRIGGER_WHITELIST:
-                continue
-            seen.add(text)
-            matched_triggers.append(text)
-
-    if not matched_triggers and positive_score <= 0.0 and negative_score <= 0.0:
+    if positive_score <= 0.0 and negative_score <= 0.0:
         return None
 
     return {
-        "matched_triggers": matched_triggers,
         "positive_score": positive_score,
         "negative_score": negative_score,
         "confidence": confidence,

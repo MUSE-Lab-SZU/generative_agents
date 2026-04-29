@@ -40,10 +40,14 @@ def get_depression_runtime_snapshot(agent_data):
     profile = agent_data.get("depression_profile", {}) if isinstance(agent_data, dict) else {}
     runtime = profile.get("runtime", {}) if isinstance(profile, dict) else {}
     current_event = runtime.get("current_event", {}) if isinstance(runtime.get("current_event", {}), dict) else {}
+    emotion = runtime.get("emotion", {}) if isinstance(runtime.get("emotion", {}), dict) else {}
     meta = runtime.get("update_meta", {}) if isinstance(runtime.get("update_meta", {}), dict) else {}
 
     return {
         "current_event_wording": current_event.get("wording", ""),
+        "emotion_label": emotion.get("label", ""),
+        "emotion_style": emotion.get("style", ""),
+        "emotion_intensity": emotion.get("intensity", 0.0),
         "last_throttle_reason": meta.get("last_throttle_reason", ""),
         "short_term_changed": bool(meta.get("short_term_changed", False)),
         "long_term_changed": bool(meta.get("long_term_changed", False)),
@@ -263,6 +267,14 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file):
             runtime_snapshot = get_depression_runtime_snapshot(agent_data)
             if runtime_snapshot["current_event_wording"]:
                 markdown_content += f"抑郁运行态-主导事件：{runtime_snapshot['current_event_wording']}  \n"
+            if runtime_snapshot["emotion_label"]:
+                markdown_content += (
+                    "抑郁运行态-当前说话情绪："
+                    f"{runtime_snapshot['emotion_label']} "
+                    f"(强度={float(runtime_snapshot['emotion_intensity'] or 0.0):.2f})  \n"
+                )
+            if runtime_snapshot["emotion_style"]:
+                markdown_content += f"抑郁运行态-说话风格：{runtime_snapshot['emotion_style']}  \n"
             if runtime_snapshot["last_throttle_reason"]:
                 markdown_content += f"抑郁运行态-最近节流原因：{runtime_snapshot['last_throttle_reason']}  \n"
             markdown_content += (
