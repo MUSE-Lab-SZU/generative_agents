@@ -24,27 +24,27 @@ DEFAULT_DEPRESSION_TARGET_HINTS = {
 }
 
 DEFAULT_DEPRESSION_PROMPT_CONTEXT_MAPPING = {
-    "decide_chat": "闂傝尪浜?,
-    "generate_chat": "濞ｅ崬瀹虫禍銈嗙ウ",
-    "decide_chat_terminate": "濞ｅ崬瀹虫禍銈嗙ウ",
-    "summarize_relation": "閸忓磭閮撮崶鐐恒€?,
-    "summarize_chats": "濞ｅ崬瀹虫禍銈嗙ウ",
-    "determine_sector": "閺冦儱鐖跺ú璇插З",
-    "determine_arena": "閺冦儱鐖跺ú璇插З",
-    "determine_object": "閺冦儱鐖跺ú璇插З",
-    "describe_object": "閺冦儱鐖跺ú璇插З",
+    "decide_chat": "闲聊",
+    "generate_chat": "深度交流",
+    "decide_chat_terminate": "深度交流",
+    "summarize_relation": "关系回顾",
+    "summarize_chats": "深度交流",
+    "determine_sector": "日常活动",
+    "determine_arena": "日常活动",
+    "determine_object": "日常活动",
+    "describe_object": "日常活动",
 }
 
 DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING = {
-    "chat_event": "濞ｅ崬瀹虫禍銈嗙ウ",
+    "chat_event": "深度交流",
 }
 
 KNOWN_DEPRESSION_RELATIONSHIPS = {
-    "娴滄彃鐦戦張瀣几",
-    "閺咁噣鈧碍婀呴崣?,
-    "濞岃崵鏋熺敮?,
-    "闂勫瞼鏁撴禍?,
-    "閸愯尙鐛婇崗宕囬兇",
+    "亲密朋友",
+    "普通朋友",
+    "治疗师",
+    "陌生人",
+    "冲突关系",
 }
 
 DEFAULT_GLOBAL_CFG = {
@@ -230,7 +230,7 @@ def patch_prompt(
         patched_prompt["prompt"] = (
             f"{layer_text}\n\n"
             f"{'=' * 50}\n\n"
-            f"=== 瑜版挸澧犳禒璇插閹稿洣鎶ょ仦?===\n{original_prompt}"
+            f"=== 当前任务指令层 ===\n{original_prompt}"
         )
         _log(
             agent,
@@ -284,10 +284,10 @@ def commit_event(
         relationship = _resolve_relationship(agent, "commit_interaction", (), other_agent)
     if (
         event_key == "chat_event"
-        and str(relationship or "").strip() == "濞岃崵鏋熺敮?
-        and interaction_type in {"濞ｅ崬瀹虫禍銈嗙ウ", "闂傝尪浜?, "閺冦儱鐖跺ú璇插З"}
+        and str(relationship or "").strip() == "治疗师"
+        and interaction_type in {"深度交流", "闲聊", "日常活动"}
     ):
-        interaction_type = "濞岃崵鏋熺€电鐦?
+        interaction_type = "治疗对话"
 
     try:
         llm_transition_signal = _build_llm_transition_signal(
@@ -542,23 +542,23 @@ def _handle_missing_config(agent: Any, cfg: Dict[str, Any], config_path: str) ->
 
 
 def _build_base_prompt(agent: Any) -> str:
-    parts = [f"娴ｇ姵妲竰getattr(agent, 'name', '')}"]
+    parts = [f"你是{getattr(agent, 'name', '')}"]
     scratch = getattr(agent, "scratch", None)
     if scratch is None:
         return "".join(parts)
 
     age = getattr(scratch, "age", None)
     if age is not None:
-        parts.append(f"閿涘瘚age}瀹€?)
+        parts.append(f"，{age}岁")
     innate = getattr(scratch, "innate", "")
     if innate:
-        parts.append(f"閵嗗倹鈧勭壐閻楃懓绶涢敍姝縤nnate}")
+        parts.append(f"。性格特征：{innate}")
     learned = getattr(scratch, "learned", "")
     if learned:
-        parts.append(f"\n閼冲本娅欑紒蹇撳坊閿涙learned}")
+        parts.append(f"\n背景经历：{learned}")
     lifestyle = getattr(scratch, "lifestyle", "")
     if lifestyle:
-        parts.append(f"\n閻㈢喐妞块弬鐟扮础閿涙lifestyle}")
+        parts.append(f"\n生活方式：{lifestyle}")
     return "".join(parts)
 
 
@@ -580,7 +580,7 @@ def _get_prompt_interaction_type(agent: Any, func_hint: str) -> str:
         text = str(mapping.get(func_hint, "") or "").strip()
         if text:
             return text
-    return "閺冦儱鐖跺ú璇插З"
+    return "日常活动"
 
 
 def _get_event_interaction_type(agent: Any, event_key: str, fallback_hint: Optional[str]) -> str:
@@ -591,7 +591,7 @@ def _get_event_interaction_type(agent: Any, event_key: str, fallback_hint: Optio
             return text
     if fallback_hint:
         return _get_prompt_interaction_type(agent, fallback_hint)
-    return "閺冦儱鐖跺ú璇插З"
+    return "日常活动"
 
 
 def _extract_other_agent(agent: Any, func_hint: str, args: Iterable[Any], kwargs: Dict[str, Any]) -> Optional[str]:
@@ -640,7 +640,7 @@ def _extract_content(agent: Any, func_hint: str, args: Iterable[Any], kwargs: Di
             descriptions = args[0]
         elif isinstance(kwargs.get("describes"), list):
             descriptions = kwargs.get("describes", [])
-        return "閿?.join([str(item) for item in descriptions if item])
+        return "；".join([str(item) for item in descriptions if item])
     if func_hint == "describe_object":
         if len(args) >= 2:
             return str(args[1])
@@ -661,7 +661,7 @@ def _resolve_relationship(agent: Any, func_hint: str, args: Iterable[Any], other
         mapped = _normalize_relationship(mapping.get(other_agent))
         if mapped:
             return mapped
-    return "閺咁噣鈧碍婀呴崣?
+    return "普通朋友"
 
 
 def _normalize_relationship(relationship: Any) -> Optional[str]:
@@ -697,14 +697,14 @@ def _resolve_current_location(agent: Any) -> str:
     except Exception:
         tile = None
     if tile is None:
-        return "閺堫亞鐓?
+        return "未知"
     try:
         address = tile.get_address()
         if isinstance(address, list) and address:
             return str(address[-1])
     except Exception:
         pass
-    return "閺堫亞鐓?
+    return "未知"
 
 
 def _resolve_time_of_day(agent: Any) -> str:
