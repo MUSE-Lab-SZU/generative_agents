@@ -7,6 +7,7 @@ from .state_machine import SymptomStateMachine, DepressionState
 from .context_analyzer import ContextAnalyzer
 from .bias_injector import CognitiveBiasInjector
 from .memory_system import TraumaMemorySystem
+from .emotion_inferencer import EmotionInferencer
 from .prompt_builder import DynamicPromptBuilder
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     'ContextAnalyzer',
     'CognitiveBiasInjector',
     'TraumaMemorySystem',
+    'EmotionInferencer',
     'DynamicPromptBuilder',
 ]

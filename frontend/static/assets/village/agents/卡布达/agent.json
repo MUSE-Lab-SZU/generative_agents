@@ -14,6 +14,15 @@
     "lifestyle": "作息逐步规律化，尽量在午夜前休息。",
     "daily_plan": "上午在家整理，下午散步，晚间放松和复盘。"
   },
+  "profile": {
+    "age": 23,
+    "gender": "男",
+    "occupation": "休学中的工业设计专业学生，偶尔接一些简单绘图兼职",
+    "education": "大学本科在读（因抑郁影响曾休学）",
+    "residence": "与金龟次郎同住在生活区",
+    "personality": "敏感、内省、善良，习惯先自己消化情绪",
+    "speaking_habit": "面对关心时常先说“还好”，在确认安全后才慢慢补充真实感受"
+  },
   "spatial": {
     "address": {
       "living_area": [

@@ -90,6 +90,7 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
+        self.profile = copy.deepcopy(config.get("profile", {})) if isinstance(config.get("profile", {}), dict) else {}
 
         # status
         status = {"poignancy": 0}
@@ -1057,6 +1058,15 @@ class Agent:
                     other,
                     forced,
                 )
+            self.depression_profile = drm.infer_chat_emotion(
+                patient_agent=self,
+                profile=self.depression_profile,
+                now_step=utils.get_timer().daily_duration(),
+                static_profile=self.profile,
+                other_agent=getattr(other, "name", ""),
+                relationship=relations[0],
+                conversation_content=dda.serialize_conversation(chats),
+            )
             chat_view = drm.build_intermediate_view(
                 self.depression_profile,
                 utils.get_timer().daily_duration(),
@@ -1066,6 +1076,7 @@ class Agent:
                     if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                     else {}
                 ),
+                static_profile=self.profile,
             )
             text = self.completion(
                 "generate_chat",
@@ -1189,6 +1200,15 @@ class Agent:
                     self,
                     forced,
                 )
+            other.depression_profile = drm.infer_chat_emotion(
+                patient_agent=other,
+                profile=other.depression_profile,
+                now_step=utils.get_timer().daily_duration(),
+                static_profile=getattr(other, "profile", {}),
+                other_agent=getattr(self, "name", ""),
+                relationship=relations[1],
+                conversation_content=dda.serialize_conversation(chats),
+            )
             text = other.completion(
                 "generate_chat",
                 other,
@@ -1204,6 +1224,7 @@ class Agent:
                         if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                         else {}
                     ),
+                    static_profile=getattr(other, "profile", {}),
                 ).get("chat_block", ""),
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 retrieval_profile=retrieval_profile,
