@@ -56,8 +56,7 @@
         "enabled": true,
         "doctor": "蜻蜓队长",
         "patients": [
-            "卡布达",
-            "金龟次郎"
+            "卡布达"
         ],
         "meeting_queue": {
             "enabled": true,
@@ -102,16 +101,6 @@
                 "doctor": "蜻蜓队长",
                 "patient": "卡布达",
                 "enabled": true
-            },
-            {
-                "rule_id": "fast_every_2step_jgcl",
-                "type": "interval_steps",
-                "interval_steps": 2,
-                "step_phase": 1,
-                "duration": 1440,
-                "doctor": "蜻蜓队长",
-                "patient": "金龟次郎",
-                "enabled": false
             },
             {
                 "rule_id": "prod_weekly_monday_1400",
@@ -166,14 +155,6 @@
             },
             "agent_overrides": {
                 "卡布达": {
-                    "enabled": true,
-                    "forced_only": true,
-                    "forced_chat_iter": 18,
-                    "repeat_break_threshold": 100,
-                    "forced_chat_min_turns": 2,
-                    "forced_chat_max_turns": -1
-                },
-                "金龟次郎": {
                     "enabled": true,
                     "forced_only": true,
                     "forced_chat_iter": 18,
@@ -326,8 +307,7 @@
                     "enabled": true,
                     "doctor": "蜻蜓队长",
                     "patients": [
-                        "卡布达",
-                        "金龟次郎"
+                        "卡布达"
                     ],
                     "bonus": 0.4
                 }

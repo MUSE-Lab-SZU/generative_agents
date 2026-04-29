@@ -71,16 +71,14 @@
 		this.load.image("blocks_1", "static/assets/village/tilemap/blocks_1.png");
 		this.load.image("interiors_pt1", "static/assets/village/tilemap/interiors_pt1.png");
 		this.load.image("interiors_pt2", "static/assets/village/tilemap/interiors_pt2.png");
-		this.load.image("interiors_pt3", "static/assets/village/tilemap/interiors_pt3.png");
-		this.load.image("interiors_pt4", "static/assets/village/tilemap/interiors_pt4.png");
-		this.load.image("interiors_pt5", "static/assets/village/tilemap/interiors_pt5.png");
-		this.load.image("CuteRPG_Field_B", "static/assets/village/tilemap/CuteRPG_Field_B.png");
-		this.load.image("CuteRPG_Village_B", "static/assets/village/tilemap/CuteRPG_Village_B.png");
+		this.load.image("CuteRPG_Field_C", "static/assets/village/tilemap/CuteRPG_Field_C.png");
+		this.load.image("CuteRPG_Harbor_C", "static/assets/village/tilemap/CuteRPG_Harbor_C.png");
+		this.load.image("Room_Builder_32x32", "static/assets/village/tilemap/Room_Builder_32x32.png");
 
 		// Load tilemap JSON
 		this.load.tilemapTiledJSON("map", "static/assets/village/tilemap/tilemap.json");
 
-		this.load.atlas("atlas", "static/assets/village/agents/伊莎贝拉/texture.png", filename="static/assets/village/agents/sprite.json");
+		// this.load.atlas("atlas", "static/assets/village/agents/伊莎贝拉/texture.png", filename="static/assets/village/agents/sprite.json");
 
 		// Load persona atlases
 		for (var p in persona_names) {
@@ -97,45 +95,57 @@
 		const collisions = map.addTilesetImage("blocks_1", "blocks_1");
 		const interiors_pt1 = map.addTilesetImage("interiors_pt1", "interiors_pt1");
 		const interiors_pt2 = map.addTilesetImage("interiors_pt2", "interiors_pt2");
-		const interiors_pt3 = map.addTilesetImage("interiors_pt3", "interiors_pt3");
-		const interiors_pt4 = map.addTilesetImage("interiors_pt4", "interiors_pt4");
-		const interiors_pt5 = map.addTilesetImage("interiors_pt5", "interiors_pt5");
-		const CuteRPG_Field_B = map.addTilesetImage("CuteRPG_Field_B", "CuteRPG_Field_B");
-		const CuteRPG_Village_B = map.addTilesetImage("CuteRPG_Village_B", "CuteRPG_Village_B");
+		const CuteRPG_Field_C = map.addTilesetImage("CuteRPG_Field_C", "CuteRPG_Field_C");
+		const CuteRPG_Harbor_C = map.addTilesetImage("CuteRPG_Harbor_C", "CuteRPG_Harbor_C");
+		const Room_Builder_32x32 = map.addTilesetImage("Room_Builder_32x32", "Room_Builder_32x32");
+
 
 		let tileset_group_1 = [
-			CuteRPG_Village_B,
-			CuteRPG_Field_B,
+            Room_Builder_32x32,
+			CuteRPG_Field_C,
+			CuteRPG_Harbor_C,
 			interiors_pt1,
 			interiors_pt2,
-			interiors_pt3,
-			interiors_pt4,
-			interiors_pt5,
 		];
-		const mainLayer = map.createLayer("主地图", tileset_group_1, 0, 0);
-		const livingAreaLayer = map.createLayer("1生活区", tileset_group_1, 0, 0);
-		const publicAreaLayer = map.createLayer("1公共区", tileset_group_1, 0, 0);
-		const homeKabudaLayer = map.createLayer("2卡布达与金龟次郎的家", tileset_group_1, 0, 0);
-		const homeGuaguaLayer = map.createLayer("2呱呱哇的家", tileset_group_1, 0, 0);
-		const homeTiandlinaLayer = map.createLayer("2田德莉娜的家", tileset_group_1, 0, 0);
-		const homeCockroachLayer = map.createLayer("2蟑螂恶霸的家", tileset_group_1, 0, 0);
-		const counselorLayer = map.createLayer("2蜻蜓队长的心理咨询室", tileset_group_1, 0, 0);
-		const shopLayer = map.createLayer("2杂货店", tileset_group_1, 0, 0);
-		const parkLayer = map.createLayer("2公园", tileset_group_1, 0, 0);
-		const bedLayer = map.createLayer("3床", tileset_group_1, 0, 0);
-		const instrumentsLayer = map.createLayer("3乐器", tileset_group_1, 0, 0);
+		// const mainLayer = map.createLayer("主地图", tileset_group_1, 0, 0);
+		// const livingAreaLayer = map.createLayer("1生活区", tileset_group_1, 0, 0);
+		// const publicAreaLayer = map.createLayer("1公共区", tileset_group_1, 0, 0);
+		// const homeKabudaLayer = map.createLayer("2卡布达与金龟次郎的家", tileset_group_1, 0, 0);
+		// const homeGuaguaLayer = map.createLayer("2呱呱哇的家", tileset_group_1, 0, 0);
+		// const homeTiandlinaLayer = map.createLayer("2田德莉娜的家", tileset_group_1, 0, 0);
+		// const homeCockroachLayer = map.createLayer("2蟑螂恶霸的家", tileset_group_1, 0, 0);
+		// const counselorLayer = map.createLayer("2蜻蜓队长的心理咨询室", tileset_group_1, 0, 0);
+		// const shopLayer = map.createLayer("2杂货店", tileset_group_1, 0, 0);
+		// const parkLayer = map.createLayer("2公园", tileset_group_1, 0, 0);
+		// const bedLayer = map.createLayer("3床", tileset_group_1, 0, 0);
+		// const instrumentsLayer = map.createLayer("3乐器", tileset_group_1, 0, 0);
+		// const toiletLayer = map.createLayer("3马桶", tileset_group_1, 0, 0);
+		// const bathCabinetLayer = map.createLayer("3浴室柜", tileset_group_1, 0, 0);
+		// const bookshelfLayer = map.createLayer("3书架", tileset_group_1, 0, 0);
+		// const diningTableLayer = map.createLayer("3餐桌", tileset_group_1, 0, 0);
+		// const diningChairLayer = map.createLayer("3餐桌椅", tileset_group_1, 0, 0);
+		// const wardrobeLayer = map.createLayer("3衣柜", tileset_group_1, 0, 0);
+		// const mirrorLayer = map.createLayer("3全身镜", tileset_group_1, 0, 0);
+		// const gymLayer = map.createLayer("3健身器材", tileset_group_1, 0, 0);
+		// const chatTableLayer = map.createLayer("3聊天桌", tileset_group_1, 0, 0);
+		// const shopShelfLayer = map.createLayer("3杂货店货架", tileset_group_1, 0, 0);
+		// const shopShelfBackLayer = map.createLayer("3杂货店货架后面", tileset_group_1, 0, 0);
+		// const parkGardenLayer = map.createLayer("3公园花园", tileset_group_1, 0, 0);
+
+        const mainLayer = map.createLayer("主地图", tileset_group_1, 0, 0);
+        const detailLayer = map.createLayer("细节", tileset_group_1, 0, 0);
+		const counselorLayer = map.createLayer("1心理咨询室", tileset_group_1, 0, 0);
+		const receptionLayer = map.createLayer("2会客厅", tileset_group_1, 0, 0);
+		const guestroomLayer = map.createLayer("2客房", tileset_group_1, 0, 0);
+		const bathroomLayer = map.createLayer("2卫生间", tileset_group_1, 0, 0);
+		const bedroomLayer = map.createLayer("2卧室", tileset_group_1, 0, 0);
 		const toiletLayer = map.createLayer("3马桶", tileset_group_1, 0, 0);
-		const bathCabinetLayer = map.createLayer("3浴室柜", tileset_group_1, 0, 0);
-		const bookshelfLayer = map.createLayer("3书架", tileset_group_1, 0, 0);
-		const diningTableLayer = map.createLayer("3餐桌", tileset_group_1, 0, 0);
-		const diningChairLayer = map.createLayer("3餐桌椅", tileset_group_1, 0, 0);
-		const wardrobeLayer = map.createLayer("3衣柜", tileset_group_1, 0, 0);
-		const mirrorLayer = map.createLayer("3全身镜", tileset_group_1, 0, 0);
-		const gymLayer = map.createLayer("3健身器材", tileset_group_1, 0, 0);
-		const chatTableLayer = map.createLayer("3聊天桌", tileset_group_1, 0, 0);
-		const shopShelfLayer = map.createLayer("3杂货店货架", tileset_group_1, 0, 0);
-		const shopShelfBackLayer = map.createLayer("3杂货店货架后面", tileset_group_1, 0, 0);
-		const parkGardenLayer = map.createLayer("3公园花园", tileset_group_1, 0, 0);
+		const washerLayer = map.createLayer("3洗衣机", tileset_group_1, 0, 0);
+		const bedLayerBedroom = map.createLayer("3床-卧室", tileset_group_1, 0, 0);
+		const bedLayerGuestroom = map.createLayer("3床-客房", tileset_group_1, 0, 0);
+		const deskLayer = map.createLayer("3书桌", tileset_group_1, 0, 0);
+		const doctorSeatLayer = map.createLayer("3医师座位", tileset_group_1, 0, 0);
+		const patientSeatLayer = map.createLayer("3患者座位", tileset_group_1, 0, 0);
 
 		const collisionsLayer = map.createLayer("collisions", collisions, 0, 0);
 
