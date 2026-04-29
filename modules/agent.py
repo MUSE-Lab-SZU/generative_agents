@@ -1710,66 +1710,57 @@ class Agent:
     ):
         bridge = getattr(self, "external_memory_bridge", None)
         if bridge and bridge.enabled_for_chat_read():
-            prompt_file = str(bridge.resolve_chat_prompt_file() or "").strip()
-            if prompt_file and os.path.isfile(prompt_file):
-                retrieval = bridge.retrieve_chat_context(
-                    chats=chats,
-                    other_name=getattr(other, "name", ""),
-                    is_initiator=is_initiator,
-                    turn_no=turn_no,
-                )
-                query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
-                if len(query) > 120:
-                    query = query[:120] + "..."
-                retrieval_ok = bool(retrieval.get("ok", False))
-                route_reason = str(retrieval.get("reason", "") or "")
-                if retrieval_ok or (not bridge.fallback_to_local):
-                    external_memory_context = str(retrieval.get("context", "") or "")
-                    if retrieval_ok:
-                        route_reason = "retrieve_ok"
-                    elif not route_reason:
-                        route_reason = "retrieve_failed_no_fallback"
-                    self.logger.info(
-                        "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=external reason={} turn_no={} is_initiator={} query={} context_len={}".format(
-                            self.name,
-                            getattr(other, "name", ""),
-                            route_reason,
-                            turn_no,
-                            bool(is_initiator),
-                            query,
-                            len(external_memory_context),
-                        )
-                    )
-                    return self.completion(
-                        "generate_chat_external",
-                        self,
-                        other,
-                        relation,
-                        chats,
-                        external_memory_context=external_memory_context,
-                        depression_chat_block=depression_chat_block,
-                        doctor_session_prompt_injection=doctor_session_prompt_injection,
-                        doctor_consult_record_injection=doctor_consult_record_injection,
-                        chat_prompt_file=prompt_file,
-                    )
+            retrieval = bridge.retrieve_chat_context(
+                chats=chats,
+                other_name=getattr(other, "name", ""),
+                is_initiator=is_initiator,
+                turn_no=turn_no,
+            )
+            query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
+            if len(query) > 120:
+                query = query[:120] + "..."
+            retrieval_ok = bool(retrieval.get("ok", False))
+            route_reason = str(retrieval.get("reason", "") or "")
+            if retrieval_ok or (not bridge.fallback_to_local):
+                external_memory_context = str(retrieval.get("context", "") or "")
+                if retrieval_ok:
+                    route_reason = "retrieve_ok"
+                elif not route_reason:
+                    route_reason = "retrieve_failed_no_fallback"
                 self.logger.info(
-                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
+                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=external reason={} turn_no={} is_initiator={} query={} context_len={}".format(
                         self.name,
                         getattr(other, "name", ""),
-                        route_reason or "retrieve_failed_fallback",
+                        route_reason,
                         turn_no,
                         bool(is_initiator),
                         query,
+                        len(external_memory_context),
                     )
                 )
-            else:
-                self.logger.warning(
-                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason=chat_prompt_missing path={}".format(
-                        self.name,
-                        getattr(other, "name", ""),
-                        prompt_file,
-                    )
+                return self.completion(
+                    "generate_chat",
+                    self,
+                    other,
+                    relation,
+                    chats,
+                    depression_chat_block=depression_chat_block,
+                    doctor_session_prompt_injection=doctor_session_prompt_injection,
+                    doctor_consult_record_injection=doctor_consult_record_injection,
+                    retrieval_profile=retrieval_profile,
+                    memory_source="external",
+                    external_memory_context=external_memory_context,
                 )
+            self.logger.info(
+                "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
+                    self.name,
+                    getattr(other, "name", ""),
+                    route_reason or "retrieve_failed_fallback",
+                    turn_no,
+                    bool(is_initiator),
+                    query,
+                )
+            )
         return self.completion(
             "generate_chat",
             self,
@@ -1780,6 +1771,7 @@ class Agent:
             doctor_session_prompt_injection=doctor_session_prompt_injection,
             doctor_consult_record_injection=doctor_consult_record_injection,
             retrieval_profile=retrieval_profile,
+            memory_source="local",
         )
 
     def _wait_other(self, other, focus):

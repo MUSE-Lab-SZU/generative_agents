@@ -60,17 +60,44 @@ class DummyClient:
         return self.retrieve_response
 
 
-def _build_bridge(tmp_path: Path, user_id: str = "agent_demo") -> ExternalMemoryBridge:
+def _build_bridge(
+    tmp_path: Path,
+    user_id: str = "agent_demo",
+    short_term_recent_n: int = 40,
+) -> ExternalMemoryBridge:
     storage_dir = tmp_path / "results" / "checkpoints" / "save_a" / "storage" / "agent_1" / "associate"
     logger = DummyLogger()
     bridge = ExternalMemoryBridge(
         agent_name="agent_1",
-        cfg={"enabled": False, "user_id": user_id},
+        cfg={
+            "enabled": False,
+            "user_id": user_id,
+            "short_term_recent_n": short_term_recent_n,
+        },
         storage_dir=str(storage_dir),
         logger=logger,
     )
     bridge.enabled = True
     return bridge
+
+
+def _sample_formatted_prompt_with_recent_raw() -> str:
+    return (
+        "【相关记忆 (Long Term)】:\n"
+        "1. 示例长期记忆\n\n"
+        "【近期原文（本服务入库）】:\n"
+        "- [2026-04-25T06:51:05] [msg_a] 记忆时间：20260427-16:30:00\n"
+        "记忆类型：thought\n"
+        "内容：A\n"
+        "- [2026-04-25T06:51:08] [msg_b] 记忆时间：20260427-16:31:00\n"
+        "记忆类型：thought\n"
+        "内容：B\n"
+        "- [2026-04-25T06:51:09] [msg_c] 记忆时间：20260427-16:32:00\n"
+        "记忆类型：thought\n"
+        "内容：C\n\n"
+        "【近期情绪（本服务入库）】:\n"
+        "- [2026-04-25 06:51:10] Happy (Intensity: 0.8)"
+    )
 
 
 def test_scoped_user_id_uses_checkpoint_name(tmp_path: Path) -> None:
@@ -198,3 +225,91 @@ def test_retrieve_keeps_details_when_formatted_prompt_is_empty(tmp_path: Path) -
     assert result["ok"] is False
     assert result["reason"] == "empty_formatted_prompt"
     assert "short_term_recent" in result["details"]
+
+
+def test_retrieve_recent_raw_keeps_last_n_entries_and_order(tmp_path: Path) -> None:
+    bridge = _build_bridge(tmp_path, short_term_recent_n=2)
+    bridge.client = DummyClient(
+        retrieve_response={
+            "formatted_prompt": _sample_formatted_prompt_with_recent_raw(),
+            "details": {},
+        }
+    )
+    result = bridge.retrieve_chat_context(
+        chats=[("other", "How are you?")],
+        other_name="other",
+        is_initiator=False,
+        turn_no=2,
+    )
+    context = result["context"]
+    assert result["ok"] is True
+    assert "[msg_a]" not in context
+    assert "[msg_b]" in context
+    assert "[msg_c]" in context
+    assert context.index("[msg_b]") < context.index("[msg_c]")
+
+
+def test_retrieve_recent_raw_strips_timestamp_prefix(tmp_path: Path) -> None:
+    bridge = _build_bridge(tmp_path, short_term_recent_n=40)
+    bridge.client = DummyClient(
+        retrieve_response={
+            "formatted_prompt": _sample_formatted_prompt_with_recent_raw(),
+            "details": {},
+        }
+    )
+    result = bridge.retrieve_chat_context(
+        chats=[("other", "How are you?")],
+        other_name="other",
+        is_initiator=False,
+        turn_no=2,
+    )
+    context = result["context"]
+    assert result["ok"] is True
+    assert "- [2026-04-25T06:51:05] [msg_a]" not in context
+    assert "- [2026-04-25T06:51:08] [msg_b]" not in context
+    assert "- [2026-04-25T06:51:09] [msg_c]" not in context
+    assert "- [msg_a] 记忆时间：20260427-16:30:00" in context
+    assert "- [msg_b] 记忆时间：20260427-16:31:00" in context
+    assert "- [msg_c] 记忆时间：20260427-16:32:00" in context
+
+
+def test_retrieve_recent_raw_zero_keeps_title_only(tmp_path: Path) -> None:
+    bridge = _build_bridge(tmp_path, short_term_recent_n=0)
+    bridge.client = DummyClient(
+        retrieve_response={
+            "formatted_prompt": _sample_formatted_prompt_with_recent_raw(),
+            "details": {},
+        }
+    )
+    result = bridge.retrieve_chat_context(
+        chats=[("other", "How are you?")],
+        other_name="other",
+        is_initiator=False,
+        turn_no=2,
+    )
+    context = result["context"]
+    assert result["ok"] is True
+    assert "【近期原文（本服务入库）】:" in context
+    assert "[msg_a]" not in context
+    assert "[msg_b]" not in context
+    assert "[msg_c]" not in context
+    assert "【近期情绪（本服务入库）】:" in context
+
+
+def test_retrieve_recent_raw_no_section_keeps_original_context(tmp_path: Path) -> None:
+    original_context = "【相关记忆 (Long Term)】:\n1. 示例长期记忆"
+    bridge = _build_bridge(tmp_path, short_term_recent_n=2)
+    bridge.client = DummyClient(
+        retrieve_response={
+            "formatted_prompt": original_context,
+            "details": {},
+        }
+    )
+    result = bridge.retrieve_chat_context(
+        chats=[("other", "How are you?")],
+        other_name="other",
+        is_initiator=False,
+        turn_no=2,
+    )
+    assert result["ok"] is True
+    assert result["context"] == original_context

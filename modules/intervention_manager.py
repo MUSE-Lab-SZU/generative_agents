@@ -416,6 +416,42 @@ class InterventionManager:
                             bool(audit.get("completed", False)),
                         )
                     )
+                    try:
+                        action = str((audit or {}).get("action", "") or "").strip()
+                        bridge = getattr(patient_for_session, "external_memory_bridge", None)
+                        session_before = str((audit or {}).get("session_before", "") or "").strip()
+                        if bridge:
+                            session_chat_node_id = self._resolve_latest_chat_node_id(patient_for_session)
+                            bridge_summary = bridge.apply_session_chat_memory_level_adjustment(
+                                session_before=session_before,
+                                session_chat_node_id=session_chat_node_id,
+                                trace={
+                                    "meeting_id": meeting_id_for_session,
+                                    "pair_key": build_pair_key(
+                                        doctor_for_session.name,
+                                        patient_for_session.name,
+                                    ),
+                                    "action": action,
+                                    "all_session_chat_enabled": (
+                                        "all_session_chat" in getattr(bridge, "updata_to_l2_apply_scenes", [])
+                                    ),
+                                },
+                            )
+                            self._log_highlight(
+                                "SESSION_CHAT_LEVEL_ADJUST pair={}<->{} summary={}".format(
+                                    doctor_for_session.name,
+                                    patient_for_session.name,
+                                    bridge_summary,
+                                )
+                            )
+                    except Exception as exc:
+                        self._log_highlight(
+                            "SESSION_CHAT_LEVEL_ADJUST_ERROR pair={}<->{} detail={}".format(
+                                doctor_for_session.name,
+                                patient_for_session.name,
+                                str(exc),
+                            )
+                        )
                     if self.memory_injection:
                         try:
                             agents_map = dict(self._agents_ref) if isinstance(self._agents_ref, dict) else {}
@@ -2228,6 +2264,17 @@ class InterventionManager:
             return b, a
         return None, None
 
+    def _resolve_latest_chat_node_id(self, agent: Any) -> str:
+        try:
+            associate = getattr(agent, "associate", None)
+            memory = getattr(associate, "memory", {}) if associate is not None else {}
+            chats = memory.get("chat", []) if isinstance(memory, dict) else []
+            if isinstance(chats, list) and chats:
+                return str(chats[0] or "").strip()
+        except Exception:
+            return ""
+        return ""
+
     def _is_session_completed_for_pair(self, doctor_name: str, patient_name: str) -> bool:
         if not self.stop_rule_scheduling_on_session_completed:
             return False
@@ -3591,17 +3638,59 @@ class InterventionManager:
             )
             self._log_consult("PROMPT render done chars={}".format(len(prompt_text)))
 
-            llm_raw = self._call_forced_llm_json(prompt_text, retry=retry)
-            projected, dropped = project_whitelist(llm_raw)
-            self._log_consult(
-                "PARSE project done dropped_count={} dropped_paths={}".format(
-                    len(dropped),
-                    "|".join(dropped) if dropped else "-",
-                )
-            )
             soap_text_max_len = self._resolve_consult_soap_text_max_len()
-            validated_soap = validate_soap_only(projected, soap_text_max_len=soap_text_max_len)
-            self._log_consult("VALIDATE soap success pre_max_len={}".format(soap_text_max_len))
+            structure_retry = self._safe_int(consult_cfg.get("structure_retry", 1), 1)
+            if structure_retry < 0:
+                structure_retry = 0
+            dropped: List[str] = []
+            attempt = 0
+            while True:
+                attempt += 1
+                llm_raw = self._call_forced_llm_json(prompt_text, retry=retry)
+                projected, dropped = project_whitelist(llm_raw)
+                self._log_consult(
+                    "PARSE project done attempt={} dropped_count={} dropped_paths={}".format(
+                        attempt,
+                        len(dropped),
+                        "|".join(dropped) if dropped else "-",
+                    )
+                )
+                try:
+                    validated_soap = validate_soap_only(projected, soap_text_max_len=soap_text_max_len)
+                    self._log_consult(
+                        "VALIDATE soap success pre_max_len={} attempt={}".format(
+                            soap_text_max_len,
+                            attempt,
+                        )
+                    )
+                    break
+                except ConsultRecordValidationError as err:
+                    reason = str(getattr(err, "reason", ""))
+                    if reason != "soap_structure_invalid":
+                        raise
+                    if attempt > (structure_retry + 1):
+                        self._append_consult_audit(
+                            pair_key=pair_key,
+                            meeting_id=str(meeting_id or ""),
+                            record_id="",
+                            status="failed",
+                            reason="soap_structure_invalid",
+                            message="validate_failed_after_retry attempts={}".format(attempt),
+                            retryable=False,
+                        )
+                        self._log_consult(
+                            "VALIDATE soap failed reason=soap_structure_invalid attempts={} max_retry={}".format(
+                                attempt,
+                                structure_retry,
+                            )
+                        )
+                        return
+                    self._log_consult(
+                        "VALIDATE soap retry attempt={} reason=soap_structure_invalid".format(
+                            attempt,
+                        )
+                    )
+                    continue
 
             current_session = ""
             if self.session_prompt_injection:

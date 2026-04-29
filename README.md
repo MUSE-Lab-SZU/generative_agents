@@ -1,11 +1,29 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-04-25  
+> 更新时间：2026-04-29
 > 目标：快速看懂项目、跑通链路、定位关键配置与日志。
 
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+
+- 2026-04-28：手动升级session对话记忆、注入记忆的层级。（0429发现bug，已修复）
+  - 相关文件：`data/config.json`、`modules/external_memory_bridge.py`、`modules/memory_injection_manager.py`、`modules/intervention_manager.py`
+-
+- 2026-04-28：新增删除外置记忆系统中某存档所有agent接口、脚本。【待实验】
+  - 相关文件：`cleanup_memory_users_by_save.py`、`modules/ec_doll_memory_service_client.py`、
+
+- 2026-04-26：截断外置记忆系统的【近期原文（本服务入库）】记忆数量（"short_term_recent_n"配置项）、去掉 [2026-04-25Txx:xx:xx] 前缀
+  - 相关文件：`modules/external_memory_bridge.py`、`data/config.json`
+
+- 2026-04-26：修复启用外置记忆系统时未能正确注入动态抑郁人设问题（0428发现新bug，已修复）
+  - 相关文件：
+    - `data/config.json`
+    - `data/prompts/generate_chat_external_memory.txt`
+    - `modules/agent.py`
+    - `modules/external_memory_bridge.py`
+    - `modules/prompt/scratch.py`
+    - `customization/depression_scale_agent/app.py`
 
 - 2026-04-25：量表评估更新，对齐外置记忆系统
   - 相关文件：`customization\depression_scale_agent\app.py`
@@ -53,6 +71,7 @@
 - 建议 Python 3.10+。
 - 根目录当前未维护统一 `requirements.txt`；请使用项目现有可运行环境。
 - 若新环境首次运行，按报错安装依赖（常见：`flask`、`python-dotenv`、`requests`）。
+- 在当前目录下新建`.env`文件，配置deepseek api key，格式为`DEEPSEEK_API_KEY=sk-xxxx`
 
 ## 3.2 启动仿真
 
@@ -240,6 +259,10 @@ python visualize_agent_memory.py
 ## 6.7 analyze_depression_dynamic_state.py 作用
 
 该脚本用于分析动态抑郁人设系统的状态变化情况，输出每个step的状态数据，方便查看和分析。(具体由赵学长更新)
+
+## 6.8 cleanup_memory_users_by_save.py作用
+
+该脚本用于删除外置记忆系统中某个存档下的所有agent数据，避免外置记忆系统的数据冗余。
 
 ## 7. 常见问题与排障
 

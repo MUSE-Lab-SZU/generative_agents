@@ -415,7 +415,6 @@ class ChatSession:
             "question": str(question_text or ""),
             "prompt_route": route,
             "depression_chat_block": depression_chat_block,
-            "chat_prompt_file": "",
             "external_memory_retrieval": {
                 "ok": False,
                 "query": str(question_text or ""),
@@ -428,77 +427,56 @@ class ChatSession:
         }
         bridge = getattr(self.agent, "external_memory_bridge", None)
         if bridge and bridge.enabled_for_chat_read():
-            prompt_file = str(bridge.resolve_chat_prompt_file() or "").strip()
-            trace_data["chat_prompt_file"] = prompt_file
-            if prompt_file and os.path.isfile(prompt_file):
-                query_text = str(question_text or "").strip()
-                retrieval = bridge.retrieve_chat_context(
-                    chats=[(user.name, query_text)],
-                    other_name=user.name,
-                    is_initiator=False,
-                    turn_no=1,
-                )
-                trace_data["external_memory_retrieval"] = self._normalize_external_retrieval_trace(
-                    retrieval,
-                    query_text=query_text,
-                )
-                query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
-                if len(query) > 120:
-                    query = query[:120] + "..."
-                retrieval_ok = bool(retrieval.get("ok", False))
-                route_reason = str(retrieval.get("reason", "") or "")
-                if retrieval_ok or (not bridge.fallback_to_local):
-                    external_memory_context = str(retrieval.get("context", "") or "")
-                    if retrieval_ok:
-                        route_reason = "retrieve_ok"
-                    elif not route_reason:
-                        route_reason = "retrieve_failed_no_fallback"
-                    self.logger.info(
-                        "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=external reason={} query={} context_len={}".format(
-                            self.agent.name,
-                            route_reason,
-                            query,
-                            len(external_memory_context),
-                        )
-                    )
-                    route = "external"
-                    trace_data["prompt_route"] = route
-                    prompt_payload = self.agent.scratch.prompt_generate_chat_external(
-                        self.agent,
-                        user,
-                        relation,
-                        chats,
-                        external_memory_context=external_memory_context,
-                        depression_chat_block=depression_chat_block,
-                        doctor_session_prompt_injection="",
-                        doctor_consult_record_injection="",
-                        chat_prompt_file=prompt_file,
-                    )
-                    return prompt_payload, prompt_kwargs, route, trace_data
+            query_text = str(question_text or "").strip()
+            retrieval = bridge.retrieve_chat_context(
+                chats=[(user.name, query_text)],
+                other_name=user.name,
+                is_initiator=False,
+                turn_no=1,
+            )
+            trace_data["external_memory_retrieval"] = self._normalize_external_retrieval_trace(
+                retrieval,
+                query_text=query_text,
+            )
+            query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
+            if len(query) > 120:
+                query = query[:120] + "..."
+            retrieval_ok = bool(retrieval.get("ok", False))
+            route_reason = str(retrieval.get("reason", "") or "")
+            if retrieval_ok or (not bridge.fallback_to_local):
+                external_memory_context = str(retrieval.get("context", "") or "")
+                if retrieval_ok:
+                    route_reason = "retrieve_ok"
+                elif not route_reason:
+                    route_reason = "retrieve_failed_no_fallback"
                 self.logger.info(
-                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason={} query={}".format(
+                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=external reason={} query={} context_len={}".format(
                         self.agent.name,
-                        route_reason or "retrieve_failed_fallback",
+                        route_reason,
                         query,
+                        len(external_memory_context),
                     )
                 )
-                trace_data["external_memory_retrieval"]["reason"] = route_reason or "retrieve_failed_fallback"
-            else:
-                self.logger.warning(
-                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason=chat_prompt_missing path={}".format(
-                        self.agent.name,
-                        prompt_file,
-                    )
+                route = "external"
+                trace_data["prompt_route"] = route
+                prompt_payload = self.agent.scratch.prompt_generate_chat(
+                    self.agent,
+                    user,
+                    relation,
+                    chats,
+                    memory_source="external",
+                    external_memory_context=external_memory_context,
+                    **prompt_kwargs,
                 )
-                trace_data["external_memory_retrieval"] = {
-                    "ok": False,
-                    "query": str(question_text or ""),
-                    "reason": "chat_prompt_missing",
-                    "context": "",
-                    "context_len": 0,
-                    "details": {},
-                    "scoped_user_id": "",
-                }
+                return prompt_payload, prompt_kwargs, route, trace_data
+            self.logger.info(
+                "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason={} query={}".format(
+                    self.agent.name,
+                    route_reason or "retrieve_failed_fallback",
+                    query,
+                )
+            )
+            trace_data["external_memory_retrieval"]["reason"] = route_reason or "retrieve_failed_fallback"
         prompt_payload = self.agent.scratch.prompt_generate_chat(
             self.agent,
             user,
@@ -526,7 +504,6 @@ class ChatSession:
             "external_memory_retrieval": _clone_json_safe(
                 (prompt_trace or {}).get("external_memory_retrieval", {})
             ),
-            "chat_prompt_file": str((prompt_trace or {}).get("chat_prompt_file", "") or ""),
             "depression_chat_block": str((prompt_trace or {}).get("depression_chat_block", "") or ""),
             "dynamic_state_before_answer": self._dump_dynamic_state_for_trace(),
             "forced_chain_alignment": self._build_forced_alignment_trace(prompt_route),
