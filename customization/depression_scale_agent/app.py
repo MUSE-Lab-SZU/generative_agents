@@ -356,11 +356,55 @@ class ChatSession:
             conversation_content=dda.serialize_conversation(chats),
         )
 
-    def _build_depression_chat_block(self):
+    def _relation_text(self, relation):
+        return str(relation or "").strip()
+
+    def _get_runtime_emotion_snapshot(self):
         if not self.agent:
-            return ""
+            return {}
+        profile = getattr(self.agent, "depression_profile", {})
+        if not isinstance(profile, dict):
+            return {}
+        runtime = profile.get("runtime", {})
+        if not isinstance(runtime, dict):
+            return {}
+        emotion = runtime.get("emotion", {})
+        if not isinstance(emotion, dict):
+            return {}
+        return _clone_json_safe(emotion)
+
+    def _build_depression_chat_block(self, user, relation, chats):
+        emotion_trace = {
+            "applied": False,
+            "reason": "",
+            "relationship": self._relation_text(relation),
+            "emotion_before": {},
+            "emotion_after": {},
+        }
+        if not self.agent:
+            emotion_trace["reason"] = "agent_missing"
+            return "", emotion_trace
+        emotion_trace["emotion_before"] = self._get_runtime_emotion_snapshot()
+        try:
+            self.agent.depression_profile = drm.infer_chat_emotion(
+                patient_agent=self.agent,
+                profile=self.agent.depression_profile,
+                now_step=utils.get_timer().daily_duration(),
+                static_profile=getattr(self.agent, "profile", {}),
+                other_agent=getattr(user, "name", ""),
+                relationship=emotion_trace["relationship"],
+                conversation_content=dda.serialize_conversation(chats),
+            )
+            emotion_trace["applied"] = True
+            emotion_trace["reason"] = "ok"
+        except Exception as exc:
+            self.logger.warning("[DEPR_SCALE][EMOTION] infer_error={}".format(exc))
+            emotion_trace["reason"] = "infer_error:{}".format(exc)
+        emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
         if not self._chain_uses_update():
-            return ""
+            if not emotion_trace["reason"]:
+                emotion_trace["reason"] = "update_chain_disabled"
+            return "", emotion_trace
         update_cfg = {}
         if (
             getattr(self, "intervention", None)
@@ -375,12 +419,14 @@ class ChatSession:
                 utils.get_timer().daily_duration(),
                 stage="chat",
                 update_cfg=update_cfg,
+                static_profile=getattr(self.agent, "profile", {}),
             )
             block = view.get("chat_block", "")
-            return block if isinstance(block, str) else ""
+            return (block if isinstance(block, str) else ""), emotion_trace
         except Exception as exc:
             self.logger.warning("[DEPR_SCALE][CHAT_BLOCK] build_error={}".format(exc))
-            return ""
+            emotion_trace["reason"] = "build_error:{}".format(exc)
+            return "", emotion_trace
 
     def _get_forced_llm_runtime(self):
         if not getattr(self, "intervention", None):
@@ -405,7 +451,9 @@ class ChatSession:
         return (self._forced_llm, forced_cfg), "ok"
 
     def _build_prompt_payload_before_answer(self, user, relation, chats, question_text):
-        depression_chat_block = self._build_depression_chat_block()
+        depression_chat_block, emotion_trace = self._build_depression_chat_block(
+            user, relation, chats
+        )
         prompt_kwargs = {
             "depression_chat_block": depression_chat_block,
             "chat_history_target_name": self.doctor_name or user.name,
@@ -415,6 +463,7 @@ class ChatSession:
             "question": str(question_text or ""),
             "prompt_route": route,
             "depression_chat_block": depression_chat_block,
+            "emotion_inference": _clone_json_safe(emotion_trace),
             "external_memory_retrieval": {
                 "ok": False,
                 "query": str(question_text or ""),
@@ -505,6 +554,7 @@ class ChatSession:
                 (prompt_trace or {}).get("external_memory_retrieval", {})
             ),
             "depression_chat_block": str((prompt_trace or {}).get("depression_chat_block", "") or ""),
+            "emotion_inference": _clone_json_safe((prompt_trace or {}).get("emotion_inference", {})),
             "dynamic_state_before_answer": self._dump_dynamic_state_for_trace(),
             "forced_chain_alignment": self._build_forced_alignment_trace(prompt_route),
             "llm_route": "",
@@ -842,6 +892,7 @@ def build_answer_trace_record(index, question, answer, trace_payload):
         "llm_route_reason": str(trace.get("llm_route_reason", "") or ""),
         "prompt_route": str(trace.get("prompt_route", "") or ""),
         "external_memory_retrieval": _clone_json_safe(trace.get("external_memory_retrieval", {})),
+        "emotion_inference": _clone_json_safe(trace.get("emotion_inference", {})),
         "dynamic_state_before_answer": _clone_json_safe(trace.get("dynamic_state_before_answer", {})),
         "forced_chain_alignment": _clone_json_safe(trace.get("forced_chain_alignment", {})),
         "prompt_meta": _clone_json_safe(trace.get("final_prompt_payload_meta", {})),
@@ -880,6 +931,11 @@ def write_prompt_trace_markdown(path, records):
         lines.append("### 外置记忆查询返回")
         lines.append("```json")
         lines.append(json.dumps(record.get("external_memory_retrieval", {}), ensure_ascii=False, indent=2))
+        lines.append("```")
+        lines.append("")
+        lines.append("### Emotion 推导结果")
+        lines.append("```json")
+        lines.append(json.dumps(record.get("emotion_inference", {}), ensure_ascii=False, indent=2))
         lines.append("```")
         lines.append("")
         lines.append("### 动态抑郁人设状态（回答前）")

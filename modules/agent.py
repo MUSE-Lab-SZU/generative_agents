@@ -110,6 +110,11 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
+        # static persona profile used by depression chat prompt / emotion inference
+        raw_profile = config.get("profile", (config.get("_raw", {}) or {}).get("profile", {}))
+        if not isinstance(raw_profile, dict):
+            raw_profile = {}
+        self.profile = copy.deepcopy(raw_profile)
 
         # status
         status = {"poignancy": 0}
@@ -1210,7 +1215,7 @@ class Agent:
                 patient_agent=self,
                 profile=self.depression_profile,
                 now_step=utils.get_timer().daily_duration(),
-                static_profile=self.profile,
+                static_profile=getattr(self, "profile", {}),
                 other_agent=getattr(other, "name", ""),
                 relationship=relations[0],
                 conversation_content=dda.serialize_conversation(chats),
@@ -1224,6 +1229,7 @@ class Agent:
                     if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                     else {}
                 ),
+                static_profile=getattr(self, "profile", {}),
             )
             text = self._completion_generate_chat_with_external_route(
                 other=other,
@@ -1455,6 +1461,7 @@ class Agent:
                         if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                         else {}
                     ),
+                    static_profile=getattr(other, "profile", {}),
                 ).get("chat_block", ""),
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 doctor_consult_record_injection=other_doctor_consult_record_injection,
