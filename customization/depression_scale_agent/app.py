@@ -217,6 +217,17 @@ class ChatSession:
     def _chain_uses_dynamic(self):
         return self.chain_mode in {CHAIN_MODE_DYNAMIC, CHAIN_MODE_BOTH}
 
+    def _resolve_intervention_depression_update_cfg(self):
+        if (
+            getattr(self, "intervention", None)
+            and isinstance(getattr(self.intervention, "config", None), dict)
+        ):
+            cfg = (
+                ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
+            )
+            return cfg if isinstance(cfg, dict) else {}
+        return {}
+
     def _sync_agent_chain_switch(self):
         if not self.agent:
             return
@@ -385,34 +396,30 @@ class ChatSession:
             emotion_trace["reason"] = "agent_missing"
             return "", emotion_trace
         emotion_trace["emotion_before"] = self._get_runtime_emotion_snapshot()
-        try:
-            self.agent.depression_profile = drm.infer_chat_emotion(
-                patient_agent=self.agent,
-                profile=self.agent.depression_profile,
-                now_step=utils.get_timer().daily_duration(),
-                static_profile=getattr(self.agent, "profile", {}),
-                other_agent=getattr(user, "name", ""),
-                relationship=emotion_trace["relationship"],
-                conversation_content=dda.serialize_conversation(chats),
-            )
-            emotion_trace["applied"] = True
-            emotion_trace["reason"] = "ok"
-        except Exception as exc:
-            self.logger.warning("[DEPR_SCALE][EMOTION] infer_error={}".format(exc))
-            emotion_trace["reason"] = "infer_error:{}".format(exc)
+        dynamic_emotion_enabled = bool(
+            self._chain_uses_dynamic()
+            and bool(getattr(self.agent, "depression_dynamic_enabled", False))
+        )
+        if dynamic_emotion_enabled:
+            try:
+                self.agent.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=self.agent,
+                    profile=self.agent.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(self.agent, "profile", {}),
+                    other_agent=getattr(user, "name", ""),
+                    relationship=emotion_trace["relationship"],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
+                emotion_trace["applied"] = True
+                emotion_trace["reason"] = "ok"
+            except Exception as exc:
+                self.logger.warning("[DEPR_SCALE][EMOTION] infer_error={}".format(exc))
+                emotion_trace["reason"] = "infer_error:{}".format(exc)
+        else:
+            emotion_trace["reason"] = "dynamic_emotion_disabled"
         emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
-        if not self._chain_uses_update():
-            if not emotion_trace["reason"]:
-                emotion_trace["reason"] = "update_chain_disabled"
-            return "", emotion_trace
-        update_cfg = {}
-        if (
-            getattr(self, "intervention", None)
-            and isinstance(getattr(self.intervention, "config", None), dict)
-        ):
-            update_cfg = (
-                ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-            )
+        update_cfg = self._resolve_intervention_depression_update_cfg()
         try:
             view = drm.build_intermediate_view(
                 self.agent.depression_profile,
@@ -886,6 +893,7 @@ def build_answer_trace_record(index, question, answer, trace_payload):
     return {
         "index": int(index),
         "question": str(question or ""),
+         "depression_chat_block": str(trace.get("depression_chat_block", "") or ""), # <--- 新增这一行
         "full_injected_prompt": str(trace.get("full_injected_prompt", "") or ""),
         "answer": str(answer or ""),
         "llm_route": str(trace.get("llm_route", "") or ""),

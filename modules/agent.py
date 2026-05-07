@@ -1211,15 +1211,16 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                 )
-            self.depression_profile = drm.infer_chat_emotion(
-                patient_agent=self,
-                profile=self.depression_profile,
-                now_step=utils.get_timer().daily_duration(),
-                static_profile=getattr(self, "profile", {}),
-                other_agent=getattr(other, "name", ""),
-                relationship=relations[0],
-                conversation_content=dda.serialize_conversation(chats),
-            )
+            if bool(getattr(self, "depression_dynamic_enabled", False)):
+                self.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=self,
+                    profile=self.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(self, "profile", {}),
+                    other_agent=getattr(other, "name", ""),
+                    relationship=relations[0],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
             chat_view = drm.build_intermediate_view(
                 self.depression_profile,
                 utils.get_timer().daily_duration(),
@@ -1439,15 +1440,16 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                     )
-            other.depression_profile = drm.infer_chat_emotion(
-                patient_agent=other,
-                profile=other.depression_profile,
-                now_step=utils.get_timer().daily_duration(),
-                static_profile=getattr(other, "profile", {}),
-                other_agent=getattr(self, "name", ""),
-                relationship=relations[1],
-                conversation_content=dda.serialize_conversation(chats),
-            )
+            if bool(getattr(other, "depression_dynamic_enabled", False)):
+                other.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=other,
+                    profile=other.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(other, "profile", {}),
+                    other_agent=getattr(self, "name", ""),
+                    relationship=relations[1],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
             text = other._completion_generate_chat_with_external_route(
                 other=self,
                 relation=relations[1],

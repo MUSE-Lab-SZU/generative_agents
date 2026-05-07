@@ -1,12 +1,13 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-04-29
+> 更新时间：2026-05-07
 > 目标：快速看懂项目、跑通链路、定位关键配置与日志。
 
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
 
+- 2026-05-06：修复emotion模块在app.py以及仿真链路中未能正常显示的问题，因为emotion模块绑定在了旧人设链路中，待学长修复后再进行二次更新。
 - 2026-04-28：手动升级session对话记忆、注入记忆的层级。（0429发现bug，已修复）
   - 相关文件：`data/config.json`、`modules/external_memory_bridge.py`、`modules/memory_injection_manager.py`、`modules/intervention_manager.py`
 -

@@ -52,6 +52,7 @@ DEFAULT_GLOBAL_CFG = {
     "normal_chain_enabled": True,
     "forced_chain_enabled": True,
     "prompt_injection_enabled": True,
+    "emotion_prompt_injection_enabled": True,
     "event_commit_enabled": True,
     "target_hints": sorted(list(DEFAULT_DEPRESSION_TARGET_HINTS)),
     "on_missing_agent_config": "warn_and_disable",
@@ -226,9 +227,20 @@ def patch_prompt(
             )
             return prompt
 
+        emotion_block = ""
+        if func_hint == "generate_chat" and bool(
+            cfg.get("emotion_prompt_injection_enabled", True)
+        ):
+            emotion_block = _render_dynamic_emotion_section(agent)
+
+        prefix_parts = [layer_text]
+        if isinstance(emotion_block, str) and emotion_block.strip():
+            prefix_parts.append(emotion_block.strip())
+        prompt_prefix = "\n\n".join([part for part in prefix_parts if part])
+
         patched_prompt = dict(prompt)
         patched_prompt["prompt"] = (
-            f"{layer_text}\n\n"
+            f"{prompt_prefix}\n\n"
             f"{'=' * 50}\n\n"
             f"=== 当前任务指令层 ===\n{original_prompt}"
         )
@@ -389,6 +401,41 @@ def serialize_focus(focus: Any, max_items: int = 6) -> str:
     return "\n".join([line for line in lines if line])
 
 
+def _render_dynamic_emotion_section(agent: Any) -> str:
+    profile = getattr(agent, "depression_profile", {})
+    if not isinstance(profile, dict):
+        return ""
+    runtime = profile.get("runtime", {})
+    if not isinstance(runtime, dict):
+        return ""
+    emotion = runtime.get("emotion", {})
+    if not isinstance(emotion, dict):
+        return ""
+
+    label = str(emotion.get("label", "") or "").strip()
+    style = str(emotion.get("style", "") or "").strip()
+    volatility_note = str(emotion.get("volatility_note", "") or "").strip()
+    if not any([label, style, volatility_note]):
+        return ""
+
+    intensity_raw = emotion.get("intensity", 0.0)
+    try:
+        intensity = float(intensity_raw)
+    except Exception:
+        intensity = 0.0
+    intensity = max(0.0, min(1.0, intensity))
+
+    lines = ["=== Emotion (Current Speaking State) ==="]
+    if label:
+        lines.append(f"- Current Emotion: {label}")
+    if style:
+        lines.append(f"- Speaking Style: {style}")
+    lines.append(f"- Emotion Intensity: {intensity:.2f}")
+    if volatility_note:
+        lines.append(f"- Volatility Note: {volatility_note}")
+    return "\n".join(lines)
+
+
 def _runtime_ready(agent: Any) -> bool:
     return bool(
         getattr(agent, "depression_dynamic_enabled", False)
@@ -410,6 +457,7 @@ def _normalize_global_cfg(raw_cfg: Any) -> Dict[str, Any]:
         "normal_chain_enabled",
         "forced_chain_enabled",
         "prompt_injection_enabled",
+        "emotion_prompt_injection_enabled",
         "event_commit_enabled",
         "log_enabled",
         "persist_enabled",
