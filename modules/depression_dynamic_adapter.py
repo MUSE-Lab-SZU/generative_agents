@@ -60,13 +60,18 @@ DEFAULT_GLOBAL_CFG = {
     "persist_enabled": True,
 }
 
-DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
+DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG = {
     "enabled": False,
-    "timeout_ms": 1200,
     "min_confidence": 0.60,
     "max_text_length": 1600,
-    "signal_weight": 0.25,
     "allowed_event_keys": ["chat_event"],
+    "retry": 1,
+}
+# legacy alias: keep old helper functions import-safe during migration
+DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
+    **DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG,
+    "timeout_ms": 1200,
+    "signal_weight": 0.25,
 }
 
 
@@ -84,9 +89,12 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     agent.depression_dynamic_event_interaction_mapping = dict(
         DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING
     )
-    agent.depression_dynamic_llm_transition_judge_cfg = dict(
-        DEFAULT_LLM_TRANSITION_JUDGE_CFG
+    agent.depression_dynamic_llm_roadmap_cfg = dict(
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG
     )
+    agent.depression_dynamic_llm_transition_judge_cfg = dict(
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG
+    )  # legacy alias
 
     if not cfg.get("enabled", False):
         _log(agent, "info", "[DEPR_DYNAMIC][INIT] agent={} enabled=false reason=global_disabled".format(agent.name))
@@ -144,8 +152,8 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     prompt_map, event_map = _build_interaction_mappings(simulation_config)
     relationship_mapping = _build_relationship_mapping(simulation_config.get("relationship_mapping", {}))
     target_hints = _resolve_target_hints(cfg, simulation_config)
-    llm_transition_cfg = _normalize_llm_transition_judge_cfg(
-        simulation_config.get("llm_transition_judge", {})
+    llm_roadmap_cfg = _normalize_llm_roadmap_judge_cfg(
+        simulation_config.get("complaint_roadmap_judge", simulation_config.get("llm_transition_judge", {}))
     )
 
     agent.depression_dynamic_engine = engine
@@ -154,7 +162,8 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     agent.depression_dynamic_relationship_mapping = relationship_mapping
     agent.depression_dynamic_prompt_interaction_mapping = prompt_map
     agent.depression_dynamic_event_interaction_mapping = event_map
-    agent.depression_dynamic_llm_transition_judge_cfg = llm_transition_cfg
+    agent.depression_dynamic_llm_roadmap_cfg = llm_roadmap_cfg
+    agent.depression_dynamic_llm_transition_judge_cfg = llm_roadmap_cfg  # legacy alias
 
     load_result = {"loaded": False, "reason": "persist_disabled_or_empty"}
     if cfg.get("persist_enabled", True):
@@ -167,14 +176,14 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     _log(
         agent,
         "info",
-        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={} llm_transition_enabled={} llm_allowed_events={}".format(
+        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={} llm_roadmap_enabled={} llm_allowed_events={}".format(
             agent.name,
             config_path,
             len(target_hints),
             bool(load_result.get("loaded", False)),
             load_result.get("reason", ""),
-            bool(llm_transition_cfg.get("enabled", False)),
-            ",".join(list(llm_transition_cfg.get("allowed_event_keys", []))),
+            bool(llm_roadmap_cfg.get("enabled", False)),
+            ",".join(list(llm_roadmap_cfg.get("allowed_event_keys", []))),
         ),
     )
 
@@ -302,12 +311,10 @@ def commit_event(
         interaction_type = "治疗对话"
 
     try:
-        llm_transition_signal = _build_llm_transition_signal(
+        roadmap_cfg = getattr(agent, "depression_dynamic_llm_roadmap_cfg", {})
+        roadmap_completion_func = _build_roadmap_completion_func(
             agent=agent,
             event_key=event_key,
-            interaction_type=interaction_type,
-            relationship=relationship,
-            conversation_content=conversation_content or "",
         )
         result = agent.depression_dynamic_engine.commit_interaction(
             location=_resolve_current_location(agent),
@@ -316,18 +323,19 @@ def commit_event(
             relationship=relationship,
             interaction_type=interaction_type,
             conversation_content=conversation_content or "",
-            llm_transition_signal=llm_transition_signal,
+            roadmap_completion_func=roadmap_completion_func,
+            roadmap_llm_cfg=roadmap_cfg,
         )
         _log(
             agent,
             "info",
-            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true transitioned={} state={} llm_signal={}".format(
+            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true advanced={} state={} llm_roadmap={}".format(
                 agent.name,
                 event_key,
                 bool(forced),
-                bool((result or {}).get("transitioned", False)),
+                bool((result or {}).get("advanced", (result or {}).get("transitioned", False))),
                 (result or {}).get("current_state", ""),
-                bool(llm_transition_signal),
+                bool(roadmap_completion_func),
             ),
         )
         return result
@@ -480,14 +488,13 @@ def _normalize_global_cfg(raw_cfg: Any) -> Dict[str, Any]:
     return cfg
 
 
-def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
-    cfg = dict(DEFAULT_LLM_TRANSITION_JUDGE_CFG)
+def _normalize_llm_roadmap_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG)
     if not isinstance(raw_cfg, dict):
         return cfg
 
     if "enabled" in raw_cfg:
         cfg["enabled"] = bool(raw_cfg.get("enabled"))
-    cfg["timeout_ms"] = _bounded_int(raw_cfg.get("timeout_ms"), cfg["timeout_ms"], 200, 30000)
     cfg["min_confidence"] = _bounded_float(
         raw_cfg.get("min_confidence"),
         cfg["min_confidence"],
@@ -500,12 +507,7 @@ def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
         200,
         8000,
     )
-    cfg["signal_weight"] = _bounded_float(
-        raw_cfg.get("signal_weight"),
-        cfg["signal_weight"],
-        0.0,
-        1.0,
-    )
+    cfg["retry"] = _bounded_int(raw_cfg.get("retry"), cfg["retry"], 1, 5)
 
     allowed = raw_cfg.get("allowed_event_keys", cfg["allowed_event_keys"])
     cleaned_allowed: List[str] = []
@@ -765,6 +767,56 @@ def _resolve_time_of_day(agent: Any) -> str:
     if 18 <= hour < 22:
         return "evening"
     return "night"
+
+
+def _build_roadmap_completion_func(
+    agent: Any,
+    event_key: str,
+) -> Optional[Any]:
+    raw_cfg = getattr(agent, "depression_dynamic_llm_roadmap_cfg", {})
+    cfg = raw_cfg if isinstance(raw_cfg, dict) else dict(DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG)
+    if not bool(cfg.get("enabled", False)):
+        return None
+
+    allowed_event_keys = cfg.get("allowed_event_keys", [])
+    if isinstance(allowed_event_keys, list) and allowed_event_keys:
+        if event_key not in allowed_event_keys:
+            return None
+
+    llm = getattr(agent, "_llm", None)
+    if llm is None:
+        _log(
+            agent,
+            "debug",
+            "[DEPR_DYNAMIC][LLM_ROADMAP] agent={} key={} enabled=true ready=false reason=llm_unavailable".format(
+                getattr(agent, "name", ""),
+                event_key,
+            ),
+        )
+        return None
+    if callable(getattr(llm, "is_available", None)):
+        try:
+            if not bool(llm.is_available()):
+                return None
+        except Exception:
+            pass
+
+    retry = _bounded_int(
+        cfg.get("retry"),
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG["retry"],
+        1,
+        5,
+    )
+
+    def _completion(prompt: str) -> str:
+        return llm.completion(
+            prompt=prompt,
+            retry=retry,
+            caller="depr_roadmap_judge",
+            failsafe="",
+        )
+
+    return _completion
 
 
 def _build_llm_transition_signal(
