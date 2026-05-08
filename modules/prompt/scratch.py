@@ -699,71 +699,81 @@ class Scratch:
         doctor_consult_record_injection="",
         retrieval_profile=None,
         chat_history_target_name=None,
+        memory_source="local",
+        external_memory_context="",
     ):
-        focus = [relation, other.get_event().get_describe()]
         recent_turn_focus_n = 4
         if hasattr(agent, "get_chat_recent_turn_focus_n"):
             recent_turn_focus_n = agent.get_chat_recent_turn_focus_n()
-        if recent_turn_focus_n > 0 and len(chats) > recent_turn_focus_n:
-            focus.append(
-                "; ".join(
-                    "{}: {}".format(n, t) for n, t in chats[-recent_turn_focus_n:]
-                )
-            )
         focus_retrieve_max = 15
         if hasattr(agent, "get_chat_focus_retrieve_max"):
             focus_retrieve_max = agent.get_chat_focus_retrieve_max()
-        nodes = agent.associate.retrieve_focus(
-            focus,
-            focus_retrieve_max,
-            retrieval_profile=retrieval_profile,
-        )
-        memory = "\n- " + "\n- ".join([n.describe for n in nodes])
-        chat_history_target_name = (
-            str(chat_history_target_name or other.name or "").strip() or other.name
-        )
-        max_read_items = 5
-        if hasattr(agent, "get_chat_history_max_read_items"):
-            max_read_items = agent.get_chat_history_max_read_items()
-        chat_nodes = agent.associate.retrieve_chats(
-            chat_history_target_name,
-            limit=max_read_items,
-        )
-        summary_window_minutes = 480
-        if hasattr(agent, "get_chat_summary_window_minutes"):
-            summary_window_minutes = agent.get_chat_summary_window_minutes()
-        pass_context = ""
-        kept_context_num = 0
-        for n in chat_nodes:
-            delta = utils.get_timer().get_delta(n.create)
-            if summary_window_minutes != -1 and delta > summary_window_minutes:
-                continue
-            kept_context_num += 1
-            pass_context += f"{delta} 分钟前，{agent.name} 和 {other.name} 进行过对话。{n.describe}\n"
-
-        if hasattr(agent, "logger") and agent.logger:
-            agent.logger.info(
-                "[CHAT_HISTORY_INJECTION] agent={} other={} target={} window_minutes={} read_limit={} focus_retrieve_max={} recent_turn_focus_n={} total_chat_nodes={} kept_chat_nodes={}".format(
-                    agent.name,
-                    other.name,
-                    chat_history_target_name,
-                    summary_window_minutes,
-                    max_read_items,
-                    focus_retrieve_max,
-                    recent_turn_focus_n,
-                    len(chat_nodes),
-                    kept_context_num,
-                )
-            )
-
-        address = agent.get_tile().get_address()
-        if len(pass_context) > 0:
-            prev_context = f'\n背景：\n"""\n{pass_context}"""\n\n'
+        memory_mode = str(memory_source or "local").strip().lower()
+        if memory_mode == "external":
+            memory = str(external_memory_context or "")
         else:
+            focus = [relation, other.get_event().get_describe()]
+            if recent_turn_focus_n > 0 and len(chats) > recent_turn_focus_n:
+                focus.append(
+                    "; ".join(
+                        "{}: {}".format(n, t) for n, t in chats[-recent_turn_focus_n:]
+                    )
+                )
+            nodes = agent.associate.retrieve_focus(
+                focus,
+                focus_retrieve_max,
+                retrieval_profile=retrieval_profile,
+            )
+            memory = "\n- " + "\n- ".join([n.describe for n in nodes])
+        address = agent.get_tile().get_address()
+        if memory_mode == "external":
             prev_context = ""
-        curr_context = (
-            f"{agent.name} {agent.get_event().get_describe(False)} 时，看到 {other.name} {other.get_event().get_describe(False)}。"
-        )
+            curr_context = ""
+        else:
+            chat_history_target_name = (
+                str(chat_history_target_name or other.name or "").strip() or other.name
+            )
+            max_read_items = 5
+            if hasattr(agent, "get_chat_history_max_read_items"):
+                max_read_items = agent.get_chat_history_max_read_items()
+            chat_nodes = agent.associate.retrieve_chats(
+                chat_history_target_name,
+                limit=max_read_items,
+            )
+            summary_window_minutes = 480
+            if hasattr(agent, "get_chat_summary_window_minutes"):
+                summary_window_minutes = agent.get_chat_summary_window_minutes()
+            pass_context = ""
+            kept_context_num = 0
+            for n in chat_nodes:
+                delta = utils.get_timer().get_delta(n.create)
+                if summary_window_minutes != -1 and delta > summary_window_minutes:
+                    continue
+                kept_context_num += 1
+                pass_context += f"{delta} 分钟前，{agent.name} 和 {other.name} 进行过对话。{n.describe}\n"
+
+            if hasattr(agent, "logger") and agent.logger:
+                agent.logger.info(
+                    "[CHAT_HISTORY_INJECTION] agent={} other={} target={} window_minutes={} read_limit={} focus_retrieve_max={} recent_turn_focus_n={} total_chat_nodes={} kept_chat_nodes={}".format(
+                        agent.name,
+                        other.name,
+                        chat_history_target_name,
+                        summary_window_minutes,
+                        max_read_items,
+                        focus_retrieve_max,
+                        recent_turn_focus_n,
+                        len(chat_nodes),
+                        kept_context_num,
+                    )
+                )
+
+            if len(pass_context) > 0:
+                prev_context = f'\n背景：\n"""\n{pass_context}"""\n\n'
+            else:
+                prev_context = ""
+            curr_context = (
+                f"{agent.name} {agent.get_event().get_describe(False)} 时，看到 {other.name} {other.get_event().get_describe(False)}。"
+            )
 
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
@@ -783,52 +793,6 @@ class Scratch:
                 "current_time": utils.get_timer().get_date("%H:%M"),
                 "previous_context": prev_context,
                 "current_context": curr_context,
-                "another": other.name,
-                "conversation": conversation,
-            }
-        )
-
-        def _callback(response):
-            assert "{" in response and "}" in response
-            json_content = utils.load_dict(
-                "{" + response.split("{")[1].split("}")[0] + "}"
-            )
-            text = json_content[agent.name].replace("\n\n", "\n").strip(" \n\"'“”‘’")
-            return text
-
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": "嗯",
-        }
-
-    def prompt_generate_chat_external(
-        self,
-        agent,
-        other,
-        relation,
-        chats,
-        external_memory_context="",
-        depression_chat_block="",
-        doctor_session_prompt_injection="",
-        doctor_consult_record_injection="",
-        chat_prompt_file="",
-    ):
-        address = agent.get_tile().get_address()
-        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
-        conversation = conversation or "[对话尚未开始]"
-
-        prompt = self.build_prompt_by_file(
-            chat_prompt_file,
-            {
-                "agent": agent.name,
-                "base_desc": self._base_desc(),
-                "depression_chat_block": depression_chat_block or "",
-                "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
-                "doctor_consult_record_injection": doctor_consult_record_injection or "",
-                "external_memory_context": external_memory_context or "",
-                "address": f"{address[-2]}，{address[-1]}",
-                "current_time": utils.get_timer().get_date("%H:%M"),
                 "another": other.name,
                 "conversation": conversation,
             }

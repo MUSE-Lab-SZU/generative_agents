@@ -1,58 +1,60 @@
 """
-动态抑郁症状模拟引擎 - 主引擎类
-"""
-import copy
-from typing import Any, Callable, Dict, List, Optional
-from datetime import datetime
+动态抑郁模块主引擎。
 
-from .state_machine import SymptomStateMachine, DepressionState
-from .context_analyzer import ContextAnalyzer
+当前版本已由“症状状态转换”改为“主诉认知路线图推进”，但对外仍尽量保留
+DepressionSimulationEngine 的既有接口，以减少外围代码改动。
+"""
+
+from __future__ import annotations
+
+import copy
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
+
 from .bias_injector import CognitiveBiasInjector
+from .context_analyzer import ContextAnalyzer
 from .memory_system import TraumaMemorySystem
 from .prompt_builder import DynamicPromptBuilder
+from .state_machine import DepressionState, SymptomStateMachine
 
 
 class DepressionSimulationEngine:
-    """
-    动态抑郁症状模拟引擎
-    
-    整合所有子系统，提供统一的接口来模拟抑郁症状的动态表现
-    """
-    
+    """动态抑郁引擎：由主诉路线图驱动表现层。"""
+
     def __init__(
         self,
         config: Optional[Dict] = None,
         clock_provider: Optional[Callable[[], datetime]] = None,
     ):
-        """
-        初始化抑郁症状模拟引擎
-        
-        Args:
-            config: 配置字典，包含各子系统的配置参数
-        """
         config = config or {}
-        
-        # 初始化各子系统
-        state_config = config.get("state_machine", {})
+
+        roadmap_config = config.get("complaint_roadmap", {})
+        if not isinstance(roadmap_config, dict) or not roadmap_config:
+            roadmap_config = config.get("state_machine", {})
+        if not isinstance(roadmap_config, dict):
+            roadmap_config = {}
+
         self.state_machine = SymptomStateMachine(
-            initial_state=state_config.get("initial_state", DepressionState.SEVERE_EPISODE),
-            transition_sensitivity=state_config.get("transition_sensitivity", 0.7),
-            minimum_state_duration=state_config.get("minimum_state_duration", 30),
+            initial_state=roadmap_config.get("initial_state", DepressionState.SEVERE_EPISODE),
+            transition_sensitivity=roadmap_config.get("transition_sensitivity", 0.7),
+            minimum_state_duration=roadmap_config.get("minimum_state_duration", 0),
+            window_size=roadmap_config.get("window_size", 2),
+            initial_stage=roadmap_config.get("initial_stage"),
+            seed_chain=roadmap_config.get("seed_chain"),
+            max_dialog_history=roadmap_config.get("max_dialog_history", 12),
         )
-        
+
         self.context_analyzer = ContextAnalyzer()
         self.bias_injector = CognitiveBiasInjector()
-        
-        trauma_memories = config.get("trauma_memories") # 加载创伤记忆
+
+        trauma_memories = config.get("trauma_memories")
         self.memory_system = TraumaMemorySystem(trauma_memories)
-        
+
         self.prompt_builder = DynamicPromptBuilder()
-        
-        # 配置参数
+
         self.enabled = config.get("enabled", True)
         self.base_prompt = ""
-        
-        # 运行时数据
+
         self.interaction_count = 0
         self._clock_provider: Callable[[], datetime] = (
             clock_provider if callable(clock_provider) else datetime.now
@@ -70,34 +72,22 @@ class DepressionSimulationEngine:
         return datetime.now()
 
     def set_clock_provider(self, clock_provider: Optional[Callable[[], datetime]]) -> None:
-        """设置时钟提供器，并同步到状态机。"""
         if callable(clock_provider):
             self._clock_provider = clock_provider
             self.state_machine.set_now_provider(clock_provider)
-        
+
     def set_base_prompt(self, base_prompt: str):
-        """设置基础prompt（从agent配置中获取）"""
         self.base_prompt = base_prompt
-    
-    def process_interaction(self, location: str, time_of_day: str,
-                          other_agent: Optional[str] = None,
-                          relationship: Optional[str] = None,
-                          interaction_type: Optional[str] = None,
-                          conversation_content: str = "") -> str:
-        """
-        处理一次交互，返回动态构建的prompt
-        
-        Args:
-            location: 当前位置
-            time_of_day: 时间段 (morning/afternoon/evening/night)
-            other_agent: 对方agent名称（如果有）
-            relationship: 关系类型（如果有）
-            interaction_type: 互动类型（如果有）
-            conversation_content: 对话内容
-            
-        Returns:
-            动态构建的完整prompt
-        """
+
+    def process_interaction(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+    ) -> str:
         return self._generate_prompt_for_interaction(
             location=location,
             time_of_day=time_of_day,
@@ -108,14 +98,15 @@ class DepressionSimulationEngine:
             commit=True,
         )
 
-    def preview_interaction_prompt(self, location: str, time_of_day: str,
-                                   other_agent: Optional[str] = None,
-                                   relationship: Optional[str] = None,
-                                   interaction_type: Optional[str] = None,
-                                   conversation_content: str = "") -> str:
-        """
-        预览某次互动对应的动态prompt，不更新内部症状状态。
-        """
+    def preview_interaction_prompt(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+    ) -> str:
         return self._generate_prompt_for_interaction(
             location=location,
             time_of_day=time_of_day,
@@ -126,20 +117,30 @@ class DepressionSimulationEngine:
             commit=False,
         )
 
-    def commit_interaction(self, location: str, time_of_day: str,
-                           other_agent: Optional[str] = None,
-                           relationship: Optional[str] = None,
-                           interaction_type: Optional[str] = None,
-                           conversation_content: str = "",
-                           llm_transition_signal: Optional[Dict[str, Any]] = None) -> Dict:
+    def commit_interaction(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+        llm_transition_signal: Optional[Dict[str, Any]] = None,
+        roadmap_completion_func: Optional[Callable[[str], str]] = None,
+        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict:
         """
-        提交一次真实互动，更新症状状态与运行时统计，不构建prompt文本。
-        llm_transition_signal 为可选辅助评分信号，缺省时走纯规则状态机。
+        提交一次真实互动，更新路线图状态与运行时统计。
+
+        兼容说明：
+        - llm_transition_signal 参数保留，但现在可承载“路线图识别/预测”结果。
+        - roadmap_completion_func + roadmap_llm_cfg 是新的主诉链 LLM 推演入口。
         """
         if not self.enabled:
             return {
                 "enabled": False,
                 "current_state": self.state_machine.get_current_state(),
+                "current_stage": self.state_machine.get_current_stage(),
                 "context": {},
             }
 
@@ -151,12 +152,26 @@ class DepressionSimulationEngine:
             interaction_type=interaction_type,
             conversation_content=conversation_content,
         )
+
         self.interaction_count += 1
-        transitioned = self.state_machine.update_state(
+        advanced = self.state_machine.update_state(
             context,
             llm_transition_signal=llm_transition_signal,
+            conversation_content=conversation_content,
+            roadmap_context={
+                "base_prompt": self.base_prompt,
+                "location": location,
+                "time_of_day": time_of_day,
+                "other_agent": other_agent,
+                "relationship": relationship,
+                "interaction_type": interaction_type,
+            },
+            roadmap_completion_func=roadmap_completion_func,
+            roadmap_llm_cfg=roadmap_llm_cfg,
         )
         current_state = self.state_machine.get_current_state()
+        current_stage = self.state_machine.get_current_stage()
+        roadmap_snapshot = self.state_machine.get_roadmap_snapshot()
 
         activated_memories = self.memory_system.check_memory_activation(
             context, conversation_content
@@ -168,8 +183,12 @@ class DepressionSimulationEngine:
 
         return {
             "enabled": True,
-            "transitioned": transitioned,
+            "advanced": advanced,
+            "transitioned": advanced,
             "current_state": current_state,
+            "current_stage": current_stage,
+            "roadmap": roadmap_snapshot,
+            "is_recovered": bool(roadmap_snapshot.get("reached_terminal_recovery", False)),
             "context": context,
             "activated_memories": [m.get("id") for m in activated_memories],
             "active_biases": [b.get("type") for b in cognitive_biases],
@@ -177,12 +196,16 @@ class DepressionSimulationEngine:
             "last_update": self.last_update_time.isoformat(),
         }
 
-    def _generate_prompt_for_interaction(self, location: str, time_of_day: str,
-                                         other_agent: Optional[str] = None,
-                                         relationship: Optional[str] = None,
-                                         interaction_type: Optional[str] = None,
-                                         conversation_content: str = "",
-                                         commit: bool = False) -> str:
+    def _generate_prompt_for_interaction(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+        commit: bool = False,
+    ) -> str:
         if not self.enabled:
             return self.base_prompt
 
@@ -197,8 +220,21 @@ class DepressionSimulationEngine:
 
         if commit:
             self.interaction_count += 1
-            self.state_machine.update_state(context)
+            self.state_machine.update_state(
+                context,
+                conversation_content=conversation_content,
+                roadmap_context={
+                    "base_prompt": self.base_prompt,
+                    "location": location,
+                    "time_of_day": time_of_day,
+                    "other_agent": other_agent,
+                    "relationship": relationship,
+                    "interaction_type": interaction_type,
+                },
+            )
             current_state = self.state_machine.get_current_state()
+            current_stage = self.state_machine.get_current_stage()
+            roadmap_snapshot = self.state_machine.get_roadmap_snapshot()
             activated_memories = self.memory_system.check_memory_activation(
                 context, conversation_content
             )
@@ -208,6 +244,8 @@ class DepressionSimulationEngine:
             self.last_update_time = self._now()
         else:
             current_state = self.state_machine.get_current_state()
+            current_stage = self.state_machine.get_current_stage()
+            roadmap_snapshot = self.state_machine.get_roadmap_snapshot()
             activated_memories = self._preview_activated_memories(
                 context, conversation_content
             )
@@ -220,15 +258,19 @@ class DepressionSimulationEngine:
         return self.prompt_builder.build_prompt(
             base_prompt=self.base_prompt,
             current_state=current_state,
+            current_stage=current_stage,
+            roadmap_snapshot=roadmap_snapshot,
             state_characteristics=state_characteristics,
             context=context,
             cognitive_biases=cognitive_biases,
             activated_memories=activated_memories,
         )
 
-    def _preview_activated_memories(self, context: Dict,
-                                    conversation_content: str) -> List[Dict]:
-        """计算记忆激活但不持久化到运行时状态。"""
+    def _preview_activated_memories(
+        self,
+        context: Dict,
+        conversation_content: str,
+    ) -> List[Dict]:
         previous = list(self.memory_system.activated_memories)
         try:
             current = self.memory_system.check_memory_activation(
@@ -238,9 +280,12 @@ class DepressionSimulationEngine:
         finally:
             self.memory_system.activated_memories = previous
 
-    def _preview_cognitive_biases(self, current_state: str, context: Dict,
-                                  conversation_content: str) -> List[Dict]:
-        """计算认知偏差但不持久化到运行时状态。"""
+    def _preview_cognitive_biases(
+        self,
+        current_state: str,
+        context: Dict,
+        conversation_content: str,
+    ) -> List[Dict]:
         previous = list(self.bias_injector.active_biases)
         try:
             current = self.bias_injector.inject_bias(
@@ -249,37 +294,35 @@ class DepressionSimulationEngine:
             return list(current)
         finally:
             self.bias_injector.active_biases = previous
-    
+
     def get_simple_prompt(self) -> str:
-        """
-        获取简化版prompt（用于不需要完整情境分析的场景）
-        
-        Returns:
-            简化的prompt
-        """
         if not self.enabled:
             return self.base_prompt
-        
+
         current_state = self.state_machine.get_current_state()
+        current_stage = self.state_machine.get_current_stage()
+        roadmap_snapshot = self.state_machine.get_roadmap_snapshot()
         state_characteristics = self.state_machine.get_state_characteristics()
-        
+
         return self.prompt_builder.build_simple_prompt(
-            self.base_prompt, current_state, state_characteristics
+            self.base_prompt,
+            current_state,
+            state_characteristics,
+            current_stage=current_stage,
+            roadmap_snapshot=roadmap_snapshot,
         )
-    
+
     def get_current_state_info(self) -> Dict:
-        """
-        获取当前状态信息（用于调试和监控）
-        
-        Returns:
-            包含当前状态各项信息的字典
-        """
         current_state = self.state_machine.get_current_state()
+        current_stage = self.state_machine.get_current_stage()
         state_characteristics = self.state_machine.get_state_characteristics()
-        
+        roadmap_snapshot = self.state_machine.get_roadmap_snapshot()
+
         return {
             "enabled": self.enabled,
             "current_state": current_state,
+            "current_stage": current_stage,
+            "roadmap": roadmap_snapshot,
             "state_duration_minutes": self.state_machine.get_state_duration(),
             "state_characteristics": state_characteristics,
             "active_biases": self.bias_injector.active_biases,
@@ -287,28 +330,11 @@ class DepressionSimulationEngine:
             "interaction_count": self.interaction_count,
             "last_update": self.last_update_time.isoformat(),
         }
-    
-    def force_state_transition(self, new_state: str, reason: str = "manual"):
-        """
-        强制转换到指定状态（用于测试或特殊情况）
-        
-        Args:
-            new_state: 目标状态
-            reason: 转换原因
-        """
+
+    def force_state_transition(self, new_state: Any, reason: str = "manual"):
         self.state_machine.force_transition(new_state, reason)
-    
+
     def get_symptom_intensity(self, symptom: str) -> float:
-        """
-        获取特定症状的当前强度
-        
-        Args:
-            symptom: 症状名称
-            
-        Returns:
-            症状强度 (0-1)
-        """
-        # 根据当前时间确定时间段
         hour = self._now().hour
         if 5 <= hour < 12:
             time_of_day = "morning"
@@ -318,53 +344,36 @@ class DepressionSimulationEngine:
             time_of_day = "evening"
         else:
             time_of_day = "night"
-        
+
         return self.state_machine.get_symptom_intensity(symptom, time_of_day)
-    
+
     def simulate_therapy_progress(self, effectiveness: float = 0.1):
-        """
-        模拟治疗进展（降低创伤记忆强度）
-        
-        Args:
-            effectiveness: 治疗效果 (0-1)
-        """
         for memory in self.memory_system.trauma_memories:
             self.memory_system.reduce_memory_intensity(
-                memory["id"], 
-                reduction=effectiveness
+                memory["id"],
+                reduction=effectiveness,
             )
-    
+
     def get_state_history(self) -> List[Dict]:
-        """获取状态转换历史"""
         return self.state_machine.get_state_history()
-    
+
     def reset(self):
-        """重置引擎状态（用于测试）"""
         self.interaction_count = 0
         self.last_update_time = self._now()
         self.state_machine.accumulated_triggers.clear()
+        self.state_machine.dialogue_history.clear()
         self.bias_injector.active_biases.clear()
         self.memory_system.activated_memories.clear()
-    
+
     @classmethod
-    def from_config_file(cls, config_path: str) -> 'DepressionSimulationEngine':
-        """
-        从配置文件创建引擎实例
-        
-        Args:
-            config_path: 配置文件路径
-            
-        Returns:
-            引擎实例
-        """
+    def from_config_file(cls, config_path: str) -> "DepressionSimulationEngine":
         import json
-        with open(config_path, 'r', encoding='utf-8') as f:
+
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
-        
         return cls(config.get("depression_simulation", {}))
 
     def to_dict(self) -> Dict[str, Any]:
-        """导出可序列化运行状态。"""
         return {
             "enabled": bool(self.enabled),
             "base_prompt": str(self.base_prompt or ""),
@@ -377,7 +386,6 @@ class DepressionSimulationEngine:
         }
 
     def load_state(self, payload: Dict[str, Any]) -> None:
-        """从序列化状态恢复运行时。"""
         payload = payload or {}
         self.enabled = bool(payload.get("enabled", self.enabled))
         self.base_prompt = str(payload.get("base_prompt", self.base_prompt or "") or "")
@@ -422,7 +430,6 @@ class DepressionSimulationEngine:
         payload: Dict[str, Any],
         clock_provider: Optional[Callable[[], datetime]] = None,
     ) -> "DepressionSimulationEngine":
-        """从序列化数据构建引擎实例。"""
         payload = payload or {}
         init_cfg = {"enabled": bool(payload.get("enabled", True))}
         engine = cls(config=init_cfg, clock_provider=clock_provider)

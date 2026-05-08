@@ -465,6 +465,61 @@ class MemoryInjectionManager:
                     errors_n,
                 )
             )
+            try:
+                target = agents_map.get(target_agent)
+                bridge = getattr(target, "external_memory_bridge", None) if target is not None else None
+                injected_node_ids = self._collect_injected_node_ids(result)
+                injected_policy = self._resolve_rule_injected_memory_policy(rule_cfg)
+                if injected_policy == "none":
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=policy_not_enabled".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                elif bridge is None:
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=bridge_missing".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                elif not injected_node_ids:
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=node_ids_empty".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                else:
+                    adjust_summary = bridge.apply_injected_memory_level_adjustments(
+                        node_ids=injected_node_ids,
+                        policy_mode=injected_policy,
+                        trace={
+                            "rule_id": rule_id,
+                            "request_id": req_id,
+                            "scene": "init_rule_only",
+                            "step": resolved_step,
+                        },
+                    )
+                    summary["results"][-1]["injected_memory_level_adjustment"] = adjust_summary
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_DONE rule_id={} request_id={} policy={} success={} failed={}".format(
+                            rule_id,
+                            req_id,
+                            injected_policy,
+                            int(adjust_summary.get("success", 0) or 0),
+                            int(adjust_summary.get("failed", 0) or 0),
+                        )
+                    )
+            except Exception as exc:
+                self._log_warn(
+                    "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=bridge_apply_error detail={}".format(
+                        rule_id,
+                        req_id,
+                        str(exc),
+                    )
+                )
             if status in {"ok", "partial"}:
                 summary["executed"] += 1
                 applied_rules[rule_id] = {
@@ -802,18 +857,17 @@ class MemoryInjectionManager:
             skipped = int(result.get("skipped", 0) or 0)
             errors_n = len(result.get("errors", []))
             req_id = self._safe_str(result.get("request_id"))
-            summary["results"].append(
-                {
-                    "rule_id": rule_id,
-                    "request_id": req_id,
-                    "target_agent": target_agent,
-                    "status": status,
-                    "reason": reason,
-                    "injected": injected,
-                    "skipped": skipped,
-                    "errors": errors_n,
-                }
-            )
+            result_entry: Dict[str, Any] = {
+                "rule_id": rule_id,
+                "request_id": req_id,
+                "target_agent": target_agent,
+                "status": status,
+                "reason": reason,
+                "injected": injected,
+                "skipped": skipped,
+                "errors": errors_n,
+            }
+            summary["results"].append(result_entry)
             self._log_info(
                 "SESSION_RULE_DONE rule={} status={} injected={} skipped={} errors={}".format(
                     rule_id,
@@ -823,6 +877,62 @@ class MemoryInjectionManager:
                     errors_n,
                 )
             )
+            try:
+                target = agents_map.get(target_agent)
+                bridge = getattr(target, "external_memory_bridge", None) if target is not None else None
+                injected_node_ids = self._collect_injected_node_ids(result)
+                injected_policy = self._resolve_rule_injected_memory_policy(rule_cfg)
+                if injected_policy == "none":
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=policy_not_enabled".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                elif bridge is None:
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=bridge_missing".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                elif not injected_node_ids:
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=node_ids_empty".format(
+                            rule_id,
+                            req_id,
+                        )
+                    )
+                else:
+                    adjust_summary = bridge.apply_injected_memory_level_adjustments(
+                        node_ids=injected_node_ids,
+                        policy_mode=injected_policy,
+                        trace={
+                            "rule_id": rule_id,
+                            "request_id": req_id,
+                            "meeting_id": meeting,
+                            "doctor": doctor,
+                            "patient": patient,
+                        },
+                    )
+                    result_entry["injected_memory_level_adjustment"] = adjust_summary
+                    self._log_info(
+                        "MEMORY_LEVEL_ADJUST_BRIDGE_DONE rule_id={} request_id={} policy={} success={} failed={}".format(
+                            rule_id,
+                            req_id,
+                            injected_policy,
+                            int(adjust_summary.get("success", 0) or 0),
+                            int(adjust_summary.get("failed", 0) or 0),
+                        )
+                    )
+            except Exception as exc:
+                self._log_warn(
+                    "MEMORY_LEVEL_ADJUST_BRIDGE_SKIP rule_id={} request_id={} reason=bridge_apply_error detail={}".format(
+                        rule_id,
+                        req_id,
+                        str(exc),
+                    )
+                )
             if status in {"ok", "partial"}:
                 summary["executed"] += 1
                 applied_session_rules[event_key] = {
@@ -862,6 +972,40 @@ class MemoryInjectionManager:
             summary["status"] = "skipped"
             summary["reason"] = "no_rule_executed"
         return summary
+
+    def _collect_injected_node_ids(self, inject_result: Dict[str, Any]) -> List[str]:
+        records = inject_result.get("records", []) if isinstance(inject_result, dict) else []
+        if not isinstance(records, list):
+            return []
+        out: List[str] = []
+        seen = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if self._safe_str(record.get("status")) != "ok":
+                continue
+            node_id = self._safe_str(record.get("node_id"))
+            if (not node_id) or (node_id in seen):
+                continue
+            seen.add(node_id)
+            out.append(node_id)
+        return out
+
+    def _resolve_rule_injected_memory_policy(self, rule_cfg: Dict[str, Any]) -> str:
+        if not isinstance(rule_cfg, dict):
+            return "none"
+        use_l2 = self._safe_bool(rule_cfg.get("update_to_L2"), False)
+        use_milestone = self._safe_bool(rule_cfg.get("update_to_milestone"), False)
+        if use_l2 and use_milestone:
+            self._log_warn(
+                "SESSION_RULE_POLICY_CONFLICT policy=update_to_L2+update_to_milestone preferred=update_to_milestone"
+            )
+            return "update_to_milestone"
+        if use_milestone:
+            return "update_to_milestone"
+        if use_l2:
+            return "update_to_L2"
+        return "none"
 
     def _resolve_runtime_config(self) -> Dict[str, Any]:
         intervention_cfg = self.config.get("intervention", {}) or {}

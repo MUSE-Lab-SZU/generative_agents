@@ -110,6 +110,11 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
+        # static persona profile used by depression chat prompt / emotion inference
+        raw_profile = config.get("profile", (config.get("_raw", {}) or {}).get("profile", {}))
+        if not isinstance(raw_profile, dict):
+            raw_profile = {}
+        self.profile = copy.deepcopy(raw_profile)
 
         # status
         status = {"poignancy": 0}
@@ -180,6 +185,26 @@ class Agent:
         func = getattr(self.scratch, "prompt_" + func_hint)
         prompt = func(*args, **kwargs)
         prompt = dda.patch_prompt(self, func_hint, prompt, args, kwargs)
+        if func_hint == "generate_chat" and isinstance(prompt, dict):
+            intervention_state = self.status.get("intervention", {})
+            if not isinstance(intervention_state, dict):
+                intervention_state = {}
+                self.status["intervention"] = intervention_state
+            other_name = ""
+            if len(args) >= 2:
+                other_name = str(getattr(args[1], "name", "") or "")
+            turn_no = -1
+            try:
+                turn_no = int(kwargs.get("turn_no", -1) or -1)
+            except Exception:
+                turn_no = -1
+            intervention_state["last_generate_chat_prompt"] = {
+                "prompt_text": str(prompt.get("prompt", "") or ""),
+                "turn_no": turn_no,
+                "speaker": str(self.name or ""),
+                "other": other_name,
+                "ts": str(utils.get_timer().get_date("%Y%m%d-%H:%M:%S") or ""),
+            }
         terminate_policy = {
             "retry": 2,
             "force_forced_llm": True,
@@ -295,6 +320,49 @@ class Agent:
         else:
             output = prompt.get("failsafe")
         msg["<OUTPUT>"] = "\n" + str(output) + "\n"
+        try:
+            if (
+                self.intervention
+                and func_hint == "generate_chat"
+                and isinstance(self._chat_route_ctx, dict)
+                and bool(self._chat_route_ctx.get("forced", False))
+                and hasattr(self.intervention, "append_forced_prompt_trace_record")
+            ):
+                peer_agent = self._chat_route_ctx.get("peer_agent")
+                turn_no = -1
+                try:
+                    turn_no = int(kwargs.get("turn_no", -1) or -1)
+                except Exception:
+                    turn_no = -1
+                route_value = route if "route" in locals() else "fallback"
+                route_reason_value = route_reason if "route_reason" in locals() else "fallback_no_reason"
+                retry_value = 0
+                try:
+                    retry_value = int((prompt or {}).get("retry", 0) or 0)
+                except Exception:
+                    retry_value = 0
+                self.intervention.append_forced_prompt_trace_record(
+                    speaker=self,
+                    other=peer_agent,
+                    role="",
+                    prompt_text=str((prompt or {}).get("prompt", "") or ""),
+                    output=output,
+                    turn_no=turn_no,
+                    meta={
+                        "source": "agent_generate_chat",
+                        "caller": str(func_hint or ""),
+                        "route": str(route_value or ""),
+                        "reason": str(route_reason_value or ""),
+                        "retry": retry_value,
+                    },
+                )
+        except Exception as e:
+            self.logger.warning(
+                "[FORCED_PROMPT_TRACE_APPEND_FAIL] agent={} err={}".format(
+                    self.name,
+                    str(e),
+                )
+            )
         self.logger.debug(utils.block_msg(title, msg))
         return output
 
@@ -1205,7 +1273,17 @@ class Agent:
                         "\n<医生回复建议>\n"
                         + advice_text
                         + "\n</医生回复建议>"
-                    )
+                )
+            if bool(getattr(self, "depression_dynamic_enabled", False)):
+                self.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=self,
+                    profile=self.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(self, "profile", {}),
+                    other_agent=getattr(other, "name", ""),
+                    relationship=relations[0],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
             chat_view = drm.build_intermediate_view(
                 self.depression_profile,
                 utils.get_timer().daily_duration(),
@@ -1215,6 +1293,7 @@ class Agent:
                     if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                     else {}
                 ),
+                static_profile=getattr(self, "profile", {}),
             )
             text = self._completion_generate_chat_with_external_route(
                 other=other,
@@ -1424,6 +1503,16 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                     )
+            if bool(getattr(other, "depression_dynamic_enabled", False)):
+                other.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=other,
+                    profile=other.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(other, "profile", {}),
+                    other_agent=getattr(self, "name", ""),
+                    relationship=relations[1],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
             text = other._completion_generate_chat_with_external_route(
                 other=self,
                 relation=relations[1],
@@ -1437,6 +1526,7 @@ class Agent:
                         if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
                         else {}
                     ),
+                    static_profile=getattr(other, "profile", {}),
                 ).get("chat_block", ""),
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 doctor_consult_record_injection=other_doctor_consult_record_injection,
@@ -1710,66 +1800,57 @@ class Agent:
     ):
         bridge = getattr(self, "external_memory_bridge", None)
         if bridge and bridge.enabled_for_chat_read():
-            prompt_file = str(bridge.resolve_chat_prompt_file() or "").strip()
-            if prompt_file and os.path.isfile(prompt_file):
-                retrieval = bridge.retrieve_chat_context(
-                    chats=chats,
-                    other_name=getattr(other, "name", ""),
-                    is_initiator=is_initiator,
-                    turn_no=turn_no,
-                )
-                query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
-                if len(query) > 120:
-                    query = query[:120] + "..."
-                retrieval_ok = bool(retrieval.get("ok", False))
-                route_reason = str(retrieval.get("reason", "") or "")
-                if retrieval_ok or (not bridge.fallback_to_local):
-                    external_memory_context = str(retrieval.get("context", "") or "")
-                    if retrieval_ok:
-                        route_reason = "retrieve_ok"
-                    elif not route_reason:
-                        route_reason = "retrieve_failed_no_fallback"
-                    self.logger.info(
-                        "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=external reason={} turn_no={} is_initiator={} query={} context_len={}".format(
-                            self.name,
-                            getattr(other, "name", ""),
-                            route_reason,
-                            turn_no,
-                            bool(is_initiator),
-                            query,
-                            len(external_memory_context),
-                        )
-                    )
-                    return self.completion(
-                        "generate_chat_external",
-                        self,
-                        other,
-                        relation,
-                        chats,
-                        external_memory_context=external_memory_context,
-                        depression_chat_block=depression_chat_block,
-                        doctor_session_prompt_injection=doctor_session_prompt_injection,
-                        doctor_consult_record_injection=doctor_consult_record_injection,
-                        chat_prompt_file=prompt_file,
-                    )
+            retrieval = bridge.retrieve_chat_context(
+                chats=chats,
+                other_name=getattr(other, "name", ""),
+                is_initiator=is_initiator,
+                turn_no=turn_no,
+            )
+            query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
+            if len(query) > 120:
+                query = query[:120] + "..."
+            retrieval_ok = bool(retrieval.get("ok", False))
+            route_reason = str(retrieval.get("reason", "") or "")
+            if retrieval_ok or (not bridge.fallback_to_local):
+                external_memory_context = str(retrieval.get("context", "") or "")
+                if retrieval_ok:
+                    route_reason = "retrieve_ok"
+                elif not route_reason:
+                    route_reason = "retrieve_failed_no_fallback"
                 self.logger.info(
-                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
+                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=external reason={} turn_no={} is_initiator={} query={} context_len={}".format(
                         self.name,
                         getattr(other, "name", ""),
-                        route_reason or "retrieve_failed_fallback",
+                        route_reason,
                         turn_no,
                         bool(is_initiator),
                         query,
+                        len(external_memory_context),
                     )
                 )
-            else:
-                self.logger.warning(
-                    "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason=chat_prompt_missing path={}".format(
-                        self.name,
-                        getattr(other, "name", ""),
-                        prompt_file,
-                    )
+                return self.completion(
+                    "generate_chat",
+                    self,
+                    other,
+                    relation,
+                    chats,
+                    depression_chat_block=depression_chat_block,
+                    doctor_session_prompt_injection=doctor_session_prompt_injection,
+                    doctor_consult_record_injection=doctor_consult_record_injection,
+                    retrieval_profile=retrieval_profile,
+                    memory_source="external",
+                    external_memory_context=external_memory_context,
                 )
+            self.logger.info(
+                "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
+                    self.name,
+                    getattr(other, "name", ""),
+                    route_reason or "retrieve_failed_fallback",
+                    turn_no,
+                    bool(is_initiator),
+                    query,
+                )
+            )
         return self.completion(
             "generate_chat",
             self,
@@ -1780,6 +1861,7 @@ class Agent:
             doctor_session_prompt_injection=doctor_session_prompt_injection,
             doctor_consult_record_injection=doctor_consult_record_injection,
             retrieval_profile=retrieval_profile,
+            memory_source="local",
         )
 
     def _wait_other(self, other, focus):

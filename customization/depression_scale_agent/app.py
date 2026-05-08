@@ -217,6 +217,17 @@ class ChatSession:
     def _chain_uses_dynamic(self):
         return self.chain_mode in {CHAIN_MODE_DYNAMIC, CHAIN_MODE_BOTH}
 
+    def _resolve_intervention_depression_update_cfg(self):
+        if (
+            getattr(self, "intervention", None)
+            and isinstance(getattr(self.intervention, "config", None), dict)
+        ):
+            cfg = (
+                ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
+            )
+            return cfg if isinstance(cfg, dict) else {}
+        return {}
+
     def _sync_agent_chain_switch(self):
         if not self.agent:
             return
@@ -356,31 +367,73 @@ class ChatSession:
             conversation_content=dda.serialize_conversation(chats),
         )
 
-    def _build_depression_chat_block(self):
+    def _relation_text(self, relation):
+        return str(relation or "").strip()
+
+    def _get_runtime_emotion_snapshot(self):
         if not self.agent:
-            return ""
-        if not self._chain_uses_update():
-            return ""
-        update_cfg = {}
-        if (
-            getattr(self, "intervention", None)
-            and isinstance(getattr(self.intervention, "config", None), dict)
-        ):
-            update_cfg = (
-                ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-            )
+            return {}
+        profile = getattr(self.agent, "depression_profile", {})
+        if not isinstance(profile, dict):
+            return {}
+        runtime = profile.get("runtime", {})
+        if not isinstance(runtime, dict):
+            return {}
+        emotion = runtime.get("emotion", {})
+        if not isinstance(emotion, dict):
+            return {}
+        return _clone_json_safe(emotion)
+
+    def _build_depression_chat_block(self, user, relation, chats):
+        emotion_trace = {
+            "applied": False,
+            "reason": "",
+            "relationship": self._relation_text(relation),
+            "emotion_before": {},
+            "emotion_after": {},
+        }
+        if not self.agent:
+            emotion_trace["reason"] = "agent_missing"
+            return "", emotion_trace
+        emotion_trace["emotion_before"] = self._get_runtime_emotion_snapshot()
+        dynamic_emotion_enabled = bool(
+            self._chain_uses_dynamic()
+            and bool(getattr(self.agent, "depression_dynamic_enabled", False))
+        )
+        if dynamic_emotion_enabled:
+            try:
+                self.agent.depression_profile = drm.infer_chat_emotion(
+                    patient_agent=self.agent,
+                    profile=self.agent.depression_profile,
+                    now_step=utils.get_timer().daily_duration(),
+                    static_profile=getattr(self.agent, "profile", {}),
+                    other_agent=getattr(user, "name", ""),
+                    relationship=emotion_trace["relationship"],
+                    conversation_content=dda.serialize_conversation(chats),
+                )
+                emotion_trace["applied"] = True
+                emotion_trace["reason"] = "ok"
+            except Exception as exc:
+                self.logger.warning("[DEPR_SCALE][EMOTION] infer_error={}".format(exc))
+                emotion_trace["reason"] = "infer_error:{}".format(exc)
+        else:
+            emotion_trace["reason"] = "dynamic_emotion_disabled"
+        emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
+        update_cfg = self._resolve_intervention_depression_update_cfg()
         try:
             view = drm.build_intermediate_view(
                 self.agent.depression_profile,
                 utils.get_timer().daily_duration(),
                 stage="chat",
                 update_cfg=update_cfg,
+                static_profile=getattr(self.agent, "profile", {}),
             )
             block = view.get("chat_block", "")
-            return block if isinstance(block, str) else ""
+            return (block if isinstance(block, str) else ""), emotion_trace
         except Exception as exc:
             self.logger.warning("[DEPR_SCALE][CHAT_BLOCK] build_error={}".format(exc))
-            return ""
+            emotion_trace["reason"] = "build_error:{}".format(exc)
+            return "", emotion_trace
 
     def _get_forced_llm_runtime(self):
         if not getattr(self, "intervention", None):
@@ -405,7 +458,9 @@ class ChatSession:
         return (self._forced_llm, forced_cfg), "ok"
 
     def _build_prompt_payload_before_answer(self, user, relation, chats, question_text):
-        depression_chat_block = self._build_depression_chat_block()
+        depression_chat_block, emotion_trace = self._build_depression_chat_block(
+            user, relation, chats
+        )
         prompt_kwargs = {
             "depression_chat_block": depression_chat_block,
             "chat_history_target_name": self.doctor_name or user.name,
@@ -415,7 +470,7 @@ class ChatSession:
             "question": str(question_text or ""),
             "prompt_route": route,
             "depression_chat_block": depression_chat_block,
-            "chat_prompt_file": "",
+            "emotion_inference": _clone_json_safe(emotion_trace),
             "external_memory_retrieval": {
                 "ok": False,
                 "query": str(question_text or ""),
@@ -428,77 +483,56 @@ class ChatSession:
         }
         bridge = getattr(self.agent, "external_memory_bridge", None)
         if bridge and bridge.enabled_for_chat_read():
-            prompt_file = str(bridge.resolve_chat_prompt_file() or "").strip()
-            trace_data["chat_prompt_file"] = prompt_file
-            if prompt_file and os.path.isfile(prompt_file):
-                query_text = str(question_text or "").strip()
-                retrieval = bridge.retrieve_chat_context(
-                    chats=[(user.name, query_text)],
-                    other_name=user.name,
-                    is_initiator=False,
-                    turn_no=1,
-                )
-                trace_data["external_memory_retrieval"] = self._normalize_external_retrieval_trace(
-                    retrieval,
-                    query_text=query_text,
-                )
-                query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
-                if len(query) > 120:
-                    query = query[:120] + "..."
-                retrieval_ok = bool(retrieval.get("ok", False))
-                route_reason = str(retrieval.get("reason", "") or "")
-                if retrieval_ok or (not bridge.fallback_to_local):
-                    external_memory_context = str(retrieval.get("context", "") or "")
-                    if retrieval_ok:
-                        route_reason = "retrieve_ok"
-                    elif not route_reason:
-                        route_reason = "retrieve_failed_no_fallback"
-                    self.logger.info(
-                        "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=external reason={} query={} context_len={}".format(
-                            self.agent.name,
-                            route_reason,
-                            query,
-                            len(external_memory_context),
-                        )
-                    )
-                    route = "external"
-                    trace_data["prompt_route"] = route
-                    prompt_payload = self.agent.scratch.prompt_generate_chat_external(
-                        self.agent,
-                        user,
-                        relation,
-                        chats,
-                        external_memory_context=external_memory_context,
-                        depression_chat_block=depression_chat_block,
-                        doctor_session_prompt_injection="",
-                        doctor_consult_record_injection="",
-                        chat_prompt_file=prompt_file,
-                    )
-                    return prompt_payload, prompt_kwargs, route, trace_data
+            query_text = str(question_text or "").strip()
+            retrieval = bridge.retrieve_chat_context(
+                chats=[(user.name, query_text)],
+                other_name=user.name,
+                is_initiator=False,
+                turn_no=1,
+            )
+            trace_data["external_memory_retrieval"] = self._normalize_external_retrieval_trace(
+                retrieval,
+                query_text=query_text,
+            )
+            query = str(retrieval.get("query", "") or "").replace("\n", " ").strip()
+            if len(query) > 120:
+                query = query[:120] + "..."
+            retrieval_ok = bool(retrieval.get("ok", False))
+            route_reason = str(retrieval.get("reason", "") or "")
+            if retrieval_ok or (not bridge.fallback_to_local):
+                external_memory_context = str(retrieval.get("context", "") or "")
+                if retrieval_ok:
+                    route_reason = "retrieve_ok"
+                elif not route_reason:
+                    route_reason = "retrieve_failed_no_fallback"
                 self.logger.info(
-                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason={} query={}".format(
+                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=external reason={} query={} context_len={}".format(
                         self.agent.name,
-                        route_reason or "retrieve_failed_fallback",
+                        route_reason,
                         query,
+                        len(external_memory_context),
                     )
                 )
-                trace_data["external_memory_retrieval"]["reason"] = route_reason or "retrieve_failed_fallback"
-            else:
-                self.logger.warning(
-                    "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason=chat_prompt_missing path={}".format(
-                        self.agent.name,
-                        prompt_file,
-                    )
+                route = "external"
+                trace_data["prompt_route"] = route
+                prompt_payload = self.agent.scratch.prompt_generate_chat(
+                    self.agent,
+                    user,
+                    relation,
+                    chats,
+                    memory_source="external",
+                    external_memory_context=external_memory_context,
+                    **prompt_kwargs,
                 )
-                trace_data["external_memory_retrieval"] = {
-                    "ok": False,
-                    "query": str(question_text or ""),
-                    "reason": "chat_prompt_missing",
-                    "context": "",
-                    "context_len": 0,
-                    "details": {},
-                    "scoped_user_id": "",
-                }
+                return prompt_payload, prompt_kwargs, route, trace_data
+            self.logger.info(
+                "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason={} query={}".format(
+                    self.agent.name,
+                    route_reason or "retrieve_failed_fallback",
+                    query,
+                )
+            )
+            trace_data["external_memory_retrieval"]["reason"] = route_reason or "retrieve_failed_fallback"
         prompt_payload = self.agent.scratch.prompt_generate_chat(
             self.agent,
             user,
@@ -526,8 +560,8 @@ class ChatSession:
             "external_memory_retrieval": _clone_json_safe(
                 (prompt_trace or {}).get("external_memory_retrieval", {})
             ),
-            "chat_prompt_file": str((prompt_trace or {}).get("chat_prompt_file", "") or ""),
             "depression_chat_block": str((prompt_trace or {}).get("depression_chat_block", "") or ""),
+            "emotion_inference": _clone_json_safe((prompt_trace or {}).get("emotion_inference", {})),
             "dynamic_state_before_answer": self._dump_dynamic_state_for_trace(),
             "forced_chain_alignment": self._build_forced_alignment_trace(prompt_route),
             "llm_route": "",
@@ -859,12 +893,14 @@ def build_answer_trace_record(index, question, answer, trace_payload):
     return {
         "index": int(index),
         "question": str(question or ""),
+         "depression_chat_block": str(trace.get("depression_chat_block", "") or ""), # <--- 新增这一行
         "full_injected_prompt": str(trace.get("full_injected_prompt", "") or ""),
         "answer": str(answer or ""),
         "llm_route": str(trace.get("llm_route", "") or ""),
         "llm_route_reason": str(trace.get("llm_route_reason", "") or ""),
         "prompt_route": str(trace.get("prompt_route", "") or ""),
         "external_memory_retrieval": _clone_json_safe(trace.get("external_memory_retrieval", {})),
+        "emotion_inference": _clone_json_safe(trace.get("emotion_inference", {})),
         "dynamic_state_before_answer": _clone_json_safe(trace.get("dynamic_state_before_answer", {})),
         "forced_chain_alignment": _clone_json_safe(trace.get("forced_chain_alignment", {})),
         "prompt_meta": _clone_json_safe(trace.get("final_prompt_payload_meta", {})),
@@ -903,6 +939,11 @@ def write_prompt_trace_markdown(path, records):
         lines.append("### 外置记忆查询返回")
         lines.append("```json")
         lines.append(json.dumps(record.get("external_memory_retrieval", {}), ensure_ascii=False, indent=2))
+        lines.append("```")
+        lines.append("")
+        lines.append("### Emotion 推导结果")
+        lines.append("```json")
+        lines.append(json.dumps(record.get("emotion_inference", {}), ensure_ascii=False, indent=2))
         lines.append("```")
         lines.append("")
         lines.append("### 动态抑郁人设状态（回答前）")

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import time
 from string import Template
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from modules import utils
 from modules.ec_doll_memory_service_client import ECDollMemoryServiceClient
@@ -16,6 +17,7 @@ class ExternalMemoryBridge:
     """Encapsulate external memory read/write behaviors for a single agent."""
 
     MAP_FILENAME = "external_memory_node_map.json"
+    RECENT_RAW_SECTION_TITLE = "【近期原文（本服务入库）】"
 
     def __init__(
         self,
@@ -35,19 +37,37 @@ class ExternalMemoryBridge:
         self.timeout = self._safe_float(self.cfg.get("timeout", 10.0), 10.0)
         self.read_mode = str(self.cfg.get("read_mode", "chat_only") or "chat_only").strip().lower()
         self.fallback_to_local = self._safe_bool(self.cfg.get("fallback_to_local", True), True)
+        self.short_term_recent_n = self._safe_int(
+            self.cfg.get("short_term_recent_n", 40),
+            40,
+        )
+        if self.short_term_recent_n < 0:
+            self._log(
+                "warning",
+                "[EXT_MEMORY_CFG] agent={} invalid_short_term_recent_n={} fallback=40".format(
+                    self.agent_name,
+                    self.short_term_recent_n,
+                ),
+            )
+            self.short_term_recent_n = 40
         self.user_id = str(self.cfg.get("user_id", "") or "").strip()
         self.save_name = self.resolve_save_name_from_storage_dir()
         self.scoped_user_id = self.build_scoped_user_id(self.user_id, self.save_name)
         self.ingest_template_file = self._resolve_path(self.cfg.get("ingest_template_file", ""))
-        self.chat_prompt_file = self._resolve_path(self.cfg.get("chat_prompt_file", ""))
         self.map_path = os.path.join(self.storage_dir, self.MAP_FILENAME)
+        self.updata_to_l2_apply_scenes = self._normalize_apply_scenes(
+            self.cfg.get("updata_to_L2_apply_scenes", [])
+        )
+        self.updata_to_milestone_apply_scenes = self._normalize_apply_scenes(
+            self.cfg.get("updata_to_milestone_apply_scenes", [])
+        )
 
         self._remote_map_cache = None
         self.client: Optional[ECDollMemoryServiceClient] = None
 
         self._log(
             "info",
-            "[EXT_MEMORY_CFG] agent={} enabled={} user_id={} scoped_user_id={} save_name={} read_mode={} fallback_to_local={} base_url={} timeout={} ingest_template_file={} chat_prompt_file={}".format(
+            "[EXT_MEMORY_CFG] agent={} enabled={} user_id={} scoped_user_id={} save_name={} read_mode={} fallback_to_local={} short_term_recent_n={} base_url={} timeout={} ingest_template_file={} updata_to_L2_apply_scenes={} updata_to_milestone_apply_scenes={}".format(
                 self.agent_name,
                 self.enabled,
                 self.user_id,
@@ -55,10 +75,12 @@ class ExternalMemoryBridge:
                 self.save_name,
                 self.read_mode,
                 self.fallback_to_local,
+                self.short_term_recent_n,
                 self.base_url,
                 self.timeout,
                 self.ingest_template_file,
-                self.chat_prompt_file,
+                self.updata_to_l2_apply_scenes,
+                self.updata_to_milestone_apply_scenes,
             ),
         )
 
@@ -114,9 +136,6 @@ class ExternalMemoryBridge:
             return False
         return self.read_mode == "chat_only"
 
-    def resolve_chat_prompt_file(self) -> str:
-        return self.chat_prompt_file
-
     def resolve_save_name_from_storage_dir(self) -> str:
         normalized = os.path.normpath(str(self.storage_dir or ""))
         if not normalized:
@@ -147,6 +166,588 @@ class ExternalMemoryBridge:
         )
         self.scoped_user_id = scoped_user_id
         return scoped_user_id
+
+    def _normalize_apply_scenes(self, value: Any) -> List[str]:
+        if isinstance(value, str):
+            raw_items = [value]
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        elif value is None:
+            raw_items = []
+        else:
+            raw_items = []
+            self._log(
+                "warning",
+                "[EXT_MEMORY_CFG_WARN] agent={} field=apply_scenes invalid_type={}".format(
+                    self.agent_name,
+                    type(value).__name__,
+                ),
+            )
+        out: List[str] = []
+        seen = set()
+        for item in raw_items:
+            token = str(item or "").strip().lower()
+            if (not token) or (token in seen):
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    def _resolve_session_adjust_modes(self, session_before: str, force_all_session_l2: bool = False) -> List[str]:
+        session_token = str(session_before or "").strip().lower()
+        if not session_token:
+            return []
+        scene_tag = (
+            session_token
+            if session_token.endswith("_completed")
+            else "{}_completed".format(session_token)
+        )
+        in_l2 = scene_tag in self.updata_to_l2_apply_scenes
+        in_milestone = scene_tag in self.updata_to_milestone_apply_scenes
+        all_session_l2 = "all_session_chat" in self.updata_to_l2_apply_scenes
+
+        modes: List[str] = []
+        if force_all_session_l2 or all_session_l2 or in_l2 or in_milestone:
+            modes.append("update_to_L2")
+        if in_milestone:
+            modes.append("update_to_milestone")
+        return modes
+
+    @staticmethod
+    def _format_policy_modes(modes: List[str]) -> str:
+        if not isinstance(modes, list) or not modes:
+            return "none"
+        out: List[str] = []
+        seen = set()
+        for mode in modes:
+            token = str(mode or "").strip()
+            if (not token) or (token in seen):
+                continue
+            seen.add(token)
+            out.append(token)
+        if not out:
+            return "none"
+        return "+".join(out)
+
+    def _resolve_session_adjust_policy(self, session_before: str) -> str:
+        modes = self._resolve_session_adjust_modes(session_before=session_before, force_all_session_l2=False)
+        if not modes:
+            return "none"
+        if len(modes) > 1:
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_POLICY_CONFLICT] agent={} session={} resolved_modes={} preferred={}".format(
+                    self.agent_name,
+                    str(session_before or "").strip(),
+                    ",".join(modes),
+                    modes[-1],
+                ),
+            )
+        return modes[-1]
+
+    def get_session_adjust_policy(self, session_before: str) -> str:
+        return self._resolve_session_adjust_policy(session_before)
+
+    def resolve_remote_id_by_node_id(self, node_id: str) -> str:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return ""
+        data = self._load_remote_map()
+        node_to_remote = data.get("node_to_remote", {}) if isinstance(data, dict) else {}
+        if not isinstance(node_to_remote, dict):
+            return ""
+        mapped = node_to_remote.get(node_id, {})
+        if isinstance(mapped, dict):
+            return str(mapped.get("remote_id", "") or "").strip()
+        if isinstance(mapped, str):
+            return str(mapped or "").strip()
+        return ""
+
+    def _build_actions_by_policy(self, policy_mode: str) -> List[Dict[str, Any]]:
+        mode = str(policy_mode or "").strip()
+        if mode == "update_to_L2":
+            return [{"op": "promote"}, {"op": "milestone", "is_milestone": False}]
+        if mode == "update_to_milestone":
+            return [{"op": "milestone", "is_milestone": True}]
+        return []
+
+    @staticmethod
+    def _is_action_response_ok(response: Any) -> bool:
+        if not isinstance(response, dict):
+            return True
+        status = str(response.get("status", "") or "").strip().lower()
+        if not status:
+            return True
+        return status not in {"error", "failed"}
+
+    @staticmethod
+    def _normalize_node_id_list(node_ids: Any) -> List[str]:
+        if not isinstance(node_ids, (list, tuple, set)):
+            return []
+        out: List[str] = []
+        seen = set()
+        for node_id in node_ids:
+            value = str(node_id or "").strip()
+            if (not value) or (value in seen):
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    @staticmethod
+    def _format_trace(trace: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(trace, dict) or not trace:
+            return ""
+        kvs = []
+        for key in sorted(trace.keys()):
+            value = trace.get(key)
+            if value is None:
+                continue
+            text = str(value).replace("\n", " ").strip()
+            if not text:
+                continue
+            kvs.append("{}={}".format(key, text))
+        if not kvs:
+            return ""
+        return " " + " ".join(kvs)
+
+    @staticmethod
+    def _extract_http_status_from_exc(exc: Exception) -> Optional[int]:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        try:
+            return int(status) if status is not None else None
+        except Exception:
+            return None
+
+    def _promote_with_retry(self, remote_id: str) -> Dict[str, Any]:
+        delays_s = [0.1, 0.3, 0.8]
+        last_exc: Optional[Exception] = None
+        for idx, delay_s in enumerate(delays_s, start=1):
+            try:
+                return self.client.promote_memory(remote_id)  # type: ignore[union-attr]
+            except Exception as exc:
+                status = self._extract_http_status_from_exc(exc)
+                if status != 404:
+                    raise
+                last_exc = exc
+                self._log(
+                    "warning",
+                    "[PROMOTE_RETRY] agent={} remote_id={} attempt={} status=404".format(
+                        self.agent_name,
+                        remote_id,
+                        idx,
+                    ),
+                )
+                if idx < len(delays_s):
+                    time.sleep(delay_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("promote_retry_unexpected_empty: remote_id={}".format(remote_id))
+
+    def _milestone_with_retry(self, remote_id: str, is_milestone: bool) -> Dict[str, Any]:
+        delays_s = [0.1, 0.3, 0.8]
+        last_exc: Optional[Exception] = None
+        for idx, delay_s in enumerate(delays_s, start=1):
+            try:
+                return self.client.set_memory_milestone(remote_id, is_milestone)  # type: ignore[union-attr]
+            except Exception as exc:
+                status = self._extract_http_status_from_exc(exc)
+                if status != 404:
+                    raise
+                last_exc = exc
+                self._log(
+                    "warning",
+                    "[MILESTONE_RETRY] agent={} remote_id={} attempt={} status=404".format(
+                        self.agent_name,
+                        remote_id,
+                        idx,
+                    ),
+                )
+                if idx < len(delays_s):
+                    time.sleep(delay_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("milestone_retry_unexpected_empty: remote_id={}".format(remote_id))
+
+    def _call_level_action(self, remote_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        op = str((action or {}).get("op", "") or "").strip()
+        if op == "promote":
+            return self._promote_with_retry(remote_id)
+        if op == "milestone":
+            is_milestone = bool((action or {}).get("is_milestone", False))
+            return self._milestone_with_retry(remote_id, is_milestone)
+        raise ValueError("unsupported_level_action: {}".format(op or "<empty>"))
+
+    def apply_session_chat_memory_level_adjustment(
+        self,
+        session_before: str,
+        session_chat_node_id: str,
+        trace: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        session_before = str(session_before or "").strip()
+        node_id = str(session_chat_node_id or "").strip()
+        trace_dict = trace if isinstance(trace, dict) else {}
+        force_all_session_l2 = (
+            self._safe_bool(trace_dict.get("all_session_chat_enabled"), False)
+            and ("all_session_chat" in self.updata_to_l2_apply_scenes)
+        )
+        modes = self._resolve_session_adjust_modes(
+            session_before=session_before,
+            force_all_session_l2=force_all_session_l2,
+        )
+        policy = self._format_policy_modes(modes)
+        trace = dict(trace_dict)
+        trace["all_session_chat_enabled"] = force_all_session_l2
+        trace["resolved_modes"] = ",".join(modes) if modes else "none"
+        summary: Dict[str, Any] = {
+            "status": "skipped",
+            "reason": "",
+            "session_before": session_before,
+            "policy": policy,
+            "resolved_modes": list(modes),
+            "node_id": node_id,
+            "success": 0,
+            "failed": 0,
+            "details": [],
+        }
+        trace_text = self._format_trace(trace)
+        if not modes:
+            summary["reason"] = "policy_not_matched"
+            self._log(
+                "info",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} session={} policy={} reason=policy_not_matched{}".format(
+                    self.agent_name,
+                    session_before,
+                    policy,
+                    trace_text,
+                ),
+            )
+            return summary
+        if not (self.enabled and self.client):
+            summary["reason"] = "disabled_or_not_ready"
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} session={} policy={} reason=disabled_or_not_ready{}".format(
+                    self.agent_name,
+                    session_before,
+                    policy,
+                    trace_text,
+                ),
+            )
+            return summary
+        if not node_id:
+            summary["reason"] = "session_chat_node_id_missing"
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} session={} policy={} reason=session_chat_node_id_missing{}".format(
+                    self.agent_name,
+                    session_before,
+                    policy,
+                    trace_text,
+                ),
+            )
+            return summary
+
+        remote_id = self.resolve_remote_id_by_node_id(node_id)
+        if not remote_id:
+            summary["reason"] = "remote_id_not_found"
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} session={} policy={} reason=remote_id_not_found node_id={}{}".format(
+                    self.agent_name,
+                    session_before,
+                    policy,
+                    node_id,
+                    trace_text,
+                ),
+            )
+            return summary
+
+        actions: List[Dict[str, Any]] = []
+        for mode in modes:
+            actions.extend(self._build_actions_by_policy(mode))
+        self._log(
+            "info",
+            "[EXT_MEMORY_LEVEL_ADJUST_APPLY] agent={} session={} policy={} session_chat_node_id={} remote_id={} action_count={}{}".format(
+                self.agent_name,
+                session_before,
+                policy,
+                node_id,
+                remote_id,
+                len(actions),
+                trace_text,
+            ),
+        )
+
+        node_detail: Dict[str, Any] = {
+            "node_id": node_id,
+            "remote_id": remote_id,
+            "status": "ok",
+            "actions": [],
+        }
+        for action in actions:
+            op = str(action.get("op", "") or "")
+            self._log(
+                "info",
+                "[EXT_MEMORY_LEVEL_ACTION_CALL] agent={} node_id={} remote_id={} op={}{}".format(
+                    self.agent_name,
+                    node_id,
+                    remote_id,
+                    op,
+                    trace_text,
+                ),
+            )
+            try:
+                response = self._call_level_action(remote_id=remote_id, action=action)
+                ok = self._is_action_response_ok(response)
+                action_status = "ok" if ok else "failed"
+                node_detail["actions"].append(
+                    {
+                        "op": op,
+                        "status": action_status,
+                        "response_status": str((response or {}).get("status", "") or ""),
+                        "message": str((response or {}).get("message", "") or ""),
+                    }
+                )
+                self._log(
+                    "info",
+                    "[EXT_MEMORY_LEVEL_ACTION_DONE] agent={} node_id={} remote_id={} op={} status={}{}".format(
+                        self.agent_name,
+                        node_id,
+                        remote_id,
+                        op,
+                        action_status,
+                        trace_text,
+                    ),
+                )
+                if not ok:
+                    node_detail["status"] = "failed"
+                    break
+            except Exception as exc:
+                node_detail["status"] = "failed"
+                node_detail["actions"].append(
+                    {
+                        "op": op,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                self._log(
+                    "warning",
+                    "[EXT_MEMORY_LEVEL_ACTION_DONE] agent={} node_id={} remote_id={} op={} status=failed error={}{}".format(
+                        self.agent_name,
+                        node_id,
+                        remote_id,
+                        op,
+                        exc,
+                        trace_text,
+                    ),
+                )
+                break
+
+        summary["details"].append(node_detail)
+        if node_detail["status"] == "ok":
+            summary["status"] = "ok"
+            summary["reason"] = "success"
+            summary["success"] = 1
+            summary["failed"] = 0
+        else:
+            summary["status"] = "failed"
+            summary["reason"] = "action_failed"
+            summary["success"] = 0
+            summary["failed"] = 1
+        self._log(
+            "info",
+            "[EXT_MEMORY_LEVEL_ADJUST_SUMMARY] agent={} session={} policy={} success={} failed={} status={}{}".format(
+                self.agent_name,
+                session_before,
+                policy,
+                summary["success"],
+                summary["failed"],
+                summary["status"],
+                trace_text,
+            ),
+        )
+        return summary
+
+    def apply_injected_memory_level_adjustments(
+        self,
+        node_ids: List[str],
+        policy_mode: str,
+        trace: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        mode = str(policy_mode or "").strip()
+        normalized_node_ids = self._normalize_node_id_list(node_ids)
+        summary: Dict[str, Any] = {
+            "status": "skipped",
+            "reason": "",
+            "policy": mode,
+            "success": 0,
+            "failed": 0,
+            "details": [],
+        }
+        trace_text = self._format_trace(trace)
+        if mode not in {"update_to_L2", "update_to_milestone"}:
+            summary["reason"] = "policy_mode_invalid"
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} policy={} reason=policy_mode_invalid{}".format(
+                    self.agent_name,
+                    mode,
+                    trace_text,
+                ),
+            )
+            return summary
+        if not (self.enabled and self.client):
+            summary["reason"] = "disabled_or_not_ready"
+            self._log(
+                "warning",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} policy={} reason=disabled_or_not_ready{}".format(
+                    self.agent_name,
+                    mode,
+                    trace_text,
+                ),
+            )
+            return summary
+        if not normalized_node_ids:
+            summary["reason"] = "node_ids_empty"
+            self._log(
+                "info",
+                "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} policy={} reason=node_ids_empty{}".format(
+                    self.agent_name,
+                    mode,
+                    trace_text,
+                ),
+            )
+            return summary
+
+        actions = self._build_actions_by_policy(mode)
+        self._log(
+            "info",
+            "[EXT_MEMORY_LEVEL_ADJUST_APPLY] agent={} policy={} node_count={} action_count={}{}".format(
+                self.agent_name,
+                mode,
+                len(normalized_node_ids),
+                len(actions),
+                trace_text,
+            ),
+        )
+
+        for node_id in normalized_node_ids:
+            remote_id = self.resolve_remote_id_by_node_id(node_id)
+            node_detail: Dict[str, Any] = {
+                "node_id": node_id,
+                "remote_id": remote_id,
+                "status": "ok",
+                "actions": [],
+            }
+            if not remote_id:
+                node_detail["status"] = "skipped"
+                node_detail["reason"] = "remote_id_not_found"
+                summary["details"].append(node_detail)
+                summary["failed"] += 1
+                self._log(
+                    "warning",
+                    "[EXT_MEMORY_LEVEL_ADJUST_SKIP] agent={} policy={} reason=remote_id_not_found node_id={}{}".format(
+                        self.agent_name,
+                        mode,
+                        node_id,
+                        trace_text,
+                    ),
+                )
+                continue
+
+            for action in actions:
+                op = str(action.get("op", "") or "")
+                self._log(
+                    "info",
+                    "[EXT_MEMORY_LEVEL_ACTION_CALL] agent={} node_id={} remote_id={} op={}{}".format(
+                        self.agent_name,
+                        node_id,
+                        remote_id,
+                        op,
+                        trace_text,
+                    ),
+                )
+                try:
+                    response = self._call_level_action(remote_id=remote_id, action=action)
+                    ok = self._is_action_response_ok(response)
+                    action_status = "ok" if ok else "failed"
+                    node_detail["actions"].append(
+                        {
+                            "op": op,
+                            "status": action_status,
+                            "response_status": str((response or {}).get("status", "") or ""),
+                            "message": str((response or {}).get("message", "") or ""),
+                        }
+                    )
+                    self._log(
+                        "info",
+                        "[EXT_MEMORY_LEVEL_ACTION_DONE] agent={} node_id={} remote_id={} op={} status={}{}".format(
+                            self.agent_name,
+                            node_id,
+                            remote_id,
+                            op,
+                            action_status,
+                            trace_text,
+                        ),
+                    )
+                    if not ok:
+                        node_detail["status"] = "failed"
+                        break
+                except Exception as exc:
+                    node_detail["status"] = "failed"
+                    node_detail["actions"].append(
+                        {
+                            "op": op,
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+                    )
+                    self._log(
+                        "warning",
+                        "[EXT_MEMORY_LEVEL_ACTION_DONE] agent={} node_id={} remote_id={} op={} status=failed error={}{}".format(
+                            self.agent_name,
+                            node_id,
+                            remote_id,
+                            op,
+                            exc,
+                            trace_text,
+                        ),
+                    )
+                    break
+
+            summary["details"].append(node_detail)
+            if node_detail["status"] == "ok":
+                summary["success"] += 1
+            else:
+                summary["failed"] += 1
+
+        if summary["success"] > 0 and summary["failed"] > 0:
+            summary["status"] = "partial"
+            summary["reason"] = "partial_success"
+        elif summary["success"] > 0:
+            summary["status"] = "ok"
+            summary["reason"] = "success"
+        elif summary["failed"] > 0:
+            summary["status"] = "failed"
+            summary["reason"] = "all_failed"
+        else:
+            summary["status"] = "skipped"
+            summary["reason"] = "no_effective_node"
+        self._log(
+            "info",
+            "[EXT_MEMORY_LEVEL_ADJUST_SUMMARY] agent={} policy={} success={} failed={} status={}{}".format(
+                self.agent_name,
+                mode,
+                summary["success"],
+                summary["failed"],
+                summary["status"],
+                trace_text,
+            ),
+        )
+        return summary
 
     def render_ingest_text(
         self,
@@ -408,7 +1009,8 @@ class ExternalMemoryBridge:
             result["details"] = details
             hit_remote_ids = self._extract_ranked_memory_remote_ids(details=details)
             hit_remote_ids_text = ",".join(hit_remote_ids) if hit_remote_ids else "-"
-            context = str((response or {}).get("formatted_prompt", "") or "").strip()
+            raw_context = str((response or {}).get("formatted_prompt", "") or "").strip()
+            context = self._postprocess_retrieved_formatted_prompt(raw_context)
             if context:
                 result["ok"] = True
                 result["reason"] = "ok"
@@ -456,6 +1058,137 @@ class ExternalMemoryBridge:
                 ),
             )
             return result
+
+    def _postprocess_retrieved_formatted_prompt(self, context: str) -> str:
+        text = str(context or "")
+        if not text:
+            return text
+        try:
+            before_count = self._count_recent_raw_entries(text)
+            processed = self._trim_recent_raw_section(text, int(self.short_term_recent_n))
+            after_count = self._count_recent_raw_entries(processed)
+            if processed != text:
+                self._log(
+                    "info",
+                    "[EXT_MEMORY_RETRIEVE_POSTPROCESS] agent={} recent_n={} recent_before={} recent_after={} context_len_before={} context_len_after={}".format(
+                        self.agent_name,
+                        int(self.short_term_recent_n),
+                        before_count,
+                        after_count,
+                        len(text),
+                        len(processed),
+                    ),
+                )
+            return processed
+        except Exception as exc:
+            self._log(
+                "warning",
+                "[EXT_MEMORY_RETRIEVE_POSTPROCESS_FAIL] agent={} error={}".format(
+                    self.agent_name,
+                    exc,
+                ),
+            )
+            return text
+
+    def _trim_recent_raw_section(self, context: str, n: int) -> str:
+        text = str(context or "")
+        lines = text.splitlines()
+        if not lines:
+            return text
+        start_idx, end_idx = self._find_recent_raw_section_range(lines)
+        if start_idx < 0:
+            return text
+        section_body = lines[start_idx + 1: end_idx]
+        leading_lines, entries = self._split_recent_raw_entries(section_body)
+        if not entries:
+            return text
+        if n <= 0:
+            kept_entries: List[List[str]] = []
+        elif len(entries) <= n:
+            kept_entries = entries
+        else:
+            kept_entries = entries[-n:]
+
+        rebuilt_section: List[str] = list(leading_lines)
+        for entry in kept_entries:
+            if not entry:
+                continue
+            rebuilt_section.append(self._strip_recent_raw_timestamp(entry[0]))
+            if len(entry) > 1:
+                rebuilt_section.extend(entry[1:])
+
+        updated_lines = lines[: start_idx + 1] + rebuilt_section + lines[end_idx:]
+        return "\n".join(updated_lines)
+
+    def _count_recent_raw_entries(self, context: str) -> int:
+        text = str(context or "")
+        lines = text.splitlines()
+        if not lines:
+            return 0
+        start_idx, end_idx = self._find_recent_raw_section_range(lines)
+        if start_idx < 0:
+            return 0
+        count = 0
+        for line in lines[start_idx + 1: end_idx]:
+            if str(line).startswith("- "):
+                count += 1
+        return count
+
+    def _find_recent_raw_section_range(self, lines: List[str]) -> Tuple[int, int]:
+        start_idx = -1
+        for idx, line in enumerate(lines):
+            if str(line).strip().startswith(self.RECENT_RAW_SECTION_TITLE):
+                start_idx = idx
+                break
+        if start_idx < 0:
+            return -1, -1
+
+        end_idx = len(lines)
+        for idx in range(start_idx + 1, len(lines)):
+            if self._is_prompt_section_header(lines[idx]):
+                end_idx = idx
+                break
+        return start_idx, end_idx
+
+    @staticmethod
+    def _split_recent_raw_entries(lines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        leading_lines: List[str] = []
+        entries: List[List[str]] = []
+        current_entry: List[str] = []
+        seen_entry = False
+        for line in lines:
+            if str(line).startswith("- "):
+                seen_entry = True
+                if current_entry:
+                    entries.append(current_entry)
+                current_entry = [line]
+                continue
+            if seen_entry and current_entry:
+                current_entry.append(line)
+            else:
+                leading_lines.append(line)
+        if current_entry:
+            entries.append(current_entry)
+        return leading_lines, entries
+
+    @staticmethod
+    def _strip_recent_raw_timestamp(line: str) -> str:
+        text = str(line or "")
+        match = re.match(
+            r"^(\s*-\s*)\[\d{4}-\d{2}-\d{2}T[^\]]+\]\s*(.*)$",
+            text,
+        )
+        if not match:
+            return text
+        prefix = str(match.group(1) or "")
+        remainder = str(match.group(2) or "")
+        if not remainder:
+            return text
+        return "{}{}".format(prefix, remainder)
+
+    @staticmethod
+    def _is_prompt_section_header(line: str) -> bool:
+        return bool(re.match(r"^【[^】]+】[:：]?$", str(line or "").strip()))
 
     def _load_template(self, path: str) -> str:
         if not path:
@@ -647,6 +1380,15 @@ class ExternalMemoryBridge:
             return float(value)
         except Exception:
             return float(default)
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        if isinstance(value, bool):
+            return int(default)
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
 
     @staticmethod
     def _trim_for_log(text: str, max_len: int = 120) -> str:

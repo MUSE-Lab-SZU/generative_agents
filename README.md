@@ -1,11 +1,52 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-04-25  
-> 目标：快速看懂项目、跑通链路、定位关键配置与日志。
+> 更新时间：2026-05-07
+
+## 关键测试结果速查
+
+某存档所有结果在`results/checkpoints/xxx`目录下，关键测试结果如下：
+
+1. **Prompt使用情况**：`forced_prompt_traces`文件夹可以看到所有对话的所有Prompt使用情况，包括患者、判断LLM、医生、评估LLM的Prompt。
+   - 作用：最直观观察患者状态变化、各种Prompt注入是否合理。
+   - 生成：运行完仿真实验后自然生成。
+2. app.py评估脚本：`app_py评估结果`文件夹存放了app.py评估脚本的输出结果，包括量表问题（jsonl）、量表回答（jsonl）、患者Prompt使用情况（json、md）、评估结果（txt）。
+   - 作用：使用三种自评量表评估患者抑郁程度，包括SDS、BDI-II、PHQ-9。因为上次心理医生反馈说最好就使用自评量表，所以没使用联合量表。
+   - 生成：运行`customization/depression_scale_agent/app.py`后生成，然后复制到`app_py评估结果`文件夹里。
+3. 医患对话、判断LLM、会后评估LLM、咨询记录：`merge_consultation_dialogues\merge_consultation_dialogues.json`文件。
+   - 作用：可视化所有医患干预对话，包括患者、判断LLM、医生、评估LLM的输出。适合给心理专业人员查看、分析。
+   - 生成：运行完仿真实验后，运行`merge_consultation_dialogues.py`脚本生成
+4. 记忆可视化：`memory_visualization\memory_view_卡布达_simulate-20260509-0830.csv`可以查看某角色的所有记忆
+   - 作用：可视化某角色的所有记忆，可以筛选chat记忆查看对话情况、筛选thought记忆查看反思结果、筛选event记忆查看遇到的事件。
+   - 生成：运行完仿真实验后，运行`visualize_agent_memory.py`脚本生成。
+5. 外置记忆系统存储情况：`results\external_memory_audit\xxx\report.html`文件。
+   - 作用：可视化某存档的所有agent在外置记忆系统中的存储情况，包括记忆数量、记忆层级情况等。
+   - 生成：运行完仿真实验后，运行`visualize_external_memory_audit.py`脚本生成。
 
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+
+- 2026-05-07：可视化Prompt使用后，优化以前 Prompt 注入中的一些问题。
+- 2026-05-07：新增可视化强制干预对话时LLM调用的Prompt，包括患者、判断LLM、医生、评估LLM。可视化md文档在`result/checkpoints/xxx/force_prompt_traces`里。注：md文档命名的时间不一定是发生对话的时间。
+- 2026-05-07：合并学长更新的主诉链分支。
+- 2026-05-06：修复emotion模块在app.py以及仿真链路中未能正常显示的问题，因为emotion模块绑定在了旧人设链路中，待学长修复后再进行二次更新。
+- 2026-04-28：手动升级session对话记忆、注入记忆的层级。（0429发现bug，已修复）
+  - 相关文件：`data/config.json`、`modules/external_memory_bridge.py`、`modules/memory_injection_manager.py`、`modules/intervention_manager.py`
+-
+- 2026-04-28：新增删除外置记忆系统中某存档所有agent接口、脚本。【待实验】
+  - 相关文件：`cleanup_memory_users_by_save.py`、`modules/ec_doll_memory_service_client.py`、
+
+- 2026-04-26：截断外置记忆系统的【近期原文（本服务入库）】记忆数量（"short_term_recent_n"配置项）、去掉 [2026-04-25Txx:xx:xx] 前缀
+  - 相关文件：`modules/external_memory_bridge.py`、`data/config.json`
+
+- 2026-04-26：修复启用外置记忆系统时未能正确注入动态抑郁人设问题（0428发现新bug，已修复）
+  - 相关文件：
+    - `data/config.json`
+    - `data/prompts/generate_chat_external_memory.txt`
+    - `modules/agent.py`
+    - `modules/external_memory_bridge.py`
+    - `modules/prompt/scratch.py`
+    - `customization/depression_scale_agent/app.py`
 
 - 2026-04-25：量表评估更新，对齐外置记忆系统
   - 相关文件：`customization\depression_scale_agent\app.py`
@@ -53,6 +94,7 @@
 - 建议 Python 3.10+。
 - 根目录当前未维护统一 `requirements.txt`；请使用项目现有可运行环境。
 - 若新环境首次运行，按报错安装依赖（常见：`flask`、`python-dotenv`、`requests`）。
+- 在当前目录下新建`.env`文件，配置deepseek api key，格式为`DEEPSEEK_API_KEY=sk-xxxx`
 
 ## 3.2 启动仿真
 
@@ -240,6 +282,10 @@ python visualize_agent_memory.py
 ## 6.7 analyze_depression_dynamic_state.py 作用
 
 该脚本用于分析动态抑郁人设系统的状态变化情况，输出每个step的状态数据，方便查看和分析。(具体由赵学长更新)
+
+## 6.8 cleanup_memory_users_by_save.py作用
+
+该脚本用于删除外置记忆系统中某个存档下的所有agent数据，避免外置记忆系统的数据冗余。
 
 ## 7. 常见问题与排障
 

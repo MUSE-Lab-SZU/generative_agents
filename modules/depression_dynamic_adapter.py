@@ -9,7 +9,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from modules import utils
 from modules.depression import DepressionSimulationEngine
 from modules import depression_dynamic_codec as dynamic_codec
-from modules.model.llm_model import create_llm_model
 
 
 DEFAULT_DEPRESSION_TARGET_HINTS = {
@@ -53,6 +52,7 @@ DEFAULT_GLOBAL_CFG = {
     "normal_chain_enabled": True,
     "forced_chain_enabled": True,
     "prompt_injection_enabled": True,
+    "emotion_prompt_injection_enabled": True,
     "event_commit_enabled": True,
     "target_hints": sorted(list(DEFAULT_DEPRESSION_TARGET_HINTS)),
     "on_missing_agent_config": "warn_and_disable",
@@ -60,25 +60,18 @@ DEFAULT_GLOBAL_CFG = {
     "persist_enabled": True,
 }
 
-DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
+DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG = {
     "enabled": False,
     "min_confidence": 0.60,
     "max_text_length": 1600,
-    "signal_weight": 0.25,
     "allowed_event_keys": ["chat_event"],
+    "retry": 1,
 }
-
-LLM_TRANSITION_TRIGGER_WHITELIST = {
-    "positive_interaction",
-    "positive_event",
-    "therapy",
-    "therapy_progress",
-    "sustained_support",
-    "stress",
-    "extreme_stress",
-    "negative_event",
-    "isolation",
-    "trigger_event",
+# legacy alias: keep old helper functions import-safe during migration
+DEFAULT_LLM_TRANSITION_JUDGE_CFG = {
+    **DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG,
+    "timeout_ms": 1200,
+    "signal_weight": 0.25,
 }
 
 
@@ -96,9 +89,12 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     agent.depression_dynamic_event_interaction_mapping = dict(
         DEFAULT_DEPRESSION_EVENT_INTERACTION_MAPPING
     )
-    agent.depression_dynamic_llm_transition_judge_cfg = dict(
-        DEFAULT_LLM_TRANSITION_JUDGE_CFG
+    agent.depression_dynamic_llm_roadmap_cfg = dict(
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG
     )
+    agent.depression_dynamic_llm_transition_judge_cfg = dict(
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG
+    )  # legacy alias
 
     if not cfg.get("enabled", False):
         _log(agent, "info", "[DEPR_DYNAMIC][INIT] agent={} enabled=false reason=global_disabled".format(agent.name))
@@ -156,8 +152,8 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     prompt_map, event_map = _build_interaction_mappings(simulation_config)
     relationship_mapping = _build_relationship_mapping(simulation_config.get("relationship_mapping", {}))
     target_hints = _resolve_target_hints(cfg, simulation_config)
-    llm_transition_cfg = _normalize_llm_transition_judge_cfg(
-        simulation_config.get("llm_transition_judge", {})
+    llm_roadmap_cfg = _normalize_llm_roadmap_judge_cfg(
+        simulation_config.get("complaint_roadmap_judge", simulation_config.get("llm_transition_judge", {}))
     )
 
     agent.depression_dynamic_engine = engine
@@ -166,7 +162,8 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     agent.depression_dynamic_relationship_mapping = relationship_mapping
     agent.depression_dynamic_prompt_interaction_mapping = prompt_map
     agent.depression_dynamic_event_interaction_mapping = event_map
-    agent.depression_dynamic_llm_transition_judge_cfg = llm_transition_cfg
+    agent.depression_dynamic_llm_roadmap_cfg = llm_roadmap_cfg
+    agent.depression_dynamic_llm_transition_judge_cfg = llm_roadmap_cfg  # legacy alias
 
     load_result = {"loaded": False, "reason": "persist_disabled_or_empty"}
     if cfg.get("persist_enabled", True):
@@ -179,14 +176,14 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
     _log(
         agent,
         "info",
-        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={} llm_transition_enabled={} llm_allowed_events={}".format(
+        "[DEPR_DYNAMIC][INIT] agent={} enabled=true path={} hints={} loaded={} load_reason={} llm_roadmap_enabled={} llm_allowed_events={}".format(
             agent.name,
             config_path,
             len(target_hints),
             bool(load_result.get("loaded", False)),
             load_result.get("reason", ""),
-            bool(llm_transition_cfg.get("enabled", False)),
-            ",".join(list(llm_transition_cfg.get("allowed_event_keys", []))),
+            bool(llm_roadmap_cfg.get("enabled", False)),
+            ",".join(list(llm_roadmap_cfg.get("allowed_event_keys", []))),
         ),
     )
 
@@ -239,9 +236,20 @@ def patch_prompt(
             )
             return prompt
 
+        emotion_block = ""
+        if func_hint == "generate_chat" and bool(
+            cfg.get("emotion_prompt_injection_enabled", True)
+        ):
+            emotion_block = _render_dynamic_emotion_section(agent)
+
+        prefix_parts = [layer_text]
+        if isinstance(emotion_block, str) and emotion_block.strip():
+            prefix_parts.append(emotion_block.strip())
+        prompt_prefix = "\n\n".join([part for part in prefix_parts if part])
+
         patched_prompt = dict(prompt)
         patched_prompt["prompt"] = (
-            f"{layer_text}\n\n"
+            f"{prompt_prefix}\n\n"
             f"{'=' * 50}\n\n"
             f"=== 当前任务指令层 ===\n{original_prompt}"
         )
@@ -303,12 +311,10 @@ def commit_event(
         interaction_type = "治疗对话"
 
     try:
-        llm_transition_signal = _build_llm_transition_signal(
+        roadmap_cfg = getattr(agent, "depression_dynamic_llm_roadmap_cfg", {})
+        roadmap_completion_func = _build_roadmap_completion_func(
             agent=agent,
             event_key=event_key,
-            interaction_type=interaction_type,
-            relationship=relationship,
-            conversation_content=conversation_content or "",
         )
         result = agent.depression_dynamic_engine.commit_interaction(
             location=_resolve_current_location(agent),
@@ -317,18 +323,19 @@ def commit_event(
             relationship=relationship,
             interaction_type=interaction_type,
             conversation_content=conversation_content or "",
-            llm_transition_signal=llm_transition_signal,
+            roadmap_completion_func=roadmap_completion_func,
+            roadmap_llm_cfg=roadmap_cfg,
         )
         _log(
             agent,
             "info",
-            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true transitioned={} state={} llm_signal={}".format(
+            "[DEPR_DYNAMIC][EVENT] agent={} key={} forced={} committed=true advanced={} state={} llm_roadmap={}".format(
                 agent.name,
                 event_key,
                 bool(forced),
-                bool((result or {}).get("transitioned", False)),
+                bool((result or {}).get("advanced", (result or {}).get("transitioned", False))),
                 (result or {}).get("current_state", ""),
-                bool(llm_transition_signal),
+                bool(roadmap_completion_func),
             ),
         )
         return result
@@ -402,6 +409,41 @@ def serialize_focus(focus: Any, max_items: int = 6) -> str:
     return "\n".join([line for line in lines if line])
 
 
+def _render_dynamic_emotion_section(agent: Any) -> str:
+    profile = getattr(agent, "depression_profile", {})
+    if not isinstance(profile, dict):
+        return ""
+    runtime = profile.get("runtime", {})
+    if not isinstance(runtime, dict):
+        return ""
+    emotion = runtime.get("emotion", {})
+    if not isinstance(emotion, dict):
+        return ""
+
+    label = str(emotion.get("label", "") or "").strip()
+    style = str(emotion.get("style", "") or "").strip()
+    volatility_note = str(emotion.get("volatility_note", "") or "").strip()
+    if not any([label, style, volatility_note]):
+        return ""
+
+    intensity_raw = emotion.get("intensity", 0.0)
+    try:
+        intensity = float(intensity_raw)
+    except Exception:
+        intensity = 0.0
+    intensity = max(0.0, min(1.0, intensity))
+
+    lines = ["=== Emotion (Current Speaking State) ==="]
+    if label:
+        lines.append(f"- Current Emotion: {label}")
+    if style:
+        lines.append(f"- Speaking Style: {style}")
+    lines.append(f"- Emotion Intensity: {intensity:.2f}")
+    if volatility_note:
+        lines.append(f"- Volatility Note: {volatility_note}")
+    return "\n".join(lines)
+
+
 def _runtime_ready(agent: Any) -> bool:
     return bool(
         getattr(agent, "depression_dynamic_enabled", False)
@@ -423,6 +465,7 @@ def _normalize_global_cfg(raw_cfg: Any) -> Dict[str, Any]:
         "normal_chain_enabled",
         "forced_chain_enabled",
         "prompt_injection_enabled",
+        "emotion_prompt_injection_enabled",
         "event_commit_enabled",
         "log_enabled",
         "persist_enabled",
@@ -445,8 +488,8 @@ def _normalize_global_cfg(raw_cfg: Any) -> Dict[str, Any]:
     return cfg
 
 
-def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
-    cfg = dict(DEFAULT_LLM_TRANSITION_JUDGE_CFG)
+def _normalize_llm_roadmap_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG)
     if not isinstance(raw_cfg, dict):
         return cfg
 
@@ -464,12 +507,7 @@ def _normalize_llm_transition_judge_cfg(raw_cfg: Any) -> Dict[str, Any]:
         200,
         8000,
     )
-    cfg["signal_weight"] = _bounded_float(
-        raw_cfg.get("signal_weight"),
-        cfg["signal_weight"],
-        0.0,
-        1.0,
-    )
+    cfg["retry"] = _bounded_int(raw_cfg.get("retry"), cfg["retry"], 1, 5)
 
     allowed = raw_cfg.get("allowed_event_keys", cfg["allowed_event_keys"])
     cleaned_allowed: List[str] = []
@@ -731,40 +769,54 @@ def _resolve_time_of_day(agent: Any) -> str:
     return "night"
 
 
-def _resolve_transition_judge_llm(agent: Any) -> (Optional[Any], str):
-    intervention = getattr(agent, "intervention", None)
-    if intervention is not None and hasattr(intervention, "get_forced_llm_runtime_config"):
-        forced_cfg = None
+def _build_roadmap_completion_func(
+    agent: Any,
+    event_key: str,
+) -> Optional[Any]:
+    raw_cfg = getattr(agent, "depression_dynamic_llm_roadmap_cfg", {})
+    cfg = raw_cfg if isinstance(raw_cfg, dict) else dict(DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG)
+    if not bool(cfg.get("enabled", False)):
+        return None
+
+    allowed_event_keys = cfg.get("allowed_event_keys", [])
+    if isinstance(allowed_event_keys, list) and allowed_event_keys:
+        if event_key not in allowed_event_keys:
+            return None
+
+    llm = getattr(agent, "_llm", None)
+    if llm is None:
+        _log(
+            agent,
+            "debug",
+            "[DEPR_DYNAMIC][LLM_ROADMAP] agent={} key={} enabled=true ready=false reason=llm_unavailable".format(
+                getattr(agent, "name", ""),
+                event_key,
+            ),
+        )
+        return None
+    if callable(getattr(llm, "is_available", None)):
         try:
-            forced_cfg = intervention.get_forced_llm_runtime_config()
-        except Exception as e:
-            _log(
-                agent,
-                "debug",
-                "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_cfg_error={}".format(
-                    getattr(agent, "name", ""),
-                    e,
-                ),
-            )
-            forced_cfg = None
-        if isinstance(forced_cfg, dict) and forced_cfg:
-            try:
-                forced_llm = getattr(agent, "_forced_llm", None)
-                if forced_llm is None:
-                    forced_llm = create_llm_model(forced_cfg)
-                    setattr(agent, "_forced_llm", forced_llm)
-                if forced_llm is not None:
-                    return forced_llm, "depr_transition_judge_forced"
-            except Exception as e:
-                _log(
-                    agent,
-                    "debug",
-                    "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} forced_llm_init_error={}".format(
-                        getattr(agent, "name", ""),
-                        e,
-                    ),
-                )
-    return getattr(agent, "_llm", None), "depr_transition_judge"
+            if not bool(llm.is_available()):
+                return None
+        except Exception:
+            pass
+
+    retry = _bounded_int(
+        cfg.get("retry"),
+        DEFAULT_COMPLAINT_ROADMAP_JUDGE_CFG["retry"],
+        1,
+        5,
+    )
+
+    def _completion(prompt: str) -> str:
+        return llm.completion(
+            prompt=prompt,
+            retry=retry,
+            caller="depr_roadmap_judge",
+            failsafe="",
+        )
+
+    return _completion
 
 
 def _build_llm_transition_signal(
@@ -784,7 +836,7 @@ def _build_llm_transition_signal(
         if event_key not in allowed_event_keys:
             return None
 
-    llm, caller_name = _resolve_transition_judge_llm(agent)
+    llm = getattr(agent, "_llm", None)
     if llm is None:
         _log(
             agent,
@@ -811,10 +863,20 @@ def _build_llm_transition_signal(
             8000,
         ),
     )
-    if not clipped_text:
-        return None
+    current_state = "unknown"
+    try:
+        runtime_engine = getattr(agent, "depression_dynamic_engine", None)
+        state_machine = getattr(runtime_engine, "state_machine", None)
+        if callable(getattr(state_machine, "get_current_state", None)):
+            current_state = str(state_machine.get_current_state() or "unknown")
+    except Exception:
+        current_state = "unknown"
 
     prompt = _build_llm_transition_prompt(
+        event_key=event_key,
+        current_state=current_state,
+        location=_resolve_current_location(agent),
+        time_of_day=_resolve_time_of_day(agent),
         interaction_type=interaction_type,
         relationship=relationship,
         conversation_content=clipped_text,
@@ -824,7 +886,7 @@ def _build_llm_transition_signal(
         raw = llm.completion(
             prompt=prompt,
             retry=1,
-            caller=caller_name,
+            caller="depr_transition_judge",
             failsafe="",
         )
     except Exception as e:
@@ -866,69 +928,53 @@ def _build_llm_transition_signal(
     _log(
         agent,
         "debug",
-        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} matched={}".format(
+        "[DEPR_DYNAMIC][LLM_TRANSITION] agent={} key={} parse=true accepted=true confidence={} positive={} negative={}".format(
             getattr(agent, "name", ""),
             event_key,
             signal.get("confidence", 0.0),
-            ",".join(signal.get("matched_triggers", [])),
+            signal.get("positive_score", 0.0),
+            signal.get("negative_score", 0.0),
         ),
     )
     return signal
 
 
 def _build_llm_transition_prompt(
+    event_key: str,
+    current_state: str,
+    location: str,
+    time_of_day: str,
     interaction_type: str,
     relationship: Optional[str],
     conversation_content: str,
 ) -> str:
-    whitelist = ", ".join(sorted(list(LLM_TRANSITION_TRIGGER_WHITELIST)))
-    # Use f-string composition to avoid brace-format collision in JSON template.
+    content = str(conversation_content or "").strip()
+    if not content:
+        content = "(no explicit conversation text; infer from context only)"
     return (
-        "You are a depression-state transition signal extractor. "
+        "You are a depression-state transition semantic evaluator. "
         "Output exactly one JSON object and nothing else.\n"
-        "Task: infer matched transition triggers and directional scores from dialogue.\n"
-        "Required schema:\n"
+        "Task: infer recovery/worsening directional signals from context and dialogue.\n"
+        "Output schema:\n"
         "{\n"
-        '  "matched_triggers": ["..."],\n'
         '  "positive_score": 0.0,\n'
         '  "negative_score": 0.0,\n'
         '  "confidence": 0.0\n'
         "}\n"
         "Constraints:\n"
-        "- matched_triggers must be selected from whitelist only.\n"
         "- positive_score / negative_score / confidence must be in [0, 1].\n"
-        "- If uncertain, return low confidence with empty matched_triggers.\n"
-        f"Trigger whitelist: {whitelist}\n\n"
-        f"Interaction type: {str(interaction_type or '')}\n"
-        f"Relationship: {str(relationship or '')}\n"
-        f"Conversation:\n{conversation_content}\n"
+        "- positive_score means recovery-direction signal strength.\n"
+        "- negative_score means worsening-direction signal strength.\n"
+        "- If information is insufficient, lower confidence.\n\n"
+        "Context:\n"
+        f"event_key: {str(event_key or '')}\n"
+        f"current_state: {str(current_state or '')}\n"
+        f"location: {str(location or '')}\n"
+        f"time_of_day: {str(time_of_day or '')}\n"
+        f"interaction_type: {str(interaction_type or '')}\n"
+        f"relationship: {str(relationship or '')}\n"
+        f"conversation:\n{content}\n"
     )
-
-    return (
-        "你是抑郁状态转换信号抽取器。仅输出一个 JSON 对象，不要输出其他文字。\n"
-        "任务：基于对话内容判断可匹配触发词，并给出正负向分数与置信度。\n"
-        "必须遵循字段：\n"
-        "{\n"
-        '  "matched_triggers": ["..."],\n'
-        '  "positive_score": 0.0,\n'
-        '  "negative_score": 0.0,\n'
-        '  "confidence": 0.0\n'
-        "}\n"
-        "字段约束：\n"
-        "- matched_triggers 只能从白名单中选择。\n"
-        "- positive_score / negative_score / confidence 必须在 0 到 1 之间。\n"
-        "- 如果无法判断，返回低置信度和空触发词。\n"
-        "触发词白名单：{}\n\n"
-        "互动类型：{}\n"
-        "关系类型：{}\n"
-        "对话内容：\n{}\n"
-    ).format(
-        whitelist,
-        str(interaction_type or ""),
-        str(relationship or ""),
-        conversation_content,
-    )
-
 
 def _sanitize_llm_transition_signal(
     payload: Dict[str, Any],
@@ -953,25 +999,10 @@ def _sanitize_llm_transition_signal(
 
     positive_score = _bounded_float(payload.get("positive_score"), 0.0, 0.0, 1.0)
     negative_score = _bounded_float(payload.get("negative_score"), 0.0, 0.0, 1.0)
-
-    matched_triggers: List[str] = []
-    seen = set()
-    raw_matched = payload.get("matched_triggers", [])
-    if isinstance(raw_matched, list):
-        for trigger in raw_matched:
-            text = str(trigger or "").strip()
-            if not text or text in seen:
-                continue
-            if text not in LLM_TRANSITION_TRIGGER_WHITELIST:
-                continue
-            seen.add(text)
-            matched_triggers.append(text)
-
-    if not matched_triggers and positive_score <= 0.0 and negative_score <= 0.0:
+    if positive_score <= 0.0 and negative_score <= 0.0:
         return None
 
     return {
-        "matched_triggers": matched_triggers,
         "positive_score": positive_score,
         "negative_score": negative_score,
         "confidence": confidence,

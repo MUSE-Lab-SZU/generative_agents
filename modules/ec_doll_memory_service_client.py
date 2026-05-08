@@ -38,6 +38,7 @@ class ECDollMemoryServiceClient:
         "retrieve": "POST /retrieve",
         "milestones": "GET /api/milestones",
         "memories": "GET /api/memories",
+        "user_delete": "DELETE /api/users/{user_id}",
         "memory_update": "PUT /api/memories/{id}",
         "memory_delete": "DELETE /api/memories/{id}",
         "memory_promote": "POST /api/memories/{id}/promote",
@@ -273,6 +274,31 @@ class ECDollMemoryServiceClient:
         - 透传服务端返回，常见字段：`status`, `message`, `id`。
         """
         data = self._request("DELETE", f"/api/memories/{memory_id}")
+        return data if isinstance(data, dict) else {}
+
+    def delete_user_data(self, user_id: str, dry_run: bool = False) -> JsonDict:
+        """
+        按 user_id 级联清理：`DELETE /api/users/{user_id}`。
+
+        输入（Path + Query）：
+        - `user_id`(str, 必填): 目标用户 ID。
+        - `dry_run`(bool, 可选): 默认 `False`；为 `True` 时只预览匹配条数，不执行删除。
+
+        输出（JSON）：
+        - `status`(str): `ok` / `partial` / `dry_run` / `error`。
+        - `deleted_chroma`(int): Chroma 匹配条数（或删除条数）。
+        - `deleted_pg`(dict): PG 各表计数。
+        - `deleted_redis`(dict): Redis key 命中情况。
+        - `errors`(list): 分层删除失败信息。
+        """
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            raise ValueError("delete_user_data requires non-empty user_id")
+        data = self._request(
+            "DELETE",
+            f"/api/users/{user_id}",
+            params={"dry_run": dry_run},
+        )
         return data if isinstance(data, dict) else {}
 
     def promote_memory(self, memory_id: str) -> JsonDict:

@@ -48,8 +48,16 @@
             "timeout": 10.0,
             "read_mode": "chat_only",
             "fallback_to_local": true,
+            "short_term_recent_n": 20,
             "ingest_template_file": "data/prompts/external_memory_ingest.txt",
-            "chat_prompt_file": "data/prompts/generate_chat_external_memory.txt"
+            "updata_to_L2_apply_scenes": [
+                "all_session_chat"
+            ],
+            "updata_to_milestone_apply_scenes": [
+                "session2.3_completed",
+                "session3.3-A_completed",
+                "session4.2_completed"
+            ]
         }
     },
     "intervention": {
@@ -258,6 +266,8 @@
                     "enabled": true,
                     "target_agent": "卡布达",
                     "source": "初始化规则注入_卡布达抑郁压力事件",
+                    "update_to_L2": false,
+                    "update_to_milestone": true,
                     "options": {
                         "allow_partial_success": true,
                         "dedup_mode": "global"
@@ -274,6 +284,8 @@
                             "session4.4"
                         ]
                     },
+                    "update_to_L2": true,
+                    "update_to_milestone": false,
                     "options": {
                         "allow_partial_success": true,
                         "dedup_mode": "global",

@@ -111,7 +111,7 @@ python start.py --name sim_dual_path --step 30 --stride 10 --verbose debug
 判断独立路径生效的经验标准：
 
 1. 某些轮次无规则触发词命中仍出现状态转换。
-2. 状态转换触发记录中可见 `llm_signal` 或 LLM 匹配触发词。
+2. 状态转换触发记录中可见 `llm_signal`，且转移方向与 `positive_score/negative_score` 一致。
 3. 在同样规则输入下，仅调整 `signal_weight` 时，转移率可观察变化。
 
 ## 8. 调参建议

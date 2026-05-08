@@ -125,6 +125,51 @@ class SimulateServer:
                         session_count,
                     )
                 )
+            forced_prompt_dir = os.path.join(self.checkpoints_folder, "forced_prompt_traces")
+            os.makedirs(forced_prompt_dir, exist_ok=True)
+            forced_prompt_payload = {"sessions": []}
+            if self.intervention and hasattr(self.intervention, "export_forced_prompt_trace_payload"):
+                try:
+                    payload = self.intervention.export_forced_prompt_trace_payload()
+                    if isinstance(payload, dict):
+                        forced_prompt_payload = payload
+                except Exception:
+                    forced_prompt_payload = {"sessions": []}
+            forced_sessions = (
+                forced_prompt_payload.get("sessions", [])
+                if isinstance(forced_prompt_payload, dict)
+                else []
+            )
+            written_count = 0
+            if isinstance(forced_sessions, list):
+                for session_item in forced_sessions:
+                    if not isinstance(session_item, dict):
+                        continue
+                    meeting = session_item.get("meeting", {}) if isinstance(session_item.get("meeting", {}), dict) else {}
+                    meeting_id = str(meeting.get("meeting_id", "") or "").strip() or "meeting_unknown"
+                    safe_meeting_id = (
+                        meeting_id.replace(":", "")
+                        .replace("/", "_")
+                        .replace("\\", "_")
+                    )
+                    md_path = os.path.join(
+                        forced_prompt_dir,
+                        "{}_prompt_trace.md".format(safe_meeting_id),
+                    )
+                    if self.intervention and hasattr(self.intervention, "render_forced_prompt_trace_markdown"):
+                        md_content = self.intervention.render_forced_prompt_trace_markdown(session_item)
+                    else:
+                        md_content = "# forced prompt trace\n"
+                    with open(md_path, "w", encoding="utf-8") as f:
+                        f.write(str(md_content or ""))
+                    written_count += 1
+            if self.logger:
+                self.logger.info(
+                    "[FORCED_PROMPT_TRACE_WRITE] dir={} files={}".format(
+                        forced_prompt_dir,
+                        written_count,
+                    )
+                )
 
             if stride > 0:
                 timer.forward(stride)
