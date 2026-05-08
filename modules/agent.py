@@ -185,6 +185,26 @@ class Agent:
         func = getattr(self.scratch, "prompt_" + func_hint)
         prompt = func(*args, **kwargs)
         prompt = dda.patch_prompt(self, func_hint, prompt, args, kwargs)
+        if func_hint == "generate_chat" and isinstance(prompt, dict):
+            intervention_state = self.status.get("intervention", {})
+            if not isinstance(intervention_state, dict):
+                intervention_state = {}
+                self.status["intervention"] = intervention_state
+            other_name = ""
+            if len(args) >= 2:
+                other_name = str(getattr(args[1], "name", "") or "")
+            turn_no = -1
+            try:
+                turn_no = int(kwargs.get("turn_no", -1) or -1)
+            except Exception:
+                turn_no = -1
+            intervention_state["last_generate_chat_prompt"] = {
+                "prompt_text": str(prompt.get("prompt", "") or ""),
+                "turn_no": turn_no,
+                "speaker": str(self.name or ""),
+                "other": other_name,
+                "ts": str(utils.get_timer().get_date("%Y%m%d-%H:%M:%S") or ""),
+            }
         terminate_policy = {
             "retry": 2,
             "force_forced_llm": True,
@@ -300,6 +320,49 @@ class Agent:
         else:
             output = prompt.get("failsafe")
         msg["<OUTPUT>"] = "\n" + str(output) + "\n"
+        try:
+            if (
+                self.intervention
+                and func_hint == "generate_chat"
+                and isinstance(self._chat_route_ctx, dict)
+                and bool(self._chat_route_ctx.get("forced", False))
+                and hasattr(self.intervention, "append_forced_prompt_trace_record")
+            ):
+                peer_agent = self._chat_route_ctx.get("peer_agent")
+                turn_no = -1
+                try:
+                    turn_no = int(kwargs.get("turn_no", -1) or -1)
+                except Exception:
+                    turn_no = -1
+                route_value = route if "route" in locals() else "fallback"
+                route_reason_value = route_reason if "route_reason" in locals() else "fallback_no_reason"
+                retry_value = 0
+                try:
+                    retry_value = int((prompt or {}).get("retry", 0) or 0)
+                except Exception:
+                    retry_value = 0
+                self.intervention.append_forced_prompt_trace_record(
+                    speaker=self,
+                    other=peer_agent,
+                    role="",
+                    prompt_text=str((prompt or {}).get("prompt", "") or ""),
+                    output=output,
+                    turn_no=turn_no,
+                    meta={
+                        "source": "agent_generate_chat",
+                        "caller": str(func_hint or ""),
+                        "route": str(route_value or ""),
+                        "reason": str(route_reason_value or ""),
+                        "retry": retry_value,
+                    },
+                )
+        except Exception as e:
+            self.logger.warning(
+                "[FORCED_PROMPT_TRACE_APPEND_FAIL] agent={} err={}".format(
+                    self.name,
+                    str(e),
+                )
+            )
         self.logger.debug(utils.block_msg(title, msg))
         return output
 

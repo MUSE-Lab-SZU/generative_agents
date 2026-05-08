@@ -1182,6 +1182,7 @@ class InterventionManager:
                 policy.get("prompt_file", ""),
             )
         )
+        prompt_text = ""
         try:
             prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("prompt_file", "") or ""))
             prompt_text = self._render_prompt_template(
@@ -1215,6 +1216,21 @@ class InterventionManager:
                     len(str(normalized.get("reason", "") or "")),
                 )
             )
+            self.append_forced_prompt_trace_record(
+                speaker=doctor,
+                other=patient,
+                role="session_eval_llm",
+                prompt_text=prompt_text,
+                output=normalized,
+                turn_no=-1,
+                meeting_id=str(meeting_id or ""),
+                pair_key=str(pair_key or ""),
+                meta={
+                    "source": "session_eval",
+                    "route": str(policy.get("route", "forced_llm") or ""),
+                    "retry": int(policy.get("retry", 2) or 2),
+                },
+            )
             return normalized
         except Exception as exc:
             fallback = self._normalize_session_eval_output({})
@@ -1226,6 +1242,22 @@ class InterventionManager:
                     bool(fallback.get("session_end", False)),
                     len(str(fallback.get("reason", "") or "")),
                 )
+            )
+            self.append_forced_prompt_trace_record(
+                speaker=doctor,
+                other=patient,
+                role="session_eval_llm",
+                prompt_text=prompt_text,
+                output=fallback,
+                turn_no=-1,
+                meeting_id=str(meeting_id or ""),
+                pair_key=str(pair_key or ""),
+                meta={
+                    "source": "session_eval_error",
+                    "route": str(policy.get("route", "forced_llm") or ""),
+                    "retry": int(policy.get("retry", 2) or 2),
+                    "error": str(exc),
+                },
             )
             return fallback
 
@@ -1282,6 +1314,7 @@ class InterventionManager:
             )
             return default_output
 
+        prompt_text = ""
         try:
             self._log_highlight(
                 "[DIALOG_JUDGE_CALL] turn={} retry={} prompt_file={}".format(
@@ -1309,6 +1342,18 @@ class InterventionManager:
                     bool(normalized.get("terminate", False)),
                 )
             )
+            self.append_forced_prompt_trace_record(
+                speaker=speaker,
+                other=other,
+                role="judge_llm",
+                prompt_text=prompt_text,
+                output=normalized,
+                turn_no=int(turn_no or -1),
+                meta={
+                    "source": "dialog_judge",
+                    "retry": int(policy.get("retry", 2) or 2),
+                },
+            )
             return normalized
         except Exception as exc:
             self._log_highlight(
@@ -1316,6 +1361,23 @@ class InterventionManager:
                     int(turn_no or 0),
                     str(exc),
                 )
+            )
+            self.append_forced_prompt_trace_record(
+                speaker=speaker,
+                other=other,
+                role="judge_llm",
+                prompt_text=prompt_text,
+                output={
+                    "valid": False,
+                    "terminate": False,
+                    "advice": "",
+                    "error": str(exc),
+                },
+                turn_no=int(turn_no or -1),
+                meta={
+                    "source": "dialog_judge_error",
+                    "retry": int(policy.get("retry", 2) or 2),
+                },
             )
             return default_output
 
@@ -1651,32 +1713,27 @@ class InterventionManager:
             return int(default)
 
     def _build_patient_dynamic_state_text(self, patient_agent: Any) -> str:
-        payload = {
-            "agent": str(getattr(patient_agent, "name", "") or ""),
-            "depression_dynamic": {
-                "enabled": bool(getattr(patient_agent, "depression_dynamic_enabled", False)),
-                "cfg": {},
-                "runtime": {},
-            },
-        }
-        cfg = getattr(patient_agent, "depression_dynamic_cfg", {})
-        if isinstance(cfg, dict):
-            payload["depression_dynamic"]["cfg"] = copy.deepcopy(cfg)
-
-        engine = getattr(patient_agent, "depression_dynamic_engine", None)
-        if engine is not None and hasattr(engine, "to_dict"):
-            try:
-                runtime = engine.to_dict()
-                if isinstance(runtime, dict):
-                    payload["depression_dynamic"]["runtime"] = runtime
-            except Exception as exc:
-                self._log_highlight(
-                    "[DIALOG_JUDGE_DYNAMIC_STATE] patient={} runtime_export_failed={}".format(
-                        str(getattr(patient_agent, "name", "") or ""),
-                        str(exc),
-                    )
+        intervention_state = getattr(patient_agent, "status", {}).get("intervention", {})
+        cached = intervention_state.get("last_generate_chat_prompt", {}) if isinstance(intervention_state, dict) else {}
+        prompt_text = str((cached or {}).get("prompt_text", "") or "")
+        patient_name = str(getattr(patient_agent, "name", "") or "")
+        if not prompt_text:
+            self._log_highlight(
+                "[DIALOG_JUDGE_PATIENT_STATE_EMPTY] level=warning patient={} reason=cache_missing".format(
+                    patient_name
                 )
-        return json.dumps(payload, ensure_ascii=False)
+            )
+            return ""
+        marker = "=== 当前任务指令层 ==="
+        idx = prompt_text.find(marker)
+        if idx <= 0:
+            self._log_highlight(
+                "[DIALOG_JUDGE_PATIENT_STATE_EMPTY] level=warning patient={} reason=marker_not_found".format(
+                    patient_name
+                )
+            )
+            return ""
+        return str(prompt_text[:idx].strip() or "")
 
     def _normalize_dialog_judge_output(self, payload: Any) -> Dict[str, Any]:
         raw = payload if isinstance(payload, dict) else {}
@@ -1825,8 +1882,6 @@ class InterventionManager:
         latest = state.setdefault("latest_reason_by_pair", {})
         item = latest.get(str(pair_key or ""))
         if not isinstance(item, dict):
-            return ""
-        if str(item.get("current_session", "") or "") != str(current_session or ""):
             return ""
         return str(item.get("reason", "") or "")
 
@@ -2045,6 +2100,203 @@ class InterventionManager:
         if not isinstance(sessions, list):
             sessions = []
         return {"sessions": copy.deepcopy(sessions)}
+
+    def append_forced_prompt_trace_record(
+        self,
+        speaker: Any,
+        other: Any,
+        role: str,
+        prompt_text: str,
+        output: Any,
+        turn_no: int = -1,
+        meta: Optional[Dict[str, Any]] = None,
+        meeting_id: str = "",
+        pair_key: str = "",
+    ) -> None:
+        self._ensure_forced_prompt_trace_state_schema()
+
+        resolved_role = str(role or "").strip().lower()
+        doctor = None
+        patient = None
+        if speaker is not None and other is not None:
+            doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+
+        speaker_name = str(getattr(speaker, "name", "") or "")
+        doctor_name = str(getattr(doctor, "name", "") or "")
+        patient_name = str(getattr(patient, "name", "") or "")
+        if not resolved_role:
+            if speaker_name and speaker_name == doctor_name:
+                resolved_role = "doctor"
+            elif speaker_name and speaker_name == patient_name:
+                resolved_role = "patient"
+            else:
+                resolved_role = "unknown"
+
+        trace_meeting_id = str(meeting_id or "").strip()
+        trace_pair_key = str(pair_key or "").strip()
+        step_time = self._resolve_trace_step_time()
+        if doctor and patient:
+            resolved_meeting_id, resolved_pair_key, resolved_step_time = self._resolve_trace_session_context(
+                doctor,
+                patient,
+            )
+            if not trace_meeting_id:
+                trace_meeting_id = str(resolved_meeting_id or "")
+            if not trace_pair_key:
+                trace_pair_key = str(resolved_pair_key or "")
+            if resolved_step_time:
+                step_time = str(resolved_step_time or step_time)
+
+        state = self.state.setdefault("forced_prompt_trace_state", {})
+        sessions = state.setdefault("sessions", [])
+        session_item = self._ensure_trace_session(
+            sessions,
+            str(trace_meeting_id or ""),
+            str(trace_pair_key or ""),
+            str(step_time or self._resolve_trace_step_time()),
+        )
+        records = session_item.setdefault("records", [])
+        if not isinstance(records, list):
+            records = []
+            session_item["records"] = records
+
+        output_payload = self._normalize_forced_prompt_trace_output(output)
+        output_preview = self._forced_prompt_trace_output_preview(output_payload)
+        records.append(
+            {
+                "seq": len(records) + 1,
+                "role": resolved_role,
+                "turn_no": self._safe_int(turn_no, -1),
+                "prompt_text": str(prompt_text or ""),
+                "output": output_payload,
+                "meta": copy.deepcopy(meta if isinstance(meta, dict) else {}),
+                "ts": self._fmt_iso8601_with_tz(self._now()),
+            }
+        )
+        self._log_highlight(
+            "[FORCED_PROMPT_TRACE_APPEND] meeting_id={} pair_key={} role={} turn_no={} prompt_len={} output_len={}".format(
+                str(trace_meeting_id or ""),
+                str(trace_pair_key or ""),
+                resolved_role,
+                self._safe_int(turn_no, -1),
+                len(str(prompt_text or "")),
+                len(output_preview),
+            )
+        )
+
+    def export_forced_prompt_trace_payload(self) -> Dict[str, Any]:
+        self._ensure_forced_prompt_trace_state_schema()
+        state = self.state.setdefault("forced_prompt_trace_state", {})
+        sessions = state.get("sessions", [])
+        if not isinstance(sessions, list):
+            sessions = []
+        return {"sessions": copy.deepcopy(sessions)}
+
+    def render_forced_prompt_trace_markdown(self, session_item: Dict[str, Any]) -> str:
+        session = session_item if isinstance(session_item, dict) else {}
+        meeting = session.get("meeting", {}) if isinstance(session.get("meeting", {}), dict) else {}
+        records = session.get("records", []) if isinstance(session.get("records", []), list) else []
+
+        meeting_id = str(meeting.get("meeting_id", "") or "").strip() or "meeting_unknown"
+        pair_key = str(meeting.get("pair_key", "") or "").strip()
+        step_time = str(meeting.get("step_time", "") or "").strip()
+
+        counts = {
+            "patient": 0,
+            "doctor": 0,
+            "judge_llm": 0,
+            "session_eval_llm": 0,
+            "unknown": 0,
+        }
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            role_text = str(record.get("role", "") or "").strip().lower()
+            if role_text in counts:
+                counts[role_text] += 1
+            else:
+                counts["unknown"] += 1
+
+        lines = [
+            "# 强制干预对话 Prompt 全链路追踪",
+            "",
+            "- meeting_id: `{}`".format(meeting_id),
+            "- pair_key: `{}`".format(pair_key),
+            "- step_time: `{}`".format(step_time),
+            "- total_records: `{}`".format(len(records)),
+            "",
+        ]
+
+        for idx, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                continue
+            role_text = str(record.get("role", "") or "").strip().lower() or "unknown"
+            turn_no = self._safe_int(record.get("turn_no", -1), -1)
+            prompt_text = str(record.get("prompt_text", "") or "")
+            output_payload = record.get("output", "")
+            output_text = self._forced_prompt_trace_output_preview(output_payload)
+            if isinstance(output_payload, (dict, list)):
+                output_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
+            meta_payload = record.get("meta", {})
+            meta_text = "{}"
+            if isinstance(meta_payload, dict):
+                meta_text = json.dumps(meta_payload, ensure_ascii=False, indent=2)
+
+            lines.extend(
+                [
+                    "## Record {}".format(idx),
+                    "",
+                    "- role: `{}`".format(role_text),
+                    "- turn_no: `{}`".format(turn_no),
+                    "- ts: `{}`".format(str(record.get("ts", "") or "")),
+                    "",
+                    "### Prompt",
+                    "```text",
+                    prompt_text,
+                    "```",
+                    "",
+                    "### Output",
+                    "```text",
+                    output_text,
+                    "```",
+                    "",
+                    "### Meta",
+                    "```json",
+                    meta_text,
+                    "```",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "## Summary",
+                "",
+                "- patient_count: `{}`".format(counts["patient"]),
+                "- doctor_count: `{}`".format(counts["doctor"]),
+                "- judge_count: `{}`".format(counts["judge_llm"]),
+                "- session_eval_count: `{}`".format(counts["session_eval_llm"]),
+                "- unknown_count: `{}`".format(counts["unknown"]),
+                "- total_count: `{}`".format(len(records)),
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _normalize_forced_prompt_trace_output(self, output: Any) -> Any:
+        if isinstance(output, (dict, list)):
+            return copy.deepcopy(output)
+        if output is None:
+            return ""
+        return str(output)
+
+    def _forced_prompt_trace_output_preview(self, payload: Any) -> str:
+        if isinstance(payload, (dict, list)):
+            try:
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                return str(payload)
+        return str(payload or "")
 
     def _resolve_trace_session_context(self, doctor: Any, patient: Any):
         meeting_id = ""
@@ -2391,6 +2643,7 @@ class InterventionManager:
         self._ensure_consult_record_state_schema()
         self._ensure_dialog_judge_trace_state_schema()
         self._ensure_session_eval_state_schema()
+        self._ensure_forced_prompt_trace_state_schema()
 
     def _ensure_consult_record_state_schema(self) -> None:
         state = self.state.setdefault("consult_record_state", {})
@@ -2425,6 +2678,14 @@ class InterventionManager:
             state["latest_reason_by_pair"] = {}
         if not isinstance(state.get("history_by_pair"), dict):
             state["history_by_pair"] = {}
+
+    def _ensure_forced_prompt_trace_state_schema(self) -> None:
+        state = self.state.setdefault("forced_prompt_trace_state", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.state["forced_prompt_trace_state"] = state
+        if not isinstance(state.get("sessions"), list):
+            state["sessions"] = []
 
     def _build_rule_patients(self, rule: Dict[str, Any]) -> List[str]:
         patient = str(rule.get("patient", "") or "").strip()

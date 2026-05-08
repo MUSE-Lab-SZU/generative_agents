@@ -345,13 +345,38 @@ class ExternalMemoryBridge:
             raise last_exc
         raise RuntimeError("promote_retry_unexpected_empty: remote_id={}".format(remote_id))
 
+    def _milestone_with_retry(self, remote_id: str, is_milestone: bool) -> Dict[str, Any]:
+        delays_s = [0.1, 0.3, 0.8]
+        last_exc: Optional[Exception] = None
+        for idx, delay_s in enumerate(delays_s, start=1):
+            try:
+                return self.client.set_memory_milestone(remote_id, is_milestone)  # type: ignore[union-attr]
+            except Exception as exc:
+                status = self._extract_http_status_from_exc(exc)
+                if status != 404:
+                    raise
+                last_exc = exc
+                self._log(
+                    "warning",
+                    "[MILESTONE_RETRY] agent={} remote_id={} attempt={} status=404".format(
+                        self.agent_name,
+                        remote_id,
+                        idx,
+                    ),
+                )
+                if idx < len(delays_s):
+                    time.sleep(delay_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("milestone_retry_unexpected_empty: remote_id={}".format(remote_id))
+
     def _call_level_action(self, remote_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         op = str((action or {}).get("op", "") or "").strip()
         if op == "promote":
             return self._promote_with_retry(remote_id)
         if op == "milestone":
             is_milestone = bool((action or {}).get("is_milestone", False))
-            return self.client.set_memory_milestone(remote_id, is_milestone)  # type: ignore[union-attr]
+            return self._milestone_with_retry(remote_id, is_milestone)
         raise ValueError("unsupported_level_action: {}".format(op or "<empty>"))
 
     def apply_session_chat_memory_level_adjustment(
