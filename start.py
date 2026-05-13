@@ -8,8 +8,6 @@ from dotenv import load_dotenv, find_dotenv
 
 from modules.game import create_game, get_game
 from modules import utils
-from modules.intervention_manager import InterventionManager
-from modules import depression_runtime_manager as drm
 
 personas = [
     "卡布达",  # 抑郁症患者
@@ -45,15 +43,11 @@ class SimulateServer:
         else:
             self.logger = utils.create_io_logger(verbose)
 
-        drm.validate_all_agents_or_raise(config, self.load_static)
-
         # 创建游戏
         game = create_game(name, static_root, config, conversation, logger=self.logger)
         game.reset_game()
 
         self.game = get_game()
-        self.intervention = InterventionManager(config=self.config, logger=self.logger)
-        self.game.set_intervention_manager(self.intervention)
         self.tile_size = self.game.maze.tile_size
         self.agent_status = {}
         if "agent_base" in config:
@@ -77,7 +71,6 @@ class SimulateServer:
         for i in range(self.start_step, self.start_step + step):
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
-            self.intervention.on_step_start(self.game, timer.get_date())
             for name, status in self.agent_status.items():
                 plan = self.game.agent_think(name, status)["plan"]
                 agent = self.game.get_agent(name)
@@ -144,7 +137,6 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
     with open("data/config.json", "r", encoding="utf-8") as f:
         json_data = json.load(f)
         agent_config = json_data["agent"]
-        intervention_config = copy.deepcopy(json_data.get("intervention", {}))
 
     assets_root = os.path.join("assets", "village")
     config = {
@@ -154,8 +146,6 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
         "agent_base": agent_config,
         "agents": {},
     }
-    if intervention_config:
-        config["intervention"] = intervention_config
     for a in agents:
         config["agents"][a] = {
             "config_path": os.path.join(

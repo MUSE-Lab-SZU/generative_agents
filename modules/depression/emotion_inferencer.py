@@ -76,11 +76,9 @@ class EmotionInferencer:
             "- 如果信息不足，优先保持与上一轮相近，但允许有轻微波动。\n"
             "- 不要把 emotion 写成长期诊断结论。\n\n"
             f"静态Profile：{static_profile_json}\n"
-            f"当前主导事件：{current_event_json}\n"
-            f"当前有效抑郁画像：{merged_case_config_json}\n"
+            f"当前主导事件：{current_event_json}\n" # 想通过主诉链实现
             f"上一轮Emotion：{previous_emotion_json}\n"
             f"对话对象：{str(payload.get('other_agent', '') or '')}\n"
-            f"关系：{str(payload.get('relationship', '') or '')}\n"
             f"最近对话：{conversation_content if conversation_content else '（暂无对话内容）'}\n"
         )
 

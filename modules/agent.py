@@ -4,11 +4,8 @@ import os
 import math
 import random
 import datetime
-import copy
 
 from modules import memory, prompt, utils
-from modules import depression_runtime_manager as drm
-from modules import depression_dynamic_adapter as dda
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
 
@@ -19,66 +16,12 @@ class Agent:
         self.maze = maze
         self.conversation = conversation
         self._llm = None
-        self._forced_llm = None
-        self._chat_route_ctx = None
         self.logger = logger
 
         # agent config
         self.percept_config = config["percept"]
         self.think_config = config["think"]
         self.chat_iter = config["chat_iter"]
-        global_chat_history = config.get("chat_history", {}) or {}
-        local_chat_history = (config.get("_raw", {}) or {}).get("chat_history", {})
-        if not isinstance(local_chat_history, dict):
-            local_chat_history = {}
-        self.chat_history_config = {}
-        if isinstance(global_chat_history, dict):
-            self.chat_history_config.update(global_chat_history)
-        self.chat_history_config.update(local_chat_history)
-        global_chat_memory = config.get("chat_memory", {}) or {}
-        local_chat_memory = (config.get("_raw", {}) or {}).get("chat_memory", {})
-        if not isinstance(local_chat_memory, dict):
-            local_chat_memory = {}
-        self.chat_memory_config = {}
-        if isinstance(global_chat_memory, dict):
-            self.chat_memory_config.update(global_chat_memory)
-        self.chat_memory_config.update(local_chat_memory)
-        self.chat_summary_window_minutes = self._resolve_chat_summary_window_minutes(
-            self.chat_history_config.get("summary_window_minutes", 480)
-        )
-        self.chat_history_max_read_items = self._resolve_chat_history_max_read_items(
-            self.chat_history_config.get("max_read_items", 5)
-        )
-        self.chat_focus_retrieve_max = self._resolve_chat_focus_retrieve_max(
-            self.chat_history_config.get("focus_retrieve_max", 15)
-        )
-        self.chat_recent_turn_focus_n = self._resolve_chat_recent_turn_focus_n(
-            self.chat_history_config.get("recent_turn_focus_n", 4)
-        )
-        self.chat_memory_write_mode = self._resolve_chat_memory_write_mode(
-            self.chat_memory_config.get("write_mode", "hybrid")
-        )
-        self.logger.info(
-            "[CHAT_HISTORY_WINDOW] agent={} summary_window_minutes={} source={}".format(
-                self.name,
-                self.chat_summary_window_minutes,
-                "agent.chat_history.summary_window_minutes",
-            )
-        )
-        self.logger.info(
-            "[CHAT_HISTORY_READ_CFG] agent={} max_read_items={} focus_retrieve_max={} recent_turn_focus_n={}".format(
-                self.name,
-                self.chat_history_max_read_items,
-                self.chat_focus_retrieve_max,
-                self.chat_recent_turn_focus_n,
-            )
-        )
-        self.logger.info(
-            "[CHAT_MEMORY_WRITE_CFG] agent={} write_mode={}".format(
-                self.name,
-                self.chat_memory_write_mode,
-            )
-        )
 
         # memory
         self.spatial = memory.Spatial(**config["spatial"])
@@ -90,19 +33,11 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
-        self.profile = copy.deepcopy(config.get("profile", {})) if isinstance(config.get("profile", {}), dict) else {}
 
         # status
         status = {"poignancy": 0}
         self.status = utils.update_dict(status, config.get("status", {}))
         self.plan = config.get("plan", {})
-        self.intervention = None
-        self.depression_profile = drm.ensure_profile(config)
-        self.depression_dynamic_enabled = False
-        self.depression_dynamic_engine = None
-        self.depression_dynamic_cfg = {}
-        self.depression_dynamic_state = {}
-        dda.init_runtime(self, config)
 
         # record
         self.last_record = utils.get_timer().daily_duration()
@@ -159,123 +94,13 @@ class Agent:
             self.scratch, "prompt_" + func_hint
         ), "Can not find func prompt_{} from scratch".format(func_hint)
         func = getattr(self.scratch, "prompt_" + func_hint)
-        prompt = func(*args, **kwargs)
-        prompt = dda.patch_prompt(self, func_hint, prompt, args, kwargs)
-        terminate_policy = {
-            "retry": 2,
-            "force_forced_llm": True,
-            "source": "defaults",
-        }
-        if func_hint == "decide_chat_terminate":
-            if self.intervention and hasattr(self.intervention, "get_decide_chat_terminate_runtime_policy"):
-                try:
-                    policy = self.intervention.get_decide_chat_terminate_runtime_policy()
-                    if isinstance(policy, dict):
-                        terminate_policy.update(policy)
-                except Exception as e:
-                    self.logger.warning(
-                        "{} decide_chat_terminate policy error: {}".format(self.name, e)
-                    )
-            try:
-                retry = max(1, int(terminate_policy.get("retry", 2) or 2))
-            except Exception:
-                retry = 2
-            prompt["retry"] = retry
+        res = func(*args, **kwargs)._asdict()
         title, msg = "{}.{}".format(self.name, func_hint), {}
         if self.llm_available():
             self.logger.info("{} -> {}".format(self.name, func_hint))
-            route = "default"
-            route_reason = "default_path"
-            fallback = False
-            output = None
-            responses = []
-
-            should_try_forced = False
-            if self.intervention and isinstance(self._chat_route_ctx, dict):
-                forced_flag = bool(self._chat_route_ctx.get("forced", False))
-                peer_agent = self._chat_route_ctx.get("peer_agent")
-                if forced_flag and peer_agent and hasattr(self.intervention, "should_route_forced_llm"):
-                    should_try_forced = bool(
-                        self.intervention.should_route_forced_llm(
-                            speaker=self,
-                            other=peer_agent,
-                            forced=forced_flag,
-                        )
-                    )
-
-            if func_hint == "decide_chat_terminate" and not bool(terminate_policy.get("force_forced_llm", True)):
-                should_try_forced = False
-                route_reason = "terminate_policy_force_default"
-
-            if should_try_forced:
-                route_reason = "forced_route_eligible"
-                forced_cfg = None
-                try:
-                    forced_cfg = self.intervention.get_forced_llm_runtime_config()
-                except Exception as e:
-                    forced_cfg = None
-                    route_reason = "forced_cfg_error:{}".format(e)
-                    self.logger.warning("{} forced_llm cfg error: {}".format(self.name, e))
-
-                if forced_cfg:
-                    try:
-                        if not self._forced_llm:
-                            self._forced_llm = create_llm_model(forced_cfg)
-                        forced_prompt = dict(prompt)
-                        forced_prompt["failsafe"] = None
-                        forced_prompt["retry"] = max(
-                            1,
-                            int(forced_prompt.get("retry", forced_cfg.get("retry", 2)) or 2),
-                        )
-                        forced_prompt["temperature"] = float(forced_cfg.get("temperature", forced_prompt.get("temperature", 0.5)))
-                        output = self._forced_llm.completion(
-                            **forced_prompt,
-                            caller="{}_forced".format(func_hint),
-                        )
-                        responses = self._forced_llm.meta_responses
-                        if output is not None:
-                            route = "forced_llm"
-                            route_reason = "forced_llm_success"
-                        else:
-                            route_reason = "forced_llm_empty_fallback"
-                    except Exception as e:
-                        route_reason = "forced_llm_error:{}".format(e)
-                        self.logger.warning("{} forced_llm call error: {}".format(self.name, e))
-                else:
-                    route_reason = "forced_cfg_unavailable"
-
-            if route != "forced_llm":
-                fallback = should_try_forced
-                output = self._llm.completion(**prompt, caller=func_hint)
-                responses = self._llm.meta_responses
-
-            if func_hint == "decide_chat_terminate":
-                route_reason = "{}|terminate_retry={}|terminate_force_forced_llm={}|terminate_policy_source={}".format(
-                    route_reason,
-                    prompt.get("retry", 2),
-                    bool(terminate_policy.get("force_forced_llm", True)),
-                    terminate_policy.get("source", "defaults"),
-                )
-
-            self.logger.info(
-                "{} -> {} route={} fallback={} reason={}".format(
-                    self.name,
-                    func_hint,
-                    route,
-                    fallback,
-                    route_reason,
-                )
-            )
-            msg = {"<PROMPT>": "\n" + prompt["prompt"] + "\n"}
-            msg.update(
-                {
-                    "<RESPONSE[{}/{}]>".format(idx+1, len(responses)): "\n" + r + "\n"
-                    for idx, r in enumerate(responses)
-                }
-            )
-        else:
-            output = prompt.get("failsafe")
-        msg["<OUTPUT>"] = "\n" + str(output) + "\n"
+            output = self._llm.completion(**res)
+            msg = {"<PROMPT>": "\n" + res["prompt"] + "\n"}
+            msg.update({"response": output})
         self.logger.debug(utils.block_msg(title, msg))
         return output
 
@@ -433,8 +258,6 @@ class Agent:
                 )
                 start += duration
             plan["decompose"] = decompose
-        if self.intervention:
-            self.intervention.apply_forced_tasks(self, utils.get_timer().get_date())
         return self.schedule.current_plan()
 
     def revise_schedule(self, event, start, duration):
@@ -475,16 +298,6 @@ class Agent:
                     )
                 else:
                     valid_num += 1
-                    if event.fit(predicate="对话") and event.subject != self.name:
-                        self.logger.info(
-                            "[CHAT_SEMANTIC_DEDUP] agent={} skip_mirror_chat_event subject={} object={} address={}".format(
-                                self.name,
-                                event.subject,
-                                event.object,
-                                ":".join(event.address),
-                            )
-                        )
-                        continue
                     node_type = "chat" if event.fit(self.name, "对话") else "event"
                     node = self._add_concept(node_type, event)
                     self.status["poignancy"] += node.poignancy
@@ -550,39 +363,7 @@ class Agent:
         focus = self.completion("reflect_focus", nodes, 3)
         retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
         for r_nodes in retrieved.values():
-            allow_reflect_constraint = True
-            if self.intervention and isinstance(getattr(self.intervention, "config", None), dict):
-                intervention_cfg = self.intervention.config.get("intervention", {}) or {}
-                depression_cfg = intervention_cfg.get("depression_update", {}) or {}
-                allow_reflect_constraint = bool(
-                    depression_cfg.get("allow_reflection_constraint", True)
-                )
-            view = drm.build_intermediate_view(
-                self.depression_profile,
-                utils.get_timer().daily_duration(),
-                stage="reflect",
-                update_cfg=(
-                    ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                    if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                    else {}
-                ),
-            )
-            thoughts = self.completion(
-                "reflect_insights",
-                r_nodes,
-                5,
-                depression_reflect_block=(
-                    view.get("reflect_block", "") if allow_reflect_constraint else ""
-                ),
-            )
-            self.logger.info(
-                "========== [DEPR][REFLECT] agent={} allow_reflect_constraint={} reflect_block_len={} insights_count={} ==========".format(
-                    self.name,
-                    allow_reflect_constraint,
-                    len(view.get("reflect_block", "") if allow_reflect_constraint else ""),
-                    len(thoughts or []),
-                )
-            )
+            thoughts = self.completion("reflect_insights", r_nodes, 5)
             for thought, evidence in thoughts:
                 _add_thought(thought, evidence)
         # summary chats
@@ -679,29 +460,6 @@ class Agent:
         focus = None
         ignore_words = ignore_words or ["空闲"]
 
-        # 干预锁定优先：命中 lock 时优先尝试与 target 对话
-        if self.intervention and agents:
-            lock = self.status.get("intervention", {}).get("lock", {})
-            target_name = lock.get("target_agent", "")
-            if lock.get("enabled") and target_name in agents:
-                other = agents[target_name]
-                self.logger.info(
-                    "========== [INTERVENTION][FORCED_REACTION] {} lock hit -> target={} meeting_id={} ==========".format(
-                        self.name,
-                        target_name,
-                        lock.get("meeting_id", ""),
-                    )
-                )
-                if self._chat_with(other, focus={"events": [], "thoughts": []}, forced=True):
-                    return True
-                self.logger.info(
-                    "========== [INTERVENTION][FORCED_REACTION] {} forced chat failed with {} ==========".format(
-                        self.name,
-                        target_name,
-                    )
-                )
-                return False
-
         def _focus(concept):
             return concept.event.subject in agents
 
@@ -740,163 +498,16 @@ class Agent:
             return True
         return False
 
-    def _resolve_chat_control_policy(self, other, forced=False):
-        if not forced:
-            return {
-                "enabled": False,
-                "source": "normal_chat",
-                "forced_only": True,
-                "forced_chat_iter": -1,
-                "repeat_break_threshold": 2,
-                "forced_chat_min_turns": -1,
-                "forced_chat_max_turns": -1,
-                "normalize_notes": ["normal_chat"],
-            }
-
-        mgr = getattr(self, "intervention", None)
-        if not mgr or not hasattr(mgr, "get_chat_control_policy"):
-            self.logger.info(
-                "========== [INTERVENTION][CHAT_CTRL_POLICY_MISSING] initiator={} responder={} source=no_manager keep_main_loop=true ==========".format(
-                    self.name,
-                    other.name,
-                )
-            )
-            return {
-                "enabled": False,
-                "source": "no_manager",
-                "forced_only": True,
-                "forced_chat_iter": -1,
-                "repeat_break_threshold": 2,
-                "forced_chat_min_turns": -1,
-                "forced_chat_max_turns": -1,
-                "normalize_notes": ["no_manager"],
-            }
-
-        policy = mgr.get_chat_control_policy(self, other, forced=True)
-        if not isinstance(policy, dict):
-            self.logger.info(
-                "========== [INTERVENTION][CHAT_CTRL_POLICY_MISSING] initiator={} responder={} source=invalid_policy keep_main_loop=true ==========".format(
-                    self.name,
-                    other.name,
-                )
-            )
-            return {
-                "enabled": False,
-                "source": "invalid_policy",
-                "forced_only": True,
-                "forced_chat_iter": -1,
-                "repeat_break_threshold": 2,
-                "forced_chat_min_turns": -1,
-                "forced_chat_max_turns": -1,
-                "normalize_notes": ["invalid_policy"],
-            }
-        return policy
-
-    def _resolve_controlled_turn_limits(self, policy):
-        budget = self.chat_iter
-        min_turns = 1
-        max_turns = budget
-
-        forced_chat_iter = int(policy.get("forced_chat_iter", -1) or -1)
-        if forced_chat_iter != -1:
-            budget = forced_chat_iter
-
-        forced_chat_min_turns = int(policy.get("forced_chat_min_turns", -1) or -1)
-        if forced_chat_min_turns != -1:
-            min_turns = forced_chat_min_turns
-
-        forced_chat_max_turns = int(policy.get("forced_chat_max_turns", -1) or -1)
-        if forced_chat_max_turns != -1:
-            max_turns = forced_chat_max_turns
-
-        if max_turns < min_turns:
-            max_turns = min_turns
-        if budget < 1:
-            budget = 1
-
-        return budget, min_turns, max_turns
-
-    def _is_question_text(self, text):
-        content = str(text or "").strip()
-        if not content:
-            return False
-        if content.endswith("?") or content.endswith("？"):
-            return True
-        return ("吗" in content) or ("么" in content)
-
-    def _set_chat_route_ctx(self, other, forced=False):
-        prev_self_ctx = self._chat_route_ctx
-        prev_other_ctx = getattr(other, "_chat_route_ctx", None)
-        if bool(forced):
-            self._chat_route_ctx = {
-                "forced": True,
-                "peer_name": getattr(other, "name", ""),
-                "peer_agent": other,
-            }
-            if hasattr(other, "_chat_route_ctx"):
-                other._chat_route_ctx = {
-                    "forced": True,
-                    "peer_name": getattr(self, "name", ""),
-                    "peer_agent": self,
-                }
-        return prev_self_ctx, prev_other_ctx
-
-    def _restore_chat_route_ctx(self, other, prev_self_ctx, prev_other_ctx):
-        self._chat_route_ctx = prev_self_ctx
-        if hasattr(other, "_chat_route_ctx"):
-            other._chat_route_ctx = prev_other_ctx
-
-    def _chat_with(self, other, focus, forced=False):
-        trace_scope = "INTERVENTION" if forced else "CHAT_CORE"
-        self.logger.info(
-            "========== [{}][CHAT_ATTEMPT] {} -> {} forced={} ==========".format(
-                trace_scope,
-                self.name,
-                other.name,
-                forced,
-            )
-        )
+    def _chat_with(self, other, focus):
         if len(self.schedule.daily_schedule) < 1 or len(other.schedule.daily_schedule) < 1:
             # initializing
-            self.logger.info(
-                "========== [{}][CHAT_BLOCKED] reason=init_schedule_empty self={} other={} forced={} ==========".format(
-                    trace_scope,
-                    self.name,
-                    other.name,
-                    forced,
-                )
-            )
             return False
-        if not forced and self._skip_react(other):
-            self.logger.info(
-                "========== [{}][CHAT_BLOCKED] reason=skip_react self={} other={} ==========".format(
-                    trace_scope,
-                    self.name,
-                    other.name,
-                )
-            )
+        if self._skip_react(other):
             return False
-        if not forced and other.path:
-            self.logger.info(
-                "========== [{}][CHAT_BLOCKED] reason=other_path self={} other={} ==========".format(
-                    trace_scope,
-                    self.name,
-                    other.name,
-                )
-            )
+        if other.path:
             return False
         if self.get_event().fit(predicate="对话") or other.get_event().fit(predicate="对话"):
-            self.logger.info(
-                "========== [{}][CHAT_BLOCKED] reason=already_chatting self={} other={} forced={} ==========".format(
-                    trace_scope,
-                    self.name,
-                    other.name,
-                    forced,
-                )
-            )
             return False
-
-        prev_self_ctx, prev_other_ctx = self._set_chat_route_ctx(other, forced=forced)
 
         chats = self.associate.retrieve_chats(other.name)
         if chats:
@@ -906,442 +517,60 @@ class Agent:
                     self.name, other.name, delta, chats[0]
                 )
             )
-            if not forced and delta < 60:
-                self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
-                self.logger.info(
-                    "========== [{}][CHAT_BLOCKED] reason=delta_lt_60 self={} other={} delta={} ==========".format(
-                        trace_scope,
-                        self.name,
-                        other.name,
-                        delta,
-                    )
-                )
+            if delta < 60:
                 return False
 
-        if not forced and (not self.completion("decide_chat", self, other, focus, chats)):
-            self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
-            self.logger.info(
-                "========== [{}][CHAT_BLOCKED] reason=decide_chat_reject self={} other={} ==========".format(
-                    trace_scope,
-                    self.name,
-                    other.name,
-                )
-            )
+        if not self.completion("decide_chat", self, other, focus, chats):
             return False
 
-        policy = self._resolve_chat_control_policy(other, forced=forced)
-        enhanced = bool(forced and policy.get("enabled", False))
-        if forced and not enhanced:
-            self.logger.info(
-                "========== [INTERVENTION][CHAT_CTRL_POLICY_MISSING_OR_DISABLED] initiator={} responder={} source={} keep_main_loop=true ==========".format(
-                    self.name,
-                    other.name,
-                    policy.get("source", "fallback"),
-                )
-            )
-
-        chat_iter_budget = int(self.chat_iter)
-        min_gate_turn = 1
-        max_cap_turn = chat_iter_budget
-        repeat_break_threshold = 1
-        repeat_detection_enabled = True
-        terminate_tail_window_enabled = False
-        terminate_tail_window_turns = 2
-
-        if enhanced:
-            chat_iter_budget, min_gate_turn, max_cap_turn = self._resolve_controlled_turn_limits(policy)
-            repeat_break_threshold = int(policy.get("repeat_break_threshold", 2) or 2)
-            repeat_detection_enabled = bool(policy.get("repeat_detection_enabled", True))
-            terminate_tail_window_enabled = bool(policy.get("terminate_detection_tail_window_enabled", False))
-            terminate_tail_window_turns = int(policy.get("terminate_detection_tail_window_turns", 2) or 2)
-        else:
-            repeat_break_threshold = 1
-            repeat_detection_enabled = True
-            terminate_tail_window_enabled = False
-            terminate_tail_window_turns = 2
-
-        self.logger.info(
-            "========== [{}][CHAT_LOOP_MODE] mode=main_loop enhanced={} forced={} source={} ==========".format(
-                trace_scope,
-                enhanced,
-                forced,
-                policy.get("source", "normal_chat") if isinstance(policy, dict) else "unknown",
-            )
-        )
-
         self.logger.info("{} decides chat with {}".format(self.name, other.name))
-        self.logger.info(
-            "========== [{}][CHAT_LOOP_CFG] initiator={} responder={} chat_iter={} forced={} ==========".format(
-                trace_scope,
-                self.name,
-                other.name,
-                int(chat_iter_budget),
-                forced,
-            )
-        )
         start, chats = utils.get_timer().get_date(), []
         relations = [
             self.completion("summarize_relation", self, other.name),
             other.completion("summarize_relation", other, self.name),
         ]
 
-        repeat_streak_self = 0
-        repeat_streak_other = 0
-        question_streak_self = 0
-        question_streak_other = 0
-
-        retrieval_profile = {}
-        retrieval_profile_meta = {
-            "enabled": False,
-            "scope": "",
-            "reason": "not_configured",
-        }
-        if self.intervention and hasattr(self.intervention, "get_memory_retrieval_profile"):
-            profile_payload = self.intervention.get_memory_retrieval_profile(
-                self, other, forced=forced
-            )
-            if isinstance(profile_payload, dict):
-                retrieval_profile_meta = {
-                    "enabled": bool(profile_payload.get("enabled", False)),
-                    "scope": str(profile_payload.get("scope", "") or ""),
-                    "reason": str(profile_payload.get("reason", "") or ""),
-                }
-                if retrieval_profile_meta["enabled"]:
-                    retrieval_profile = profile_payload.get("profile", {}) or {}
-        self.logger.info(
-            "[CHAT_RETRIEVAL_PROFILE] agent={} other={} forced={} enabled={} scope={} reason={} profile={}".format(
-                self.name,
-                other.name,
-                forced,
-                retrieval_profile_meta.get("enabled", False),
-                retrieval_profile_meta.get("scope", ""),
-                retrieval_profile_meta.get("reason", ""),
-                retrieval_profile,
-            )
-        )
-
-        forced_chat_expire_days = None
-        if self.intervention and hasattr(self.intervention, "get_forced_chat_expire_days"):
-            forced_chat_expire_days = self.intervention.get_forced_chat_expire_days(
-                self, other, forced=forced
-            )
-        self.logger.info(
-            "[FORCED_CHAT_EXPIRE_RESOLVE] agent={} other={} forced={} expire_days={}".format(
-                self.name,
-                other.name,
-                forced,
-                forced_chat_expire_days,
-            )
-        )
-
-        for i in range(chat_iter_budget):
-            turn_no = i + 1
-            terminate_check_enabled_this_turn = True
-            if enhanced and terminate_tail_window_enabled:
-                tail_turns = max(1, int(terminate_tail_window_turns))
-                if tail_turns > int(max_cap_turn):
-                    tail_turns = int(max_cap_turn)
-                terminate_start_turn = int(max_cap_turn) - tail_turns + 1
-                terminate_check_enabled_this_turn = bool(turn_no >= terminate_start_turn)
-            self.logger.info(
-                "========== [{}][CHAT_TURN] role=initiator i={} chat_iter={} chats_so_far={} ==========".format(
-                    trace_scope,
-                    i,
-                    int(chat_iter_budget),
-                    len(chats),
-                )
-            )
-            doctor_session_prompt_injection = ""
-            if self.intervention:
-                doctor_session_prompt_injection = self.intervention.get_doctor_session_prompt_injection(
-                    self,
-                    other,
-                    forced,
-                )
-            self.depression_profile = drm.infer_chat_emotion(
-                patient_agent=self,
-                profile=self.depression_profile,
-                now_step=utils.get_timer().daily_duration(),
-                static_profile=self.profile,
-                other_agent=getattr(other, "name", ""),
-                relationship=relations[0],
-                conversation_content=dda.serialize_conversation(chats),
-            )
-            chat_view = drm.build_intermediate_view(
-                self.depression_profile,
-                utils.get_timer().daily_duration(),
-                stage="chat",
-                update_cfg=(
-                    ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                    if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                    else {}
-                ),
-                static_profile=self.profile,
-            )
+        for i in range(self.chat_iter):
             text = self.completion(
-                "generate_chat",
-                self,
-                other,
-                relations[0],
-                chats,
-                depression_chat_block=chat_view.get("chat_block", ""),
-                doctor_session_prompt_injection=doctor_session_prompt_injection,
-                retrieval_profile=retrieval_profile,
+                "generate_chat", self, other, relations[0], chats
             )
-
-            if self._is_question_text(text):
-                question_streak_self += 1
-            else:
-                question_streak_self = 0
 
             if i > 0:
                 # 对于发起对话的Agent，从第2轮对话开始，检查是否出现“复读”现象
-                if repeat_detection_enabled:
-                    end = self.completion(
-                        "generate_chat_check_repeat", self, chats, text
-                    )
-                    repeat_end = bool(end)
-                else:
-                    repeat_end = False
-                    if enhanced:
-                        self.logger.info(
-                            "========== [{}][CHAT_REPEAT_SKIP] role=initiator i={} reason=repeat_detection_disabled ==========".format(
-                                trace_scope,
-                                i,
-                            )
-                        )
-                if repeat_end:
-                    if enhanced:
-                        repeat_streak_self += 1
-                    else:
-                        repeat_streak_self = 1
-                else:
-                    repeat_streak_self = 0
-                self.logger.info(
-                    "========== [{}][CHAT_REPEAT] role=initiator i={} repeat_end={} repeat_streak={} threshold={} ==========".format(
-                        trace_scope,
-                        i,
-                        repeat_end,
-                        repeat_streak_self,
-                        repeat_break_threshold,
-                    )
+                end = self.completion(
+                    "generate_chat_check_repeat", self, chats, text
                 )
-                if repeat_end:
-                    if repeat_streak_self >= repeat_break_threshold and (not enhanced or turn_no >= min_gate_turn):
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=repeat role=initiator i={} repeat_streak={} ==========".format(
-                                trace_scope,
-                                i,
-                                repeat_streak_self,
-                            )
-                        )
-                        break
+                if end:
+                    break
 
                 # 对于发起对话的Agent，从第2轮对话开始，检查话题是否结束
                 chats.append((self.name, text))
-                terminate_end = False
-                if terminate_check_enabled_this_turn:
-                    end = self.completion(
-                        "decide_chat_terminate", self, other, chats
-                    )
-                    terminate_end = bool(end)
-                else:
-                    marker_hit = False
-                    if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
-                        marker_hit = bool(
-                            self.intervention.is_forced_chat_advance_marker_hit(
-                                self,
-                                other,
-                                text,
-                                forced=forced,
-                            )
-                        )
-                    self.logger.info(
-                        "========== [{}][CHAT_TERMINATE_SKIP] role=initiator i={} reason=tail_window_not_reached marker_hit={} ==========".format(
-                            trace_scope,
-                            i,
-                            marker_hit,
-                        )
-                    )
-                    if marker_hit:
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=initiator i={} ==========".format(
-                                trace_scope,
-                                i,
-                            )
-                        )
-                        break
-                self.logger.info(
-                    "========== [{}][CHAT_TERMINATE] role=initiator i={} terminate_end={} ==========".format(
-                        trace_scope,
-                        i,
-                        terminate_end,
-                    )
+                end = self.completion(
+                    "decide_chat_terminate", self, other, chats
                 )
-                if terminate_end:
-                    can_break = True
-                    if enhanced:
-                        can_break = turn_no >= min_gate_turn
-                    if can_break:
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=terminate role=initiator i={} ==========".format(
-                                trace_scope,
-                                i,
-                            )
-                        )
-                        break
-            else:
+                if end:
+                    break
+            else :
                 chats.append((self.name, text))
 
-            other_doctor_session_prompt_injection = ""
-            if self.intervention:
-                other_doctor_session_prompt_injection = self.intervention.get_doctor_session_prompt_injection(
-                    other,
-                    self,
-                    forced,
-                )
-            other.depression_profile = drm.infer_chat_emotion(
-                patient_agent=other,
-                profile=other.depression_profile,
-                now_step=utils.get_timer().daily_duration(),
-                static_profile=getattr(other, "profile", {}),
-                other_agent=getattr(self, "name", ""),
-                relationship=relations[1],
-                conversation_content=dda.serialize_conversation(chats),
-            )
             text = other.completion(
-                "generate_chat",
-                other,
-                self,
-                relations[1],
-                chats,
-                depression_chat_block=drm.build_intermediate_view(
-                    other.depression_profile,
-                    utils.get_timer().daily_duration(),
-                    stage="chat",
-                    update_cfg=(
-                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                        else {}
-                    ),
-                    static_profile=getattr(other, "profile", {}),
-                ).get("chat_block", ""),
-                doctor_session_prompt_injection=other_doctor_session_prompt_injection,
-                retrieval_profile=retrieval_profile,
+                "generate_chat", other, self, relations[1], chats
             )
-
-            if self._is_question_text(text):
-                question_streak_other += 1
-            else:
-                question_streak_other = 0
-
             if i > 0:
                 # 对于响应对话的Agent，从第2轮开始，检查是否出现“复读”现象
-                if repeat_detection_enabled:
-                    end = self.completion(
-                        "generate_chat_check_repeat", other, chats, text
-                    )
-                    repeat_end = bool(end)
-                else:
-                    repeat_end = False
-                    if enhanced:
-                        self.logger.info(
-                            "========== [{}][CHAT_REPEAT_SKIP] role=responder i={} reason=repeat_detection_disabled ==========".format(
-                                trace_scope,
-                                i,
-                            )
-                        )
-                if repeat_end:
-                    if enhanced:
-                        repeat_streak_other += 1
-                    else:
-                        repeat_streak_other = 1
-                else:
-                    repeat_streak_other = 0
-                self.logger.info(
-                    "========== [{}][CHAT_REPEAT] role=responder i={} repeat_end={} repeat_streak={} threshold={} ==========".format(
-                        trace_scope,
-                        i,
-                        repeat_end,
-                        repeat_streak_other,
-                        repeat_break_threshold,
-                    )
+                end = self.completion(
+                    "generate_chat_check_repeat", other, chats, text
                 )
-                if repeat_end:
-                    if repeat_streak_other >= repeat_break_threshold and (not enhanced or turn_no >= min_gate_turn):
-                        self.logger.info(
-                            "========== [{}][CHAT_BREAK] reason=repeat role=responder i={} repeat_streak={} ==========".format(
-                                trace_scope,
-                                i,
-                                repeat_streak_other,
-                            )
-                        )
-                        break
+                if end:
+                    break
 
             chats.append((other.name, text))
 
             # 对于响应对话的Agent，从第1轮开始，检查话题是否结束
-            terminate_end = False
-            if terminate_check_enabled_this_turn:
-                end = other.completion(
-                    "decide_chat_terminate", other, self, chats
-                )
-                terminate_end = bool(end)
-            else:
-                marker_hit = False
-                if enhanced and self.intervention and hasattr(self.intervention, "is_forced_chat_advance_marker_hit"):
-                    marker_hit = bool(
-                        self.intervention.is_forced_chat_advance_marker_hit(
-                            other,
-                            self,
-                            text,
-                            forced=forced,
-                        )
-                    )
-                self.logger.info(
-                    "========== [{}][CHAT_TERMINATE_SKIP] role=responder i={} reason=tail_window_not_reached marker_hit={} ==========".format(
-                        trace_scope,
-                        i,
-                        marker_hit,
-                    )
-                )
-                if marker_hit:
-                    self.logger.info(
-                        "========== [{}][CHAT_BREAK] reason=advance_marker_pre_terminate_window role=responder i={} ==========".format(
-                            trace_scope,
-                            i,
-                        )
-                    )
-                    break
-            self.logger.info(
-                "========== [{}][CHAT_TERMINATE] role=responder i={} terminate_end={} ==========".format(
-                    trace_scope,
-                    i,
-                    terminate_end,
-                )
+            end = other.completion(
+                "decide_chat_terminate", other, self, chats
             )
-            if terminate_end:
-                can_break = True
-                if enhanced:
-                    can_break = turn_no >= min_gate_turn
-                if can_break:
-                    self.logger.info(
-                        "========== [{}][CHAT_BREAK] reason=terminate role=responder i={} ==========".format(
-                            trace_scope,
-                            i,
-                        )
-                    )
-                    break
-
-            if enhanced and turn_no >= max_cap_turn:
-                self.logger.info(
-                    "========== [{}][CHAT_BREAK] reason=max_turn_cap i={} turn_no={} max_turn_cap={} ==========".format(
-                        trace_scope,
-                        i,
-                        turn_no,
-                        max_cap_turn,
-                    )
-                )
+            if end:
                 break
 
         key = utils.get_timer().get_date("%Y%m%d-%H:%M")
@@ -1356,64 +585,12 @@ class Agent:
                 "\n  ".join(["{}: {}".format(n, c) for n, c in chats]),
             )
         )
-        self.logger.info(
-            "========== [{}][CHAT_DONE] pair={}<->{} utterances={} ==========".format(
-                trace_scope,
-                self.name,
-                other.name,
-                len(chats),
-            )
-        )
         chat_summary = self.completion("summarize_chats", chats)
         duration = int(sum([len(c[1]) for c in chats]) / 240)
-
-        chat_expire = None
-        if isinstance(forced_chat_expire_days, int):
-            if forced_chat_expire_days == -1:
-                chat_expire = start + datetime.timedelta(days=36500)
-            elif forced_chat_expire_days > 0:
-                chat_expire = start + datetime.timedelta(days=forced_chat_expire_days)
-        self.logger.info(
-            "[CHAT_MEMORY_EXPIRE] pair={}<->{} forced={} expire_days={} expire_at={}".format(
-                self.name,
-                other.name,
-                forced,
-                forced_chat_expire_days,
-                chat_expire.strftime("%Y%m%d-%H:%M:%S") if chat_expire else "<default>",
-            )
-        )
-
         self.schedule_chat(
-            chats,
-            chat_summary,
-            start,
-            duration,
-            other,
-            chat_expire=chat_expire,
-            chat_meta={
-                "forced": bool(forced),
-                "expire_days": forced_chat_expire_days,
-                "retrieval_profile_enabled": bool(retrieval_profile_meta.get("enabled", False)),
-                "retrieval_scope": retrieval_profile_meta.get("scope", ""),
-            },
+            chats, chat_summary, start, duration, other
         )
-        other.schedule_chat(
-            chats,
-            chat_summary,
-            start,
-            duration,
-            self,
-            chat_expire=chat_expire,
-            chat_meta={
-                "forced": bool(forced),
-                "expire_days": forced_chat_expire_days,
-                "retrieval_profile_enabled": bool(retrieval_profile_meta.get("enabled", False)),
-                "retrieval_scope": retrieval_profile_meta.get("scope", ""),
-            },
-        )
-        self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
-        if self.intervention:
-            self.intervention.after_chat(self, other, chats, chat_summary, start)
+        other.schedule_chat(chats, chat_summary, start, duration, self)
         return True
 
     def _wait_other(self, other, focus):
@@ -1440,17 +617,7 @@ class Agent:
         )
         self.revise_schedule(event, start, duration)
 
-    def schedule_chat(
-        self,
-        chats,
-        chats_summary,
-        start,
-        duration,
-        other,
-        address=None,
-        chat_expire=None,
-        chat_meta=None,
-    ):
+    def schedule_chat(self, chats, chats_summary, start, duration, other, address=None):
         self.chats.extend(chats)
         event = memory.Event(
             self.name,
@@ -1460,88 +627,7 @@ class Agent:
             address=address or self.get_tile().get_address(),
             emoji=f"💬",
         )
-        self._pending_chat_memory_meta = {
-            "expire": chat_expire,
-            "meta": copy.deepcopy(chat_meta or {}),
-            "start": start,
-            "duration": duration,
-            "other": getattr(other, "name", ""),
-        }
-        self.logger.info(
-            "[SCHEDULE_CHAT_META] agent={} other={} start={} duration={} expire_at={} meta={}".format(
-                self.name,
-                getattr(other, "name", ""),
-                start.strftime("%Y%m%d-%H:%M:%S") if isinstance(start, datetime.datetime) else str(start),
-                duration,
-                chat_expire.strftime("%Y%m%d-%H:%M:%S") if isinstance(chat_expire, datetime.datetime) else "<default>",
-                self._pending_chat_memory_meta.get("meta", {}),
-            )
-        )
-        persisted_now = False
-        if self.chat_memory_write_mode in {"immediate", "hybrid"}:
-            persisted_now = self._persist_chat_memory_now(
-                event=event,
-                start=start,
-                expire=chat_expire,
-                other_name=getattr(other, "name", ""),
-                chat_meta=self._pending_chat_memory_meta.get("meta", {}),
-            )
-            self.logger.info(
-                "[CHAT_MEMORY_WRITE_MODE] agent={} mode={} persisted_now={} delayed_fallback={}".format(
-                    self.name,
-                    self.chat_memory_write_mode,
-                    persisted_now,
-                    not persisted_now,
-                )
-            )
-        if persisted_now:
-            self._pending_chat_memory_meta = None
         self.revise_schedule(event, start, duration)
-        forced = bool((chat_meta or {}).get("forced", False))
-        dda.commit_event(
-            self,
-            event_key="chat_event",
-            forced=forced,
-            fallback_hint="generate_chat",
-            other_agent=getattr(other, "name", ""),
-            conversation_content=dda.serialize_conversation(chats),
-        )
-
-    def _persist_chat_memory_now(
-        self, event, start, expire=None, other_name="", chat_meta=None
-    ):
-        try:
-            node = self._add_concept(
-                "chat",
-                event,
-                create=start,
-                expire=expire,
-            )
-            self.logger.info(
-                "[CHAT_MEMORY_WRITE_IMMEDIATE] agent={} other={} node_id={} create={} expire={} meta={}".format(
-                    self.name,
-                    other_name,
-                    getattr(node, "node_id", ""),
-                    start.strftime("%Y%m%d-%H:%M:%S")
-                    if isinstance(start, datetime.datetime)
-                    else str(start),
-                    expire.strftime("%Y%m%d-%H:%M:%S")
-                    if isinstance(expire, datetime.datetime)
-                    else "<default>",
-                    chat_meta or {},
-                )
-            )
-            return True
-        except Exception as e:
-            self.logger.warning(
-                "[CHAT_MEMORY_WRITE_IMMEDIATE_FAIL] agent={} other={} mode={} error={}".format(
-                    self.name,
-                    other_name,
-                    self.chat_memory_write_mode,
-                    str(e),
-                )
-            )
-            return False
 
     def _add_concept(
         self,
@@ -1560,22 +646,6 @@ class Agent:
         else:
             poignancy = self.completion("poignancy_event", event)
         self.logger.debug("{} add associate {}".format(self.name, event))
-        if e_type == "chat":
-            pending = getattr(self, "_pending_chat_memory_meta", None)
-            if isinstance(pending, dict) and pending:
-                pending_expire = pending.get("expire")
-                if isinstance(pending_expire, datetime.datetime):
-                    expire = pending_expire
-                self.logger.info(
-                    "[CHAT_MEMORY_WRITE] agent={} other={} create={} expire={} meta={}".format(
-                        self.name,
-                        pending.get("other", ""),
-                        create.strftime("%Y%m%d-%H:%M:%S") if isinstance(create, datetime.datetime) else "<timer_default>",
-                        expire.strftime("%Y%m%d-%H:%M:%S") if isinstance(expire, datetime.datetime) else "<default>",
-                        pending.get("meta", {}),
-                    )
-                )
-                self._pending_chat_memory_meta = None
         return self.associate.add_node(
             e_type,
             event,
@@ -1590,105 +660,6 @@ class Agent:
 
     def get_event(self, as_act=True):
         return self.action.event if as_act else self.action.obj_event
-
-    def _resolve_chat_summary_window_minutes(self, value):
-        default_window = 480
-        if isinstance(value, bool):
-            self.logger.warning(
-                "[CHAT_HISTORY_WINDOW] agent={} invalid_bool={} fallback={}".format(
-                    self.name,
-                    value,
-                    default_window,
-                )
-            )
-            return default_window
-        try:
-            window = int(value)
-        except Exception:
-            self.logger.warning(
-                "[CHAT_HISTORY_WINDOW] agent={} invalid_value={} fallback={}".format(
-                    self.name,
-                    value,
-                    default_window,
-                )
-            )
-            return default_window
-        if window == -1:
-            return -1
-        if window <= 0:
-            self.logger.warning(
-                "[CHAT_HISTORY_WINDOW] agent={} non_positive_value={} fallback={}".format(
-                    self.name,
-                    value,
-                    default_window,
-                )
-            )
-            return default_window
-        return window
-
-    def _resolve_chat_history_max_read_items(self, value):
-        default_items = 5
-        if isinstance(value, bool):
-            return default_items
-        try:
-            limit = int(value)
-        except Exception:
-            return default_items
-        if limit == -1:
-            return -1
-        if limit <= 0:
-            return default_items
-        return limit
-
-    def _resolve_chat_focus_retrieve_max(self, value):
-        default_limit = 15
-        if isinstance(value, bool):
-            return default_limit
-        try:
-            limit = int(value)
-        except Exception:
-            return default_limit
-        if limit == -1:
-            return -1
-        if limit <= 0:
-            return default_limit
-        return limit
-
-    def _resolve_chat_recent_turn_focus_n(self, value):
-        default_recent_turn = 4
-        if isinstance(value, bool):
-            return default_recent_turn
-        try:
-            recent_turn = int(value)
-        except Exception:
-            return default_recent_turn
-        if recent_turn < 0:
-            return default_recent_turn
-        return recent_turn
-
-    def _resolve_chat_memory_write_mode(self, value):
-        mode = str(value or "hybrid").strip().lower()
-        if mode not in {"delayed", "immediate", "hybrid"}:
-            self.logger.warning(
-                "[CHAT_MEMORY_WRITE_CFG] agent={} invalid_mode={} fallback=hybrid".format(
-                    self.name,
-                    value,
-                )
-            )
-            return "hybrid"
-        return mode
-
-    def get_chat_summary_window_minutes(self):
-        return self.chat_summary_window_minutes
-
-    def get_chat_history_max_read_items(self):
-        return self.chat_history_max_read_items
-
-    def get_chat_focus_retrieve_max(self):
-        return self.chat_focus_retrieve_max
-
-    def get_chat_recent_turn_focus_n(self):
-        return self.chat_recent_turn_focus_n
 
     def is_awake(self):
         if not self.action:
@@ -1711,8 +682,6 @@ class Agent:
             "associate": self.associate.to_dict(),
             "chats": self.chats,
             "currently": self.scratch.currently,
-            "depression_profile": self.depression_profile,
-            "depression_dynamic_state": dda.dump_state(self),
         }
         if with_action:
             info.update({"action": self.action.to_dict()})
