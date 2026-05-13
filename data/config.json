@@ -28,6 +28,10 @@
                 "api_key": ""
             },
             "retention": 32,
+            "recency_decay": 0.995,
+            "recency_weight": 0.5,
+            "relevance_weight": 5.0,
+            "importance_weight": 1.0,
             "chat_retrieve": {
                 "mode": "semantic",
                 "similarity_top_k": 6
@@ -102,10 +106,10 @@
                 "enabled": false
             },
             {
-                "rule_id": "fast_every_2step",
+                "rule_id": "fast_every_4step",
                 "type": "interval_steps",
-                "interval_steps": 2,
-                "step_phase": 0,
+                "interval_steps": 4,
+                "step_phase": 1,
                 "duration": 1440,
                 "doctor": "蜻蜓队长",
                 "patient": "卡布达",
@@ -115,7 +119,7 @@
                 "rule_id": "fast_every_2step_jgcl",
                 "type": "interval_steps",
                 "interval_steps": 2,
-                "step_phase": 1,
+                "step_phase": 0,
                 "duration": 1440,
                 "doctor": "蜻蜓队长",
                 "patient": "金龟次郎",
@@ -202,7 +206,7 @@
         "forced_llm": {
             "enabled": true,
             "provider": "openai",
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-flash",
             "base_url": "https://api.deepseek.com",
             "api_key_env": "DEEPSEEK_API_KEY",
             "retry": 5,
@@ -218,7 +222,9 @@
             "enabled": true,
             "prompt_file": "data/prompts/intervention/dialog_judge.txt",
             "retry": 3,
-            "force_forced_llm": true
+            "force_forced_llm": true,
+            "patient_state_prompt_file": "data/prompts/intervention/dialog_judge_patient_state_summary.txt",
+            "patient_state_summary_retry": 2
         },
         "session_eval": {
             "enabled": true,

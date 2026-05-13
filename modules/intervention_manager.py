@@ -80,8 +80,8 @@ class InterventionManager:
         self.consult_record_cfg = intervention_cfg.get("consult_record", {}) or {}
         self._consult_record_llm = None
         self._consult_record_llm_key = ""
-        self._session_eval_think_llm = None
-        self._session_eval_think_llm_key = ""
+        self._think_llm = None
+        self._think_llm_key = ""
 
         # 全局运行时状态（随 config 落盘）
         self.state = config.setdefault(
@@ -1034,17 +1034,21 @@ class InterventionManager:
             "prompt_file": "data/prompts/intervention/dialog_judge.txt",
             "retry": 2,
             "force_forced_llm": True,
+            "patient_state_prompt_file": "data/prompts/intervention/dialog_judge_patient_state_summary.txt",
+            "patient_state_summary_retry": 2,
             "source": "defaults",
         }
         intervention_cfg = self.config.get("intervention", {}) or {}
         raw_cfg = intervention_cfg.get("dialog_judge", {}) or {}
         if not isinstance(raw_cfg, dict):
             self._log_highlight(
-                "[DIALOG_JUDGE_POLICY] source=defaults enabled={} retry={} force_forced_llm={} prompt_file={}".format(
+                "[DIALOG_JUDGE_POLICY] source=defaults enabled={} retry={} force_forced_llm={} prompt_file={} patient_state_prompt_file={} patient_state_summary_retry={}".format(
                     bool(default_policy["enabled"]),
                     int(default_policy["retry"]),
                     bool(default_policy["force_forced_llm"]),
                     default_policy["prompt_file"],
+                    default_policy["patient_state_prompt_file"],
+                    int(default_policy["patient_state_summary_retry"]),
                 )
             )
             return default_policy
@@ -1060,13 +1064,26 @@ class InterventionManager:
             raw_cfg.get("force_forced_llm", default_policy["force_forced_llm"]),
             default_policy["force_forced_llm"],
         )
+        patient_state_prompt_file = str(
+            raw_cfg.get("patient_state_prompt_file", default_policy["patient_state_prompt_file"]) or ""
+        ).strip()
+        policy["patient_state_prompt_file"] = patient_state_prompt_file or default_policy["patient_state_prompt_file"]
+        patient_state_summary_retry = self._safe_int(
+            raw_cfg.get("patient_state_summary_retry", default_policy["patient_state_summary_retry"]),
+            default_policy["patient_state_summary_retry"],
+        )
+        policy["patient_state_summary_retry"] = (
+            patient_state_summary_retry if patient_state_summary_retry >= 1 else default_policy["patient_state_summary_retry"]
+        )
         self._log_highlight(
-            "[DIALOG_JUDGE_POLICY] source={} enabled={} retry={} force_forced_llm={} prompt_file={}".format(
+            "[DIALOG_JUDGE_POLICY] source={} enabled={} retry={} force_forced_llm={} prompt_file={} patient_state_prompt_file={} patient_state_summary_retry={}".format(
                 policy["source"],
                 bool(policy["enabled"]),
                 int(policy["retry"]),
                 bool(policy["force_forced_llm"]),
                 policy["prompt_file"],
+                policy["patient_state_prompt_file"],
+                int(policy["patient_state_summary_retry"]),
             )
         )
         return policy
@@ -1152,6 +1169,11 @@ class InterventionManager:
             history_recent_n=int(policy.get("history_recent_n", 3) or 3),
         )
         history_text = self._format_session_eval_history_reasons_for_prompt(history_items)
+        session_usage_log = self._build_session_usage_log(
+            pair_key=pair_key,
+            current_session=current_session,
+            history_items=history_items,
+        )
         fallback_levels = 0
         for item in history_items:
             sid = str((item or {}).get("session_id", "") or "")
@@ -1192,6 +1214,7 @@ class InterventionManager:
                     "patient": str(getattr(patient, "name", "") or ""),
                     "session_prompt": str(session_prompt_text or ""),
                     "session_eval_history_reasons": str(history_text or ""),
+                    "session_usage_log": str(session_usage_log or ""),
                     "conversation": conversation_text,
                 },
             )
@@ -1327,7 +1350,11 @@ class InterventionManager:
             prompt_text = self._render_prompt_template(
                 prompt_tpl,
                 {
-                    "patient_state": self._build_patient_dynamic_state_text(patient),
+                    "patient_state": self._build_patient_dynamic_state_text(
+                        patient_agent=patient,
+                        doctor_agent=doctor,
+                        policy=policy,
+                    ),
                     "conversation": to_conversation_text(chats or []),
                     "session_prompt": str(session_prompt_text or ""),
                     "prev_session_eval_reason": str(prev_session_eval_reason or ""),
@@ -1712,7 +1739,7 @@ class InterventionManager:
         except Exception:
             return int(default)
 
-    def _build_patient_dynamic_state_text(self, patient_agent: Any) -> str:
+    def _get_patient_dynamic_state_raw_text(self, patient_agent: Any) -> str:
         intervention_state = getattr(patient_agent, "status", {}).get("intervention", {})
         cached = intervention_state.get("last_generate_chat_prompt", {}) if isinstance(intervention_state, dict) else {}
         prompt_text = str((cached or {}).get("prompt_text", "") or "")
@@ -1734,6 +1761,80 @@ class InterventionManager:
             )
             return ""
         return str(prompt_text[:idx].strip() or "")
+
+    def _strip_text_code_fence(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("```") and raw.endswith("```"):
+            parts = raw.split("```")
+            if len(parts) >= 3:
+                body = str(parts[1] or "").strip()
+                if "\n" in body:
+                    first_line, rest = body.split("\n", 1)
+                    lang = first_line.strip()
+                    if lang and all(ch.isalnum() or ch in ("_", "-", "+") for ch in lang):
+                        body = rest.strip()
+                return str(body.strip() or "")
+        return raw
+
+    def _build_patient_dynamic_state_text(
+        self,
+        patient_agent: Any,
+        doctor_agent: Any,
+        policy: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        raw_state = self._get_patient_dynamic_state_raw_text(patient_agent)
+        if not raw_state:
+            return ""
+
+        runtime_policy = policy if isinstance(policy, dict) else self.get_dialog_judge_runtime_policy()
+        prompt_file = str(runtime_policy.get("patient_state_prompt_file", "") or "").strip()
+        retry = self._safe_int(runtime_policy.get("patient_state_summary_retry", 2), 2)
+        patient_name = str(getattr(patient_agent, "name", "") or "")
+        doctor_name = str(getattr(doctor_agent, "name", "") or "")
+
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(prompt_file)
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {
+                    "patient": patient_name,
+                    "doctor": doctor_name,
+                    "patient_state": raw_state,
+                },
+            )
+            summary = self._call_think_llm_text(
+                prompt_text=prompt_text,
+                retry=retry,
+                doctor_agent=doctor_agent,
+                caller="dialog_judge_patient_state_summary",
+            )
+            cleaned = self._strip_text_code_fence(summary)
+            if cleaned:
+                self._log_highlight(
+                    "[DIALOG_JUDGE_PATIENT_STATE_SUMMARY] patient={} doctor={} chars={} route=think_llm".format(
+                        patient_name,
+                        doctor_name,
+                        len(cleaned),
+                    )
+                )
+                return cleaned
+            self._log_highlight(
+                "[DIALOG_JUDGE_PATIENT_STATE_SUMMARY] patient={} doctor={} chars=0 route=fallback_raw reason=empty_summary".format(
+                    patient_name,
+                    doctor_name,
+                )
+            )
+        except Exception as exc:
+            self._log_highlight(
+                "[DIALOG_JUDGE_PATIENT_STATE_SUMMARY] patient={} doctor={} route=fallback_raw reason={}".format(
+                    patient_name,
+                    doctor_name,
+                    str(exc),
+                )
+            )
+        return raw_state
 
     def _normalize_dialog_judge_output(self, payload: Any) -> Dict[str, Any]:
         raw = payload if isinstance(payload, dict) else {}
@@ -1758,7 +1859,7 @@ class InterventionManager:
         normalized["advice"] = advice if isinstance(advice, str) else ""
         return normalized
 
-    def _call_think_llm_json(self, prompt_text: str, retry: int, doctor_agent: Any) -> Dict[str, Any]:
+    def _resolve_think_llm_runtime(self, doctor_agent: Any) -> Any:
         llm_cfg = {}
         if doctor_agent is not None:
             think_cfg = getattr(doctor_agent, "think_config", {}) or {}
@@ -1772,12 +1873,29 @@ class InterventionManager:
             llm_cfg.get("model", ""),
             llm_cfg.get("base_url", ""),
         )
-        if self._session_eval_think_llm is None or self._session_eval_think_llm_key != cache_key:
-            self._session_eval_think_llm = create_llm_model(llm_cfg)
-            self._session_eval_think_llm_key = cache_key
+        if self._think_llm is None or self._think_llm_key != cache_key:
+            self._think_llm = create_llm_model(llm_cfg)
+            self._think_llm_key = cache_key
+        return llm_cfg, self._think_llm
 
+    def _call_think_llm_text(self, prompt_text: str, retry: int, doctor_agent: Any, caller: str) -> str:
+        llm_cfg, llm = self._resolve_think_llm_runtime(doctor_agent)
         retry_count = max(1, int(retry or llm_cfg.get("retry", 2) or 2))
-        payload = self._session_eval_think_llm.completion(
+        payload = llm.completion(
+            prompt_text,
+            retry=retry_count,
+            failsafe="",
+            caller=str(caller or "think_llm_text"),
+        )
+        text = str(payload or "").strip()
+        if not text:
+            raise ConsultRecordError(reason="think_llm_empty_text", retryable=False)
+        return text
+
+    def _call_think_llm_json(self, prompt_text: str, retry: int, doctor_agent: Any) -> Dict[str, Any]:
+        _, llm = self._resolve_think_llm_runtime(doctor_agent)
+        retry_count = max(1, int(retry or 2))
+        payload = llm.completion(
             prompt_text,
             retry=retry_count,
             callback=self._json_loads_loose,
@@ -2021,6 +2139,68 @@ class InterventionManager:
             lines.append(line)
         if not lines:
             return "- （无历史评估结论）"
+        return "\n".join(lines)
+
+    def _build_session_usage_log(
+        self,
+        pair_key: str,
+        current_session: str,
+        history_items: List[Dict[str, Any]],
+    ) -> str:
+        self._ensure_session_eval_state_schema()
+        state = self.state.setdefault("session_eval_state", {})
+        history_by_pair = state.setdefault("history_by_pair", {})
+        items = history_by_pair.get(str(pair_key or ""))
+        if not isinstance(items, list):
+            items = []
+
+        current_session_text = str(current_session or "").strip()
+        order = self._get_session_prompt_order()
+        current_index = order.index(current_session_text) if (current_session_text and current_session_text in order) else -1
+        prior_sessions = []
+        if current_index > 0:
+            prior_sessions = order[:current_index]
+
+        current_entries = []
+        last_other_session = ""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            session_id = str(item.get("session_id", "") or "").strip()
+            if session_id == current_session_text and current_session_text:
+                current_entries.append(item)
+            elif session_id:
+                last_other_session = session_id
+
+        reason_texts = []
+        for entry in current_entries[-3:]:
+            reason = str(entry.get("reason", "") or "").strip()
+            if reason:
+                reason_texts.append(reason)
+
+        normalized_text = " ".join(reason_texts)
+        low_yield_hits = 0
+        for keyword in ["暂不能结束当前session", "未完成", "推进", "答不上来", "不知道", "想不出来", "收益较低", "低收益", "卡住"]:
+            if keyword and keyword in normalized_text:
+                low_yield_hits += 1
+        repeated_low_yield = bool(len(current_entries) >= 3 and low_yield_hits >= 2)
+
+        lines = [
+            "- 当前session: {}".format(current_session_text or "<unknown>"),
+            "- 当前session累计会后评估次数: {}".format(len(current_entries)),
+            "- 当前session在固定顺序中的位置: {} / {}".format((current_index + 1) if current_index >= 0 else "?", len(order)),
+            "- 已经历过的更早session: {}".format(" -> ".join(prior_sessions) if prior_sessions else "（无）"),
+            "- 最近一次非当前session: {}".format(last_other_session or "（无）"),
+            "- 是否疑似连续低收益停留: {}".format("是" if repeated_low_yield else "否"),
+        ]
+
+        if reason_texts:
+            lines.append("- 当前session最近几次评估阻塞摘要:")
+            for idx, reason in enumerate(reason_texts, start=max(1, len(current_entries) - len(reason_texts) + 1)):
+                lines.append("  - 第{}次: {}".format(idx, reason))
+        else:
+            lines.append("- 当前session最近几次评估阻塞摘要: （无）")
+
         return "\n".join(lines)
 
     def append_dialog_judge_trace_record(

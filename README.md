@@ -26,6 +26,12 @@
 
 以下为 README 内维护的近期更新摘要：
 
+- 2026-05-13：在`readme.md`第五章增加流程图，方便理解流程
+- 2026-05-13：新增功能：使用think.llm压缩患者状态信息后再注入给judge-llm，避免信息冗余
+- 2026-05-12：新增`scripts\intervention_prompt_txt_sync.py`脚本，方便查看和修改 session Prompt。
+- 2026-05-12：根据心理医生反馈调整 CBT session Prompt、judge-llm Prompt 和 session-eval Prompt，主要降低患者表达能力的要求、让session-eval和judge-llm输出更合理。session-eval的Prompt里新增了当前session停留情况，避免长时间停留某个session里【待实验】
+- 2026-05-11：新增3个量表的单独提示词，在app.py中复制到专家模型提示词里。新增3个量表的v2版本，放到`customization\depression_scale_agent\questions`文件夹里。
+- 2026-05-10：将"memory_policy"配置落实到app.py中。config.json新增记忆排序权重调整项并落地到快照里。（关于系统自带的记忆系统，与外置记忆系统无关）
 - 2026-05-07：可视化Prompt使用后，优化以前 Prompt 注入中的一些问题。
 - 2026-05-07：新增可视化强制干预对话时LLM调用的Prompt，包括患者、判断LLM、医生、评估LLM。可视化md文档在`result/checkpoints/xxx/force_prompt_traces`里。注：md文档命名的时间不一定是发生对话的时间。
 - 2026-05-07：合并学长更新的主诉链分支。
@@ -183,35 +189,105 @@ http://127.0.0.1:5051/?name=sim-xxx
 - `session_prompt_injection.order` 需与提示词文件中的 session id 对齐。
 - 若启用外置记忆，请确认 `agent.external_memory.base_url` 可访问，且服务端接口就绪。可运行`test\live_ec_doll_memory_service_health_ready.py`检查。
 
-## 5. 医患对话主要链路
+## 5. 运行流程图总览
 
-核心链路可理解为“调度 -> 锁定 -> 对话 -> 判定 -> 收尾 -> 会后处理”。
+下面用“时间推进 -> 整体主循环 -> 强制干预对话中的 LLM 协作”三个视角说明当前工作区的核心流程。
 
-1. 步进入口  
-   `start.py` 每个 step 调用 `InterventionManager.on_step_start(...)`。
+### 5.1 step / stride 的时间流逝机制
 
-2. 会诊调度  
-   在 `on_step_start` 内根据 `meeting_rules` 判断触发时机，调用 `_trigger_meeting(...)` 建立会诊任务。
+- `step`：本次 `simulate()` 要执行多少个“离散仿真步”。
+- `stride`：每个 step 结束后，仿真时间统一向前推进多少分钟。
+- 一个 step 内，所有 agent 都共享同一个仿真时刻 `T`；不会在 agent 之间单独推进时间。
+- 每个 step 的顺序是：**在当前时刻 `T` 完成调度与所有 agent 行为 -> 写 checkpoint / conversation / judge trace -> 最后再 `forward(stride)`**。
+- 因此，相邻两个 checkpoint 的时间差通常就是 `stride`。例如：`step=48, stride=60` 表示连续跑 48 个仿真步，每步代表 60 分钟仿真时间。
+- `resume` 时，会读取最近一次 checkpoint 的时间，并在此基础上再加一个 `stride` 作为下一步起点。
 
-3. 对话前锁定与目标重写  
-   `before_agent_think(...)` 根据 lock 重写行动目标。
+```mermaid
+flowchart LR
+    A["起始仿真时间<br/>例如 2026-04-25 09:30"] --> B["step 1 在当前时刻 T 执行<br/>on_step_start + 所有 agent.think"]
+    B --> C["写出 checkpoint / conversation / trace<br/>时间仍然记为 T"]
+    C --> D["timer.forward(stride)<br/>例如 +60 分钟"]
+    D --> E["step 2 在下一时刻 T+stride 执行"]
+    E --> F["重复直到跑完 step 个仿真步"]
+```
 
-4. 对话主循环  
-   `Agent._chat_with(...)` 执行多轮对话生成，按`是否启用外置记忆系统`选择 `generate_chat.txt` 或 `generate_chat_external.txt`。（只是Prompt模板不一样）
+### 5.2 整体主流程
 
-5. 强制判定与终止  
-   强制会话下由`会话中判断LLM`和轮次上限控制结束时机。
+```mermaid
+flowchart TD
+    A["start.py 读取配置<br/>创建 Game / InterventionManager"] --> B["simulate(step, stride)"]
+    B --> C["当前仿真时刻 T"]
+    C --> D["InterventionManager.on_step_start(game, T)<br/>检查 meeting_rules / 更新 meeting queue"]
+    D --> E["遍历所有 agent"]
+    E --> F["before_agent_think(agent, T)<br/>如命中 lock 则重写目标地址"]
+    F --> G["agent.think()<br/>move / schedule / percept / plan / reflect"]
+    G --> H{"本轮是否进入对话?"}
+    H -- 否 --> I["更新 agent 状态 / 坐标"]
+    H -- 是 --> J["Agent._chat_with(...)"]
+    J --> I
+    I --> K{"是否还有下一个 agent?"}
+    K -- 是 --> E
+    K -- 否 --> L["写 simulate-*.json / conversation.json<br/>judge_traces / forced_prompt_traces"]
+    L --> M{"stride > 0 ?"}
+    M -- 是 --> N["timer.forward(stride)"]
+    M -- 否 --> O["保持当前仿真时间"]
+    N --> P{"是否还有剩余 step?"}
+    O --> P
+    P -- 是 --> C
+    P -- 否 --> Q["仿真结束"]
+```
 
-6. 会后收尾  
-   `InterventionManager.after_chat(...)` 清理 lock、更新队列、记录会后状态。
+可以把它理解为：**每个 step 先做完整轮业务，再统一推进一次仿真时间**。
 
-7. 会后扩展处理  
-   按配置触发：会话后评估LLM`session_eval`、咨询记录生成`consult_record`、注入外置记忆系统`memory_injection`、更新动态抑郁人设`depression_dynamic` 等链路。
+### 5.3 强制干预对话期间，哪些 LLM 在工作
+
+这里的“强制干预对话”是指：命中 `intervention lock` 后，`before_agent_think(...)` 会把医生当前行动目标重写为 `&lt;persona, patient&gt;`，随后进入 `Agent._chat_with(..., forced=True)`。
+
+```mermaid
+flowchart TD
+    A["命中 intervention lock"] --> B["before_agent_think 重写医生目标<br/>&lt;persona, patient&gt;"]
+    B --> C["Agent._chat_with(..., forced=True)"]
+    C --> D["可选：ExternalMemoryBridge.retrieve_chat_context<br/>输出 external_memory_context"]
+    C --> E["think.llm：患者状态摘要<br/>输入：患者最近一次 generate_chat Prompt 缓存<br/>输出：patient_state_summary"]
+    E --> F["judge_llm / forced_llm：会话中判断<br/>输入：patient_state_summary + conversation + session_prompt + prev_session_eval_reason<br/>输出：terminate / advice"]
+    D --> G["医生 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
+    F --> G
+    G --> H["患者 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
+    H --> I{"是否结束?"}
+    I -- 否 --> F
+    I -- 是 --> J["after_chat 收尾：清 lock / 更新队列"]
+    J --> K["session_eval LLM<br/>输出：efficacy_score / session_end / reason"]
+    J --> L["consult_record LLM<br/>输出：结构化咨询记录"]
+```
+
+#### 5.3.1 强制对话里的 LLM 分工速查
+
+| 环节                                  | 主要模型路由                                                      | 主要输入                                                                                                             | 主要输出 / 作用                           |
+| ------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                             | 给 judge 用的 `patient_state_summary`     |
+| 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                               | `terminate`、`advice`                     |
+| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context` | 医生自然语言回复                          |
+| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`                                                         | 患者自然语言回复                          |
+| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                             | 是否出现复读，用于提前结束                |
+| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`           | 当前对话历史                                                                                                         | 是否结束对话                              |
+| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`         | session prompt、历史 eval reason、usage log、完整对话                                                                | `efficacy_score`、`session_end`、`reason` |
+| 咨询记录 `consult_record`             | `forced_llm`                                                      | 医生、患者、完整对话                                                                                                 | 结构化咨询记录（SOAP）                    |
+
+#### 5.3.2 关于模型路由，最容易混淆的点
+
+- `Agent.completion(...)` 在 `forced=True` 的上下文里，不只是 `generate_chat`，很多 agent 侧 Prompt（例如 `summarize_relation`、`generate_chat_check_repeat`、`summarize_chats`，以及在关闭 `dialog_judge` 时的 `decide_chat_terminate`）都会**先尝试走 `intervention.forced_llm`**。
+- 是否真的走 `forced_llm`，要同时满足：
+  - `intervention.forced_llm.enabled = true`
+  - 当前确实是医生-患者配对
+  - 双方 lock 都有效，且 `meeting_id` 一致
+  - 对应 API key 已配置
+- 如果强制路由不可用或调用失败，agent 侧生成会回退到该角色自己的 `think.llm`。
+- `ExternalMemoryBridge.retrieve_chat_context(...)` 本身不是这里的一次 LLM 调用，但它会在回复生成前产出 `external_memory_context`，直接影响后续 `generate_chat` 的输入。
 
 配置与链路映射速查：
 
 - 调度阶段：`meeting_rules`
-- 对话阶段：`chat_controls` / `forced_llm` / `dialog_judge`
+- 强制对话阶段：`chat_controls` / `forced_llm` / `dialog_judge`
 - 会后阶段：`session_eval` / `consult_record` / `memory_injection` / `depression_dynamic`
 
 ## 6. 运行结果与回放

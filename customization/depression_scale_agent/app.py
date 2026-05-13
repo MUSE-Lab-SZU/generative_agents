@@ -457,6 +457,19 @@ class ChatSession:
             self._forced_llm_key = cache_key
         return (self._forced_llm, forced_cfg), "ok"
 
+    def _resolve_local_retrieval_profile_when_external_disabled(self):
+        bridge = getattr(getattr(self, "agent", None), "external_memory_bridge", None)
+        if bridge is not None and bool(getattr(bridge, "enabled", False)):
+            return {}
+        intervention_cfg = (self.config or {}).get("intervention", {}) or {}
+        memory_policy = intervention_cfg.get("memory_policy", {}) or {}
+        if (not isinstance(memory_policy, dict)) or (not bool(memory_policy.get("enabled", False))):
+            return {}
+        profile = memory_policy.get("retrieve_profile", {}) or {}
+        if not isinstance(profile, dict):
+            return {}
+        return _clone_json_safe(profile)
+
     def _build_prompt_payload_before_answer(self, user, relation, chats, question_text):
         depression_chat_block, emotion_trace = self._build_depression_chat_block(
             user, relation, chats
@@ -465,6 +478,9 @@ class ChatSession:
             "depression_chat_block": depression_chat_block,
             "chat_history_target_name": self.doctor_name or user.name,
         }
+        local_retrieval_profile = self._resolve_local_retrieval_profile_when_external_disabled()
+        if local_retrieval_profile:
+            prompt_kwargs["retrieval_profile"] = local_retrieval_profile
         route = "local"
         trace_data = {
             "question": str(question_text or ""),
