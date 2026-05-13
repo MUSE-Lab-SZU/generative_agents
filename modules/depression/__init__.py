@@ -1,22 +1,23 @@
-"""
-动态抑郁症状模拟系统 (Multi-layered Dynamic Symptom Simulation, MDSS)
-"""
+"""动态抑郁主诉链模块。"""
 
 from .engine import DepressionSimulationEngine
-from .state_machine import SymptomStateMachine, DepressionState
-from .context_analyzer import ContextAnalyzer
-from .bias_injector import CognitiveBiasInjector
+from .state_machine import ComplaintChainManager, ComplaintStage, SymptomStateMachine
+from .context_analyzer import ContextAnalyzer, SessionContextBuilder
+from .bias_injector import CognitiveBiasInjector, ComplaintBiasInjector
 from .memory_system import TraumaMemorySystem
 from .emotion_inferencer import EmotionInferencer
 from .prompt_builder import DynamicPromptBuilder
 
 __all__ = [
-    'DepressionSimulationEngine',
-    'SymptomStateMachine',
-    'DepressionState',
-    'ContextAnalyzer',
-    'CognitiveBiasInjector',
-    'TraumaMemorySystem',
-    'EmotionInferencer',
-    'DynamicPromptBuilder',
+    "DepressionSimulationEngine",
+    "ComplaintChainManager",
+    "ComplaintStage",
+    "SymptomStateMachine",
+    "SessionContextBuilder",
+    "ContextAnalyzer",
+    "ComplaintBiasInjector",
+    "CognitiveBiasInjector",
+    "TraumaMemorySystem",
+    "EmotionInferencer",
+    "DynamicPromptBuilder",
 ]

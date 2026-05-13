@@ -1,241 +1,309 @@
-"""
-认知偏差注入器 - 实时注入符合当前症状状态的认知偏差
-"""
+"""主诉节点驱动的认知偏差注入器。"""
+
+from __future__ import annotations
+
+import copy
 import random
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
-class CognitiveBiasInjector:
-    """认知偏差注入器 - 根据当前状态和情境注入相应的认知偏差"""
-    
-    # 认知偏差类型库
-    COGNITIVE_BIASES = {
-        "catastrophizing": {  # 灾难化思维
+class ComplaintBiasInjector:
+    """根据当前主诉节点与会话上下文选择认知偏差。"""
+
+    DEFAULT_BIASES: Dict[str, Dict[str, Any]] = {
+        "catastrophizing": {
             "name": "灾难化思维",
             "templates": [
-                "这件事会彻底毁掉我的生活",
-                "一切都会变得更糟",
-                "我永远无法从这个困境中走出来",
-                "这次失败意味着我的人生完了",
-                "没有人能帮我，我注定要失败",
+                "这件事不会只是暂时的，它大概会把我后面的一切都拖垮。",
+                "一旦这里出问题，后面只会越来越糟。",
+                "我已经能想到最坏的结果了，而且多半躲不过去。",
             ],
-            "trigger_contexts": ["failure", "criticism", "uncertainty", "学业失败", "未来焦虑"],
-            "severity_modifiers": {
-                "mild": "可能会",
-                "moderate": "一定会",
-                "severe": "必然会",
-            }
+            "cue_keywords": ["未来", "前途", "不会好", "越来越糟", "后面"],
         },
-        "all_or_nothing": {  # 全或无思维
+        "all_or_nothing": {
             "name": "全或无思维",
             "templates": [
-                "我要么完美，要么就是彻底的失败者",
-                "如果我不能做到最好，那就没有意义",
-                "这次失败证明我什么都做不好",
-                "我必须在所有方面都成功，否则就是失败",
-                "一个错误就说明我是个废物",
+                "既然这件事都做不好，那我整体就是失败的。",
+                "我不是做得不够好，而是根本就不行。",
+                "只要出了这个问题，就说明我整个人都站不住。",
             ],
-            "trigger_contexts": ["performance", "achievement", "comparison", "学业失败"],
+            "cue_keywords": ["失败", "彻底", "根本", "整个人", "不行"],
         },
-        "personalization": {  # 个人化
+        "personalization": {
             "name": "个人化",
             "templates": [
-                "这都是我的错",
-                "我让所有人失望了",
-                "如果我更努力一点，事情就不会这样",
-                "别人的不快乐都是因为我",
-                "我是个负担，给大家带来麻烦",
+                "不管表面原因是什么，最后还是能绕回我自己的问题。",
+                "如果我不是这样，事情大概就不会变成这样。",
+                "别人再怎么说，我还是会觉得问题主要在我。",
             ],
-            "trigger_contexts": ["conflict", "disappointment", "social", "自我价值"],
+            "cue_keywords": ["都是我", "怪我", "如果我", "拖累", "负担"],
         },
-        "mental_filter": {  # 心理过滤
+        "mental_filter": {
             "name": "心理过滤",
             "templates": [
-                "虽然有些好的方面，但那些都不重要",
-                "一个负面评价抹杀了所有正面反馈",
-                "我只能看到自己的缺点",
-                "别人的鼓励只是客套话，不是真心的",
-                "好的事情只是暂时的，坏的才是真实的",
+                "就算有一点好的地方，也很快会被坏的那部分盖过去。",
+                "我脑子里最后留下的总是最差的那一块。",
+                "别人说的那些好话，好像都压不过那个失败的事实。",
             ],
-            "trigger_contexts": ["praise", "success", "support"],
+            "cue_keywords": ["好的不重要", "只记得坏的", "压不过", "好话"],
         },
-        "should_statements": {  # 应该陈述
+        "should_statements": {
             "name": "应该陈述",
             "templates": [
-                "我应该更坚强",
-                "我不应该有这些感受",
-                "我必须让所有人满意",
-                "我应该能够独自处理这一切",
-                "我不应该需要帮助",
+                "我本来就应该自己扛住，而不是这样。",
+                "我不该这么脆弱，也不该把这些话说出来。",
+                "我应该更像个能处理好事情的人。",
             ],
-            "trigger_contexts": ["weakness", "emotion", "help_seeking"],
+            "cue_keywords": ["应该", "不该", "必须", "自己扛", "更坚强"],
         },
-        "fortune_telling": {  # 算命式思维
-            "name": "算命式思维",
+        "fortune_telling": {
+            "name": "预言式推断",
             "templates": [
-                "我知道这不会有好结果",
-                "事情一定会变得更糟",
-                "我永远不会好起来",
-                "没有人会真正理解我",
-                "我的未来一片黑暗",
+                "我大概已经知道接下来会怎么烂下去了。",
+                "就算现在有人帮我，结果多半也不会好。",
+                "我很难相信这件事后面会出现什么真正不同的走向。",
             ],
-            "trigger_contexts": ["future", "treatment", "relationship", "未来焦虑"],
+            "cue_keywords": ["接下来", "多半", "不会好", "结果", "以后"],
         },
-        "emotional_reasoning": {  # 情绪推理
+        "emotional_reasoning": {
             "name": "情绪推理",
             "templates": [
-                "我感觉自己很糟糕，所以我一定很糟糕",
-                "我感到绝望，说明情况真的没有希望",
-                "我觉得自己是负担，所以我就是负担",
-                "我感到害怕，说明真的有危险",
-                "我的感受就是事实",
+                "我现在这样难受，所以事情大概真的已经糟到没法看了。",
+                "既然我心里一直过不去，那就说明问题根本不小。",
+                "我会这么压着自己，应该是因为事情本身就没有什么余地。",
             ],
-            "trigger_contexts": ["emotion", "self_evaluation"],
+            "cue_keywords": ["难受", "压着", "过不去", "糟", "没有余地"],
         },
     }
-    
-    def __init__(self):
+
+    def __init__(
+        self,
+        library_override: Optional[Dict[str, Any]] = None,
+        selection_policy: Optional[Dict[str, Any]] = None,
+    ):
+        self.bias_library = copy.deepcopy(self.DEFAULT_BIASES)
+        if isinstance(library_override, dict):
+            for key, value in library_override.items():
+                if not isinstance(value, dict):
+                    continue
+                merged = copy.deepcopy(self.bias_library.get(key, {}))
+                merged.update(copy.deepcopy(value))
+                self.bias_library[str(key)] = merged
+        self.selection_policy = selection_policy if isinstance(selection_policy, dict) else {}
         self.active_biases: List[str] = []
-        
-    def inject_bias(self, current_state: str, context: Dict, 
-                   conversation_topic: str = "") -> List[Dict]:
-        """
-        根据当前状态和情境注入相应的认知偏差
-        
-        Args:
-            current_state: 当前抑郁状态
-            context: 情境分析结果
-            conversation_topic: 对话主题
-            
-        Returns:
-            注入的认知偏差列表
-        """
-        injected_biases = []
-        
-        # 根据症状严重程度确定激活的偏差数量
-        severity_map = {
-            "severe_episode": 4,
-            "moderate_episode": 3,
-            "mild_episode": 2,
-            "remission": 1,
-            "crisis": 5,
-        }
-        num_biases = severity_map.get(current_state, 2)
-        
-        # 选择相关的认知偏差
-        relevant_biases = self._select_relevant_biases(context, conversation_topic)
-        
-        # 随机选择要激活的偏差
-        selected_biases = random.sample(
-            relevant_biases, 
-            min(num_biases, len(relevant_biases))
+
+    def inject_bias(
+        self,
+        current_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str = "",
+    ) -> List[Dict[str, Any]]:
+        current_stage = current_stage if isinstance(current_stage, dict) else {}
+        session_context = session_context if isinstance(session_context, dict) else {}
+        conversation = str(conversation_content or "")
+
+        bias_profile = current_stage.get("bias_profile", {}) if isinstance(current_stage.get("bias_profile", {}), dict) else {}
+        dominant = [str(item) for item in self._to_list(bias_profile.get("dominant", [])) if str(item).strip()]
+        secondary = [str(item) for item in self._to_list(bias_profile.get("secondary", [])) if str(item).strip()]
+        max_active = self._bounded_int(
+            bias_profile.get("max_active"),
+            self.selection_policy.get("default_max_active", 2),
+            1,
+            5,
         )
-        
-        # 生成偏差思维
-        for bias_type in selected_biases:
-            bias_data = self.COGNITIVE_BIASES[bias_type]
-            thought = self._generate_biased_thought(bias_type, current_state, context)
-            
-            injected_biases.append({
-                "type": bias_type,
-                "name": bias_data["name"],
-                "thought": thought,
-                "intensity": self._calculate_bias_intensity(current_state),
-            })
-        
-        self.active_biases = selected_biases
-        return injected_biases
-    
-    def _select_relevant_biases(self, context: Dict, topic: str) -> List[str]:
-        """选择与当前情境相关的认知偏差"""
-        relevant = []
-        
-        # 获取触发因素
-        triggers = context.get("triggers", [])
-        
-        for bias_type, bias_data in self.COGNITIVE_BIASES.items():
-            # 检查是否与触发因素匹配
-            trigger_contexts = bias_data.get("trigger_contexts", [])
-            
-            # 检查触发匹配
-            if any(t in triggers for t in trigger_contexts):
-                relevant.append(bias_type)
+
+        selected: List[str] = []
+        selected.extend([item for item in dominant if item in self.bias_library])
+
+        for bias_type in secondary:
+            if bias_type not in self.bias_library:
                 continue
-            
-            # 检查话题匹配
-            if any(ctx in topic for ctx in trigger_contexts):
-                relevant.append(bias_type)
-                continue
-        
-        # 如果没有特别相关的，返回所有偏差类型
-        if not relevant:
-            relevant = list(self.COGNITIVE_BIASES.keys())
-        
-        return relevant
-    
-    def _generate_biased_thought(self, bias_type: str, state: str, context: Dict) -> str:
-        """生成具体的偏差思维"""
-        bias_data = self.COGNITIVE_BIASES[bias_type]
-        template = random.choice(bias_data["templates"])
-        
-        # 根据严重程度修改
-        severity_modifiers = bias_data.get("severity_modifiers", {})
-        if severity_modifiers:
-            if state in ["severe_episode", "crisis"]:
-                modifier = severity_modifiers.get("severe", "")
-            elif state == "moderate_episode":
-                modifier = severity_modifiers.get("moderate", "")
-            else:
-                modifier = severity_modifiers.get("mild", "")
-            
-            if modifier and "会" in template:
-                template = template.replace("会", modifier)
-        
-        return template
-    
-    def _calculate_bias_intensity(self, state: str) -> float:
-        """计算认知偏差的强度"""
-        intensity_map = {
-            "severe_episode": 0.9,
-            "moderate_episode": 0.7,
-            "mild_episode": 0.5,
-            "remission": 0.3,
-            "crisis": 1.0,
-        }
-        return intensity_map.get(state, 0.5)
-    
-    def get_bias_description(self, biases: List[Dict]) -> str:
-        """获取认知偏差的文字描述"""
+            if self._conversation_supports_bias(bias_type, conversation, session_context, current_stage):
+                selected.append(bias_type)
+
+        relationship = self._relationship(session_context)
+        if relationship in {"家人", "父母"} and "personalization" in self.bias_library:
+            selected.append("personalization")
+        if relationship == "治疗师" and self._is_help_context(session_context):
+            if "should_statements" in self.bias_library:
+                selected.append("should_statements")
+        if self._has_self_negation(conversation):
+            selected.append("all_or_nothing")
+
+        selected = self._dedupe_keep_order(selected)
+        selected = selected[:max_active]
+        self.active_biases = list(selected)
+
+        source_stage_id = str(current_stage.get("id", "") or "")
+        stage_templates = bias_profile.get("thought_templates", {}) if isinstance(bias_profile.get("thought_templates", {}), dict) else {}
+        outputs: List[Dict[str, Any]] = []
+        for index, bias_type in enumerate(selected):
+            thought = self._generate_biased_thought(
+                bias_type=bias_type,
+                current_stage=current_stage,
+                stage_templates=stage_templates,
+                conversation_content=conversation,
+            )
+            confidence = self._estimate_confidence(
+                bias_type=bias_type,
+                index=index,
+                dominant=dominant,
+                conversation_content=conversation,
+                session_context=session_context,
+            )
+            outputs.append(
+                {
+                    "type": bias_type,
+                    "name": self.bias_library.get(bias_type, {}).get("name", bias_type),
+                    "thought": thought,
+                    "source_stage_id": source_stage_id,
+                    "confidence": round(float(confidence), 4),
+                }
+            )
+        return outputs
+
+    def get_bias_description(self, biases: List[Dict[str, Any]]) -> str:
         if not biases:
-            return "当前没有明显的认知偏差"
-        
-        desc_parts = ["当前活跃的认知偏差："]
-        for bias in biases:
-            desc_parts.append(f"- {bias['name']}：{bias['thought']}")
-        
-        return "\n".join(desc_parts)
-    
+            return "当前未突出显现明显的自动化认知偏差"
+        rows = ["当前活跃的认知偏差："]
+        for item in biases:
+            rows.append(f"- {item.get('name', item.get('type', '未知偏差'))}：{item.get('thought', '')}")
+        return "\n".join(rows)
+
     def should_activate_bias(self, bias_type: str, conversation_topic: str) -> bool:
-        """判断是否应该激活特定的认知偏差"""
-        bias_data = self.COGNITIVE_BIASES.get(bias_type)
-        if not bias_data:
-            return False
-        
-        trigger_contexts = bias_data.get("trigger_contexts", [])
-        return any(ctx in conversation_topic for ctx in trigger_contexts)
+        return self._conversation_supports_bias(
+            bias_type=str(bias_type or "").strip(),
+            conversation_content=str(conversation_topic or ""),
+            session_context={},
+            current_stage={},
+        )
+
+    def _conversation_supports_bias(
+        self,
+        bias_type: str,
+        conversation_content: str,
+        session_context: Dict[str, Any],
+        current_stage: Dict[str, Any],
+    ) -> bool:
+        bias_meta = self.bias_library.get(str(bias_type or "").strip(), {})
+        keywords = [str(item) for item in self._to_list(bias_meta.get("cue_keywords", []))]
+        conversation = str(conversation_content or "")
+        if any(keyword and keyword in conversation for keyword in keywords):
+            return True
+
+        semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
+        topics = [str(item) for item in self._to_list(semantic.get("topics", []))]
+        if bias_type in {"all_or_nothing", "personalization"} and any(topic in {"自我否定", "工作挫败", "学业受挫"} for topic in topics):
+            return True
+        if bias_type in {"catastrophizing", "fortune_telling"} and "未来无望" in topics:
+            return True
+        if bias_type == "should_statements" and self._is_help_context(session_context):
+            return True
+        if bias_type == "emotional_reasoning" and any(topic in {"疲惫停滞", "一般低落叙述"} for topic in topics):
+            return True
+
+        focus = [str(item) for item in self._to_list(current_stage.get("narrative_focus", []))]
+        return any(item and item in conversation for item in focus[:2]) and bias_type in {"mental_filter", "emotional_reasoning"}
+
+    def _generate_biased_thought(
+        self,
+        bias_type: str,
+        current_stage: Dict[str, Any],
+        stage_templates: Dict[str, Any],
+        conversation_content: str,
+    ) -> str:
+        templates: List[str] = []
+        if isinstance(stage_templates.get(bias_type), list):
+            templates = [str(item) for item in stage_templates.get(bias_type, []) if str(item).strip()]
+        if not templates:
+            templates = [str(item) for item in self._to_list(self.bias_library.get(bias_type, {}).get("templates", [])) if str(item).strip()]
+        if templates:
+            return random.choice(templates)
+        core_belief = str(current_stage.get("core_belief", "") or "").strip()
+        if core_belief:
+            return core_belief
+        conversation = str(conversation_content or "").strip()
+        if conversation:
+            return f"我会不由自主地把“{conversation[:20]}”往更糟糕的方向理解。"
+        return "我会不由自主地把事情解释成对自己更不利的样子。"
+
+    def _estimate_confidence(
+        self,
+        bias_type: str,
+        index: int,
+        dominant: List[str],
+        conversation_content: str,
+        session_context: Dict[str, Any],
+    ) -> float:
+        confidence = 0.58
+        if bias_type in dominant:
+            confidence += 0.20
+        if self._conversation_supports_bias(bias_type, conversation_content, session_context, {}):
+            confidence += 0.08
+        confidence -= min(0.10, 0.03 * float(index))
+        return max(0.30, min(0.95, confidence))
+
+    def _relationship(self, session_context: Dict[str, Any]) -> str:
+        participants = session_context.get("participants", {}) if isinstance(session_context.get("participants", {}), dict) else {}
+        return str(participants.get("relationship", "") or "").strip()
+
+    def _is_help_context(self, session_context: Dict[str, Any]) -> bool:
+        flags = session_context.get("session_flags", {}) if isinstance(session_context.get("session_flags", {}), dict) else {}
+        return bool(flags.get("is_help_seeking_frame", False) or flags.get("is_professional_frame", False))
+
+    @staticmethod
+    def _has_self_negation(conversation_content: str) -> bool:
+        conversation = str(conversation_content or "")
+        return any(token in conversation for token in ["我不行", "我就是失败", "我没用", "整个人都", "彻底失败"])
 
     def to_dict(self) -> Dict[str, Any]:
-        """导出可序列化状态。"""
         return {
             "active_biases": [str(item) for item in self.active_biases],
+            "selection_policy": copy.deepcopy(self.selection_policy),
+            "bias_library": copy.deepcopy(self.bias_library),
         }
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "CognitiveBiasInjector":
-        """从序列化状态恢复实例。"""
-        payload = payload or {}
-        inst = cls()
-        raw = payload.get("active_biases", [])
-        if isinstance(raw, list):
-            inst.active_biases = [str(item) for item in raw]
+    def from_dict(cls, payload: Dict[str, Any]) -> "ComplaintBiasInjector":
+        payload = payload if isinstance(payload, dict) else {}
+        inst = cls(
+            library_override=payload.get("bias_library", {}),
+            selection_policy=payload.get("selection_policy", {}),
+        )
+        active = payload.get("active_biases", [])
+        if isinstance(active, list):
+            inst.active_biases = [str(item) for item in active if str(item).strip()]
         return inst
+
+    @staticmethod
+    def _to_list(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
+        try:
+            num = int(value)
+        except Exception:
+            num = int(default)
+        num = max(int(lower), num)
+        num = min(int(upper), num)
+        return num
+
+    @staticmethod
+    def _dedupe_keep_order(values: List[str]) -> List[str]:
+        results: List[str] = []
+        seen = set()
+        for item in values:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            results.append(text)
+        return results
+
+
+CognitiveBiasInjector = ComplaintBiasInjector

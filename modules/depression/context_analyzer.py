@@ -1,360 +1,224 @@
-"""
-情境感知引擎 - 分析环境和社交情境对症状的影响
-"""
+"""会话上下文整理器。"""
+
+from __future__ import annotations
+
 import copy
 from typing import Any, Dict, List, Optional
 
 
-class ContextAnalyzer:
-    """情境感知引擎 - 根据环境和社交情境动态调整症状表现"""
-    
-    # 环境压力评分
-    LOCATION_STRESS = {
-        "家": 0.3,
-        "卧室": 0.2,
-        "公园": 0.4,
-        "心理咨询室": 0.6,
-        "公共场所": 0.7,
-        "陌生环境": 0.8,
-    }
-    
-    # 社交密度压力
-    SOCIAL_DENSITY_STRESS = {
-        "独处": 0.2,
-        "一对一": 0.5,
-        "小群体": 0.7,
-        "大群体": 0.9,
-    }
-    
-    # 关系类型影响
-    RELATIONSHIP_IMPACT = {
-        "亲密朋友": {"support": 0.8, "pressure": 0.3},
-        "普通朋友": {"support": 0.5, "pressure": 0.5},
-        "治疗师": {"support": 0.9, "pressure": 0.4},
-        "陌生人": {"support": 0.1, "pressure": 0.8},
-        "冲突关系": {"support": 0.0, "pressure": 0.9},
-    }
-    
-    # 互动类型影响
-    INTERACTION_TYPE_IMPACT = {
-        "日常活动": {"stress": 0.3, "trigger_potential": 0.2},
-        "闲聊": {"stress": 0.4, "trigger_potential": 0.2},
-        "关系回顾": {"stress": 0.35, "trigger_potential": 0.3},
-        "深度交流": {"stress": 0.6, "trigger_potential": 0.5},
-        "寻求帮助": {"stress": 0.7, "trigger_potential": 0.6},
-        "被询问状况": {"stress": 0.8, "trigger_potential": 0.7},
-        "冲突": {"stress": 0.95, "trigger_potential": 0.9},
-        "治疗对话": {"stress": 0.5, "trigger_potential": 0.8},
-    }
-    
-    # 触发词库
-    TRIGGER_KEYWORDS = {
-        "学业失败": ["学习", "成绩", "考试", "作业", "毕业", "学业", "失败", "不及格"],
-        "自我价值": ["没用", "失败者", "废物", "负担", "价值", "意义", "能力"],
-        "社交压力": ["聚会", "见面", "社交", "朋友", "孤独", "被排斥"],
-        "未来焦虑": ["未来", "计划", "目标", "希望", "前途", "工作"],
-        "自杀意念": ["死", "结束", "解脱", "活着", "痛苦", "自杀"],
-    }
-    
-    def __init__(self):
-        self.current_context = {}
-        self.trigger_history: List[str] = []
-        
-    def analyze_environment(self, location: str, time_of_day: str, 
-                          social_density: str = "独处") -> Dict:
-        """
-        分析环境对症状的影响
-        
-        Args:
-            location: 当前位置
-            time_of_day: 时间段
-            social_density: 社交密度
-            
-        Returns:
-            环境分析结果
-        """
-        # 计算环境压力
-        stress_level = self._calculate_location_stress(location)
-        stress_level += self.SOCIAL_DENSITY_STRESS.get(social_density, 0.5)
-        stress_level = min(1.0, stress_level)
-        
-        # 计算舒适度
-        comfort_level = 1.0 - stress_level
-        if location in ["家", "卧室"]:
-            comfort_level += 0.2
-        comfort_level = min(1.0, comfort_level)
-        
-        # 识别潜在触发因素
-        trigger_potential = self._assess_trigger_potential(location, time_of_day)
-        
-        return {
-            "stress_level": stress_level,
-            "comfort_level": comfort_level,
-            "trigger_potential": trigger_potential,
-            "location": location,
-            "time_of_day": time_of_day,
-            "social_density": social_density,
-        }
-    
-    def analyze_social_interaction(self, other_agent: str, 
-                                   relationship: str,
-                                   interaction_type: str,
-                                   conversation_content: str = "") -> Dict:
-        """
-        分析社交互动对症状的影响
-        
-        Args:
-            other_agent: 对方agent名称
-            relationship: 关系类型
-            interaction_type: 互动类型
-            conversation_content: 对话内容
-            
-        Returns:
-            社交互动分析结果
-        """
-        # 评估情感支持
-        relationship_data = self.RELATIONSHIP_IMPACT.get(relationship, 
-                                                        {"support": 0.3, "pressure": 0.6})
-        emotional_support = relationship_data["support"]
-        
-        # 评估社交压力
-        social_pressure = relationship_data["pressure"]
-        interaction_data = self.INTERACTION_TYPE_IMPACT.get(interaction_type,
-                                                            {"stress": 0.5, "trigger_potential": 0.5})
-        social_pressure += interaction_data["stress"]
-        social_pressure = min(1.0, social_pressure / 2)
-        
-        # 检查触发词
-        triggers = self._check_triggers(conversation_content)
-        trigger_activation = len(triggers) > 0
-        
-        return {
-            "emotional_support": emotional_support,
-            "social_pressure": social_pressure,
-            "trigger_activation": trigger_activation,
-            "triggers": triggers,
-            "other_agent": other_agent,
-            "relationship": relationship,
-            "interaction_type": interaction_type,
-        }
-    
-    def analyze_full_context(self, location: str, time_of_day: str,
-                           other_agent: Optional[str] = None,
-                           relationship: Optional[str] = None,
-                           interaction_type: Optional[str] = None,
-                           conversation_content: str = "") -> Dict:
-        """
-        综合分析当前完整情境
-        
-        Returns:
-            完整的情境分析结果
-        """
-        # 环境分析
-        social_density = "独处" if not other_agent else "一对一"
-        env_analysis = self.analyze_environment(location, time_of_day, social_density)
-        
-        # 社交分析（如果有）
-        social_analysis = {}
-        if other_agent and relationship and interaction_type:
-            social_analysis = self.analyze_social_interaction(
-                other_agent, relationship, interaction_type, conversation_content
-            )
-        
-        # 综合评估
-        overall_stress = env_analysis["stress_level"]
-        if social_analysis:
-            overall_stress = (overall_stress + social_analysis["social_pressure"]) / 2
-        
-        # 收集所有触发因素
-        all_triggers = []
-        if social_analysis and social_analysis.get("triggers"):
-            all_triggers.extend(social_analysis["triggers"])
-        
-        # 根据压力水平添加状态触发
-        if overall_stress > 0.8:
-            all_triggers.append("extreme_stress")
-        elif overall_stress > 0.6:
-            all_triggers.append("stress")
-        
-        if social_analysis and social_analysis.get("emotional_support", 0) > 0.7:
-            all_triggers.append("support")
+class SessionContextBuilder:
+    """将当前一轮互动整理成主诉链可消费的会话上下文。"""
 
-        all_triggers = self._normalize_transition_triggers(
-            all_triggers=all_triggers,
-            social_analysis=social_analysis,
+    TOPIC_RULES = {
+        "工作挫败": ["工作", "辞职", "辞退", "公司", "绩效", "老板", "上班", "失业", "开除"],
+        "学业受挫": ["学习", "考试", "成绩", "论文", "毕业", "不及格", "导师"],
+        "自我否定": ["没用", "失败", "废物", "不行", "负担", "价值", "意义", "拖累"],
+        "关系疏离": ["朋友", "家人", "理解", "离开", "孤独", "排斥", "疏远", "没人"],
+        "未来无望": ["未来", "前途", "以后", "希望", "不会好", "没希望", "看不到"],
+        "疲惫停滞": ["累", "撑不住", "不想动", "疲惫", "睡不着", "发呆", "空掉"],
+        "求助摇摆": ["帮助", "求助", "咨询", "治疗", "要不要", "能不能", "算了", "没必要"],
+    }
+
+    def __init__(self, self_name: str = ""):
+        self.self_name = str(self_name or "").strip()
+        self.current_context: Dict[str, Any] = {}
+        self.context_history: List[Dict[str, Any]] = []
+
+    def set_self_name(self, self_name: str) -> None:
+        self.self_name = str(self_name or "").strip()
+
+    def build_context(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+    ) -> Dict[str, Any]:
+        conversation = str(conversation_content or "").strip()
+        scene = {
+            "location": str(location or "").strip(),
+            "time_of_day": str(time_of_day or "").strip(),
+            "interaction_type": str(interaction_type or "").strip(),
+        }
+        participants = {
+            "self_name": self.self_name,
+            "other_agent": str(other_agent or "").strip(),
+            "relationship": str(relationship or "").strip(),
+        }
+        semantic_cues = self._build_semantic_cues(
+            conversation_content=conversation,
+            relationship=participants["relationship"],
+            interaction_type=scene["interaction_type"],
+        )
+        session_flags = self._build_session_flags(
+            relationship=participants["relationship"],
+            interaction_type=scene["interaction_type"],
+            conversation_content=conversation,
+            semantic_cues=semantic_cues,
+        )
+        context = {
+            "scene": scene,
+            "participants": participants,
+            "conversation": {
+                "content": conversation,
+                "excerpt": self._clip_text(conversation, limit=220),
+                "turn_length": len(conversation),
+            },
+            "session_flags": session_flags,
+            "semantic_cues": semantic_cues,
+        }
+        self.current_context = copy.deepcopy(context)
+        self.context_history.append(copy.deepcopy(context))
+        if len(self.context_history) > 100:
+            self.context_history = self.context_history[-100:]
+        return context
+
+    def analyze_full_context(
+        self,
+        location: str,
+        time_of_day: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        interaction_type: Optional[str] = None,
+        conversation_content: str = "",
+    ) -> Dict[str, Any]:
+        return self.build_context(
+            location=location,
+            time_of_day=time_of_day,
+            other_agent=other_agent,
+            relationship=relationship,
             interaction_type=interaction_type,
             conversation_content=conversation_content,
-            overall_stress=overall_stress,
         )
-
-        if all_triggers:
-            self.trigger_history.extend([str(item) for item in all_triggers])
-            # 仅保留最近触发，避免无界增长
-            if len(self.trigger_history) > 200:
-                self.trigger_history = self.trigger_history[-200:]
-        
-        self.current_context = {
-            "environment": env_analysis,
-            "social": social_analysis,
-            "overall_stress": overall_stress,
-            "triggers": all_triggers,
-            "timestamp": time_of_day,
-        }
-        
-        return self.current_context
-
-    def _normalize_transition_triggers(
-        self,
-        all_triggers: List[str],
-        social_analysis: Dict[str, Any],
-        interaction_type: Optional[str],
-        conversation_content: str,
-        overall_stress: float,
-    ) -> List[str]:
-        """
-        将上下文触发词归一化到状态机可识别词表，尽量保持最小侵入。
-        """
-        del conversation_content  # 预留语义增强入口，当前版本不直接使用。
-        normalized: List[str] = []
-        seen = set()
-
-        def _append(trigger: str) -> None:
-            text = str(trigger or "").strip()
-            if not text or text in seen:
-                return
-            seen.add(text)
-            normalized.append(text)
-
-        for trigger in all_triggers or []:
-            _append(str(trigger))
-
-        negative_hints = {"学业失败", "自我价值", "社交压力"}
-        if any(trigger in negative_hints for trigger in normalized):
-            _append("negative_event")
-
-        support_level = 0.0
-        social_pressure = 0.0
-        relationship = ""
-        analyzed_interaction_type = ""
-        if isinstance(social_analysis, dict):
-            relationship = str(social_analysis.get("relationship", "") or "").strip()
-            analyzed_interaction_type = str(
-                social_analysis.get("interaction_type", "") or ""
-            ).strip()
-            try:
-                support_level = float(social_analysis.get("emotional_support", 0.0) or 0.0)
-            except Exception:
-                support_level = 0.0
-            try:
-                social_pressure = float(social_analysis.get("social_pressure", 0.0) or 0.0)
-            except Exception:
-                social_pressure = 0.0
-
-        if social_pressure >= 0.75:
-            _append("isolation")
-
-        if support_level >= 0.7:
-            _append("support")
-            _append("positive_interaction")
-
-        resolved_interaction_type = str(interaction_type or analyzed_interaction_type).strip()
-        has_therapy_context = relationship == "治疗师" or resolved_interaction_type == "治疗对话"
-        if has_therapy_context:
-            _append("therapy")
-
-        if has_therapy_context and overall_stress <= 0.55:
-            _append("therapy_progress")
-
-        if support_level >= 0.8 and overall_stress <= 0.45:
-            _append("sustained_support")
-
-        return normalized
-    
-    def _calculate_location_stress(self, location: str) -> float:
-        """计算位置压力"""
-        for key, value in self.LOCATION_STRESS.items():
-            if key in location:
-                return value
-        return 0.5  # 默认中等压力
-    
-    def _assess_trigger_potential(self, location: str, time_of_day: str) -> float:
-        """评估触发潜力"""
-        trigger_potential = 0.3
-        
-        # 夜晚和清晨触发潜力更高
-        if time_of_day in ["night", "morning"]:
-            trigger_potential += 0.2
-        
-        # 某些地点触发潜力更高
-        if "心理咨询室" in location:
-            trigger_potential += 0.3
-        
-        return min(1.0, trigger_potential)
-    
-    def _check_triggers(self, content: str) -> List[str]:
-        """检查对话内容中的触发词"""
-        triggered = []
-        
-        for trigger_type, keywords in self.TRIGGER_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in content:
-                    triggered.append(trigger_type)
-                    break
-        
-        return triggered
 
     def get_context_description(self) -> str:
-        """获取当前情境的文字描述"""
         if not self.current_context:
-            return "当前情境未分析"
-        
-        env = self.current_context.get("environment", {})
-        social = self.current_context.get("social", {})
-        
-        desc_parts = []
-        
-        # 环境描述
-        desc_parts.append(f"当前环境：{env.get('location', '未知')}")
-        desc_parts.append(f"时间：{env.get('time_of_day', '未知')}")
-        
-        # 社交描述
-        if social:
-            desc_parts.append(f"社交情境：与{social.get('other_agent', '某人')}进行{social.get('interaction_type', '交流')}")
-            desc_parts.append(f"关系类型：{social.get('relationship', '未知')}")
-        
-        # 压力水平
-        stress = self.current_context.get("overall_stress", 0)
-        if stress > 0.7:
-            desc_parts.append("环境压力：高")
-        elif stress > 0.4:
-            desc_parts.append("环境压力：中等")
-        else:
-            desc_parts.append("环境压力：低")
-        
-        return "，".join(desc_parts)
+            return "当前没有可用的会话上下文"
+        scene = self.current_context.get("scene", {}) if isinstance(self.current_context.get("scene", {}), dict) else {}
+        participants = self.current_context.get("participants", {}) if isinstance(self.current_context.get("participants", {}), dict) else {}
+        semantic = self.current_context.get("semantic_cues", {}) if isinstance(self.current_context.get("semantic_cues", {}), dict) else {}
+        topics = "、".join([str(item) for item in semantic.get("topics", [])[:3]]) or "未识别主题"
+        return "地点：{}；对象：{}；关系：{}；主题：{}".format(
+            scene.get("location", "未知"),
+            participants.get("other_agent", "未知"),
+            participants.get("relationship", "未知"),
+            topics,
+        )
+
+    def _build_semantic_cues(
+        self,
+        conversation_content: str,
+        relationship: str,
+        interaction_type: str,
+    ) -> Dict[str, Any]:
+        conversation = str(conversation_content or "")
+        topics: List[str] = []
+        for topic, keywords in self.TOPIC_RULES.items():
+            if any(keyword in conversation for keyword in keywords):
+                topics.append(topic)
+        if not topics:
+            topics.append("一般低落叙述")
+
+        speech_acts: List[str] = []
+        if any(token in conversation for token in ["我觉得", "我最近", "我一直", "我很", "我现在"]):
+            speech_acts.append("自我暴露")
+        if any(token in conversation for token in ["其实", "比如", "因为", "后来", "那天", "具体"]):
+            speech_acts.append("具体叙述")
+        if any(token in conversation for token in ["帮", "能不能", "要不要", "想聊", "想说", "该怎么办"]):
+            speech_acts.append("求助尝试")
+        if any(token in conversation for token in ["算了", "不用", "没事", "还好", "只是有点"]):
+            speech_acts.append("淡化")
+        if any(token in conversation for token in ["不想说", "不太想", "没必要", "懒得"]):
+            speech_acts.append("回避")
+        if any(token in conversation for token in ["也许", "可能", "不知道", "好像"]):
+            speech_acts.append("含蓄求助")
+        if not speech_acts:
+            speech_acts.append("简短应答")
+
+        stance: List[str] = []
+        if any(token in conversation for token in ["有点", "也许", "可能", "不知道"]):
+            stance.append("试探")
+        if any(token in conversation for token in ["没事", "算了", "不用", "还好"]):
+            stance.append("保留")
+        if any(token in conversation for token in ["失败", "没用", "废物", "丢脸", "羞耻"]):
+            stance.append("羞耻")
+        if any(token in conversation for token in ["不想", "别问", "烦", "没必要"]):
+            stance.append("防御")
+        if any(token in conversation for token in ["累", "空", "麻木", "没劲"]):
+            stance.append("低落")
+        if relationship == "治疗师" or interaction_type == "治疗对话":
+            stance.append("被评估感")
+        if not stance:
+            stance.append("谨慎")
+
+        return {
+            "topics": topics[:6],
+            "speech_acts": self._dedupe_keep_order(speech_acts)[:6],
+            "stance": self._dedupe_keep_order(stance)[:6],
+        }
+
+    def _build_session_flags(
+        self,
+        relationship: str,
+        interaction_type: str,
+        conversation_content: str,
+        semantic_cues: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        speech_acts = [str(item) for item in semantic_cues.get("speech_acts", [])]
+        return {
+            "is_help_seeking_frame": (
+                interaction_type in {"寻求帮助", "治疗对话"}
+                or relationship == "治疗师"
+                or "求助尝试" in speech_acts
+                or "含蓄求助" in speech_acts
+            ),
+            "is_evaluative_frame": (
+                interaction_type in {"被询问状况", "治疗对话"}
+                or relationship in {"治疗师", "家人", "父母"}
+            ),
+            "is_close_relationship": relationship in {"亲密朋友", "朋友", "家人", "父母", "伴侣"},
+            "is_professional_frame": relationship == "治疗师" or interaction_type == "治疗对话",
+            "is_minimizing": any(token in conversation_content for token in ["没事", "还好", "只是有点", "算了"]),
+            "is_withdrawing": any(token in conversation_content for token in ["不想说", "不太想", "没必要", "懒得"]),
+        }
 
     def to_dict(self) -> Dict[str, Any]:
-        """导出可序列化状态。"""
-        current_context = (
-            copy.deepcopy(self.current_context)
-            if isinstance(self.current_context, dict)
-            else {}
-        )
-        trigger_history = list(self.trigger_history) if isinstance(self.trigger_history, list) else []
         return {
-            "current_context": current_context,
-            "trigger_history": [str(item) for item in trigger_history],
+            "self_name": self.self_name,
+            "current_context": copy.deepcopy(self.current_context),
+            "context_history": copy.deepcopy(self.context_history[-100:]),
         }
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "ContextAnalyzer":
-        """从序列化状态恢复实例。"""
-        payload = payload or {}
-        inst = cls()
-        context = payload.get("current_context", {})
-        if isinstance(context, dict):
-            inst.current_context = copy.deepcopy(context)
-        history = payload.get("trigger_history", [])
+    def from_dict(cls, payload: Dict[str, Any]) -> "SessionContextBuilder":
+        payload = payload if isinstance(payload, dict) else {}
+        inst = cls(self_name=str(payload.get("self_name", "") or ""))
+        inst.current_context = copy.deepcopy(payload.get("current_context", {})) if isinstance(payload.get("current_context", {}), dict) else {}
+        history = payload.get("context_history", [])
         if isinstance(history, list):
-            inst.trigger_history = [str(item) for item in history][-200:]
+            inst.context_history = [copy.deepcopy(item) for item in history if isinstance(item, dict)][-100:]
         return inst
+
+    @staticmethod
+    def _clip_text(value: Any, limit: int = 220) -> str:
+        text = str(value or "").strip()
+        if len(text) <= int(limit):
+            return text
+        return text[: max(0, int(limit) - 1)] + "…"
+
+    @staticmethod
+    def _dedupe_keep_order(values: List[str]) -> List[str]:
+        results: List[str] = []
+        seen = set()
+        for item in values:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            results.append(text)
+        return results
+
+
+ContextAnalyzer = SessionContextBuilder

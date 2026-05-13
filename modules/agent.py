@@ -4,8 +4,10 @@ import os
 import math
 import random
 import datetime
+import copy
 
 from modules import memory, prompt, utils
+from modules.depression import DepressionSimulationEngine
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
 
@@ -33,6 +35,12 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
+        self.depression_dynamic_global = (
+            copy.deepcopy(config.get("depression_dynamic_global", {}))
+            if isinstance(config.get("depression_dynamic_global", {}), dict)
+            else {}
+        )
+        self.depression_dynamic = self._init_depression_dynamic(config)
 
         # status
         status = {"poignancy": 0}
@@ -74,6 +82,16 @@ class Agent:
         }
         if self.schedule.scheduled():
             des["schedule"] = self.schedule.abstract()
+        if self.depression_dynamic:
+            try:
+                dyn = self.depression_dynamic.get_current_state_info()
+                des["depression_dynamic"] = {
+                    "stage_id": dyn.get("current_stage", {}).get("id", ""),
+                    "stage_label": dyn.get("current_stage", {}).get("label", ""),
+                    "interaction_count": dyn.get("interaction_count", 0),
+                }
+            except Exception:
+                pass
         if self.llm_available():
             des["llm"] = self._llm.get_summary()
         # if self.plan.get("path"):
@@ -93,15 +111,37 @@ class Agent:
         assert hasattr(
             self.scratch, "prompt_" + func_hint
         ), "Can not find func prompt_{} from scratch".format(func_hint)
+        prompt_kwargs = dict(kwargs)
+        depression_chat_ctx = None
+        if func_hint == "generate_chat":
+            prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
+                args=args,
+                kwargs=prompt_kwargs,
+            )
+        elif func_hint == "reflect_insights":
+            prompt_kwargs = self._prepare_depression_reflect_insights(prompt_kwargs)
         func = getattr(self.scratch, "prompt_" + func_hint)
-        res = func(*args, **kwargs)._asdict()
+        raw_res = func(*args, **prompt_kwargs)
+        if hasattr(raw_res, "_asdict"):
+            res = raw_res._asdict()
+        elif isinstance(raw_res, dict):
+            res = dict(raw_res)
+        else:
+            raise TypeError(
+                "scratch prompt_{} must return dict or namedtuple-like object, got {}".format(
+                    func_hint, type(raw_res).__name__
+                )
+            )
         title, msg = "{}.{}".format(self.name, func_hint), {}
+        output = res.get("failsafe")
         if self.llm_available():
             self.logger.info("{} -> {}".format(self.name, func_hint))
             output = self._llm.completion(**res)
             msg = {"<PROMPT>": "\n" + res["prompt"] + "\n"}
             msg.update({"response": output})
         self.logger.debug(utils.block_msg(title, msg))
+        if func_hint == "generate_chat" and depression_chat_ctx:
+            self._commit_depression_generate_chat(depression_chat_ctx, output)
         return output
 
     def think(self, status, agents):
@@ -683,6 +723,246 @@ class Agent:
             "chats": self.chats,
             "currently": self.scratch.currently,
         }
+        if self.depression_dynamic:
+            info.update(
+                {
+                    "depression_dynamic_state": self.depression_dynamic.to_dict(),
+                    "depression_config_path": str(
+                        getattr(self.depression_dynamic, "config_path", "") or ""
+                    ),
+                }
+            )
         if with_action:
             info.update({"action": self.action.to_dict()})
         return info
+
+    def _init_depression_dynamic(self, config):
+        global_cfg = (
+            self.depression_dynamic_global
+            if isinstance(self.depression_dynamic_global, dict)
+            else {}
+        )
+        if global_cfg and not bool(global_cfg.get("enabled", True)):
+            return None
+
+        explicit_config_path = str(config.get("depression_config_path", "") or "").strip()
+        agent_dir = str(config.get("agent_dir", "") or "").strip()
+        candidate_paths = []
+        if explicit_config_path:
+            candidate_paths.append(explicit_config_path)
+        if agent_dir:
+            candidate_paths.append(os.path.join(agent_dir, "depression_config.json"))
+
+        config_path = ""
+        for item in candidate_paths:
+            path = os.path.abspath(str(item or "").strip())
+            if path and os.path.isfile(path):
+                config_path = path
+                break
+
+        if not config_path:
+            if global_cfg.get("on_missing_agent_config", "warn_and_disable") == "warn_and_disable":
+                if self.logger:
+                    self.logger.info(
+                        "[DEPRESSION_DYNAMIC] agent={} disabled: missing depression_config.json".format(
+                            self.name
+                        )
+                    )
+            return None
+
+        try:
+            engine = DepressionSimulationEngine(
+                {
+                    "config_path": config_path,
+                    "agent_dir": os.path.dirname(config_path),
+                    "agent_name": self.name,
+                }
+            )
+            engine.set_base_prompt(self._build_depression_base_prompt())
+            state_payload = config.get("depression_dynamic_state", {})
+            if isinstance(state_payload, dict) and state_payload:
+                engine.load_state(copy.deepcopy(state_payload))
+                engine.set_base_prompt(self._build_depression_base_prompt())
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} enabled config={}".format(
+                        self.name, config_path
+                    )
+                )
+            return engine
+        except Exception as exc:
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} init failed: {}".format(
+                        self.name, exc
+                    )
+                )
+            return None
+
+    def _build_depression_base_prompt(self):
+        try:
+            return self.scratch._base_desc()
+        except Exception:
+            return str(self.scratch.currently or "")
+
+    def _prepare_depression_generate_chat(self, args, kwargs):
+        if not self.depression_dynamic:
+            return kwargs, None
+        if "depression_chat_block" in kwargs and str(kwargs.get("depression_chat_block", "")).strip():
+            return kwargs, None
+        if len(args) < 4:
+            return kwargs, None
+        _, other, relation_summary, chats = args[:4]
+        self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+
+        context = self._build_depression_chat_context(
+            other=other,
+            relation_summary=relation_summary,
+            chats=chats,
+        )
+        preview_prompt = self.depression_dynamic.preview_interaction_prompt(
+            location=context["location"],
+            time_of_day=context["time_of_day"],
+            other_agent=context["other_agent"],
+            relationship=context["relationship"],
+            interaction_type=context["interaction_type"],
+            conversation_content=context["conversation_content"],
+            roadmap_completion_func=self._depression_llm_completion,
+            emotion_completion_func=self._depression_llm_completion,
+        )
+        next_kwargs = dict(kwargs)
+        next_kwargs["depression_chat_block"] = preview_prompt
+        return next_kwargs, context
+
+    def _prepare_depression_reflect_insights(self, kwargs):
+        if not self.depression_dynamic:
+            return kwargs
+        if "depression_reflect_block" in kwargs and str(kwargs.get("depression_reflect_block", "")).strip():
+            return kwargs
+        self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+        next_kwargs = dict(kwargs)
+        next_kwargs["depression_reflect_block"] = self.depression_dynamic.get_simple_prompt()
+        return next_kwargs
+
+    def _commit_depression_generate_chat(self, context, output):
+        if not self.depression_dynamic:
+            return
+        utterance = str(output or "").strip()
+        if not utterance:
+            return
+        self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+        try:
+            self.depression_dynamic.commit_interaction(
+                location=context["location"],
+                time_of_day=context["time_of_day"],
+                other_agent=context["other_agent"],
+                relationship=context["relationship"],
+                interaction_type=context["interaction_type"],
+                conversation_content=utterance,
+                roadmap_completion_func=self._depression_llm_completion,
+                emotion_completion_func=self._depression_llm_completion,
+            )
+        except Exception as exc:
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} commit failed: {}".format(
+                        self.name, exc
+                    )
+                )
+
+    def _build_depression_chat_context(self, other, relation_summary, chats):
+        location = self._dynamic_location()
+        relationship = self._infer_dynamic_relationship(other, relation_summary)
+        interaction_type = self._infer_dynamic_interaction_type(
+            other=other,
+            relationship=relationship,
+            chats=chats,
+        )
+        conversation_content = "\n".join(
+            ["{}: {}".format(name, text) for name, text in (chats or [])]
+        )
+        return {
+            "location": location,
+            "time_of_day": self._dynamic_time_of_day(),
+            "other_agent": getattr(other, "name", ""),
+            "relationship": relationship,
+            "interaction_type": interaction_type,
+            "conversation_content": conversation_content,
+        }
+
+    def _dynamic_location(self):
+        try:
+            address = self.get_tile().get_address()
+            if isinstance(address, list) and len(address) >= 2:
+                return "，".join(address[-2:])
+            return str(address)
+        except Exception:
+            return ""
+
+    def _dynamic_time_of_day(self):
+        hour = utils.get_timer().get_date().hour
+        if 5 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 18:
+            return "afternoon"
+        if 18 <= hour < 23:
+            return "evening"
+        return "night"
+
+    def _infer_dynamic_relationship(self, other, relation_summary=""):
+        if not self.depression_dynamic:
+            return ""
+        raw_config = getattr(self.depression_dynamic, "raw_config", {})
+        mapping = {}
+        if isinstance(raw_config.get("relationship_overrides", {}), dict):
+            mapping.update(raw_config.get("relationship_overrides", {}))
+        profile = raw_config.get("profile", {}) if isinstance(raw_config.get("profile", {}), dict) else {}
+        if isinstance(profile.get("relationship_overrides", {}), dict):
+            mapping.update(profile.get("relationship_overrides", {}))
+        other_name = str(getattr(other, "name", "") or "").strip()
+        if other_name in mapping:
+            return str(mapping[other_name] or "").strip()
+
+        summary = str(relation_summary or "")
+        text = "{} {}".format(other_name, summary)
+        heuristics = [
+            ("治疗师", ["治疗", "咨询", "医生", "心理", "蜻蜓队长"]),
+            ("家人", ["父", "母", "家人", "同住", "金龟次郎"]),
+            ("朋友", ["朋友", "好友", "田德莉娜"]),
+            ("邻居", ["邻居", "呱呱蛙"]),
+            ("冲突关系", ["恶霸", "冲突", "蟑螂恶霸", "讨厌"]),
+        ]
+        for label, keywords in heuristics:
+            if any(keyword in text for keyword in keywords):
+                return label
+        return "熟人"
+
+    def _infer_dynamic_interaction_type(self, other, relationship, chats):
+        other_name = str(getattr(other, "name", "") or "").strip()
+        location = self._dynamic_location()
+        conversation_text = "\n".join(
+            ["{}: {}".format(name, text) for name, text in (chats or [])]
+        )
+        if relationship == "治疗师" or "心理咨询室" in location or other_name == "蜻蜓队长":
+            return "治疗对话"
+        if any(token in conversation_text for token in ["帮我", "怎么办", "想聊", "能不能", "求助"]):
+            return "寻求帮助"
+        if any(token in conversation_text for token in ["最近怎么样", "还好吗", "怎么了", "状态"]):
+            return "被询问状况"
+        if len(chats or []) >= 4:
+            return "深度交流"
+        if relationship in {"家人", "朋友", "熟人"}:
+            return "闲聊"
+        return "日常活动"
+
+    def _depression_llm_completion(self, prompt):
+        if not self.llm_available():
+            return ""
+        llm_cfg = self.think_config.get("llm", {}) if isinstance(self.think_config.get("llm", {}), dict) else {}
+        return self._llm.completion(
+            prompt=prompt,
+            retry=int(llm_cfg.get("retry", 3) or 3),
+            failsafe="",
+            caller="depression_dynamic",
+            temperature=float(llm_cfg.get("temperature", 0.5) or 0.5),
+        ) or ""
