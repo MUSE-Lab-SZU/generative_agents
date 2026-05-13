@@ -370,7 +370,8 @@ class Agent:
         events = self.move(status["coord"], status.get("path"))
         plan, _ = self.make_schedule()
 
-        if (plan["describe"] == "sleeping" or "睡" in plan["describe"]) and self.is_awake():
+        # 干预模式下不执行睡觉判定，保持清醒以响应干预锁
+        if not self._is_intervention_mode() and (plan["describe"] == "sleeping" or "睡" in plan["describe"]) and self.is_awake():
             self.logger.info("{} is going to sleep...".format(self.name))
             address = self.spatial.find_address("睡觉", as_list=True)
             tiles = self.maze.get_address_tiles(address)
@@ -440,8 +441,24 @@ class Agent:
 
         return events
 
+    def _is_intervention_mode(self):
+        """是否在干预模式下运行（心理咨询室场景，不需要自主日常活动）。"""
+        return self.intervention is not None
+
+    def _is_intervention_locked(self):
+        """当前 agent 是否处于干预锁定中（正在接受/进行心理咨询）。"""
+        return bool(self.status.get("intervention", {}).get("lock", {}).get("enabled"))
+
     def make_schedule(self):
         if not self.schedule.scheduled():
+            # 干预模式下跳过自主活动计划生成
+            if self._is_intervention_mode():
+                self.logger.info("{} is in intervention mode, skipping schedule generation...".format(self.name))
+                self.schedule.create = utils.get_timer().get_date()
+                self.schedule.add_plan("等待心理咨询", 24 * 60)
+                self.status["poignancy"] = 0
+                return self.schedule.current_plan()
+
             self.logger.info("{} is making schedule...".format(self.name))
             # update currently
             if self.associate.index.nodes_num > 0:
@@ -587,6 +604,10 @@ class Agent:
         if self.path:
             return
         if self.action.finished():
+            # 干预模式下只在锁定中才决定行动，其余时间等待
+            if self._is_intervention_mode():
+                if not self._is_intervention_locked():
+                    return
             self.action = self._determine_action()
 
     # create action && object events

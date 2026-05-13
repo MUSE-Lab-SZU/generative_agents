@@ -78,6 +78,9 @@ class SimulateServer:
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
             self.intervention.on_step_start(self.game, timer.get_date())
+            # 同步已被 _activate_meeting 修改的 agent 坐标到 status，确保 move() 使用最新位置
+            for name, agent in self.game.agents.items():
+                self.agent_status[name]["coord"] = list(agent.coord)
             for name, status in self.agent_status.items():
                 plan = self.game.agent_think(name, status)["plan"]
                 agent = self.game.get_agent(name)

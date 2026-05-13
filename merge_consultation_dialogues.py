@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Merge judge traces and consultation records for one checkpoint archive."""
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = PROJECT_ROOT / "results" / "checkpoints"
 # Default runtime parameters (you can edit these two values directly).
 DEFAULT_ARCHIVE_NAME = "sim-test-kbd-0421-2"
-DEFAULT_OUTPUT_FILE = CHECKPOINTS_DIR / DEFAULT_ARCHIVE_NAME / "merge_consultation_dialogues/merge_consultation_dialogues.json"
+EXPERIMENT_DATA_DIR = PROJECT_ROOT / "results" / "experiment_data"
+DEFAULT_OUTPUT_FILE = EXPERIMENT_DATA_DIR / DEFAULT_ARCHIVE_NAME / "traces" / "merge_consultation_dialogues.json"
 
 
 def read_json(path: Path) -> Any:
@@ -58,15 +59,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Output JSON file path (optional). "
-            "Default: results/checkpoints/<archive_name>/merge_consultation_dialogues/merge_consultation_dialogues.json"
+            "Default: results/experiment_data/<archive_name>/traces/merge_consultation_dialogues.json"
         ),
     )
     args = parser.parse_args()
     if args.output_file is None:
         args.output_file = (
-            CHECKPOINTS_DIR
+            EXPERIMENT_DATA_DIR
             / args.archive_name
-            / "merge_consultation_dialogues"
+            / "traces"
             / "merge_consultation_dialogues.json"
         )
     return args

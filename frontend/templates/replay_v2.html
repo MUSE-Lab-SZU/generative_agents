@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<!-- ── v2 控制栏 ── -->
+<div class="row" style="margin-bottom: 0;">
+  <div class="col-md-12" style="padding: 0;">
+    <div style="background:#f5f5f5; border:1px solid #ddd; border-radius:6px;
+                padding:8px 12px; display:flex; align-items:center; gap:8px; width:100%; box-sizing:border-box;">
+
+      <button id="v2-reset"  style="padding:4px 10px; border:1px solid #bbb; border-radius:4px;
+                   background:#fff; cursor:pointer; font-size:13px; white-space:nowrap;">⏮ 重置</button>
+      <button id="v2-back"   style="padding:4px 10px; border:1px solid #bbb; border-radius:4px;
+                   background:#fff; cursor:pointer; font-size:13px; white-space:nowrap;">⏪ -1步</button>
+      <button id="v2-fwd"    style="padding:4px 10px; border:1px solid #bbb; border-radius:4px;
+                   background:#fff; cursor:pointer; font-size:13px; white-space:nowrap;">⏩ +1步</button>
+      <button id="v2-loop"   style="padding:4px 10px; border:1px solid #bbb; border-radius:4px;
+                   background:#fff; cursor:pointer; font-size:13px; white-space:nowrap;">🔁 循环</button>
+
+      <input type="range" id="v2-slider" min="0" value="0"
+             style="flex:1; min-width:100px; accent-color:#6a5acd;">
+
+      <span id="v2-frame" style="font-size:13px; font-family:monospace; white-space:nowrap;">
+        步 0 / {{ max_sim_step }}
+      </span>
+      <span id="v2-time" style="font-size:13px; font-family:monospace; white-space:nowrap;
+                   background:#ccffcc; padding:2px 8px; border-radius:4px;">
+        --:--
+      </span>
+    </div>
+  </div>
+</div>
+
+<!-- ── 原版回放界面（完全保留） ── -->
+<div id="game-container" style="text-align: center"></div>
+<div>
+    <div class="row">
+        <div class="col-md-12" style="border: solid; padding: 1em; padding-left:2em; padding-right:2em; border-radius: 5px;">
+            <div class="row" style="display: flex; flex-wrap: wrap; margin: -0.5em;">
+                {% for p in persona_names %}
+                <div style="text-align: center; margin: 0.5em;">
+                    <a href="javascript:void(0);" id="on_screen_det_trigger-{{ p }}">
+                        <div style="padding: 0;">
+                            {% set image_static = 'assets/village/agents/' ~ p ~ '/portrait.png' %}
+                            <img src="{{ url_for('static', filename=image_static) }}" style="width: 32px; padding: 0;">
+                            <br>
+                            {{ p }}
+                        </div>
+                    </a>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <div class="media" id="on_screen_det_content-init" style="background-color:#EEEEEE; padding:1em; padding-left:2em; padding-right:2em; border-radius:5px; ">
+        <em>点击角色可查看更多细节。</em>
+    </div>
+
+    {% for p in persona_names %}
+        <div class="media" id="on_screen_det_content-{{ p }}" style="background-color:#EEEEEE; padding:0em; padding-left:2em; padding-right:2em; border-radius:5px; display: none;">
+            <div class="media-left media-middle">
+                {% set image_static = 'assets/village/agents/' ~ p ~ '/portrait.png' %}
+                <img src="{{ url_for('static', filename=image_static) }}" style="width:3em">
+                <div style="display: none;" id="temp_focus"></div>
+            </div>
+            <div class="media-body" style='padding-left:3em; padding-top:1em; padding-bottom:0em'>
+                <div style="">
+                    <p style="font-size:1.0em"><span id="agent_desc__{{ p }}"></span></p>
+                    <p style="font-size:1.0em">当前活动：<span id="current_action__{{ p }}"></span> @ <span id="target_address__{{ p }}"></span></p>
+                </div>
+            </div>
+        </div>
+    {% endfor %}
+</div>
+
+{% endblock content %}
+
+{% block js_content %}
+<script src='https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.js'></script>
+{% include 'main_script.html' %}
+
+<!-- 原版角色点击事件 -->
+<script>
+{% for p in persona_names %}
+    $('#on_screen_det_trigger-{{ p }}').click(function() {
+        $('#on_screen_det_content-init').css({'display': 'none'});
+        {% for p_i in persona_names %}
+            $('#on_screen_det_content-{{p_i}}').css({'display': 'none'});
+            $('#on_screen_det_trigger-{{p_i}}').css({'font-weight': '500'});
+        {% endfor %}
+        $('#on_screen_det_trigger-{{ p }}').css({'font-weight': '900'});
+        $('#on_screen_det_trigger_container-{{ p }}').css({
+            'background-color': '#ABFF84', 'border-radius': '10px'
+        });
+        $('#on_screen_det_content-{{ p }}').css({'display': 'block'});
+        document.getElementById("temp_focus").innerHTML = "{{ p }}";
+    });
+{% endfor %}
+</script>
+
+<!-- ── v2 回放增强控制 ── -->
+<script>
+// ── 核心常量 ──
+var V2_FPS         = {{ frames_per_step }};
+var V2_MAX_STEP    = {{ max_sim_step }};
+var V2_STRIDE      = {{ stride }};
+var V2_ORIG_START  = new Date(Date.parse({{ start_datetime|tojson }}));
+// 总时长 = 步数 × 每步分钟数（滑块覆盖到最后一步的结束时刻）
+var V2_TOTAL_MINUTES = V2_MAX_STEP * V2_STRIDE;
+var v2Looping = false;
+
+document.getElementById("v2-slider").max = V2_TOTAL_MINUTES;
+
+// ── 工具函数 ──
+
+// 模拟步(1-based) → 帧索引
+function v2SimStepToFrame(s) {
+    if (s <= 1) return 1;
+    return (s - 1) * V2_FPS + 1;
+}
+
+// 帧索引 → 模拟步(1-based)
+function v2FrameToSimStep(f) {
+    if (f <= 1) return 1;
+    return Math.floor((f - 1) / V2_FPS) + 1;
+}
+
+// 分钟偏移 → 显示时间 HH:MM
+function v2MinutesToTime(minutes) {
+    var d = new Date(V2_ORIG_START.getTime() + minutes * 60000);
+    return d.getHours().toString().padStart(2, "0") + ":" +
+           d.getMinutes().toString().padStart(2, "0");
+}
+
+// 当前分钟偏移（基于 start_datetime）
+function v2CurrentMinutes() {
+    return Math.round((start_datetime.getTime() - V2_ORIG_START.getTime()) / 60000);
+}
+
+// 找到包含有效角色数据的最近帧（往前搜）
+function v2FindValidFrame(frameIdx) {
+    var key = String(frameIdx);
+    if (key in all_movement) {
+        // 检查是否有实际角色数据
+        var names = Object.keys(personas);
+        if (names.length > 0 && all_movement[key][names[0].replace("_", " ")]) return frameIdx;
+    }
+    for (var k = frameIdx; k >= 0; k--) {
+        var kk = String(k);
+        if (kk in all_movement) {
+            var ns = Object.keys(personas);
+            if (ns.length > 0 && all_movement[kk][ns[0].replace("_", " ")]) return k;
+        }
+    }
+    return 0;
+}
+
+// ── 跳转到指定分钟偏移 ──
+function v2JumpToMinutes(targetMinutes) {
+    if (targetMinutes < 0) targetMinutes = 0;
+    var simStep = Math.floor(targetMinutes / V2_STRIDE) + 1;
+    var frameIdx = v2FindValidFrame(v2SimStepToFrame(simStep));
+    var frameKey = String(frameIdx);
+
+    // 设角色位置 + 停动画
+    var names = Object.keys(personas);
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        var sprite = personas[name];
+        var safeName = name.replace("_", " ");
+        var data = all_movement[frameKey][safeName];
+        if (!data) continue;
+
+        sprite.body.x = data["movement"][0] * tile_width + tile_width / 2;
+        sprite.body.y = data["movement"][1] * tile_width + tile_width;
+        sprite.anims.stop();
+
+        var dir = pre_anims_direction_dict[name];
+        if      (dir === "l") sprite.setTexture(name, "left");
+        else if (dir === "r") sprite.setTexture(name, "right");
+        else if (dir === "u") sprite.setTexture(name, "up");
+        else                  sprite.setTexture(name, "down");
+
+        var pron = pronunciatios[name];
+        var action = data["action"] || "";
+        var short = action.length > 25 ? action.substring(0, 20) + "..." : action;
+        pron.setText(name + ": " + short);
+        pron.x = sprite.body.x - 15;
+        pron.y = sprite.body.y - 40;
+
+        document.getElementById("agent_desc__" + name).innerHTML =
+            all_movement["description"][safeName]?.currently || "";
+        document.getElementById("current_action__" + name).innerHTML = action;
+        document.getElementById("target_address__" + name).innerHTML = data["location"] || "";
+    }
+
+    // ★ 重置原版 update 的全部状态变量
+    step = frameIdx;
+    execute_count = execute_count_max;
+    finished = false;
+    v2Paused = false;
+
+    // 恢复原版按钮显示
+    buttonPlay.text = "[运行]";
+    buttonPause.setVisible(true);
+    buttonPause.text = " 暂停 ";
+
+    // 更新游戏内时间
+    var dt = new Date(V2_ORIG_START.getTime() + targetMinutes * 60000);
+    start_datetime = dt;
+    currentTime.setText(dt.toLocaleTimeString("zh-CN", datetime_options));
+}
+
+// ── UI 刷新 ──
+function v2UpdateUI() {
+    var mins = v2CurrentMinutes();
+    var slider = document.getElementById("v2-slider");
+    var frameLbl = document.getElementById("v2-frame");
+    var timeLbl = document.getElementById("v2-time");
+    var btnLoop = document.getElementById("v2-loop");
+    if (!slider) return;
+
+    var simStep = v2FrameToSimStep(step);
+    slider.value = Math.max(0, Math.min(V2_TOTAL_MINUTES, mins));
+    frameLbl.textContent = "步 " + simStep + " / " + V2_MAX_STEP;
+    timeLbl.textContent = v2MinutesToTime(mins);
+    btnLoop.style.background = v2Looping ? "#ABFF84" : "#fff";
+}
+
+// ── v2 按钮事件 ──
+
+// 重置：回到第一帧，保持播放状态
+document.getElementById("v2-reset").onclick = function() {
+    v2JumpToMinutes(0);
+    v2UpdateUI();
+};
+
+// 循环
+document.getElementById("v2-loop").onclick = function() {
+    v2Looping = !v2Looping;
+    v2UpdateUI();
+};
+
+// -1 步（最小到第 1 步，不会卡住）
+document.getElementById("v2-back").onclick = function() {
+    var curStep = v2FrameToSimStep(step);
+    var targetStep = Math.max(1, curStep - 1);
+    v2JumpToMinutes((targetStep - 1) * V2_STRIDE);
+    v2UpdateUI();
+};
+
+// +1 步
+document.getElementById("v2-fwd").onclick = function() {
+    var curStep = v2FrameToSimStep(step);
+    var targetStep = Math.min(V2_MAX_STEP, curStep + 1);
+    v2JumpToMinutes((targetStep - 1) * V2_STRIDE);
+    v2UpdateUI();
+};
+
+// 滑块
+document.getElementById("v2-slider").oninput = function() {
+    var targetMinutes = parseInt(this.value);
+    v2JumpToMinutes(targetMinutes);
+    v2UpdateUI();
+};
+
+// ── 循环播放：finished 时自动回到起点继续 ──
+setInterval(function() {
+    if (finished && v2Looping) {
+        v2JumpToMinutes(0);
+        v2UpdateUI();
+    }
+}, 300);
+
+// ── 播放时同步 UI ──
+setInterval(function() {
+    if (!v2Paused && !finished) {
+        v2UpdateUI();
+    }
+}, 300);
+
+v2UpdateUI();
+</script>
+{% endblock js_content %}

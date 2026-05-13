@@ -184,16 +184,16 @@
       }
     ],
     "complaint_roadmap": {
-      "initial_state": "severe_episode",
+      "initial_state": "mild_episode",
       "window_size": 2,
       "minimum_state_duration": 0,
       "max_dialog_history": 12,
       "initial_stage": {
-        "label": "把学业受挫和低落感当成人生失败",
-        "description": "你很容易把休学、效率下降和持续疲惫解释成“我这个人本来就不行”，既害怕让人失望，又不相信自己真的能好起来。",
-        "distress_level": 0.86,
-        "openness_level": 0.18,
-        "hopefulness_level": 0.1,
+        "label": "将低落和疲惫归因于环境和疲劳",
+        "description": "你倾向于将情绪低落和兴趣减退解释为'最近太忙了'或'没休息好'，虽然偶尔承认可能有心理层面的问题，但主要还是用外部原因来合理化自己的状态。",
+        "distress_level": 0.4,
+        "openness_level": 0.55,
+        "hopefulness_level": 0.5,
         "terminal_recovery": false
       }
     },

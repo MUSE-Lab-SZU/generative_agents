@@ -1,21 +1,21 @@
 <script type="text/javascript">
 	// Initialize variables from Flask context
-	let step = {{ step|tojson }};
-	let step_size = {{ sec_per_step|tojson }} * 1000; // Convert to milliseconds
-	let zoom = {{ zoom|tojson }};
+	var step = {{ step|tojson }};
+	var step_size = {{ sec_per_step|tojson }} * 1000; // Convert to milliseconds
+	var zoom = {{ zoom|tojson }};
 	if (zoom <= 0) zoom = document.documentElement.clientWidth / 4400;
 
-	let tile_width = 32;
-	let movement_speed = {{ play_speed|tojson }};
-	let execute_count_max = tile_width / movement_speed;
-	let execute_count = execute_count_max;
-	let all_movement = {{ all_movement|tojson }};
+	var tile_width = 32;
+	var movement_speed = {{ play_speed|tojson }};
+	var execute_count_max = tile_width / movement_speed;
+	var execute_count = execute_count_max;
+	var all_movement = {{ all_movement|tojson }};
 
-	let datetime_options = { weekday: "long", year: "numeric", month: "long", day: "numeric" };
-	let start_datetime = new Date(Date.parse({{ start_datetime|tojson }}));
+	var datetime_options = { weekday: "long", year: "numeric", month: "long", day: "numeric" };
+	var start_datetime = new Date(Date.parse({{ start_datetime|tojson }}));
 
 	// Persona related variables
-	let persona_names = {{ persona_init_pos|tojson }};
+	var persona_names = {{ persona_init_pos|tojson }};
 	var spawn_tile_loc = {};
 	for (var key in persona_names) {
 		spawn_tile_loc[key] = persona_names[key];
@@ -23,17 +23,19 @@
 
 	var personas = {};
 	var pronunciatios = {};
-	let anims_direction;
-	let pre_anims_direction;
-	let pre_anims_direction_dict = {};
+	var anims_direction;
+	var pre_anims_direction;
+	var pre_anims_direction_dict = {};
 
-	let movement_target = {};
+	var movement_target = {};
 
-	let finished = false;
-	let paused = false;
+	var finished = false;
+	var paused = false;
+	// v2 增强回放控制变量（由 replay_v2.html 设置）
+	var v2Paused = false;
 
 	// Phaser configuration
-	const config = {
+	var config = {
 		type: Phaser.AUTO,
 		// width: 4480,
 		// height: 3200,
@@ -59,9 +61,9 @@
 	};
 
 	// Create Phaser game instance
-	const game = new Phaser.Game(config);
-	let cursors;
-	let player;
+	var game = new Phaser.Game(config);
+	var cursors;
+	var player;
 
 	// Preload function
 	function preload() {
@@ -293,6 +295,7 @@
 			buttonPlay.text = "[运行]";
 			buttonPause.text = " 暂停 ";
 			paused = false;
+			v2Paused = false;
 		});
 
 		buttonPause.on("pointerdown", function() {
@@ -337,7 +340,7 @@
 			document.getElementById("temp_focus").innerHTML = "";
 		}
 
-		if (finished || paused) {
+		if (finished || paused || v2Paused) {
 			return;
 		}
 

@@ -33,6 +33,11 @@ Thumbs.db
 
 # Experiment outputs and large artifacts
 results/
-*.jsonl
 *.pdf
 *.zip
+
+# Claude Code local config
+.claude/
+
+# App.py adhoc outputs (large, regenerable)
+customization/depression_scale_agent/questions/adhoc/
