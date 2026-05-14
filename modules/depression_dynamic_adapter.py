@@ -410,15 +410,27 @@ def serialize_focus(focus: Any, max_items: int = 6) -> str:
 
 
 def _render_dynamic_emotion_section(agent: Any) -> str:
-    profile = getattr(agent, "depression_profile", {})
-    if not isinstance(profile, dict):
-        return ""
-    runtime = profile.get("runtime", {})
-    if not isinstance(runtime, dict):
-        return ""
-    emotion = runtime.get("emotion", {})
-    if not isinstance(emotion, dict):
-        return ""
+    emotion: Dict[str, Any] = {}
+    engine = getattr(agent, "depression_dynamic_engine", None)
+    if engine is not None and callable(getattr(engine, "get_current_state_info", None)):
+        try:
+            info = engine.get_current_state_info()
+            if isinstance(info, dict) and isinstance(info.get("emotion", {}), dict):
+                emotion = info.get("emotion", {})
+        except Exception:
+            emotion = {}
+
+    if not emotion:
+        profile = getattr(agent, "depression_profile", {})
+        if not isinstance(profile, dict):
+            return ""
+        runtime = profile.get("runtime", {})
+        if not isinstance(runtime, dict):
+            return ""
+        raw_emotion = runtime.get("emotion", {})
+        if not isinstance(raw_emotion, dict):
+            return ""
+        emotion = raw_emotion
 
     label = str(emotion.get("label", "") or "").strip()
     style = str(emotion.get("style", "") or "").strip()
@@ -427,11 +439,23 @@ def _render_dynamic_emotion_section(agent: Any) -> str:
         return ""
 
     intensity_raw = emotion.get("intensity", 0.0)
+    disclosure_raw = emotion.get("disclosure_level", 0.0)
+    defensiveness_raw = emotion.get("defensiveness", 0.0)
     try:
         intensity = float(intensity_raw)
     except Exception:
         intensity = 0.0
+    try:
+        disclosure = float(disclosure_raw)
+    except Exception:
+        disclosure = 0.0
+    try:
+        defensiveness = float(defensiveness_raw)
+    except Exception:
+        defensiveness = 0.0
     intensity = max(0.0, min(1.0, intensity))
+    disclosure = max(0.0, min(1.0, disclosure))
+    defensiveness = max(0.0, min(1.0, defensiveness))
 
     lines = ["=== Emotion (Current Speaking State) ==="]
     if label:
@@ -439,6 +463,10 @@ def _render_dynamic_emotion_section(agent: Any) -> str:
     if style:
         lines.append(f"- Speaking Style: {style}")
     lines.append(f"- Emotion Intensity: {intensity:.2f}")
+    if disclosure > 0.0:
+        lines.append(f"- Disclosure Level: {disclosure:.2f}")
+    if defensiveness > 0.0:
+        lines.append(f"- Defensiveness: {defensiveness:.2f}")
     if volatility_note:
         lines.append(f"- Volatility Note: {volatility_note}")
     return "\n".join(lines)

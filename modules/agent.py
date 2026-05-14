@@ -644,30 +644,45 @@ class Agent:
                 allow_reflect_constraint = bool(
                     depression_cfg.get("allow_reflection_constraint", True)
                 )
-            view = drm.build_intermediate_view(
-                self.depression_profile,
-                utils.get_timer().daily_duration(),
-                stage="reflect",
-                update_cfg=(
-                    ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                    if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                    else {}
-                ),
-            )
+            reflect_block = ""
+            if self._depression_engine_ready():
+                try:
+                    reflect_block = str(
+                        self.depression_dynamic_engine.get_simple_prompt() or ""
+                    )
+                except Exception:
+                    reflect_block = ""
+            else:
+                view = drm.build_intermediate_view(
+                    self.depression_profile,
+                    utils.get_timer().daily_duration(),
+                    stage="reflect",
+                    update_cfg=(
+                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
+                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
+                        else {}
+                    ),
+                )
+                reflect_block = view.get("reflect_block", "")
             thoughts = self.completion(
                 "reflect_insights",
                 r_nodes,
                 5,
                 depression_reflect_block=(
-                    view.get("reflect_block", "") if allow_reflect_constraint else ""
+                    reflect_block if allow_reflect_constraint else ""
                 ),
             )
             self.logger.info(
-                "========== [DEPR][REFLECT] agent={} allow_reflect_constraint={} reflect_block_len={} insights_count={} ==========".format(
+                "========== [DEPR][REFLECT] agent={} allow_reflect_constraint={} reflect_block_len={} insights_count={} source={} ==========".format(
                     self.name,
                     allow_reflect_constraint,
-                    len(view.get("reflect_block", "") if allow_reflect_constraint else ""),
+                    len(reflect_block if allow_reflect_constraint else ""),
                     len(thoughts or []),
+                    (
+                        "depression_engine"
+                        if self._depression_engine_ready()
+                        else "depression_runtime_manager"
+                    ),
                 )
             )
             for thought, evidence in thoughts:
@@ -1274,32 +1289,37 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                 )
-            if bool(getattr(self, "depression_dynamic_enabled", False)):
-                self.depression_profile = drm.infer_chat_emotion(
-                    patient_agent=self,
-                    profile=self.depression_profile,
-                    now_step=utils.get_timer().daily_duration(),
+            depression_chat_block = ""
+            if self._depression_engine_ready():
+                depression_chat_block = ""
+            else:
+                if bool(getattr(self, "depression_dynamic_enabled", False)):
+                    self.depression_profile = drm.infer_chat_emotion(
+                        patient_agent=self,
+                        profile=self.depression_profile,
+                        now_step=utils.get_timer().daily_duration(),
+                        static_profile=getattr(self, "profile", {}),
+                        other_agent=getattr(other, "name", ""),
+                        relationship=relations[0],
+                        conversation_content=dda.serialize_conversation(chats),
+                    )
+                chat_view = drm.build_intermediate_view(
+                    self.depression_profile,
+                    utils.get_timer().daily_duration(),
+                    stage="chat",
+                    update_cfg=(
+                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
+                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
+                        else {}
+                    ),
                     static_profile=getattr(self, "profile", {}),
-                    other_agent=getattr(other, "name", ""),
-                    relationship=relations[0],
-                    conversation_content=dda.serialize_conversation(chats),
                 )
-            chat_view = drm.build_intermediate_view(
-                self.depression_profile,
-                utils.get_timer().daily_duration(),
-                stage="chat",
-                update_cfg=(
-                    ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                    if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                    else {}
-                ),
-                static_profile=getattr(self, "profile", {}),
-            )
+                depression_chat_block = chat_view.get("chat_block", "")
             text = self._completion_generate_chat_with_external_route(
                 other=other,
                 relation=relations[0],
                 chats=chats,
-                depression_chat_block=chat_view.get("chat_block", ""),
+                depression_chat_block=depression_chat_block,
                 doctor_session_prompt_injection=doctor_session_prompt_injection,
                 doctor_consult_record_injection=doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
@@ -1503,21 +1523,21 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                     )
-            if bool(getattr(other, "depression_dynamic_enabled", False)):
-                other.depression_profile = drm.infer_chat_emotion(
-                    patient_agent=other,
-                    profile=other.depression_profile,
-                    now_step=utils.get_timer().daily_duration(),
-                    static_profile=getattr(other, "profile", {}),
-                    other_agent=getattr(self, "name", ""),
-                    relationship=relations[1],
-                    conversation_content=dda.serialize_conversation(chats),
-                )
-            text = other._completion_generate_chat_with_external_route(
-                other=self,
-                relation=relations[1],
-                chats=chats,
-                depression_chat_block=drm.build_intermediate_view(
+            other_depression_chat_block = ""
+            if other._depression_engine_ready():
+                other_depression_chat_block = ""
+            else:
+                if bool(getattr(other, "depression_dynamic_enabled", False)):
+                    other.depression_profile = drm.infer_chat_emotion(
+                        patient_agent=other,
+                        profile=other.depression_profile,
+                        now_step=utils.get_timer().daily_duration(),
+                        static_profile=getattr(other, "profile", {}),
+                        other_agent=getattr(self, "name", ""),
+                        relationship=relations[1],
+                        conversation_content=dda.serialize_conversation(chats),
+                    )
+                other_depression_chat_block = drm.build_intermediate_view(
                     other.depression_profile,
                     utils.get_timer().daily_duration(),
                     stage="chat",
@@ -1527,7 +1547,12 @@ class Agent:
                         else {}
                     ),
                     static_profile=getattr(other, "profile", {}),
-                ).get("chat_block", ""),
+                ).get("chat_block", "")
+            text = other._completion_generate_chat_with_external_route(
+                other=self,
+                relation=relations[1],
+                chats=chats,
+                depression_chat_block=other_depression_chat_block,
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 doctor_consult_record_injection=other_doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
@@ -2157,6 +2182,12 @@ class Agent:
 
     def get_chat_recent_turn_focus_n(self):
         return self.chat_recent_turn_focus_n
+
+    def _depression_engine_ready(self):
+        return bool(
+            getattr(self, "depression_dynamic_enabled", False)
+            and getattr(self, "depression_dynamic_engine", None) is not None
+        )
 
     def is_awake(self):
         if not self.action:

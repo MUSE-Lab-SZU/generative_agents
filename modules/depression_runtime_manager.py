@@ -2427,16 +2427,30 @@ def _render_static_profile_section(static_profile: Any) -> str:
 def _normalize_runtime_emotion(raw: Any) -> Dict[str, Any]:
     emotion = raw if isinstance(raw, dict) else {}
     intensity = emotion.get("intensity", 0.0)
+    disclosure_level = emotion.get("disclosure_level", 0.0)
+    defensiveness = emotion.get("defensiveness", 0.0)
     try:
         intensity_val = float(intensity)
     except Exception:
         intensity_val = 0.0
+    try:
+        disclosure_level_val = float(disclosure_level)
+    except Exception:
+        disclosure_level_val = 0.0
+    try:
+        defensiveness_val = float(defensiveness)
+    except Exception:
+        defensiveness_val = 0.0
     intensity_val = max(0.0, min(1.0, intensity_val))
+    disclosure_level_val = max(0.0, min(1.0, disclosure_level_val))
+    defensiveness_val = max(0.0, min(1.0, defensiveness_val))
 
     return {
         "label": str(emotion.get("label", "") or "").strip(),
         "style": str(emotion.get("style", "") or "").strip(),
         "intensity": round(float(intensity_val), 4),
+        "disclosure_level": round(float(disclosure_level_val), 4),
+        "defensiveness": round(float(defensiveness_val), 4),
         "volatility_note": str(emotion.get("volatility_note", "") or "").strip(),
         "updated_step": int(emotion.get("updated_step", -1) or -1),
         "source": str(emotion.get("source", "") or "").strip(),
