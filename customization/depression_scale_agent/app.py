@@ -24,7 +24,8 @@ from customization.depression_scale_agent.ExpertLLM import ExpertLLM  # type: ig
 CHECKPOINTS_ROOT = os.path.join(BASE_DIR, "results", "checkpoints")
 STATIC_ROOT = os.path.join(BASE_DIR, "frontend", "static")
 DEFAULT_USER_NAME = "用户"
-OUTPUT_ROOT = os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions")
+QUESTIONS_ROOT = os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions")
+OUTPUT_ROOT = os.path.join(QUESTIONS_ROOT, "adhoc")
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
 TRACE_JSON_SUFFIX = "_prompt_trace.json"
 TRACE_MD_SUFFIX = "_prompt_trace.md"
@@ -765,12 +766,13 @@ def list_simulations():
 
 
 def list_question_jsonl_files():
-    if not os.path.isdir(OUTPUT_ROOT):
+    templates_dir = os.path.join(QUESTIONS_ROOT, "templates")
+    if not os.path.isdir(templates_dir):
         return []
     return sorted(
         f
-        for f in os.listdir(OUTPUT_ROOT)
-        if f.endswith(".jsonl") and os.path.isfile(os.path.join(OUTPUT_ROOT, f))
+        for f in os.listdir(templates_dir)
+        if f.endswith(".jsonl") and os.path.isfile(os.path.join(templates_dir, f))
     )
 
 
@@ -778,7 +780,7 @@ def resolve_question_file_path(jsonl_name):
     name = os.path.basename(str(jsonl_name or "").strip())
     if not name:
         return None
-    path = os.path.join(OUTPUT_ROOT, name)
+    path = os.path.join(QUESTIONS_ROOT, "templates", name)
     if not os.path.isfile(path):
         return None
     return path
@@ -1226,5 +1228,9 @@ def build_ui():
 
 
 if __name__ == "__main__":
+    import tempfile
+    _tmp_dir = os.path.join(tempfile.gettempdir(), "gradio_" + os.getenv("USER", "default"))
+    os.makedirs(_tmp_dir, exist_ok=True)
+    os.environ["GRADIO_TEMP_DIR"] = _tmp_dir
     ui = build_ui()
     ui.launch()

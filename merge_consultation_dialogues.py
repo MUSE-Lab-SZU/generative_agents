@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Merge judge traces and consultation records for one checkpoint archive."""
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = PROJECT_ROOT / "results" / "checkpoints"
 # Default runtime parameters (you can edit these two values directly).
 DEFAULT_ARCHIVE_NAME = "sim-test-kbd-0421-2"
-DEFAULT_OUTPUT_FILE = CHECKPOINTS_DIR / DEFAULT_ARCHIVE_NAME / "merge_consultation_dialogues/merge_consultation_dialogues.json"
+EXPERIMENT_DATA_DIR = PROJECT_ROOT / "results" / "experiment_data"
+DEFAULT_OUTPUT_FILE = EXPERIMENT_DATA_DIR / DEFAULT_ARCHIVE_NAME / "traces" / "merge_consultation_dialogues.json"
 
 
 def read_json(path: Path) -> Any:
@@ -55,13 +56,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output_file",
         nargs="?",
-        default=DEFAULT_OUTPUT_FILE,
+        default=None,
         help=(
             "Output JSON file path (optional). "
-            f"Default: {DEFAULT_OUTPUT_FILE}"
+            "Default: results/experiment_data/<archive_name>/traces/merge_consultation_dialogues.json"
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.output_file is None:
+        args.output_file = (
+            EXPERIMENT_DATA_DIR
+            / args.archive_name
+            / "traces"
+            / "merge_consultation_dialogues.json"
+        )
+    return args
 
 
 def find_latest_simulate_file(checkpoint_dir: Path) -> Path:
@@ -223,7 +232,13 @@ def main() -> None:
 
     checkpoint_dir = CHECKPOINTS_DIR / args.archive_name
     if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+        available = sorted(
+            p.name for p in CHECKPOINTS_DIR.iterdir() if p.is_dir()
+        )
+        raise FileNotFoundError(
+            f"Checkpoint directory not found: {checkpoint_dir}\n"
+            f"Available checkpoint archives: {', '.join(available)}"
+        )
 
     judge_path = checkpoint_dir / "judge_traces" / "judge_conversation.json"
     if not judge_path.exists():
