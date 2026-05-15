@@ -27,6 +27,12 @@ class Agent:
         # agent config
         self.percept_config = config["percept"]
         self.think_config = config["think"]
+        self.reflect_focus_topk = self._resolve_reflect_focus_topk(
+            self.think_config.get("reflect_focus_topk", 3)
+        )
+        self.reflect_insights_topk = self._resolve_reflect_insights_topk(
+            self.think_config.get("reflect_insights_topk", 5)
+        )
         self.chat_iter = config["chat_iter"]
         global_chat_history = config.get("chat_history", {}) or {}
         local_chat_history = (config.get("_raw", {}) or {}).get("chat_history", {})
@@ -634,7 +640,7 @@ class Agent:
             : self.associate.max_importance
         ]
         # summary thought
-        focus = self.completion("reflect_focus", nodes, 3)
+        focus = self.completion("reflect_focus", nodes, self.reflect_focus_topk)
         retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
         for r_nodes in retrieved.values():
             allow_reflect_constraint = True
@@ -667,7 +673,7 @@ class Agent:
             thoughts = self.completion(
                 "reflect_insights",
                 r_nodes,
-                5,
+                self.reflect_insights_topk,
                 depression_reflect_block=(
                     reflect_block if allow_reflect_constraint else ""
                 ),
@@ -2083,6 +2089,30 @@ class Agent:
 
     def get_event(self, as_act=True):
         return self.action.event if as_act else self.action.obj_event
+
+    def _resolve_reflect_focus_topk(self, value):
+        default_topk = 3
+        if isinstance(value, bool):
+            return default_topk
+        try:
+            topk = int(value)
+        except Exception:
+            return default_topk
+        if topk <= 0:
+            return default_topk
+        return topk
+
+    def _resolve_reflect_insights_topk(self, value):
+        default_topk = 5
+        if isinstance(value, bool):
+            return default_topk
+        try:
+            topk = int(value)
+        except Exception:
+            return default_topk
+        if topk <= 0:
+            return default_topk
+        return topk
 
     def _resolve_chat_summary_window_minutes(self, value):
         default_window = 480

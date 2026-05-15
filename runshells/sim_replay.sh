@@ -11,14 +11,13 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ---------- 检查回放是否已运行 ----------
-if pgrep -f "python replay_v2.py" > /dev/null; then
+if pgrep -f "replay.py" > /dev/null; then
     echo "回放服务已在运行"
     if [ -n "$1" ]; then
         echo "请在浏览器打开: http://127.0.0.1:5051/?name=$1"
     else
-        echo "请在浏览器打开: http://127.0.0.1:5051/?name=sim-xxx"
+        echo "请在浏览器打开: http://127.0.0.1:5051/?name=<实验名称>"
     fi
-    echo "(端口号以实际输出为准)"
     exit 0
 fi
 
@@ -26,16 +25,17 @@ fi
 if [ -n "$1" ]; then
     SIM_NAME="$1"
 else
-    echo "最近 10 个仿真:"
+    echo "最近 10 个已压缩实验:"
     echo "---"
-    ls -d results/compressed/sim-test-* 2>/dev/null \
+    find results/compressed -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
         | sed 's|results/compressed/||' \
+        | sort \
         | tail -10 \
         | nl -v 0 -w 2 \
         || echo "  (无)"
     echo "---"
     echo ""
-    echo -n "请输入仿真名称: "
+    echo -n "请输入实验名称: "
     read SIM_NAME
 fi
 
@@ -54,14 +54,13 @@ python compress.py --name "$SIM_NAME"
 echo "  数据封装完成!"
 
 # ---------- 启动回放 ----------
-python replay_v2.py &
+python replay.py &
 REPLAY_PID=$!
 sleep 2
 
 echo "[2/2] 回放已启动..."
 echo ""
 echo "请在浏览器打开: http://127.0.0.1:5051/?name=$SIM_NAME"
-echo "(端口号以实际输出为准)"
 echo ""
 
 wait $REPLAY_PID

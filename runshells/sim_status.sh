@@ -16,8 +16,9 @@ if [ -n "$1" ]; then
 else
     echo "最近 10 个仿真:"
     echo "---"
-    ls -d results/checkpoints/sim-test-* 2>/dev/null \
+    find results/checkpoints -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
         | sed 's|results/checkpoints/||' \
+        | sort \
         | tail -10 \
         | nl -v 0 -w 2 \
         || echo "  (无)"

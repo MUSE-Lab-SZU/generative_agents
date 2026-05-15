@@ -498,12 +498,15 @@ def collect_trial_data(trial_name: str, severity: str, persona: str, dry_run: bo
         print(f"  [COLLECT] forced_prompt_traces/ → traces/")
 
     # 复制 merge_consultation_dialogues → traces/
-    merge_dir = os.path.join(checkpoint_dir, "merge_consultation_dialogues")
-    if os.path.isdir(merge_dir):
-        merge_file = os.path.join(merge_dir, "merge_consultation_dialogues.json")
-        if os.path.exists(merge_file):
-            shutil.copy2(merge_file, os.path.join(traces_dir, "merge_consultation_dialogues.json"))
-            print(f"  [COLLECT] merge_consultation_dialogues.json → traces/")
+    merge_file = os.path.join(output_dir, "traces", "merge_consultation_dialogues.json")
+    if os.path.exists(merge_file):
+        print(f"  [COLLECT] merge_consultation_dialogues.json 已在 traces/")
+    else:
+        legacy_merge_dir = os.path.join(checkpoint_dir, "merge_consultation_dialogues")
+        legacy_merge_file = os.path.join(legacy_merge_dir, "merge_consultation_dialogues.json")
+        if os.path.exists(legacy_merge_file):
+            shutil.copy2(legacy_merge_file, os.path.join(traces_dir, "merge_consultation_dialogues.json"))
+            print(f"  [COLLECT] legacy merge_consultation_dialogues.json → traces/")
 
     print(f"  [OK] 数据已收集到 {output_dir}")
 
@@ -1519,9 +1522,9 @@ def generate_report(dry_run: bool = False) -> None:
 SCALE_AGENT_DIR = os.path.join(BASE_DIR, "customization", "depression_scale_agent")
 SCALE_QUESTIONS_DIR = os.path.join(SCALE_AGENT_DIR, "questions", "templates")
 
-# 量表评估需要完整的依赖环境（llama_index 等），通过 conda 环境子进程调用
+# 量表评估需要完整的依赖环境（llama_index 等），通过当前解释器或显式覆盖调用
 SCALE_WORKER_SCRIPT = os.path.join(BASE_DIR, "runshells", "run_scale_worker.py")
-CONDA_PYTHON = "/mnt/nvme1/zxou/miniconda3/envs/generative_agents_py310/bin/python"
+WORKER_PYTHON = os.environ.get("GA_WORKER_PYTHON") or sys.executable
 
 
 def _find_checkpoint_dir(trial_name: str) -> Optional[str]:
@@ -1656,7 +1659,7 @@ def _run_scale_against_snapshot(
     返回 True 表示成功，结果保存到 output_path。
     """
     cmd = [
-        CONDA_PYTHON, SCALE_WORKER_SCRIPT,
+        WORKER_PYTHON, SCALE_WORKER_SCRIPT,
         "--cp-name", cp_name,
         "--snapshot", snapshot_file,
         "--agent", agent_name,
@@ -1699,7 +1702,7 @@ def _score_single_scale(answers_path: str, scoring_prompt_path: str, output_path
         return None
 
     cmd = [
-        CONDA_PYTHON,
+        WORKER_PYTHON,
         os.path.join(BASE_DIR, "runshells", "run_score_worker.py"),
         "--answers", answers_path,
         "--scoring-prompt", scoring_prompt_path,

@@ -122,7 +122,36 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
         )
         return
 
-    simulation_config = depression_config.get("depression_simulation", {})
+    if not isinstance(depression_config, dict):
+        _log(
+            agent,
+            "warning",
+            "[DEPR_DYNAMIC][INIT] agent={} enabled=false reason=invalid_simulation_config path={}".format(
+                agent.name,
+                config_path,
+            ),
+        )
+        return
+
+    if (
+        "depression_simulation" in depression_config
+        and not isinstance(depression_config.get("depression_simulation"), dict)
+    ):
+        _log(
+            agent,
+            "warning",
+            "[DEPR_DYNAMIC][INIT] agent={} enabled=false reason=invalid_simulation_config path={}".format(
+                agent.name,
+                config_path,
+            ),
+        )
+        return
+
+    engine_config = dict(depression_config)
+    engine_config["_config_path"] = config_path
+    engine_config["_agent_dir"] = agent_dir
+    engine = DepressionSimulationEngine(engine_config)
+    simulation_config = engine.raw_config if isinstance(engine.raw_config, dict) else {}
     if not isinstance(simulation_config, dict):
         _log(
             agent,
@@ -145,7 +174,6 @@ def init_runtime(agent: Any, config: Dict[str, Any]) -> None:
         )
         return
 
-    engine = DepressionSimulationEngine(simulation_config)
     engine.set_clock_provider(_now_from_timer)
     engine.set_base_prompt(_build_base_prompt(agent))
 

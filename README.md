@@ -6,16 +6,16 @@
 
 某存档所有结果在`results/experiment_data/xxx`和`results/checkpoints/xxx`目录下，关键测试结果如下：
 
-1. **Prompt使用情况**：`results/experiment_data/xxx/traces/forced_prompt_traces/`文件夹可以看到所有对话的所有Prompt使用情况，包括患者、判断LLM、医生、评估LLM的Prompt。
-   - 作用：最直观观察患者状态变化、各种Prompt注入是否合理。
-   - 生成：运行完仿真实验后由 `run_experiment.py` 收集。
-2. app.py评估脚本：`customization/depression_scale_agent/questions/adhoc/`存放了app.py评估脚本的输出结果，包括量表问题（jsonl）、量表回答（jsonl）、患者Prompt使用情况（json、md）、评估结果（txt）。
+1. **Prompt使用情况（调用LLM时的Prompt可视化）**：`results/experiment_data/xxx/traces/forced_prompt_traces/`文件夹可以看到所有对话的所有Prompt使用情况，包括患者、判断LLM、医生、评估LLM的Prompt。
+   - 作用：最直观观察患者状态变化、各种Prompt使用是否合理。
+   - 生成：运行完仿真实验后由 `run_experiment.py` 收集。（另：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成）
+2. app.py评估脚本：`results/experiment_data/xxx/scales`存放了app.py评估脚本的输出结果，包括量表回答、单量表评估和汇总（**scale_scores.json**）。
    - 作用：使用三种自评量表评估患者抑郁程度，包括SDS、BDI-II、PHQ-9。因为上次心理医生反馈说最好就使用自评量表，所以没使用联合量表。
-   - 生成：运行`customization/depression_scale_agent/app.py`后生成。
+   - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
 3. 医患对话、判断LLM、会后评估LLM、咨询记录：`results/experiment_data/xxx/traces/merge_consultation_dialogues.json`文件。
    - 作用：可视化所有医患干预对话，包括患者、判断LLM、医生、评估LLM的输出。适合给心理专业人员查看、分析。
-   - 生成：运行完仿真实验后，运行`merge_consultation_dialogues.py`脚本生成
-4. 记忆可视化：`memory_visualization\memory_view_卡布达_simulate-20260509-0830.csv`可以查看某角色的所有记忆
+   - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
+4. 记忆可视化：`memory_visualization\memory_view_卡布达_xxx.csv`可以查看某角色的所有记忆
    - 作用：可视化某角色的所有记忆，可以筛选chat记忆查看对话情况、筛选thought记忆查看反思结果、筛选event记忆查看遇到的事件。
    - 生成：运行完仿真实验后，运行`visualize_agent_memory.py`脚本生成。
 5. 外置记忆系统存储情况：`results\external_memory_audit\xxx\report.html`文件。
@@ -25,15 +25,19 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
-
+- 2026-05-15：`config.json`新增配置"reflect_focus_topk"和"reflect_insights_topk"，用于控制反思输出数量。同时降低"poignancy_max"数值，避免反思触发间隔太大
+- 2026-05-15：新增仿真后量表批量测试、重复测试脚本`runshells/run_extra_scale_eval.py`。设置好量表以及重复次数后运行，在`results/experiment_data/xxx/scales`可以看到单独以及汇总结果。
+- 2026-05-15：合并学长更新的动态抑郁人设，并且修复人设读取不成功的潜在问题。
+- 2026-05-14：新增测试脚本`test/live_external_memory_retrieve_dump.py`，用于测试外置记忆系统的记忆召回功能。发现问题：无论`query`是什么，外置记忆系统召回的内容完全一样，准备反馈给那边的同学。
+- 2026-05-14：合并欧博的脚本功能，并修正为适用于本工作区的版本。另外参照欧博脚本新增了自动化跑一次实验并评估的脚本`runshells/run_one_experiment.py`。（**特殊作用**：可以单独跑一个`step = 1`的结果，用与评估初始化状态的抑郁程度）
+- 2026-05-13：重组实验结果目录结构。experiment_data 条件目录增加 configs/traces/scales 子目录；questions/ 拆分为 templates/scoring_prompts/adhoc；experiment_logs 合并到 experiment_data/logs。详见 `counsel_context/实验结果目录重组说明.md`。（来自欧博）
 - 2026-05-13：在`readme.md`第五章增加流程图，方便理解流程
 - 2026-05-13：新增功能：使用think.llm压缩患者状态信息后再注入给judge-llm，避免信息冗余
 - 2026-05-12：新增`scripts\intervention_prompt_txt_sync.py`脚本，方便查看和修改 session Prompt。
-- 2026-05-12：根据心理医生反馈调整 CBT session Prompt、judge-llm Prompt 和 session-eval Prompt，主要降低患者表达能力的要求、让session-eval和judge-llm输出更合理。session-eval的Prompt里新增了当前session停留情况，避免长时间停留某个session里【待实验】
+- 2026-05-12：根据心理医生反馈调整 CBT session Prompt、judge-llm Prompt 和 session-eval Prompt，主要降低患者表达能力的要求、让session-eval和judge-llm输出更合理。session-eval的Prompt里新增了当前session停留情况，避免长时间停留某个session里
 - 2026-05-11：新增3个量表的单独提示词，在app.py中复制到专家模型提示词里。新增3个量表的v2版本，放到`customization\depression_scale_agent\questions`文件夹里。
 - 2026-05-10：将"memory_policy"配置落实到app.py中。config.json新增记忆排序权重调整项并落地到快照里。（关于系统自带的记忆系统，与外置记忆系统无关）
 - 2026-05-07：可视化Prompt使用后，优化以前 Prompt 注入中的一些问题。
-- 2026-05-13：重组实验结果目录结构。experiment_data 条件目录增加 configs/traces/scales 子目录；questions/ 拆分为 templates/scoring_prompts/adhoc；experiment_logs 合并到 experiment_data/logs。详见 `counsel_context/实验结果目录重组说明.md`。
 - 2026-05-07：新增可视化强制干预对话时LLM调用的Prompt，包括患者、判断LLM、医生、评估LLM。可视化md文档在`result/checkpoints/xxx/force_prompt_traces`里。注：md文档命名的时间不一定是发生对话的时间。
 - 2026-05-07：合并学长更新的主诉链分支。
 - 2026-05-06：修复emotion模块在app.py以及仿真链路中未能正常显示的问题，因为emotion模块绑定在了旧人设链路中，待学长修复后再进行二次更新。

@@ -11,9 +11,11 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ---------- 默认参数 ----------
+CONDA_ENV="generative_agents_py310"
 STEP=20
 STRIDE=360
 NAME=""
+START_TIME="$(date +%Y%m%d)-09:00"
 LOCAL_LLM=false
 
 # ---------- 解析参数 ----------
@@ -25,6 +27,8 @@ while [[ $# -gt 0 ]]; do
             STEP="$2"; shift 2 ;;
         --stride)
             STRIDE="$2"; shift 2 ;;
+        --start)
+            START_TIME="$2"; shift 2 ;;
         --local-llm)
             LOCAL_LLM=true; shift ;;
         --help|-h)
@@ -32,6 +36,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "选项:"
             echo "  --name    仿真名称 (默认自动生成, 如 sim-test-0213-0930)"
+            echo "  --start   仿真起始时间 (默认: 当天 09:00, 格式: YYYYMMDD-HH:MM)"
             echo "  --step    迭代步数  (默认: 20)"
             echo "  --stride  每步间隔分钟 (默认: 360)"
             echo "  --local-llm  使用本地 Ollama qwen3 替代 DeepSeek"
@@ -44,9 +49,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------- 自动生成参数 ----------
-# 仿真日期取今天，时刻统一为 09:00
-START_TIME="$(date +%Y%m%d)-09:00"
-
 if [ -z "$NAME" ]; then
     # 自动生成名称: sim-test-月日-时分
     NAME="sim-test-$(date +%m%d-%H%M)"
@@ -68,9 +70,6 @@ echo "  迭代步数:  $STEP"
 echo "  步间隔:    ${STRIDE}min"
 echo "=========================================="
 echo ""
-
-# ---------- Conda 环境 ----------
-CONDA_ENV="generative_agents_py310"
 
 # ---------- 启动 Ollama ----------
 echo "[1/2] 检查 Ollama 服务..."
@@ -133,7 +132,6 @@ echo ""
 echo "=========================================="
 echo " 测试完成! 后续操作:"
 echo "=========================================="
-echo "  位置移动: $PROJECT_DIR/runshells/sim_status.sh $NAME"
-echo "  回放模拟: $PROJECT_DIR/runshells/sim_replay.sh $NAME"
-echo "" ; echo -n "请选择后续操作 (1:位置 2:回放 其他:跳过): " ; read REPLY ; if [ "$REPLY" = "1" ]; then bash "$PROJECT_DIR/runshells/sim_status.sh" "$NAME"; elif [ "$REPLY" = "2" ]; then bash "$PROJECT_DIR/runshells/sim_replay.sh" "$NAME"; else echo "跳过"; fi
+echo "  位置移动: bash $PROJECT_DIR/runshells/sim_status.sh $NAME"
+echo "  回放模拟: bash $PROJECT_DIR/runshells/sim_replay.sh $NAME"
 echo "=========================================="
