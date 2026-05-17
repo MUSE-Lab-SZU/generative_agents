@@ -38,6 +38,7 @@ class ECDollMemoryServiceClient:
         "retrieve": "POST /retrieve",
         "milestones": "GET /api/milestones",
         "memories": "GET /api/memories",
+        "user_stats": "GET /api/users/{user_id}/stats",
         "user_delete": "DELETE /api/users/{user_id}",
         "memory_update": "PUT /api/memories/{id}",
         "memory_delete": "DELETE /api/memories/{id}",
@@ -46,6 +47,7 @@ class ECDollMemoryServiceClient:
         "memory_toggle_lock": "POST /api/memories/{id}/toggle_lock",
         "memory_milestone": "POST /api/memories/{id}/milestone",
         "memory_settings": "POST /api/settings/memory",
+        "embed_recheck": "POST /api/embed/recheck",
         "health": "GET /health",
         "ready": "GET /ready",
     }
@@ -276,6 +278,29 @@ class ECDollMemoryServiceClient:
         data = self._request("DELETE", f"/api/memories/{memory_id}")
         return data if isinstance(data, dict) else {}
 
+    def get_user_stats(self, user_id: str) -> JsonDict:
+        """
+        查询用户多层统计：`GET /api/users/{user_id}/stats`。
+
+        输入（Path）：
+        - `user_id`(str, 必填): 目标用户 ID。
+
+        输出（JSON）：
+        - `user_id`(str): 当前统计所属用户。
+        - `chroma`(dict): 长期记忆统计，常见字段包括
+          `total`, `l1`, `l2`, `milestones`, `locked`, `raw_fallback`。
+        - `postgres`(dict): PG 表计数，常见字段包括
+          `l3_emotion_log`, `l4_milestones`, `l4_profile_attributes`, `l4_profile_core`。
+        - `redis`(dict): Redis 统计，常见字段包括 `short_term`, `l0_cache`。
+        - `flags`(dict): 运行标记，常见字段包括 `embed_mock`。
+        - `errors`(list): 各存储读取失败信息；主体仍可能返回 200。
+        """
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            raise ValueError("get_user_stats requires non-empty user_id")
+        data = self._request("GET", f"/api/users/{user_id}/stats")
+        return data if isinstance(data, dict) else {}
+
     def delete_user_data(self, user_id: str, dry_run: bool = False) -> JsonDict:
         """
         按 user_id 级联清理：`DELETE /api/users/{user_id}`。
@@ -373,6 +398,16 @@ class ECDollMemoryServiceClient:
             "/api/settings/memory",
             json_body={"l2_threshold": l2_threshold},
         )
+        return data if isinstance(data, dict) else {}
+
+    def recheck_embedding_service(self) -> JsonDict:
+        """
+        重新探测 embedding 服务可用性：`POST /api/embed/recheck`。
+
+        输出（JSON）：
+        - 透传服务端返回；常见字段依服务实现而定。
+        """
+        data = self._request("POST", "/api/embed/recheck")
         return data if isinstance(data, dict) else {}
 
     def get_cognitive_schemas(self, user_id: str) -> List[CognitiveSchema]:

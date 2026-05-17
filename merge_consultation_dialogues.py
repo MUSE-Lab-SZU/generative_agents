@@ -96,7 +96,23 @@ def find_first_value_by_key(data: Any, target_key: str) -> Any | None:
     return None
 
 
-def extract_records_by_id(simulate_data: Any) -> dict[str, Any]:
+def is_consult_record_enabled(simulate_data: Any) -> bool:
+    if not isinstance(simulate_data, dict):
+        raise TypeError("simulate json root must be an object")
+
+    intervention = simulate_data.get("intervention") or {}
+    if isinstance(intervention, dict):
+        consult_cfg = intervention.get("consult_record") or {}
+        if isinstance(consult_cfg, dict) and "enabled" in consult_cfg:
+            return bool(consult_cfg.get("enabled"))
+
+    fallback = find_first_value_by_key(simulate_data, "consult_record")
+    if isinstance(fallback, dict) and "enabled" in fallback:
+        return bool(fallback.get("enabled"))
+    return False
+
+
+def extract_records_by_id(simulate_data: Any, *, required: bool) -> dict[str, Any]:
     if not isinstance(simulate_data, dict):
         raise TypeError("simulate json root must be an object")
 
@@ -116,7 +132,36 @@ def extract_records_by_id(simulate_data: Any) -> dict[str, Any]:
     if isinstance(fallback, dict):
         return fallback
 
-    raise KeyError("records_by_id was not found in simulate json")
+    if required:
+        raise KeyError("records_by_id was not found in simulate json")
+    return {}
+
+
+def build_session_index_by_meeting(simulate_data: Any) -> dict[str, str]:
+    if not isinstance(simulate_data, dict):
+        raise TypeError("simulate json root must be an object")
+
+    session_eval_state = (
+        (simulate_data.get("intervention_state") or {})
+        .get("session_eval_state", {})
+    )
+    history_by_pair = session_eval_state.get("history_by_pair") if isinstance(session_eval_state, dict) else {}
+
+    by_meeting: dict[str, str] = {}
+    if not isinstance(history_by_pair, dict):
+        return by_meeting
+
+    for history in history_by_pair.values():
+        if not isinstance(history, list):
+            continue
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            meeting_id = str(item.get("meeting_id") or "").strip()
+            session_id = str(item.get("session_id") or "").strip()
+            if meeting_id and session_id and meeting_id not in by_meeting:
+                by_meeting[meeting_id] = session_id
+    return by_meeting
 
 
 def build_record_index(records_by_id: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
@@ -136,18 +181,45 @@ def build_record_index(records_by_id: dict[str, Any]) -> tuple[dict[str, dict[st
     return by_meeting, duplicate_meeting_count
 
 
-def normalize_time(record: dict[str, Any], meeting: dict[str, Any]) -> str:
-    started_at = record.get("session_started_at")
-    if isinstance(started_at, str):
-        try:
-            return iso_to_slot_key(started_at)
-        except ValueError:
-            pass
+def normalize_time(record: dict[str, Any] | None, meeting: dict[str, Any]) -> str:
+    if isinstance(record, dict):
+        started_at = record.get("session_started_at")
+        if isinstance(started_at, str):
+            try:
+                return iso_to_slot_key(started_at)
+            except ValueError:
+                pass
 
     step_time = meeting.get("step_time")
     if isinstance(step_time, str):
         return step_time
     return ""
+
+
+def resolve_participants(record: dict[str, Any] | None, meeting: dict[str, Any]) -> tuple[str, str]:
+    doctor = None
+    patient = None
+
+    if isinstance(record, dict):
+        participants = record.get("participants") or {}
+        if isinstance(participants, dict):
+            doctor = participants.get("doctor")
+            patient = participants.get("patient")
+
+    if not isinstance(doctor, str) or not isinstance(patient, str):
+        pair_key = meeting.get("pair_key")
+        if isinstance(pair_key, str) and "::" in pair_key:
+            pair_doctor, pair_patient = pair_key.split("::", 1)
+            if not isinstance(doctor, str):
+                doctor = pair_doctor
+            if not isinstance(patient, str):
+                patient = pair_patient
+
+    if not isinstance(doctor, str):
+        doctor = "doctor"
+    if not isinstance(patient, str):
+        patient = "patient"
+    return doctor, patient
 
 
 def extract_dialogue(turns: Any, doctor: str, patient: str) -> list[list[str]]:
@@ -181,6 +253,9 @@ def extract_dialogue(turns: Any, doctor: str, patient: str) -> list[list[str]]:
 def merge_sessions(
     judge_sessions: list[Any],
     records_by_meeting: dict[str, dict[str, Any]],
+    session_by_meeting: dict[str, str],
+    *,
+    consult_record_enabled: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     merged: list[dict[str, Any]] = []
     stats = {"total_sessions": 0, "matched": 0, "missing_record": 0}
@@ -197,30 +272,27 @@ def merge_sessions(
             continue
 
         record = records_by_meeting.get(meeting_id)
-        if not isinstance(record, dict):
+        if consult_record_enabled and not isinstance(record, dict):
             stats["missing_record"] += 1
             continue
 
-        participants = record.get("participants") or {}
-        doctor = participants.get("doctor") if isinstance(participants, dict) else None
-        patient = participants.get("patient") if isinstance(participants, dict) else None
-        if not isinstance(doctor, str):
-            doctor = "doctor"
-        if not isinstance(patient, str):
-            patient = "patient"
-
+        doctor, patient = resolve_participants(record, meeting)
         dialogue = extract_dialogue(session.get("turns"), doctor=doctor, patient=patient)
         reason = (session.get("session_eval") or {}).get("reason")
+        current_session = session_by_meeting.get(meeting_id, "")
+        if isinstance(record, dict):
+            current_session = str(record.get("current_session") or current_session)
 
-        merged.append(
-            {
-                "time": normalize_time(record, meeting),
-                "current_session": record.get("current_session"),
-                "dialogue": dialogue,
-                "reason": reason,
-                "consultation_record": {"soap": record.get("soap")},
-            }
-        )
+        item = {
+            "time": normalize_time(record, meeting),
+            "current_session": current_session,
+            "dialogue": dialogue,
+            "reason": reason,
+        }
+        if consult_record_enabled and isinstance(record, dict):
+            item["consultation_record"] = {"soap": record.get("soap")}
+
+        merged.append(item)
         stats["matched"] += 1
 
     merged.sort(key=lambda item: item.get("time") or "")
@@ -246,17 +318,24 @@ def main() -> None:
 
     latest_simulate_path = find_latest_simulate_file(checkpoint_dir)
     simulate_data = read_json(latest_simulate_path)
-    records_by_id = extract_records_by_id(simulate_data)
+    consult_record_enabled = is_consult_record_enabled(simulate_data)
+    records_by_id = extract_records_by_id(simulate_data, required=consult_record_enabled)
     records_by_meeting, duplicate_meeting_count = build_record_index(records_by_id)
+    session_by_meeting = build_session_index_by_meeting(simulate_data)
 
     judge_data = read_json(judge_path)
     judge_sessions = judge_data.get("sessions")
     if not isinstance(judge_sessions, list):
         raise TypeError(f"Invalid sessions format in: {judge_path}")
 
-    merged, stats = merge_sessions(judge_sessions, records_by_meeting)
+    merged, stats = merge_sessions(
+        judge_sessions,
+        records_by_meeting,
+        session_by_meeting,
+        consult_record_enabled=consult_record_enabled,
+    )
 
-    if STRICT_MODE and (duplicate_meeting_count > 0 or stats["missing_record"] > 0):
+    if consult_record_enabled and STRICT_MODE and (duplicate_meeting_count > 0 or stats["missing_record"] > 0):
         raise RuntimeError(
             "STRICT_MODE=True and duplicate/missing records detected: "
             f"duplicates={duplicate_meeting_count}, missing_record={stats['missing_record']}"
@@ -272,6 +351,7 @@ def main() -> None:
     print(f"[Input] judge_conversation={judge_path}")
     print(
         "[Stats] "
+        f"consult_record_enabled={consult_record_enabled}, "
         f"total_sessions={stats['total_sessions']}, "
         f"matched={stats['matched']}, "
         f"missing_record={stats['missing_record']}, "

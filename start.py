@@ -9,7 +9,6 @@ from dotenv import load_dotenv, find_dotenv
 from modules.game import create_game, get_game
 from modules import utils
 from modules.intervention_manager import InterventionManager
-from modules import depression_runtime_manager as drm
 
 personas = [
     "卡布达",  # 抑郁症患者
@@ -44,8 +43,6 @@ class SimulateServer:
             self.logger = utils.create_file_logger(f"{checkpoints_folder}/{log_file}", verbose)
         else:
             self.logger = utils.create_io_logger(verbose)
-
-        drm.validate_all_agents_or_raise(config, self.load_static)
 
         # 创建游戏
         game = create_game(name, static_root, config, conversation, logger=self.logger)

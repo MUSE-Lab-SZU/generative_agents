@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 
 from modules.maze import Maze
+from modules import depression_dynamic_adapter as dda
 from start import personas
 
 file_markdown = "simulation.md"
@@ -37,22 +38,7 @@ def get_location(address):
 
 def get_depression_runtime_snapshot(agent_data):
     """提取回放所需的抑郁运行态关键字段。"""
-    profile = agent_data.get("depression_profile", {}) if isinstance(agent_data, dict) else {}
-    runtime = profile.get("runtime", {}) if isinstance(profile, dict) else {}
-    current_event = runtime.get("current_event", {}) if isinstance(runtime.get("current_event", {}), dict) else {}
-    emotion = runtime.get("emotion", {}) if isinstance(runtime.get("emotion", {}), dict) else {}
-    meta = runtime.get("update_meta", {}) if isinstance(runtime.get("update_meta", {}), dict) else {}
-
-    return {
-        "current_event_wording": current_event.get("wording", ""),
-        "emotion_label": emotion.get("label", ""),
-        "emotion_style": emotion.get("style", ""),
-        "emotion_intensity": emotion.get("intensity", 0.0),
-        "last_throttle_reason": meta.get("last_throttle_reason", ""),
-        "short_term_changed": bool(meta.get("short_term_changed", False)),
-        "long_term_changed": bool(meta.get("long_term_changed", False)),
-        "changed_paths": meta.get("changed_paths", []) or [],
-    }
+    return dda.get_runtime_snapshot(agent_data)
 
 
 # 插入第0帧数据（Agent的初始状态）

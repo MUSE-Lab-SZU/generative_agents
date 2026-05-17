@@ -27,19 +27,19 @@ from typing import Optional
 # ============================================================
 
 # 实验名称；留空则自动生成，例如 sim-one-0514-1830
-RUN_NAME = "sim-test-0515-2"
+RUN_NAME = "sim-init-0516"
 
 # 是否续跑已有实验（对应 start.py 的 --resume）
 # - False：新开一个实验
 # - True：基于已有 checkpoint 继续跑
-RESUME_RUN = True
+RESUME_RUN = False
 
 # 仿真起始时间（对应 start.py 的 --start）
 # 仅在 RESUME_RUN=False 时生效
-START_TIME = "20250515-09:30"
+START_TIME = "20250516-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 72
+STEP = 1
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 360
@@ -48,7 +48,7 @@ STRIDE = 360
 VERBOSE = "info"
 
 # 日志文件名（对应 start.py 的 --log）；留空表示不额外写文件日志
-LOG_FILE = "sim-init-0515-2.log"
+LOG_FILE = "sim-init-0516.log"
 
 # 量表评估的目标角色
 SCALE_AGENT = "卡布达"
@@ -69,6 +69,12 @@ RUN_30Q = False
 # 是否执行 compress.py 生成回放资源
 RUN_COMPRESS = True
 
+# 是否执行角色记忆可视化（visualize_agent_memory.py）
+RUN_AGENT_MEMORY_VIS = True
+
+# 是否执行外置记忆审计可视化（visualize_external_memory_audit.py）
+RUN_EXTERNAL_MEMORY_AUDIT = True
+
 # 是否只打印命令，不实际执行
 DRY_RUN = False
 
@@ -83,6 +89,8 @@ EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
 START_SCRIPT = BASE_DIR / "start.py"
 MERGE_SCRIPT = BASE_DIR / "merge_consultation_dialogues.py"
 COMPRESS_SCRIPT = BASE_DIR / "compress.py"
+AGENT_MEMORY_VIS_SCRIPT = BASE_DIR / "visualize_agent_memory.py"
+EXTERNAL_MEMORY_AUDIT_SCRIPT = BASE_DIR / "visualize_external_memory_audit.py"
 SCALE_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_scale_worker.py"
 SCORE_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_score_worker.py"
 WORKER_PYTHON = os.environ.get("GA_WORKER_PYTHON") or sys.executable
@@ -121,6 +129,8 @@ class RuntimeConfig:
     run_post_scale: bool
     run_30q: bool
     run_compress: bool
+    run_agent_memory_vis: bool
+    run_external_memory_audit: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,6 +149,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II/SDS 评估")
     parser.add_argument("--run-30q", action="store_true", help="显式开启治疗后 30Q 评估")
     parser.add_argument("--skip-compress", action="store_true", help="跳过 compress.py")
+    parser.add_argument("--run-agent-memory-vis", action="store_true", help="显式开启角色记忆可视化")
+    parser.add_argument("--skip-agent-memory-vis", action="store_true", help="跳过角色记忆可视化")
+    parser.add_argument("--run-external-memory-audit", action="store_true", help="显式开启外置记忆审计可视化")
+    parser.add_argument("--skip-external-memory-audit", action="store_true", help="跳过外置记忆审计可视化")
     return parser.parse_args()
 
 
@@ -170,6 +184,8 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         run_post_scale=bool(RUN_POST_SCALE and not args.skip_post_scale),
         run_30q=bool(RUN_30Q or args.run_30q),
         run_compress=bool(RUN_COMPRESS and not args.skip_compress),
+        run_agent_memory_vis=bool((RUN_AGENT_MEMORY_VIS or args.run_agent_memory_vis) and not args.skip_agent_memory_vis),
+        run_external_memory_audit=bool((RUN_EXTERNAL_MEMORY_AUDIT or args.run_external_memory_audit) and not args.skip_external_memory_audit),
     )
 
 
@@ -177,7 +193,7 @@ def run_cmd(cmd: list[str], *, dry_run: bool, timeout: Optional[int] = None) -> 
     print(f"[RUN] {' '.join(cmd)}")
     if dry_run:
         return
-    subprocess.run(cmd, cwd=BASE_DIR, timeout=timeout, check=True)
+    subprocess.run(cmd, cwd=BASE_DIR, check=True)
 
 
 def ensure_checkpoint_state(name: str, *, resume: bool, dry_run: bool) -> None:
@@ -351,6 +367,36 @@ def run_post_30q(name: str, agent_name: str, *, dry_run: bool) -> None:
     )
 
 
+def run_agent_memory_visualization(name: str, agent_name: str, *, dry_run: bool) -> None:
+    output_dir = ensure_experiment_dirs(name, dry_run=dry_run) / "visualizations" / "agent_memory"
+    run_cmd(
+        [
+            sys.executable,
+            str(AGENT_MEMORY_VIS_SCRIPT),
+            "--cp-name", name,
+            "--agent", agent_name,
+            "--output-dir", str(output_dir),
+        ],
+        dry_run=dry_run,
+        timeout=1800,
+    )
+
+
+def run_external_memory_audit(name: str, agent_name: str, *, dry_run: bool) -> None:
+    output_root = ensure_experiment_dirs(name, dry_run=dry_run) / "visualizations" / "external_memory_audit"
+    run_cmd(
+        [
+            sys.executable,
+            str(EXTERNAL_MEMORY_AUDIT_SCRIPT),
+            "--cp-name", name,
+            "--agent", agent_name,
+            "--output-root", str(output_root),
+        ],
+        dry_run=dry_run,
+        timeout=1800,
+    )
+
+
 def print_effective_config(cfg: RuntimeConfig) -> None:
     print("==========================================")
     print(" 单次实验配置")
@@ -368,6 +414,8 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  跑治疗后量表: {cfg.run_post_scale}")
     print(f"  跑 30Q:       {cfg.run_30q}")
     print(f"  跑 compress:  {cfg.run_compress}")
+    print(f"  跑记忆可视化: {cfg.run_agent_memory_vis}")
+    print(f"  跑外置审计:   {cfg.run_external_memory_audit}")
     print(f"  dry-run:      {cfg.dry_run}")
     print("==========================================")
 
@@ -408,6 +456,12 @@ def main() -> None:
 
     if cfg.run_compress:
         run_cmd([sys.executable, str(COMPRESS_SCRIPT), "--name", cfg.name], dry_run=cfg.dry_run, timeout=1800)
+
+    if cfg.run_agent_memory_vis:
+        run_agent_memory_visualization(cfg.name, cfg.agent, dry_run=cfg.dry_run)
+
+    if cfg.run_external_memory_audit:
+        run_external_memory_audit(cfg.name, cfg.agent, dry_run=cfg.dry_run)
 
     print("\n[Done] 单次实验流程完成")
     print(f"- 查看状态: bash runshells/sim_status.sh {cfg.name}")

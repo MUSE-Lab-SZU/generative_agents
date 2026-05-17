@@ -4,14 +4,14 @@
 External memory audit and visualization script.
 
 How to use:
-1) Edit the configuration block at the top of this file.
-2) Run: python visualize_external_memory_audit.py
-
-No CLI arguments are required.
+1) Edit the configuration block at the top of this file, then run: python visualize_external_memory_audit.py
+2) Or override via CLI, for example:
+   python visualize_external_memory_audit.py --cp-name sim-test-0513 --agent 卡布达
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
@@ -40,7 +40,7 @@ OUTPUT_ROOT = CURRENT_DIR / "results" / "external_memory_audit"
 
 # Optional filters:
 # [] means "all saves"/"all agents"
-TARGET_SAVE_NAMES: List[str] = ["sim-test-memory-0424-2"]
+TARGET_SAVE_NAMES: List[str] = ["sim-test-0515-2"]
 TARGET_AGENT_NAMES: List[str] = ["卡布达"]
 
 MEMORY_SERVICE_BASE_URL = "http://localhost:8031"
@@ -55,6 +55,61 @@ INCLUDE_HEALTH_CHECKS = True
 WRITE_JSON = True
 WRITE_CSV = True
 WRITE_HTML = True
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="审计并可视化外置记忆")
+    parser.add_argument("--cp-name", dest="save_names", action="append", default=None, help="实验名，可重复传入多次")
+    parser.add_argument("--agent", dest="agent_names", action="append", default=None, help="角色名，可重复传入多次")
+    parser.add_argument("--checkpoints-root", default=None, help="checkpoint 根目录")
+    parser.add_argument("--output-root", default=None, help="输出根目录")
+    parser.add_argument("--service-base-url", default=None, help="外置记忆服务地址")
+    parser.add_argument("--service-timeout", type=float, default=None, help="外置记忆服务超时秒数")
+    parser.add_argument("--retrieve-query", default=None, help="retrieve 接口使用的查询文本")
+    parser.add_argument("--no-local-supplement", action="store_true", help="跳过本地补充信息")
+    parser.add_argument("--no-timeline", action="store_true", help="跳过日志时间线回放")
+    parser.add_argument("--no-health-checks", action="store_true", help="跳过 health/ready 检查")
+    return parser.parse_args()
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    global CHECKPOINTS_ROOT
+    global OUTPUT_ROOT
+    global TARGET_SAVE_NAMES
+    global TARGET_AGENT_NAMES
+    global MEMORY_SERVICE_BASE_URL
+    global MEMORY_SERVICE_TIMEOUT_SECONDS
+    global RETRIEVE_QUERY
+    global INCLUDE_LOCAL_SUPPLEMENT
+    global INCLUDE_TIMELINE_REPLAY
+    global INCLUDE_HEALTH_CHECKS
+
+    if args.checkpoints_root:
+        checkpoints_root = Path(args.checkpoints_root)
+        if not checkpoints_root.is_absolute():
+            checkpoints_root = checkpoints_root.resolve()
+        CHECKPOINTS_ROOT = checkpoints_root
+    if args.output_root:
+        output_root = Path(args.output_root)
+        if not output_root.is_absolute():
+            output_root = output_root.resolve()
+        OUTPUT_ROOT = output_root
+    if args.save_names is not None:
+        TARGET_SAVE_NAMES = [name for name in args.save_names if name]
+    if args.agent_names is not None:
+        TARGET_AGENT_NAMES = [name for name in args.agent_names if name]
+    if args.service_base_url is not None:
+        MEMORY_SERVICE_BASE_URL = args.service_base_url
+    if args.service_timeout is not None and args.service_timeout > 0:
+        MEMORY_SERVICE_TIMEOUT_SECONDS = args.service_timeout
+    if args.retrieve_query is not None:
+        RETRIEVE_QUERY = args.retrieve_query
+    if args.no_local_supplement:
+        INCLUDE_LOCAL_SUPPLEMENT = False
+    if args.no_timeline:
+        INCLUDE_TIMELINE_REPLAY = False
+    if args.no_health_checks:
+        INCLUDE_HEALTH_CHECKS = False
 
 
 @dataclass
@@ -142,6 +197,13 @@ def _fmt_time(raw: Any) -> str:
     if dt is None:
         return str(raw or "")
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
 
 
 def _resolve_saves() -> List[Path]:
@@ -311,6 +373,14 @@ def _fetch_retrieve_details(client: ECDollMemoryServiceClient, scoped_user_id: s
     if not isinstance(details, dict):
         details = {}
     return {"formatted_prompt": str(data.get("formatted_prompt", "") or ""), "details": details}
+
+
+def _fetch_user_stats(client: ECDollMemoryServiceClient, scoped_user_id: str) -> Dict[str, Any]:
+    try:
+        data = client.get_user_stats(user_id=scoped_user_id)
+    except Exception as exc:
+        return {"error": str(exc)}
+    return data if isinstance(data, dict) else {}
 
 
 def _load_map(path: Path) -> Dict[str, Any]:
@@ -531,11 +601,126 @@ def _mws_stats(memories: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _stats_dashboard(memories: List[Dict[str, Any]], milestones: List[Dict[str, Any]], relation_audit: Dict[str, Any]) -> Dict[str, Any]:
+def _consistency_with_stats(
+    memories: List[Dict[str, Any]],
+    milestones: List[Dict[str, Any]],
+    retrieve_data: Dict[str, Any],
+    user_stats: Dict[str, Any],
+) -> Dict[str, Any]:
+    details = retrieve_data.get("details", {}) if isinstance(retrieve_data, dict) else {}
+    if not isinstance(details, dict):
+        details = {}
+    ranked_memories = details.get("ranked_memories", [])
+    if not isinstance(ranked_memories, list):
+        ranked_memories = []
+
+    level_counter = Counter([_memory_level(m) for m in memories if _memory_level(m)])
+    locked = sum(1 for m in memories if bool(m.get("is_locked")))
+    milestone_flag = sum(1 for m in memories if bool(m.get("is_milestone")))
+    observed_counts = {
+        "listed_memories": len(memories),
+        "listed_l1": level_counter.get("L1", 0),
+        "listed_l2": level_counter.get("L2", 0),
+        "listed_milestone_flags": milestone_flag,
+        "listed_locked_flags": locked,
+        "listed_milestones": len(milestones),
+        "retrieve_ranked_memories": len(ranked_memories),
+    }
+    if not user_stats:
+        return {
+            "service_available": False,
+            "matches": {},
+            "service_counts": {},
+            "observed_counts": observed_counts,
+            "stats_errors": [],
+            "warnings": ["本次未拿到 /api/users/{user_id}/stats 返回，因此无法做服务端权威计数对照。"],
+        }
+
+    chroma = user_stats.get("chroma", {}) if isinstance(user_stats, dict) else {}
+    postgres = user_stats.get("postgres", {}) if isinstance(user_stats, dict) else {}
+    flags = user_stats.get("flags", {}) if isinstance(user_stats, dict) else {}
+    stats_errors = user_stats.get("errors", []) if isinstance(user_stats, dict) else []
+    if not isinstance(chroma, dict):
+        chroma = {}
+    if not isinstance(postgres, dict):
+        postgres = {}
+    if not isinstance(flags, dict):
+        flags = {}
+    if not isinstance(stats_errors, list):
+        stats_errors = []
+
+    service_total = _safe_int(chroma.get("total", 0))
+    service_l1 = _safe_int(chroma.get("l1", 0))
+    service_l2 = _safe_int(chroma.get("l2", 0))
+    service_milestones = _safe_int(chroma.get("milestones", 0))
+    service_locked = _safe_int(chroma.get("locked", 0))
+    service_raw_fallback = _safe_int(chroma.get("raw_fallback", 0))
+    service_pg_milestones = _safe_int(postgres.get("l4_milestones", 0))
+    ranked_count = len(ranked_memories)
+    embed_mock = bool(flags.get("embed_mock", False))
+
+    warnings: List[str] = []
+    if embed_mock:
+        warnings.append("flags.embed_mock=true，说明 embedding 服务已退化到 MOCK，当前检索质量会下降。")
+    if service_raw_fallback > 0:
+        warnings.append(
+            "chroma.raw_fallback={}，说明有一部分长期记忆是在分析链路异常时以 raw_fallback 方式写入。".format(
+                service_raw_fallback
+            )
+        )
+    if service_l2 > ranked_count:
+        warnings.append(
+            "chroma.l2={} 但本次 retrieve.ranked_memories={}，这通常是 /retrieve 的 Top-K 召回截断，不代表 L2 数据丢失。".format(
+                service_l2,
+                ranked_count,
+            )
+        )
+    if stats_errors:
+        warnings.append("stats 接口返回了底层存储读取错误，请结合 errors 字段判断统计是否完整。")
+
+    return {
+        "service_available": bool(user_stats),
+        "matches": {
+            "memory_total_match": service_total == len(memories),
+            "l1_match": service_l1 == level_counter.get("L1", 0),
+            "l2_match": service_l2 == level_counter.get("L2", 0),
+            "milestone_flag_match": service_milestones == milestone_flag,
+            "locked_flag_match": service_locked == locked,
+            "milestones_pg_vs_listing_match": service_pg_milestones == len(milestones),
+        },
+        "service_counts": {
+            "chroma_total": service_total,
+            "chroma_l1": service_l1,
+            "chroma_l2": service_l2,
+            "chroma_milestones": service_milestones,
+            "chroma_locked": service_locked,
+            "chroma_raw_fallback": service_raw_fallback,
+            "postgres_l4_milestones": service_pg_milestones,
+            "embed_mock": embed_mock,
+        },
+        "observed_counts": observed_counts,
+        "stats_errors": [str(item) for item in stats_errors],
+        "warnings": warnings,
+    }
+
+
+def _stats_dashboard(
+    memories: List[Dict[str, Any]],
+    milestones: List[Dict[str, Any]],
+    relation_audit: Dict[str, Any],
+    user_stats: Dict[str, Any],
+    consistency_with_stats: Dict[str, Any],
+) -> Dict[str, Any]:
     total = len(memories)
     level_counter = Counter([_memory_level(m) for m in memories if _memory_level(m)])
     locked = sum(1 for m in memories if bool(m.get("is_locked")))
     milestone_flag = sum(1 for m in memories if bool(m.get("is_milestone")))
+    flags = user_stats.get("flags", {}) if isinstance(user_stats, dict) else {}
+    chroma = user_stats.get("chroma", {}) if isinstance(user_stats, dict) else {}
+    if not isinstance(flags, dict):
+        flags = {}
+    if not isinstance(chroma, dict):
+        chroma = {}
     return {
         "memory_total": total,
         "L1_count": level_counter.get("L1", 0),
@@ -545,6 +730,9 @@ def _stats_dashboard(memories: List[Dict[str, Any]], milestones: List[Dict[str, 
         "milestone_total": len(milestones),
         "relation_audit": relation_audit,
         "mws": _mws_stats(memories),
+        "embed_mock": bool(flags.get("embed_mock", False)),
+        "raw_fallback_count": _safe_int(chroma.get("raw_fallback", 0)),
+        "consistency_with_stats": consistency_with_stats,
     }
 
 
@@ -780,6 +968,157 @@ def _build_html(report: Dict[str, Any]) -> str:
 </html>"""
 
 
+def _build_user_stats_markdown(report: Dict[str, Any]) -> str:
+    meta = report.get("meta", {}) if isinstance(report, dict) else {}
+    user_stats = report.get("user_stats", {}) if isinstance(report, dict) else {}
+    consistency = report.get("consistency_with_stats", {}) if isinstance(report, dict) else {}
+    errors = report.get("errors", {}) if isinstance(report, dict) else {}
+
+    chroma = user_stats.get("chroma", {}) if isinstance(user_stats, dict) else {}
+    postgres = user_stats.get("postgres", {}) if isinstance(user_stats, dict) else {}
+    redis_stats = user_stats.get("redis", {}) if isinstance(user_stats, dict) else {}
+    flags = user_stats.get("flags", {}) if isinstance(user_stats, dict) else {}
+    stats_errors = user_stats.get("errors", []) if isinstance(user_stats, dict) else []
+    if not isinstance(chroma, dict):
+        chroma = {}
+    if not isinstance(postgres, dict):
+        postgres = {}
+    if not isinstance(redis_stats, dict):
+        redis_stats = {}
+    if not isinstance(flags, dict):
+        flags = {}
+    if not isinstance(stats_errors, list):
+        stats_errors = []
+
+    warnings = consistency.get("warnings", []) if isinstance(consistency, dict) else []
+    matches = consistency.get("matches", {}) if isinstance(consistency, dict) else {}
+    service_counts = consistency.get("service_counts", {}) if isinstance(consistency, dict) else {}
+    observed_counts = consistency.get("observed_counts", {}) if isinstance(consistency, dict) else {}
+    if not isinstance(warnings, list):
+        warnings = []
+    if not isinstance(matches, dict):
+        matches = {}
+    if not isinstance(service_counts, dict):
+        service_counts = {}
+    if not isinstance(observed_counts, dict):
+        observed_counts = {}
+
+    def _mark(flag: Any) -> str:
+        return "一致" if bool(flag) else "不一致"
+
+    lines = [
+        "# 外置记忆用户 Stats 诊断",
+        "",
+        "## 基本信息",
+        "- save_name: `{}`".format(meta.get("save_name", "")),
+        "- agent_name: `{}`".format(meta.get("agent_name", "")),
+        "- user_id: `{}`".format(meta.get("user_id", "")),
+        "- scoped_user_id: `{}`".format(meta.get("scoped_user_id", "")),
+        "- service_base_url: `{}`".format(meta.get("service_base_url", "")),
+        "- generated_at: `{}`".format(meta.get("generated_at", "")),
+        "",
+    ]
+
+    if not user_stats:
+        lines.extend(
+            [
+                "## 接口结果",
+                "- 未获取到 `/api/users/{user_id}/stats` 返回。",
+                "- user_stats_error: `{}`".format(errors.get("user_stats_error", "")),
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    lines.extend(
+        [
+            "## 服务端权威统计（`GET /api/users/{user_id}/stats`）",
+            "- `chroma.total`: **{}**，表示 Chroma 中该 user_id 的长期记忆总数（含 L1/L2，也包含 raw_fallback 条目）。".format(_safe_int(chroma.get("total", 0))),
+            "- `chroma.l1`: **{}**，表示按 MWS 阈值划分后落在 L1 的条数。".format(_safe_int(chroma.get("l1", 0))),
+            "- `chroma.l2`: **{}**，表示按 MWS 阈值划分后落在 L2 的条数。".format(_safe_int(chroma.get("l2", 0))),
+            "- `chroma.milestones`: **{}**，表示 metadata 中 `is_milestone=true` 的长期记忆条数。".format(_safe_int(chroma.get("milestones", 0))),
+            "- `chroma.locked`: **{}**，表示 metadata 中 `is_locked=true` 的长期记忆条数。".format(_safe_int(chroma.get("locked", 0))),
+            "- `chroma.raw_fallback`: **{}**，如果大于 0，说明有一段时间分析链路不健康，长期记忆以 raw_fallback 方式落盘。".format(_safe_int(chroma.get("raw_fallback", 0))),
+            "",
+            "## PostgreSQL 侧统计",
+            "- `postgres.l3_emotion_log`: **{}**，对应 L3 情绪日志表条数。".format(_safe_int(postgres.get("l3_emotion_log", 0))),
+            "- `postgres.l4_milestones`: **{}**，对应 L4 milestone 表条数。".format(_safe_int(postgres.get("l4_milestones", 0))),
+            "- `postgres.l4_profile_attributes`: **{}**，对应画像属性表条数。".format(_safe_int(postgres.get("l4_profile_attributes", 0))),
+            "- `postgres.l4_profile_core`: **{}**，对应画像核心表条数。".format(_safe_int(postgres.get("l4_profile_core", 0))),
+            "",
+            "## Redis 侧统计",
+            "- `redis.short_term`: **{}**，对应 `memory_st:{{user_id}}` 的列表长度。".format(_safe_int(redis_stats.get("short_term", 0))),
+            "- `redis.l0_cache`: **{}**，对应 `l0_history:{{user_id}}` 的字段数。".format(_safe_int(redis_stats.get("l0_cache", 0))),
+            "",
+            "## 运行标记",
+            "- `flags.embed_mock`: **{}**。为 `true` 时表示 embedding 服务退化到了 MOCK，检索质量会下降。".format(bool(flags.get("embed_mock", False))),
+        ]
+    )
+
+    if stats_errors:
+        lines.append("")
+        lines.append("## stats 接口 errors")
+        for item in stats_errors:
+            lines.append("- {}".format(item))
+
+    lines.extend(
+        [
+            "",
+            "## 与本次审计结果对照",
+            "- 长期记忆总数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
+                _safe_int(service_counts.get("chroma_total", 0)),
+                _safe_int(observed_counts.get("listed_memories", 0)),
+                _mark(matches.get("memory_total_match", False)),
+            ),
+            "- L1 条数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
+                _safe_int(service_counts.get("chroma_l1", 0)),
+                _safe_int(observed_counts.get("listed_l1", 0)),
+                _mark(matches.get("l1_match", False)),
+            ),
+            "- L2 条数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
+                _safe_int(service_counts.get("chroma_l2", 0)),
+                _safe_int(observed_counts.get("listed_l2", 0)),
+                _mark(matches.get("l2_match", False)),
+            ),
+            "- milestone 标记数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
+                _safe_int(service_counts.get("chroma_milestones", 0)),
+                _safe_int(observed_counts.get("listed_milestone_flags", 0)),
+                _mark(matches.get("milestone_flag_match", False)),
+            ),
+            "- locked 标记数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
+                _safe_int(service_counts.get("chroma_locked", 0)),
+                _safe_int(observed_counts.get("listed_locked_flags", 0)),
+                _mark(matches.get("locked_flag_match", False)),
+            ),
+            "- PG milestone 表 vs milestone listing：服务端 **{}** / 当前 list_milestones **{}** / {}".format(
+                _safe_int(service_counts.get("postgres_l4_milestones", 0)),
+                _safe_int(observed_counts.get("listed_milestones", 0)),
+                _mark(matches.get("milestones_pg_vs_listing_match", False)),
+            ),
+            "- retrieve.ranked_memories 当前返回 **{}** 条；它是 Top-K 召回结果，不应直接当作 L2 全量计数。".format(
+                _safe_int(observed_counts.get("retrieve_ranked_memories", 0))
+            ),
+        ]
+    )
+
+    if warnings:
+        lines.append("")
+        lines.append("## 诊断提示")
+        for item in warnings:
+            lines.append("- {}".format(item))
+
+    lines.extend(
+        [
+            "",
+            "## 原始返回 JSON",
+            "```json",
+            json.dumps(user_stats, ensure_ascii=False, indent=2),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _build_report(target: AgentTarget) -> Dict[str, Any]:
     client = ECDollMemoryServiceClient(
         base_url=MEMORY_SERVICE_BASE_URL,
@@ -790,6 +1129,7 @@ def _build_report(target: AgentTarget) -> Dict[str, Any]:
     memories: List[Dict[str, Any]] = []
     milestones: List[Dict[str, Any]] = []
     retrieve_data: Dict[str, Any] = {}
+    user_stats: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
 
     try:
@@ -803,11 +1143,27 @@ def _build_report(target: AgentTarget) -> Dict[str, Any]:
     retrieve_data = _fetch_retrieve_details(client=client, scoped_user_id=target.scoped_user_id)
     if "error" in retrieve_data:
         errors["retrieve_error"] = str(retrieve_data.get("error"))
+    user_stats = _fetch_user_stats(client=client, scoped_user_id=target.scoped_user_id)
+    if "error" in user_stats:
+        errors["user_stats_error"] = str(user_stats.get("error"))
+        user_stats = {}
 
     map_data = _load_map(target.map_path)
     relations, relation_audit = _build_relations(memories=memories, map_data=map_data)
     layer_summary = _layer_summary(memories=memories, milestones=milestones, retrieve_data=retrieve_data)
-    stats_dashboard = _stats_dashboard(memories=memories, milestones=milestones, relation_audit=relation_audit)
+    consistency_with_stats = _consistency_with_stats(
+        memories=memories,
+        milestones=milestones,
+        retrieve_data=retrieve_data,
+        user_stats=user_stats,
+    )
+    stats_dashboard = _stats_dashboard(
+        memories=memories,
+        milestones=milestones,
+        relation_audit=relation_audit,
+        user_stats=user_stats,
+        consistency_with_stats=consistency_with_stats,
+    )
     l3_visualization = _l3_view(retrieve_data)
     l4_visualization = _l4_view(milestones=milestones, retrieve_data=retrieve_data)
     timeline = _build_timeline(target=target, map_data=map_data, memories=memories, milestones=milestones)
@@ -829,6 +1185,8 @@ def _build_report(target: AgentTarget) -> Dict[str, Any]:
         "layer_summary": layer_summary,
         "stats_dashboard": stats_dashboard,
         "consistency_audit": relation_audit,
+        "consistency_with_stats": consistency_with_stats,
+        "user_stats": user_stats,
         "retrieve_snapshot": retrieve_data,
         "relations": relations,
         "memories": memories,
@@ -854,6 +1212,7 @@ def _export_report(report: Dict[str, Any]) -> None:
         _write_csv(out_dir / "relations.csv", report.get("relations", []))
         _write_csv(out_dir / "memories.csv", report.get("memories", []))
         _write_csv(out_dir / "timeline.csv", report.get("timeline_replay", []))
+    (out_dir / "user_stats.md").write_text(_build_user_stats_markdown(report), encoding="utf-8")
     if WRITE_HTML:
         (out_dir / "report.html").write_text(_build_html(report), encoding="utf-8")
 
@@ -861,6 +1220,9 @@ def _export_report(report: Dict[str, Any]) -> None:
 
 
 def main() -> int:
+    args = parse_args()
+    _apply_cli_overrides(args)
+
     targets = _collect_targets()
     if not targets:
         print("[WARN] No valid targets found. Check TARGET_SAVE_NAMES/TARGET_AGENT_NAMES and user_id resolution.")

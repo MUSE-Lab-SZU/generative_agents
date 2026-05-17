@@ -4,8 +4,9 @@
 可视化某存档中某角色的全部记忆（event/thought/chat）。
 
 用法：
-1) 直接修改下方“配置区”常量
-2) 运行：python visualize_agent_memory.py
+1) 直接修改下方“配置区”常量后运行：python visualize_agent_memory.py
+2) 或通过命令行覆盖，例如：
+   python visualize_agent_memory.py --cp-name sim-test-0513 --agent 卡布达
 
 说明：
 - 不依赖项目业务模块，纯标准库读取存档文件；
@@ -15,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
@@ -23,11 +25,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+BASE_DIR = Path(__file__).resolve().parent
+CHECKPOINTS_ROOT = BASE_DIR / "results" / "checkpoints"
+
 # =========================
 # 配置区（按需修改）
 # =========================
-CHECKPOINT_DIR = Path("results/checkpoints/sim-test-memory-0424-3")
-SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20260424-1630.json"
+CHECKPOINT_DIR = Path("results/checkpoints/sim-test-0515-2")
+SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20250529-1530.json"
 AGENT_NAME = "卡布达"  # 设为 None 则自动取快照里的第一个角色
 
 OUTPUT_DIR = CHECKPOINT_DIR / "memory_visualization"
@@ -36,6 +41,97 @@ OUTPUT_NAME_PREFIX = ""  # 留空则自动生成
 SORT_BY = "create"  # 可选: create / access / node_id / snapshot
 INCLUDE_EMBEDDING_PREVIEW = False
 EMBEDDING_PREVIEW_DIM = 8
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="可视化单个角色的记忆快照")
+    parser.add_argument("--cp-name", default=None, help="实验名，对应 results/checkpoints/<name>")
+    parser.add_argument("--checkpoint-dir", default=None, help="直接指定 checkpoint 目录")
+    parser.add_argument("--snapshot", default=None, help="快照路径或文件名；未传时自动取最新 simulate-*.json")
+    parser.add_argument("--agent", default=None, help="角色名；未传则沿用配置区 AGENT_NAME")
+    parser.add_argument("--output-dir", default=None, help="输出目录")
+    parser.add_argument("--output-prefix", default=None, help="输出文件名前缀")
+    parser.add_argument("--sort-by", choices=["create", "access", "node_id", "snapshot"], default=None, help="输出排序方式")
+    parser.add_argument("--include-embedding-preview", action="store_true", help="附带 embedding 预览")
+    parser.add_argument("--embedding-preview-dim", type=int, default=None, help="embedding 预览维度")
+    return parser.parse_args()
+
+
+def _latest_snapshot(checkpoint_dir: Path) -> Path:
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"checkpoint 目录不存在: {checkpoint_dir}")
+    snapshots = sorted(checkpoint_dir.glob("simulate-*.json"))
+    if not snapshots:
+        raise FileNotFoundError(f"未找到 simulate-*.json: {checkpoint_dir}")
+    return snapshots[-1]
+
+
+def _resolve_checkpoint_dir(raw_cp_name: Optional[str], raw_checkpoint_dir: Optional[str]) -> Path:
+    if raw_checkpoint_dir:
+        checkpoint_dir = Path(raw_checkpoint_dir)
+    elif raw_cp_name:
+        checkpoint_dir = CHECKPOINTS_ROOT / raw_cp_name
+    else:
+        checkpoint_dir = Path(CHECKPOINT_DIR)
+    if not checkpoint_dir.is_absolute():
+        checkpoint_dir = checkpoint_dir.resolve()
+    return checkpoint_dir
+
+
+def _resolve_snapshot_path(raw_snapshot: Optional[str], checkpoint_dir: Path, *, prefer_latest: bool) -> Path:
+    if raw_snapshot:
+        snapshot_path = Path(raw_snapshot)
+        if not snapshot_path.is_absolute():
+            checkpoint_candidate = checkpoint_dir / raw_snapshot
+            if checkpoint_candidate.exists():
+                snapshot_path = checkpoint_candidate
+            else:
+                snapshot_path = snapshot_path.resolve()
+        return snapshot_path
+    if prefer_latest:
+        return _latest_snapshot(checkpoint_dir)
+    snapshot_path = Path(SNAPSHOT_FILE)
+    if not snapshot_path.is_absolute():
+        snapshot_path = snapshot_path.resolve()
+    return snapshot_path
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    global CHECKPOINT_DIR
+    global SNAPSHOT_FILE
+    global AGENT_NAME
+    global OUTPUT_DIR
+    global OUTPUT_NAME_PREFIX
+    global SORT_BY
+    global INCLUDE_EMBEDDING_PREVIEW
+    global EMBEDDING_PREVIEW_DIM
+
+    prefer_latest = bool(args.cp_name or args.checkpoint_dir)
+    checkpoint_dir = _resolve_checkpoint_dir(args.cp_name, args.checkpoint_dir)
+    snapshot_path = _resolve_snapshot_path(args.snapshot, checkpoint_dir, prefer_latest=prefer_latest)
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    elif prefer_latest:
+        output_dir = checkpoint_dir / "memory_visualization"
+    else:
+        output_dir = Path(OUTPUT_DIR)
+    if not output_dir.is_absolute():
+        output_dir = output_dir.resolve()
+
+    CHECKPOINT_DIR = checkpoint_dir
+    SNAPSHOT_FILE = snapshot_path
+    if args.agent is not None:
+        AGENT_NAME = args.agent or None
+    OUTPUT_DIR = output_dir
+    if args.output_prefix is not None:
+        OUTPUT_NAME_PREFIX = args.output_prefix
+    if args.sort_by is not None:
+        SORT_BY = args.sort_by
+    if args.include_embedding_preview:
+        INCLUDE_EMBEDDING_PREVIEW = True
+    if args.embedding_preview_dim is not None:
+        EMBEDDING_PREVIEW_DIM = max(1, args.embedding_preview_dim)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -498,6 +594,9 @@ def _build_html(meta: Dict[str, Any], rows: List[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
+    args = parse_args()
+    _apply_cli_overrides(args)
+
     checkpoint_dir = Path(CHECKPOINT_DIR)
     snapshot_path = Path(SNAPSHOT_FILE)
     if not snapshot_path.is_absolute():

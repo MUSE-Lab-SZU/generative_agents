@@ -17,7 +17,9 @@
                 "api_key": ""
             },
             "interval": 1000,
-            "poignancy_max": 75
+            "poignancy_max": 30,
+            "reflect_focus_topk": 4,
+            "reflect_insights_topk": 1
         },
         "chat_iter": 4,
         "associate": {
@@ -28,6 +30,7 @@
                 "api_key": ""
             },
             "retention": 32,
+            "recent_dedup_limit": 0,
             "recency_decay": 0.995,
             "recency_weight": 0.5,
             "relevance_weight": 5.0,
@@ -109,7 +112,7 @@
                 "rule_id": "fast_every_4step",
                 "type": "interval_steps",
                 "interval_steps": 4,
-                "step_phase": 1,
+                "step_phase": 2,
                 "duration": 1440,
                 "doctor": "蜻蜓队长",
                 "patient": "卡布达",
@@ -234,7 +237,7 @@
             "history_recent_n": 3
         },
         "consult_record": {
-            "enabled": true,
+            "enabled": false,
             "prompt_generate_file": "data/prompts/intervention/consult_record_generate.txt",
             "prompt_injection_file": "data/prompts/intervention/doctor_consult_record_injection.txt",
             "llm_retry": 3,
@@ -244,24 +247,6 @@
             "audit": {
                 "max_entries": 2000
             }
-        },
-        "depression_update": {
-            "enabled": false,
-            "short_term_enabled": true,
-            "progress_state_enabled": false,
-            "min_update_interval_steps": 3,
-            "max_changed_subitems_per_chat": 100,
-            "max_progress_delta_per_update": 0.06,
-            "score_smoothing_alpha": 0.7,
-            "short_term_ttl_steps": 100,
-            "short_term_updates_per_chat": 2,
-            "short_term_max_items_per_chat": 100,
-            "short_term_text_max_len": 1000,
-            "long_term_update_interval_chats": 2,
-            "long_term_update_threshold": 1.0,
-            "current_event_update_enabled": false,
-            "llm_patch_required_on_doctor_chat": true,
-            "allow_reflection_constraint": true
         },
         "depression_dynamic": {
             "enabled": true,

@@ -194,6 +194,7 @@ class Associate:
         chat_retrieve=None,
         logger=None,
         external_write_hook=None,
+        recent_dedup_limit=None,
     ):
         self._index = LlamaIndex(embedding, path)
         self.logger = logger
@@ -210,6 +211,10 @@ class Associate:
         self.retention = retention
         self.max_memory = max_memory
         self.max_importance = max_importance
+        self.recent_dedup_limit = self._resolve_recent_dedup_limit(
+            recent_dedup_limit,
+            default=self.retention,
+        )
         self._retrieve_config = {
             "recency_decay": recency_decay,
             "recency_weight": recency_weight,
@@ -494,6 +499,22 @@ class Associate:
             return default
         return val
 
+    def _resolve_recent_dedup_limit(self, value, default):
+        if isinstance(value, bool):
+            value = default
+        try:
+            val = int(value)
+        except Exception:
+            val = default
+        if val == 0:
+            return 0
+        return self._normalize_limit(
+            val,
+            default=default,
+            allow_unlimited=True,
+            minimum=1,
+        )
+
     def _resolve_chat_retrieve_mode(self, value):
         mode = str(value or "direct").strip().lower()
         if mode not in {"direct", "semantic"}:
@@ -610,7 +631,14 @@ class Associate:
 
     def to_dict(self):
         self._index.save()
-        return {"memory": self.memory}
+        return {
+            "memory": self.memory,
+            "recency_decay": self._retrieve_config.get("recency_decay", 0.995),
+            "recency_weight": self._retrieve_config.get("recency_weight", 0.5),
+            "relevance_weight": self._retrieve_config.get("relevance_weight", 3),
+            "importance_weight": self._retrieve_config.get("importance_weight", 2),
+            "recent_dedup_limit": self.recent_dedup_limit,
+        }
 
     @property
     def index(self):

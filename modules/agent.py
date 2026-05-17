@@ -7,7 +7,6 @@ import datetime
 import copy
 
 from modules import memory, prompt, utils
-from modules import depression_runtime_manager as drm
 from modules import depression_dynamic_adapter as dda
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
@@ -127,7 +126,6 @@ class Agent:
         self.status = utils.update_dict(status, config.get("status", {}))
         self.plan = config.get("plan", {})
         self.intervention = None
-        self.depression_profile = drm.ensure_profile(config)
         self.depression_dynamic_enabled = False
         self.depression_dynamic_engine = None
         self.depression_dynamic_cfg = {}
@@ -557,11 +555,17 @@ class Agent:
         # get concepts
         self.concepts, valid_num = [], 0
         for idx, event in enumerate(events[: self.percept_config["att_bandwidth"]]):
-            recent_nodes = (
-                self.associate.retrieve_events() + self.associate.retrieve_chats()
-            )
-            recent_nodes = set(n.describe for n in recent_nodes)
-            if event.get_describe() not in recent_nodes:
+            recent_dedup_limit = getattr(self.associate, "recent_dedup_limit", self.associate.retention)
+            recent_nodes = set()
+            if recent_dedup_limit != 0:
+                recent_nodes = set(
+                    n.describe
+                    for n in (
+                        self.associate.retrieve_events(limit=recent_dedup_limit)
+                        + self.associate.retrieve_chats(limit=recent_dedup_limit)
+                    )
+                )
+            if recent_dedup_limit == 0 or event.get_describe() not in recent_nodes:
                 if event.object == "idle" or event.object == "空闲":
                     node = Concept.from_event(
                         "idle_" + str(idx), "event", event, poignancy=1
@@ -643,33 +647,8 @@ class Agent:
         focus = self.completion("reflect_focus", nodes, self.reflect_focus_topk)
         retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
         for r_nodes in retrieved.values():
-            allow_reflect_constraint = True
-            if self.intervention and isinstance(getattr(self.intervention, "config", None), dict):
-                intervention_cfg = self.intervention.config.get("intervention", {}) or {}
-                depression_cfg = intervention_cfg.get("depression_update", {}) or {}
-                allow_reflect_constraint = bool(
-                    depression_cfg.get("allow_reflection_constraint", True)
-                )
-            reflect_block = ""
-            if self._depression_engine_ready():
-                try:
-                    reflect_block = str(
-                        self.depression_dynamic_engine.get_simple_prompt() or ""
-                    )
-                except Exception:
-                    reflect_block = ""
-            else:
-                view = drm.build_intermediate_view(
-                    self.depression_profile,
-                    utils.get_timer().daily_duration(),
-                    stage="reflect",
-                    update_cfg=(
-                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                        else {}
-                    ),
-                )
-                reflect_block = view.get("reflect_block", "")
+            allow_reflect_constraint = dda.allow_reflection_constraint(self)
+            reflect_block = dda.get_prompt_block(self, stage="reflect")
             thoughts = self.completion(
                 "reflect_insights",
                 r_nodes,
@@ -687,7 +666,7 @@ class Agent:
                     (
                         "depression_engine"
                         if self._depression_engine_ready()
-                        else "depression_runtime_manager"
+                        else "dynamic_adapter_fallback"
                     ),
                 )
             )
@@ -1295,32 +1274,7 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                 )
-            depression_chat_block = ""
-            if self._depression_engine_ready():
-                depression_chat_block = ""
-            else:
-                if bool(getattr(self, "depression_dynamic_enabled", False)):
-                    self.depression_profile = drm.infer_chat_emotion(
-                        patient_agent=self,
-                        profile=self.depression_profile,
-                        now_step=utils.get_timer().daily_duration(),
-                        static_profile=getattr(self, "profile", {}),
-                        other_agent=getattr(other, "name", ""),
-                        relationship=relations[0],
-                        conversation_content=dda.serialize_conversation(chats),
-                    )
-                chat_view = drm.build_intermediate_view(
-                    self.depression_profile,
-                    utils.get_timer().daily_duration(),
-                    stage="chat",
-                    update_cfg=(
-                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                        else {}
-                    ),
-                    static_profile=getattr(self, "profile", {}),
-                )
-                depression_chat_block = chat_view.get("chat_block", "")
+            depression_chat_block = dda.get_prompt_block(self, stage="chat")
             text = self._completion_generate_chat_with_external_route(
                 other=other,
                 relation=relations[0],
@@ -1529,31 +1483,7 @@ class Agent:
                         + advice_text
                         + "\n</医生回复建议>"
                     )
-            other_depression_chat_block = ""
-            if other._depression_engine_ready():
-                other_depression_chat_block = ""
-            else:
-                if bool(getattr(other, "depression_dynamic_enabled", False)):
-                    other.depression_profile = drm.infer_chat_emotion(
-                        patient_agent=other,
-                        profile=other.depression_profile,
-                        now_step=utils.get_timer().daily_duration(),
-                        static_profile=getattr(other, "profile", {}),
-                        other_agent=getattr(self, "name", ""),
-                        relationship=relations[1],
-                        conversation_content=dda.serialize_conversation(chats),
-                    )
-                other_depression_chat_block = drm.build_intermediate_view(
-                    other.depression_profile,
-                    utils.get_timer().daily_duration(),
-                    stage="chat",
-                    update_cfg=(
-                        ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-                        if (self.intervention and isinstance(getattr(self.intervention, "config", None), dict))
-                        else {}
-                    ),
-                    static_profile=getattr(other, "profile", {}),
-                ).get("chat_block", "")
+            other_depression_chat_block = dda.get_prompt_block(other, stage="chat")
             text = other._completion_generate_chat_with_external_route(
                 other=self,
                 relation=relations[1],
@@ -1996,6 +1926,7 @@ class Agent:
                 create=start,
                 expire=expire,
             )
+            self.status["poignancy"] += node.poignancy
             self.logger.info(
                 "[CHAT_MEMORY_WRITE_IMMEDIATE] agent={} other={} node_id={} create={} expire={} meta={}".format(
                     self.name,
@@ -2240,7 +2171,6 @@ class Agent:
             "associate": self.associate.to_dict(),
             "chats": self.chats,
             "currently": self.scratch.currently,
-            "depression_profile": self.depression_profile,
             "depression_dynamic_state": dda.dump_state(self),
         }
         if with_action:

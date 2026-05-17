@@ -1,5 +1,6 @@
 """Dynamic depression integration adapter for Agent/Game."""
 
+import copy
 import datetime
 import json
 import os
@@ -402,6 +403,59 @@ def dump_state(agent: Any) -> Dict[str, Any]:
     return payload
 
 
+def allow_reflection_constraint(agent: Any) -> bool:
+    raw_cfg = getattr(agent, "depression_dynamic_cfg", {})
+    if isinstance(raw_cfg, dict) and "reflection_constraint_enabled" in raw_cfg:
+        return bool(raw_cfg.get("reflection_constraint_enabled"))
+    return True
+
+
+def get_prompt_block(agent: Any, stage: str = "chat") -> str:
+    stage = str(stage or "").strip().lower()
+    if stage != "reflect":
+        return ""
+    if not _runtime_ready(agent):
+        return ""
+    engine = getattr(agent, "depression_dynamic_engine", None)
+    if engine is None or not callable(getattr(engine, "get_simple_prompt", None)):
+        return ""
+    try:
+        return str(engine.get_simple_prompt() or "")
+    except Exception:
+        return ""
+
+
+def get_runtime_emotion(source: Any) -> Dict[str, Any]:
+    dynamic_emotion = _extract_dynamic_emotion(source)
+    if dynamic_emotion:
+        return dynamic_emotion
+    return {}
+
+
+def get_runtime_snapshot(source: Any) -> Dict[str, Any]:
+    current_stage = _extract_dynamic_current_stage(source)
+    emotion = get_runtime_emotion(source)
+
+    current_event_wording = _stage_to_runtime_wording(current_stage)
+
+    intensity_raw = emotion.get("intensity", 0.0)
+    try:
+        emotion_intensity = float(intensity_raw)
+    except Exception:
+        emotion_intensity = 0.0
+
+    return {
+        "current_event_wording": current_event_wording,
+        "emotion_label": str(emotion.get("label", "") or ""),
+        "emotion_style": str(emotion.get("style", "") or ""),
+        "emotion_intensity": emotion_intensity,
+        "last_throttle_reason": "",
+        "short_term_changed": False,
+        "long_term_changed": False,
+        "changed_paths": [],
+    }
+
+
 def serialize_conversation(conversation: Any, max_items: int = 8) -> str:
     if not conversation:
         return ""
@@ -437,28 +491,94 @@ def serialize_focus(focus: Any, max_items: int = 6) -> str:
     return "\n".join([line for line in lines if line])
 
 
-def _render_dynamic_emotion_section(agent: Any) -> str:
-    emotion: Dict[str, Any] = {}
-    engine = getattr(agent, "depression_dynamic_engine", None)
-    if engine is not None and callable(getattr(engine, "get_current_state_info", None)):
-        try:
-            info = engine.get_current_state_info()
-            if isinstance(info, dict) and isinstance(info.get("emotion", {}), dict):
-                emotion = info.get("emotion", {})
-        except Exception:
-            emotion = {}
+def _extract_dynamic_state_payload(source: Any) -> Dict[str, Any]:
+    if isinstance(source, dict):
+        nested = source.get("depression_dynamic_state", {})
+        if isinstance(nested, dict):
+            return nested
+        runtime = source.get("runtime", {})
+        if isinstance(runtime, dict) and ("schema_version" in source or "enabled" in source):
+            return source
+        return {}
+    return {}
 
+
+def _extract_dynamic_info_from_agent(agent: Any) -> Dict[str, Any]:
+    engine = getattr(agent, "depression_dynamic_engine", None)
+    if engine is None or not callable(getattr(engine, "get_current_state_info", None)):
+        return {}
+    try:
+        info = engine.get_current_state_info()
+    except Exception:
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def _extract_dynamic_emotion(source: Any) -> Dict[str, Any]:
+    if not isinstance(source, dict):
+        info = _extract_dynamic_info_from_agent(source)
+        emotion = info.get("emotion", {}) if isinstance(info, dict) else {}
+        return copy.deepcopy(emotion) if isinstance(emotion, dict) else {}
+
+    payload = _extract_dynamic_state_payload(source)
+    runtime = payload.get("runtime", {}) if isinstance(payload.get("runtime", {}), dict) else {}
+    emotion = runtime.get("last_emotion", {}) if isinstance(runtime.get("last_emotion", {}), dict) else {}
+    return copy.deepcopy(emotion) if isinstance(emotion, dict) else {}
+
+
+def _extract_dynamic_current_stage(source: Any) -> Dict[str, Any]:
+    if not isinstance(source, dict):
+        info = _extract_dynamic_info_from_agent(source)
+        stage = info.get("current_stage", {}) if isinstance(info, dict) else {}
+        return copy.deepcopy(stage) if isinstance(stage, dict) else {}
+
+    payload = _extract_dynamic_state_payload(source)
+    runtime = payload.get("runtime", {}) if isinstance(payload.get("runtime", {}), dict) else {}
+    chain_payload = runtime.get("chain_manager", {}) if isinstance(runtime.get("chain_manager", {}), dict) else {}
+    config = chain_payload.get("config", {}) if isinstance(chain_payload.get("config", {}), dict) else {}
+    stages = config.get("stages", []) if isinstance(config.get("stages", []), list) else []
+    stage_catalog: Dict[str, Dict[str, Any]] = {}
+    for item in stages:
+        if not isinstance(item, dict):
+            continue
+        stage_id = str(item.get("id", "") or "").strip()
+        if stage_id:
+            stage_catalog[stage_id] = copy.deepcopy(item)
+
+    planned_chain = chain_payload.get("planned_chain", []) if isinstance(chain_payload.get("planned_chain", []), list) else []
+    try:
+        stage_index = int(chain_payload.get("stage_index", 0) or 0)
+    except Exception:
+        stage_index = 0
+
+    stage_id = ""
+    if planned_chain:
+        bounded_index = min(max(stage_index, 0), len(planned_chain) - 1)
+        stage_id = str(planned_chain[bounded_index] or "").strip()
+    if not stage_id:
+        stage_id = str(config.get("initial_stage_id", "") or "").strip()
+
+    if stage_id and stage_id in stage_catalog:
+        return stage_catalog[stage_id]
+    if stage_id:
+        return {"id": stage_id, "label": stage_id}
+    return {}
+
+
+def _stage_to_runtime_wording(stage: Any) -> str:
+    if not isinstance(stage, dict):
+        return ""
+    for key in ("summary", "label", "core_belief", "id"):
+        text = str(stage.get(key, "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _render_dynamic_emotion_section(agent: Any) -> str:
+    emotion = get_runtime_emotion(agent)
     if not emotion:
-        profile = getattr(agent, "depression_profile", {})
-        if not isinstance(profile, dict):
-            return ""
-        runtime = profile.get("runtime", {})
-        if not isinstance(runtime, dict):
-            return ""
-        raw_emotion = runtime.get("emotion", {})
-        if not isinstance(raw_emotion, dict):
-            return ""
-        emotion = raw_emotion
+        return ""
 
     label = str(emotion.get("label", "") or "").strip()
     style = str(emotion.get("style", "") or "").strip()

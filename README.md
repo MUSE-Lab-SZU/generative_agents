@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-05-07
+> 更新时间：2026-05-17
 
 ## 关键测试结果速查
 
@@ -15,16 +15,21 @@
 3. 医患对话、判断LLM、会后评估LLM、咨询记录：`results/experiment_data/xxx/traces/merge_consultation_dialogues.json`文件。
    - 作用：可视化所有医患干预对话，包括患者、判断LLM、医生、评估LLM的输出。适合给心理专业人员查看、分析。
    - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
-4. 记忆可视化：`memory_visualization\memory_view_卡布达_xxx.csv`可以查看某角色的所有记忆
+4. 记忆可视化：`results/experiment_data/xxx/visualizations/agent_memory/memory_view_卡布达_xxx.csv`可以查看某角色的所有记忆
    - 作用：可视化某角色的所有记忆，可以筛选chat记忆查看对话情况、筛选thought记忆查看反思结果、筛选event记忆查看遇到的事件。
-   - 生成：运行完仿真实验后，运行`visualize_agent_memory.py`脚本生成。
+   - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
 5. 外置记忆系统存储情况：`results\external_memory_audit\xxx\report.html`文件。
    - 作用：可视化某存档的所有agent在外置记忆系统中的存储情况，包括记忆数量、记忆层级情况等。
-   - 生成：运行完仿真实验后，运行`visualize_external_memory_audit.py`脚本生成。
+   - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
 
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+
+- 2026-05-17：`config.json`新增配置`xxx`，用于控制event/chat记忆描述相似去重的最近条数范围，设为0时不去重。修复chat记忆的`poignancy`值异常不计入累加而导致thought触发频率下降的问题
+- 2026-05-17：根据记忆服务更新，新增2个脚本并优化`visualize_external_memory_audit.py`。新脚本`recheck_memory_embedding_service.py`作用是“调用外置记忆服务的 embedding 重探活接口”，检索服务重启时使用。`inspect_memory_user_stats_by_save.py`作用是查看某存档所有角色记忆总体情况，目前看下来所有记忆在运行期间都是"raw_fallback"状态，后续问问怎么回事。
+- 2026-05-16：仿真实验脚本`runshells/run_one_experiment.py`新增可视化本地记忆、外置记忆系统的环节（相当于自动执行`visualize_agent_memory.py`和`visualize_external_memory_audit.py`）
+- 2026-05-16：完整删除旧人设系统，现在只有学长的动态抑郁人设
 - 2026-05-15：`config.json`新增配置"reflect_focus_topk"和"reflect_insights_topk"，用于控制反思输出数量。同时降低"poignancy_max"数值，避免反思触发间隔太大
 - 2026-05-15：新增仿真后量表批量测试、重复测试脚本`runshells/run_extra_scale_eval.py`。设置好量表以及重复次数后运行，在`results/experiment_data/xxx/scales`可以看到单独以及汇总结果。
 - 2026-05-15：合并学长更新的动态抑郁人设，并且修复人设读取不成功的潜在问题。
@@ -74,6 +79,68 @@
 - 2026-04-20：新增会话中判断LLM、会话后评估LLM
   - 相关文件：`modules/intervention_manager.py`、`data/config.json`等
 
+## config.json 推荐配置（当前主线实验）
+
+以下推荐面向当前主线链路：**外置记忆 + 强制干预 + 动态抑郁人设**。真正生效仍以 `data/config.json` 为准；若要排查行为异常，建议优先看这里，再顺着 `start.py -> modules/game.py -> modules/agent.py / modules/intervention_manager.py` 往下追。
+
+```text
+data/config.json
+├── agent
+│   ├── think
+│   │   ├── llm -> provider=ollama / model=qwen3:8b-q4_K_M
+│   │   ├── poignancy_max -> 30（推荐先保持 20~40；太大反思太少，太小容易过密）
+│   │   ├── reflect_focus_topk -> 4（推荐 3~5）
+│   │   └── reflect_insights_topk -> 1（推荐先保持 1）
+│   ├── associate
+│   │   ├── embedding -> provider=ollama / model=bge-m3:lates
+│   │   ├── recent_dedup_limit -> 0（0=不去重；控制event/chat记忆描述去重）
+│   └── external_memory
+│       ├── enabled -> true（开启外置记忆系统）
+│       ├── short_term_recent_n -> 20（控制近期记忆数量）
+│       └── updata_to_milestone_apply_scenes -> ["session2.3_completed", "session3.3-A_completed", "session4.2_completed"]（哪些session对话记忆升级L2）
+└── intervention
+    ├── enabled -> true
+    ├── doctor -> 蜻蜓队长
+    ├── patients -> [卡布达, 金龟次郎]（后者暂时无设置人设）
+    ├── meeting_rules
+    │   ├── 推荐：同一轮实验只启用 1 条规则，避免会诊频率叠加
+    │   └── 当前启用：fast_every_4step（卡布达）；其他规则按需单独切换
+    ├── order_extract.enabled -> true（后续可能删除医嘱提取功能，没什么用感觉）
+    ├── session_prompt_injection
+    │   ├── enabled -> true
+    │   └── namespace -> CBT
+    ├── chat_controls
+    │   ├── enabled -> true
+    │   └── agent_overrides[*]
+    │       ├── forced_chat_iter -> 18（控制发言次数上限）
+    │       └── forced_chat_min_turns -> 2
+    ├── forced_llm
+    │   ├── enabled -> true
+    │   ├── model -> deepseek-v4-flash
+    │   ├── api_key_env -> DEEPSEEK_API_KEY
+    │   └── temperature -> 0.5（推荐 0.3~0.7）
+    ├── dialog_judge
+    │   ├── enabled -> true
+    │   ├── force_forced_llm -> true
+    │   └── patient_state_summary_retry -> 2
+    ├── session_eval
+    │   ├── enabled -> true
+    │   ├── route -> forced_llm
+    │   └── history_recent_n -> 3
+    ├── consult_record.enabled -> false（咨询记录模块，感觉没什么用暂时关闭了）
+    ├── depression_dynamic
+    │   ├── enabled -> true（当前主线建议开启）
+    │   └── target_hints -> （详情看config.json，人设使用范围）
+    ├── memory_injection.enabled -> true（记忆注入功能）
+    └── memory_policy.enabled -> true（使用了小镇自带记忆系统，不用理会）
+```
+
+补充说明：
+
+- 若你本地分支仍保留 `intervention.depression_update` 旧配置，建议继续保持 `enabled=false`，不要与 `depression_dynamic` 同时启用。
+- `doctor`、`patients`、`meeting_rules[*].doctor/patient`、`chat_controls.agent_overrides` 里的角色名必须完全一致。
+- 推荐先确认 `external_memory`、`forced_llm`、`dialog_judge`、`session_eval`、`depression_dynamic` 这 5 条链路都通，再微调 `meeting_rules`、`chat_controls`、`recent_dedup_limit` 等细项。
+
 ## 1. 项目简介
 
 本项目是一个多智能体仿真系统，在常规行为仿真基础上，扩展了医患场景中的干预会话能力，重点包含：
@@ -88,14 +155,14 @@
 
 ## 2. 代码目录结构
 
-| 路径          | 说明                                                             |
-| ------------- | ---------------------------------------------------------------- |
-| `start.py`    | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）             |
-| `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`） |
-| `replay.py`   | 回放 Web 服务入口（Flask）                                       |
-| `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）       |
-| `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）           |
-| `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`     |
+| 路径          | 说明                                                              |
+| ------------- | ----------------------------------------------------------------- |
+| `start.py`    | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
+| `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
+| `replay.py`   | 回放 Web 服务入口（Flask）                                        |
+| `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
+| `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
+| `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
 | `results/`    | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
 
 ## 3. 快速使用说明
@@ -176,11 +243,11 @@ python -u customization/depression_scale_agent/app.py
 
 所有输出位于 `customization/depression_scale_agent/questions/adhoc/` 目录：
 
-| 文件 | 说明 |
-|------|------|
-| `*_answered.jsonl` | 量表问答结果（每题问题 + 回答） |
-| `*_answered_prompt_trace.json` | 完整 Prompt 注入追踪（JSON） |
-| `*_answered_prompt_trace.md` | 完整 Prompt 注入追踪（Markdown，可读性好） |
+| 文件                           | 说明                                       |
+| ------------------------------ | ------------------------------------------ |
+| `*_answered.jsonl`             | 量表问答结果（每题问题 + 回答）            |
+| `*_answered_prompt_trace.json` | 完整 Prompt 注入追踪（JSON）               |
+| `*_answered_prompt_trace.md`   | 完整 Prompt 注入追踪（Markdown，可读性好） |
 
 ## 3.6 结果目录
 
@@ -224,42 +291,55 @@ start.py 直接输出的仿真数据：
 
 ## 4. data/config.json 模块配置
 
-下面给出快速索引，详细值以 `data/config.json` 为准。
+下面给出与上方“config.json 推荐配置（当前主线实验）”一致的快速索引；更细的推荐值和当前启用状态，优先以上面的配置树与 `data/config.json` 为准。
 
 ## 4.1 agent 配置
 
-- `think.llm`,`associate.embedding`：模型配置
-- `agent.think.poignancy_max`：积累到该分数是产生一次反思，值越小反思地越多
-- `agent.external_memory`：外置记忆系统配置
-  - `read_mode`：仅在强制干预对话中进行外置记忆系统的检索，当前只实现了这个
-- `chat_history`/`chat_memory`等：与旧记忆系统有关，不必理会
+- `think.llm`、`associate.embedding`：当前主线实验默认都走本地 `ollama`
+- `agent.think.poignancy_max`：反思触发阈值；当前为 `30`，一般建议先在 `20~40` 内调
+- `agent.think.reflect_focus_topk` / `reflect_insights_topk`：控制反思输出数量；当前分别为 `4` / `1`
+- `agent.associate.recent_dedup_limit`：event/chat 记忆近期相似去重范围；`0` 表示不去重，当前为 `32`
+- `agent.associate.chat_retrieve.similarity_top_k`：本地语义检索条数；当前为 `6`
+- `agent.external_memory`：当前主线建议开启
+  - `enabled=true`
+  - `read_mode=chat_only`：只在强制干预对话中检索外置记忆
+  - `fallback_to_local=true`：外置记忆服务异常时回退本地记忆
+  - `short_term_recent_n=20`：近期原文注入数量，建议先在 `10~30` 内调
+- `chat_history` / `chat_memory`：仍保留在旧链路里，但通常不是当前主线实验的首要调参点
 
 ## 4.2 intervention 配置
 
-- `enabled`：开启定期强制干预对话功能
-- `doctor/patients`：医患角色定义
-- `meeting_rules`：会诊触发规则（基本上设置为"fast_every_2step"与"fast_every_2step_jgcl"，其他规则未实验过）
-- `order_extract`：医嘱提取（感觉该功能暂无用处）
-- `session_prompt_injection`：治疗Prompt的注入
-- `chat_controls`：强制会话轮次与终止控制
-  - `forced_chat_iter`：对话轮数上限（单角色回复次数上限）
-- `forced_llm`：**强制干预对话模型设置**，需要在`.env`里配置deepseek api key
-- `dialog_judge`：会话中判断LLM
-- `session_eval`：会话后评估LLM
-  - `history_recent_n`：注入历史reason的数量
-- `consult_record`：咨询记录生成与注入
-- `depression_update`：抑郁运行态更新（**请设置`enabled`为`false`**，已弃用）
-- `depression_dynamic`：动态抑郁人设（**请设置`enabled`为`true`**，赵学长的动态抑郁人设配置）
-  - `target_hints`：触发环节
-  - 注：请在`frontend\static\assets\village\agents\卡布达\depression_config.json`做出抑郁人设配置
-- `memory_injection`：记忆注入规则（当前有初始化注入、某会话完成后注入2种规则）
-- `memory_policy`：会话检索权重策略（与旧记忆系统相关，不必理会）
+- `enabled`：开启强制干预主链路
+- `doctor` / `patients`：医患角色定义
+- `meeting_queue.enabled`：建议保持开启，避免同一医生的会诊调度混乱
+- `meeting_rules`：会诊触发规则
+  - 推荐一次实验只启用 **1 条** 规则，避免频率叠加
+  - 当前主线启用的是 `fast_every_4step`（卡布达）；其他规则默认关闭，按需单独切换
+- `order_extract.enabled`：当前为 `true`；若本轮不分析医嘱，可临时关闭
+- `session_prompt_injection`：治疗 Prompt 注入链路，当前主线保持开启，`namespace=CBT`
+- `chat_controls`：强制对话轮次控制
+  - 当前采用 `defaults.enabled=false + agent_overrides.enabled=true` 的方式
+  - `forced_chat_iter=18`：当前每个相关角色都按 override 单独控制
+- `forced_llm`：强制干预对话模型；当前为 `deepseek-v4-flash`，需在 `.env` 配置 `DEEPSEEK_API_KEY`
+- `dialog_judge`：会话中判断 LLM；当前保持 `enabled=true` 且 `force_forced_llm=true`
+- `session_eval`：会话后评估 LLM；当前 `route=forced_llm`，`history_recent_n=3`
+- `consult_record`：咨询记录生成；当前主线为 `enabled=false`，要看 SOAP 记录时再开启
+- `depression_dynamic`：动态抑郁人设主链路；当前主线建议保持 `enabled=true`
+  - `normal_chain_enabled=true`
+  - `forced_chain_enabled=true`
+  - `prompt_injection_enabled=true`
+  - `event_commit_enabled=true`
+  - 角色侧配置见 `frontend/static/assets/village/agents/卡布达/depression_config.json`
+- `memory_injection`：记忆注入规则，当前启用了初始化注入和指定 session 完成后的注入
+- `memory_policy`：强制对话阶段的检索权重策略；当前主线保持开启
 
 ## 4.3 配置注意事项
 
-- `doctor`、`patients`、`meeting_rules`、`chat_controls.agent_overrides` 的角色名必须一致。
-- `session_prompt_injection.order` 需与提示词文件中的 session id 对齐。
-- 若启用外置记忆，请确认 `agent.external_memory.base_url` 可访问，且服务端接口就绪。可运行`test\live_ec_doll_memory_service_health_ready.py`检查。
+- `doctor`、`patients`、`meeting_rules[*].doctor/patient`、`chat_controls.agent_overrides` 里的角色名必须完全一致。
+- `session_prompt_injection.order` 必须与提示词文件中的 session id 对齐。
+- 若本地分支仍保留 `intervention.depression_update` 旧配置，建议继续保持 `enabled=false`，不要与 `depression_dynamic` 同时启用。
+- 若启用外置记忆，请确认 `agent.external_memory.base_url` 可访问，且服务端接口就绪；可运行 `test/live_ec_doll_memory_service_health_ready.py` 检查。
+- 建议优先确认 `external_memory`、`forced_llm`、`dialog_judge`、`session_eval`、`depression_dynamic` 这 5 条链路都正常，再去微调 `meeting_rules`、`chat_controls`、`recent_dedup_limit` 等细项。
 
 ## 5. 运行流程图总览
 

@@ -5,6 +5,9 @@ import re
 import requests
 
 
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
+
+
 class LLMModel:
     def __init__(self, config):
         self._api_key = config["api_key"]
@@ -106,13 +109,26 @@ class OllamaLLMModel(LLMModel):
             "temperature": temperature,
             "stream": False,
         }
+        request_url = f"{self._base_url}/chat/completions"
 
-        response = requests.post(
-            url=f"{self._base_url}/chat/completions",
-            headers=headers,
-            json=params,
-            stream=False
-        )
+        try:
+            response = requests.post(
+                url=request_url,
+                headers=headers,
+                json=params,
+                stream=False,
+                timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+            )
+        except requests.exceptions.Timeout as exc:
+            print(
+                "[OLLAMA_TIMEOUT] model={} url={} timeout={}s error={}".format(
+                    self._model,
+                    request_url,
+                    OLLAMA_REQUEST_TIMEOUT_SECONDS,
+                    exc,
+                )
+            )
+            raise
         return response.json()
 
     def _completion(self, prompt, temperature=0.5):

@@ -30,7 +30,7 @@ from pathlib import Path
 # ============================================================
 
 # 实验名称；必须对应 results/checkpoints/<name>
-RUN_NAME = "sim-init-0515-eval-v2"
+RUN_NAME = "sim-init-0516"
 
 # 量表评估的目标角色
 SCALE_AGENT = "卡布达"
@@ -58,17 +58,17 @@ SCALES = {
     "PHQ-9": {
         "question_file": "PHQ-9-v2.jsonl",
         "scoring_prompt": "PHQ-9评估提示词.md",
-        "repeat": 3,
+        "repeat": 1,
     },
     "BDI-II": {
         "question_file": "BDI-II-v2.jsonl",
         "scoring_prompt": "BDI-II评估提示词.md",
-        "repeat": 3,
+        "repeat": 1,
     },
     "SDS": {
         "question_file": "SDS-v2.jsonl",
         "scoring_prompt": "SDS评估提示词.md",
-        "repeat": 3,
+        "repeat": 1,
     },
 }
 

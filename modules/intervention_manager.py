@@ -18,7 +18,7 @@ from string import Template
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 
-from modules import depression_runtime_manager as drm
+from modules import depression_dynamic_adapter as dda
 from modules.memory_injection_manager import MemoryInjectionManager
 from modules.intervention_consult_record import (
     ConsultRecordError,
@@ -161,22 +161,11 @@ class InterventionManager:
         )
 
         now_step = int(self.config.get("step", 0) or 0) + 1
-        update_cfg = (self.config.get("intervention", {}) or {}).get("depression_update", {}) or {}
-        for agent in game.agents.values():
-            profile = drm.ensure_profile(getattr(agent, "depression_profile", {}))
-            profile = self._ensure_depression_runtime_initialized(
-                agent=agent,
-                profile=profile,
-                now_step=now_step,
-                update_cfg=update_cfg,
+        self._log_highlight(
+            "[DEPR][STEP] step={} legacy_update_chain=skipped reason=dynamic_runtime_authoritative".format(
+                now_step
             )
-            drm.decay_short_term(profile, now_step, update_cfg)
-            changed, next_profile = drm.try_rebase_case_config(profile, now_step, update_cfg)
-            agent.depression_profile = next_profile
-            if changed:
-                self._log_highlight(
-                    "[DEPR][REBASE] agent={} step={} applied=true".format(agent.name, now_step)
-                )
+        )
 
         if self.meeting_queue_enabled:
             self._recover_queue_state(game, now)
@@ -493,75 +482,24 @@ class InterventionManager:
             return
 
         now_step = int(self.config.get("step", 0) or 0)
-        update_cfg = (self.config.get("intervention", {}) or {}).get("depression_update", {}) or {}
-        update_cfg = copy.deepcopy(update_cfg)
-        update_cfg["llm_patch_required_on_doctor_chat"] = bool(
-            update_cfg.get("llm_patch_required_on_doctor_chat", True)
-        )
-        depr_summary = self._build_depr_summary_with_consult_fallback(
-            speaker=speaker,
-            other=other,
-            chat_summary=summary or "",
-            meeting_id=closed_meeting_id,
-        )
-        before = copy.deepcopy(getattr(patient, "depression_profile", {}))
-        result = drm.evaluate_post_chat_update(
-            patient_agent=patient,
-            chats=chats or [],
-            summary=depr_summary,
-            now_step=now_step,
-            now_time=self._fmt_dt(start_time),
-            update_cfg=update_cfg,
-        )
-        after = copy.deepcopy(getattr(patient, "depression_profile", {}))
-        audit = drm.diff_runtime(before, after)
-
+        runtime_snapshot = dda.get_runtime_snapshot(patient)
         self._log_highlight(
-            "[DEPR][EVAL] patient={} step={} throttled={} reason={}".format(
+            "[DEPR][EVAL] patient={} step={} skipped=true reason=legacy_update_chain_removed".format(
                 patient.name,
                 now_step,
-                bool(result.get("throttled", False)),
-                result.get("reason", ""),
-            )
-        )
-        cfg_adjustments = result.get("cfg_adjustments", {}) if isinstance(result, dict) else {}
-        if cfg_adjustments:
-            self._log_highlight(
-                "[DEPR][CFG] patient={} normalized={}".format(
-                    patient.name,
-                    cfg_adjustments,
-                )
-            )
-
-        self._log_highlight(
-            "[DEPR][EVENT] patient={} wording={} long_term_triggered={} chat_count={}".format(
-                patient.name,
-                result.get("current_event_wording", ""),
-                bool(result.get("long_term_triggered", False)),
-                int(result.get("doctor_chat_count", 0) or 0),
-            )
-        )
-        if result.get("throttled"):
-            self._log_highlight(
-                "[DEPR][THROTTLE] patient={} step={} reason={}".format(
-                    patient.name,
-                    now_step,
-                    result.get("reason", ""),
-                )
-            )
-        self._log_highlight(
-            "[DEPR][DIFF] patient={} changed_paths={}".format(
-                patient.name,
-                audit.get("changed_paths", []),
             )
         )
         self._log_highlight(
-            "[DEPR][LAYER] patient={} short_term_changed={} long_term_changed={} llm_patch_attempted={} llm_patch_used={}".format(
+            "[DEPR][EVENT] patient={} wording={}".format(
                 patient.name,
-                audit.get("short_term_changed", False),
-                audit.get("long_term_changed", False),
-                bool(result.get("llm_patch_attempted", False)),
-                bool(result.get("llm_patch_used", False)),
+                runtime_snapshot.get("current_event_wording", ""),
+            )
+        )
+        self._log_highlight(
+            "[DEPR][LAYER] patient={} short_term_changed={} long_term_changed={}".format(
+                patient.name,
+                bool(runtime_snapshot.get("short_term_changed", False)),
+                bool(runtime_snapshot.get("long_term_changed", False)),
             )
         )
 
@@ -2538,23 +2476,6 @@ class InterventionManager:
             if speaker == str(patient_name or ""):
                 return text
         return ""
-
-    def _ensure_depression_runtime_initialized(
-        self,
-        agent: Any,
-        profile: Dict[str, Any],
-        now_step: int,
-        update_cfg: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """幂等初始化 depression runtime，确保 topic 首次固化。"""
-        ensured = drm.ensure_profile(profile)
-        initialized = drm.initialize_current_event_if_needed(
-            patient_agent=agent,
-            profile=ensured,
-            now_step=int(now_step),
-            update_cfg=update_cfg or {},
-        )
-        return initialized
 
     def apply_forced_tasks(self, agent: Any, now: Any) -> None:
         """将 pending 医嘱任务并入当天日程。"""
