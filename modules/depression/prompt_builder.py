@@ -57,6 +57,7 @@ class DynamicPromptBuilder:
     def _build_stage_layer(self, current_stage: Dict[str, Any], chain_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
         current_window = chain_snapshot.get("current_chain_window", []) if isinstance(chain_snapshot.get("current_chain_window", []), list) else []
+        branch_options = chain_snapshot.get("current_stage_branch_options", []) if isinstance(chain_snapshot.get("current_stage_branch_options", []), list) else []
 
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
         summary = str(current_stage.get("summary", "") or "").strip()
@@ -88,23 +89,44 @@ class DynamicPromptBuilder:
                 "- 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。",
                 "- 即使出现一点松动，也应表现为试探性的、会反复的变化。",
                 "- 若当前对话没有真正触及这个节点，就不要跨越到下一个节点。",
+                "- 你可以在相关旧主诉与相邻分支之间摇摆，但不要无意义地来回抖动。",
             ]
         )
 
-        if self.include_chain_window and current_window:
-            lines.append("")
-            lines.append("当前窗口中的主诉走向：")
-            for idx, stage in enumerate(current_window):
-                if not isinstance(stage, dict):
-                    continue
-                marker = "当前" if idx == 0 else f"后续{idx}"
-                lines.append(
-                    f"- [{marker}] {str(stage.get('label', '未知节点') or '未知节点')}：{str(stage.get('summary', '') or '').strip()}"
-                )
-            if len(current_window) > 1:
-                next_label = str(current_window[1].get("label", "") or "").strip() if isinstance(current_window[1], dict) else ""
-                if next_label:
-                    lines.append(f"- 若本轮确实出现推进，最多只自然靠近「{next_label}」，不要跨越式跳转。")
+        if self.include_chain_window:
+            active_path_ids = {
+                str(stage.get("id", "") or "").strip()
+                for stage in current_window[1:]
+                if isinstance(stage, dict) and str(stage.get("id", "") or "").strip()
+            }
+            if current_window:
+                lines.append("")
+                lines.append("当前活跃路径窗口：")
+                for idx, stage in enumerate(current_window):
+                    if not isinstance(stage, dict):
+                        continue
+                    marker = "当前" if idx == 0 else f"近端后续{idx}"
+                    pending_tag = "（待生成）" if bool(stage.get("is_pending", False)) else ""
+                    lines.append(
+                        f"- [{marker}] {str(stage.get('label', '未知节点') or '未知节点')}{pending_tag}：{str(stage.get('summary', '') or '').strip()}"
+                    )
+                if len(current_window) > 1:
+                    next_label = str(current_window[1].get("label", "") or "").strip() if isinstance(current_window[1], dict) else ""
+                    if next_label:
+                        lines.append(f"- 若本轮确实出现推进，优先自然靠近「{next_label}」，但不要跨越到无关的远端节点。")
+            if branch_options:
+                lines.append("")
+                lines.append("当前节点可分化的相关分支：")
+                for option in branch_options[:6]:
+                    if not isinstance(option, dict):
+                        continue
+                    option_id = str(option.get("id", "") or "").strip()
+                    option_label = str(option.get("label", "未知节点") or "未知节点").strip()
+                    option_summary = str(option.get("summary", "") or "").strip()
+                    path_tag = "活跃路径" if option_id in active_path_ids else "备选分支"
+                    pending_tag = "待生成" if bool(option.get("is_pending", False)) else "已存在"
+                    lines.append(f"- [{path_tag}/{pending_tag}] {option_label}：{option_summary}")
+                lines.append("- 若对话真实触发了别的相关分支，你可以自然靠近它；也可能短暂回到旧主诉，但不要在两个节点间机械往返。")
 
         return "\n".join(lines) + "\n"
 

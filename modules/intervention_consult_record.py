@@ -275,3 +275,53 @@ def flatten_record_for_injection(record: Dict[str, Any]) -> Dict[str, str]:
         "a_outcome": str(a.get("outcome", "") or "").strip(),
         "a_understanding": str(a.get("understanding", "") or "").strip(),
     }
+
+
+def build_consult_history_record(
+    record_id: str,
+    meeting_id: str,
+    session_started_at: str,
+    doctor: str,
+    patient: str,
+    pair_key: str,
+    chat_summary: str,
+    transcript: str,
+) -> Dict[str, Any]:
+    return {
+        "record_id": str(record_id or "").strip(),
+        "meeting_id": str(meeting_id or "").strip(),
+        "session_started_at": str(session_started_at or "").strip(),
+        "participants": {
+            "doctor": str(doctor or "").strip(),
+            "patient": str(patient or "").strip(),
+        },
+        "pair_key": str(pair_key or "").strip(),
+        "chat_summary": str(chat_summary or "").strip(),
+        "transcript": str(transcript or "").strip(),
+    }
+
+
+def validate_consult_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ConsultRecordValidationError(reason="consult_history_structure_invalid")
+
+    normalized = dict(record)
+    for key in ["record_id", "session_started_at", "pair_key", "chat_summary", "transcript"]:
+        text = str(normalized.get(key, "") or "").strip()
+        if not text:
+            raise ConsultRecordValidationError(reason="required_field_empty")
+        normalized[key] = text
+
+    if not ISO8601_WITH_TZ_RE.match(str(normalized.get("session_started_at", "") or "").strip()):
+        raise ConsultRecordValidationError(reason="session_started_at_invalid")
+
+    participants = normalized.get("participants", {})
+    if not isinstance(participants, dict):
+        raise ConsultRecordValidationError(reason="pair_mismatch")
+    doctor = str(participants.get("doctor", "") or "").strip()
+    patient = str(participants.get("patient", "") or "").strip()
+    if not doctor or not patient:
+        raise ConsultRecordValidationError(reason="pair_mismatch")
+    normalized["participants"] = {"doctor": doctor, "patient": patient}
+    normalized["meeting_id"] = str(normalized.get("meeting_id", "") or "").strip()
+    return normalized

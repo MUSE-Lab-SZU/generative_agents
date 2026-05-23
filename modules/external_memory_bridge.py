@@ -18,6 +18,7 @@ class ExternalMemoryBridge:
 
     MAP_FILENAME = "external_memory_node_map.json"
     RECENT_RAW_SECTION_TITLE = "【近期原文（本服务入库）】"
+    LEVEL_ACTION_RETRY_DELAYS_S = (0.2, 0.8, 2.0, 5.0, 8.0)
 
     def __init__(
         self,
@@ -321,7 +322,7 @@ class ExternalMemoryBridge:
             return None
 
     def _promote_with_retry(self, remote_id: str) -> Dict[str, Any]:
-        delays_s = [0.1, 0.3, 0.8]
+        delays_s = self.LEVEL_ACTION_RETRY_DELAYS_S
         last_exc: Optional[Exception] = None
         for idx, delay_s in enumerate(delays_s, start=1):
             try:
@@ -346,7 +347,7 @@ class ExternalMemoryBridge:
         raise RuntimeError("promote_retry_unexpected_empty: remote_id={}".format(remote_id))
 
     def _milestone_with_retry(self, remote_id: str, is_milestone: bool) -> Dict[str, Any]:
-        delays_s = [0.1, 0.3, 0.8]
+        delays_s = self.LEVEL_ACTION_RETRY_DELAYS_S
         last_exc: Optional[Exception] = None
         for idx, delay_s in enumerate(delays_s, start=1):
             try:

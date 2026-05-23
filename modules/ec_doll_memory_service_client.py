@@ -140,9 +140,11 @@ class ECDollMemoryServiceClient:
         - `message`(str): 人类可读说明。
         - `remote_id`(str): 本条消息最终 ID。
         - `long_term_pending`(bool): 是否已进入长期分析后台队列。
-        - `analysis_ok`(bool|None): 分析结果是否可用。
-        - `mws_score`(float|None): 消息 MWS 分数。
-        - `stored_raw_fallback`(bool): LLM 不可用时是否退化为仅存原文。
+        - `analysis_ok`(bool|None): 分析结果是否可用；raw_fallback 场景常为 `False` / `None`。
+        - `mws_score`(float|None): 消息 MWS 分数；raw_fallback 场景通常退化到较低默认值。
+        - `stored_raw_fallback`(bool): 是否走了“原文降级写入”分支。
+        - `fallback_reason`(str|None): v2.1.3 起记录真实异常字符串，便于事后区分 ConnectionError / Timeout / JSON 解析失败。
+        - `embed_mock_at_write`(bool|None): v2.1.3 起记录 ingest 当下 embedding 是否退到 MOCK；为 `True` 时该条向量质量已退化。
         """
         data = self._request(
             "POST",
@@ -225,6 +227,11 @@ class ECDollMemoryServiceClient:
         输出（JSON）：
         - 非分页：`List[dict]`。
         - 分页：`dict`，固定字段为 `items`, `total`, `page`, `page_size`。
+        - 单条记忆常见字段包括：`remote_id`, `content`, `level`, `mws_score`,
+          `mws_components`, `timestamp`, `is_locked`, `is_milestone`,
+          `milestone_title`, `user_id`。
+        - v2.1.3 起若该条写入时经历了退化路径，还可能带：
+          `ingest_mode`, `fallback_reason`, `embed_mock_at_write`。
         """
         return self._request(
             "GET",
@@ -242,26 +249,25 @@ class ECDollMemoryServiceClient:
         self,
         memory_id: str,
         content: Optional[str] = None,
-        mws_score: Optional[float] = None,
     ) -> JsonDict:
         """
-        更新记忆：`PUT /api/memories/{id}`。
+        更新记忆内容：`PUT /api/memories/{id}`。
 
         输入（Path + JSON）：
         - `memory_id`(str, 必填): 目标记忆 ID。
         - `content`(str|None): 新内容摘要。
-        - `mws_score`(float|None): 新 MWS 分数。
-        - 约束：`content` 与 `mws_score` 至少传一个。
+        - 约束：v2.1 起 PUT 仅接受 `content`；分数与状态请改用
+          `promote` / `demote` / `milestone` / `toggle_lock`。
 
         输出（JSON）：
         - 透传服务端返回，常见字段：`status`, `id`, `message`。
         """
-        if content is None and mws_score is None:
-            raise ValueError("update_memory requires at least one of content or mws_score")
+        if content is None:
+            raise ValueError("update_memory requires content")
         data = self._request(
             "PUT",
             f"/api/memories/{memory_id}",
-            json_body={"content": content, "mws_score": mws_score},
+            json_body={"content": content},
         )
         return data if isinstance(data, dict) else {}
 
@@ -288,7 +294,8 @@ class ECDollMemoryServiceClient:
         输出（JSON）：
         - `user_id`(str): 当前统计所属用户。
         - `chroma`(dict): 长期记忆统计，常见字段包括
-          `total`, `l1`, `l2`, `milestones`, `locked`, `raw_fallback`。
+          `total`, `l1`, `l2`, `milestones`, `locked`, `raw_fallback`；
+          v2.1.3 起还可能包含 `embed_mock_at_write`（零向量写入条数）。
         - `postgres`(dict): PG 表计数，常见字段包括
           `l3_emotion_log`, `l4_milestones`, `l4_profile_attributes`, `l4_profile_core`。
         - `redis`(dict): Redis 统计，常见字段包括 `short_term`, `l0_cache`。
@@ -515,7 +522,10 @@ class ECDollMemoryServiceClient:
         - `redis`(bool): Redis 依赖是否可用。
         - `postgres`(bool): PostgreSQL 依赖是否可用。
         - `chroma`(bool): Chroma 依赖是否可用。
-        - 语义：任一依赖不可用时，服务应返回 HTTP 503。
+        - `llm_alive`(bool|None): v2.1.3 起新增 advisory 字段；仅用于说明长期分析链路是否健康。
+        - `llm_err`(str|None): v2.1.3 起新增 advisory 字段；当 `llm_alive=false` 时用于解释 raw_fallback 成因。
+        - `embed_mock`(bool|None): v2.1.3 起新增 advisory 字段；为 `true` 时说明 embedding 已退到 MOCK。
+        - 语义：任一强依赖（Redis / PostgreSQL / Chroma）不可用时，服务应返回 HTTP 503；advisory 字段不阻塞 ready。
         """
         try:
             data = self._request("GET", "/ready")

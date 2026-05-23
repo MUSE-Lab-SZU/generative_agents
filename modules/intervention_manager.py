@@ -18,23 +18,26 @@ from string import Template
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 
-from modules import depression_dynamic_adapter as dda
+from modules import utils
 from modules.memory_injection_manager import MemoryInjectionManager
 from modules.intervention_consult_record import (
     ConsultRecordError,
     ConsultRecordPromptError,
     ConsultRecordValidationError,
+    build_consult_history_record,
     build_dedup_key,
     build_full_record,
     build_pair_key,
     flatten_record_for_injection,
     project_whitelist,
     to_conversation_text,
+    validate_consult_history_record,
     validate_full_record,
     validate_soap_only,
 )
 from modules.model import create_llm_model
 from modules.session_prompt_injection_manager import SessionPromptInjectionManager
+from modules.storage.index import LlamaIndex
 
 
 @dataclass
@@ -78,10 +81,12 @@ class InterventionManager:
         self.chat_controls_cfg = intervention_cfg.get("chat_controls", {}) or {}
         self.forced_llm_cfg = intervention_cfg.get("forced_llm", {}) or {}
         self.consult_record_cfg = intervention_cfg.get("consult_record", {}) or {}
+        self.consult_history_cfg = intervention_cfg.get("consult_history", {}) or {}
         self._consult_record_llm = None
         self._consult_record_llm_key = ""
         self._think_llm = None
         self._think_llm_key = ""
+        self._consult_history_indexes: Dict[str, Any] = {}
 
         # 全局运行时状态（随 config 落盘）
         self.state = config.setdefault(
@@ -329,6 +334,15 @@ class InterventionManager:
         )
         self._extract_and_queue_orders(speaker, other, chats)
 
+        self._handle_consult_history_after_chat(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            summary=summary,
+            start_time=start_time,
+            meeting_id=closed_meeting_id,
+        )
+
         self._handle_consult_record_after_chat(
             speaker=speaker,
             other=other,
@@ -482,7 +496,7 @@ class InterventionManager:
             return
 
         now_step = int(self.config.get("step", 0) or 0)
-        runtime_snapshot = dda.get_runtime_snapshot(patient)
+        runtime_snapshot = self._get_patient_depression_runtime_snapshot(patient)
         self._log_highlight(
             "[DEPR][EVAL] patient={} step={} skipped=true reason=legacy_update_chain_removed".format(
                 patient.name,
@@ -502,6 +516,44 @@ class InterventionManager:
                 bool(runtime_snapshot.get("long_term_changed", False)),
             )
         )
+
+    def _get_patient_depression_runtime_snapshot(self, patient: Any) -> Dict[str, Any]:
+        snapshot = {
+            "current_event_wording": "",
+            "emotion_label": "",
+            "emotion_style": "",
+            "emotion_intensity": 0.0,
+            "last_throttle_reason": "",
+            "short_term_changed": False,
+            "long_term_changed": False,
+            "changed_paths": [],
+        }
+        engine = getattr(patient, "depression_dynamic", None)
+        if engine is None or not callable(getattr(engine, "get_current_state_info", None)):
+            return snapshot
+        try:
+            info = engine.get_current_state_info()
+        except Exception:
+            return snapshot
+        if not isinstance(info, dict):
+            return snapshot
+
+        stage = info.get("current_stage", {}) if isinstance(info.get("current_stage", {}), dict) else {}
+        emotion = info.get("emotion", {}) if isinstance(info.get("emotion", {}), dict) else {}
+        wording = ""
+        for key in ("summary", "label", "core_belief", "id"):
+            text = str(stage.get(key, "") or "").strip()
+            if text:
+                wording = text
+                break
+        snapshot["current_event_wording"] = wording
+        snapshot["emotion_label"] = str(emotion.get("label", "") or "")
+        snapshot["emotion_style"] = str(emotion.get("style", "") or "")
+        try:
+            snapshot["emotion_intensity"] = float(emotion.get("intensity", 0.0) or 0.0)
+        except Exception:
+            snapshot["emotion_intensity"] = 0.0
+        return snapshot
 
     def get_session_prompt_for_judge(self, speaker: Any, other: Any, forced: bool) -> str:
         if not self.enabled:
@@ -1072,6 +1124,51 @@ class InterventionManager:
                 int(policy["retry"]),
                 policy["prompt_file"],
                 int(policy["history_recent_n"]),
+            )
+        )
+        return policy
+
+    def get_consult_history_runtime_policy(self) -> Dict[str, Any]:
+        default_policy = {
+            "enabled": False,
+            "retrieve_top_k": 3,
+            "gate_prompt_file": "data/prompts/intervention/consult_history_gate.txt",
+            "gate_retry": 2,
+            "summary_route": "forced_llm",
+            "summary_prompt_file": "data/prompts/intervention/consult_history_summary.txt",
+            "summary_retry": 2,
+            "source": "defaults",
+        }
+        raw_cfg = self.consult_history_cfg if isinstance(self.consult_history_cfg, dict) else {}
+        if not isinstance(raw_cfg, dict):
+            return default_policy
+        policy = dict(default_policy)
+        policy["source"] = "consult_history_config"
+        policy["enabled"] = self._safe_bool(raw_cfg.get("enabled", False), False)
+        retrieve_top_k = self._safe_int(raw_cfg.get("retrieve_top_k", default_policy["retrieve_top_k"]), default_policy["retrieve_top_k"])
+        policy["retrieve_top_k"] = retrieve_top_k if retrieve_top_k >= 1 else default_policy["retrieve_top_k"]
+        gate_prompt_file = str(raw_cfg.get("gate_prompt_file", default_policy["gate_prompt_file"]) or "").strip()
+        policy["gate_prompt_file"] = gate_prompt_file or default_policy["gate_prompt_file"]
+        gate_retry = self._safe_int(raw_cfg.get("gate_retry", default_policy["gate_retry"]), default_policy["gate_retry"])
+        policy["gate_retry"] = gate_retry if gate_retry >= 1 else default_policy["gate_retry"]
+        summary_route = str(raw_cfg.get("summary_route", default_policy["summary_route"]) or default_policy["summary_route"]).strip().lower()
+        if summary_route not in ("forced_llm", "think_llm"):
+            summary_route = default_policy["summary_route"]
+        policy["summary_route"] = summary_route
+        summary_prompt_file = str(raw_cfg.get("summary_prompt_file", default_policy["summary_prompt_file"]) or "").strip()
+        policy["summary_prompt_file"] = summary_prompt_file or default_policy["summary_prompt_file"]
+        summary_retry = self._safe_int(raw_cfg.get("summary_retry", default_policy["summary_retry"]), default_policy["summary_retry"])
+        policy["summary_retry"] = summary_retry if summary_retry >= 1 else default_policy["summary_retry"]
+        self._log_highlight(
+            "[CONSULT_HISTORY_POLICY] source={} enabled={} top_k={} gate_retry={} summary_route={} summary_retry={} gate_prompt_file={} summary_prompt_file={}".format(
+                policy["source"],
+                bool(policy["enabled"]),
+                int(policy["retrieve_top_k"]),
+                int(policy["gate_retry"]),
+                policy["summary_route"],
+                int(policy["summary_retry"]),
+                policy["gate_prompt_file"],
+                policy["summary_prompt_file"],
             )
         )
         return policy
@@ -1830,7 +1927,13 @@ class InterventionManager:
             raise ConsultRecordError(reason="think_llm_empty_text", retryable=False)
         return text
 
-    def _call_think_llm_json(self, prompt_text: str, retry: int, doctor_agent: Any) -> Dict[str, Any]:
+    def _call_think_llm_json(
+        self,
+        prompt_text: str,
+        retry: int,
+        doctor_agent: Any,
+        caller: str = "session_eval_think_llm",
+    ) -> Dict[str, Any]:
         _, llm = self._resolve_think_llm_runtime(doctor_agent)
         retry_count = max(1, int(retry or 2))
         payload = llm.completion(
@@ -1838,7 +1941,7 @@ class InterventionManager:
             retry=retry_count,
             callback=self._json_loads_loose,
             failsafe=None,
-            caller="session_eval_think_llm",
+            caller=str(caller or "session_eval_think_llm"),
         )
         if not isinstance(payload, dict):
             raise ConsultRecordError(reason="json_parse_failed", retryable=False)
@@ -3652,6 +3755,318 @@ class InterventionManager:
             return 2000
         return value
 
+    def _consult_history_enabled(self) -> bool:
+        cfg = self.consult_history_cfg if isinstance(self.consult_history_cfg, dict) else {}
+        return bool(self.enabled and self._safe_bool(cfg.get("enabled", False), False))
+
+    def _pair_key_to_history_slug(self, pair_key: str) -> str:
+        slug = str(pair_key or "").strip().replace("::", "__")
+        for old, new in (("/", "_"), ("\\", "_"), (":", "_"), (" ", "_")):
+            slug = slug.replace(old, new)
+        return slug or "pair_unknown"
+
+    def _get_consult_history_root(self, agent: Any) -> str:
+        storage_root = str(getattr(agent, "storage_root", "") or "").strip()
+        if not storage_root:
+            return ""
+        storage_dir = os.path.dirname(storage_root)
+        checkpoint_root = os.path.dirname(storage_dir)
+        if not checkpoint_root:
+            return ""
+        return os.path.join(checkpoint_root, "consult_history")
+
+    def _get_consult_history_pair_dir(self, agent: Any, pair_key: str) -> str:
+        root = self._get_consult_history_root(agent)
+        if not root:
+            return ""
+        return os.path.join(root, self._pair_key_to_history_slug(pair_key))
+
+    def _get_consult_history_manifest_path(self, agent: Any, pair_key: str) -> str:
+        pair_dir = self._get_consult_history_pair_dir(agent, pair_key)
+        if not pair_dir:
+            return ""
+        return os.path.join(pair_dir, "manifest.json")
+
+    def _get_consult_history_index_dir(self, agent: Any, pair_key: str) -> str:
+        pair_dir = self._get_consult_history_pair_dir(agent, pair_key)
+        if not pair_dir:
+            return ""
+        return os.path.join(pair_dir, "index")
+
+    def _default_consult_history_manifest(self) -> Dict[str, Any]:
+        return {
+            "records_by_id": {},
+            "meeting_to_record": {},
+            "dedup_keys": {},
+            "write_audit": [],
+            "record_seq": 0,
+        }
+
+    def _load_consult_history_manifest(self, agent: Any, pair_key: str) -> Dict[str, Any]:
+        manifest = self._default_consult_history_manifest()
+        path = self._get_consult_history_manifest_path(agent, pair_key)
+        if not path or (not os.path.exists(path)):
+            return manifest
+        try:
+            loaded = utils.load_dict(path)
+        except Exception:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            loaded = {}
+        for key, default in manifest.items():
+            value = loaded.get(key, default)
+            if isinstance(default, dict):
+                manifest[key] = value if isinstance(value, dict) else copy.deepcopy(default)
+            elif isinstance(default, list):
+                manifest[key] = value if isinstance(value, list) else list(default)
+            else:
+                manifest[key] = value
+        try:
+            manifest["record_seq"] = max(0, int(manifest.get("record_seq", 0) or 0))
+        except Exception:
+            manifest["record_seq"] = 0
+        return manifest
+
+    def _save_consult_history_manifest(self, agent: Any, pair_key: str, manifest: Dict[str, Any]) -> str:
+        path = self._get_consult_history_manifest_path(agent, pair_key)
+        if not path:
+            raise ConsultRecordError(reason="consult_history_manifest_path_missing", retryable=False)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        utils.save_dict(manifest if isinstance(manifest, dict) else self._default_consult_history_manifest(), path)
+        return path
+
+    def _consult_history_record_relpath(self, record_id: str) -> str:
+        return os.path.join("records", "{}.json".format(str(record_id or "").strip()))
+
+    def _consult_history_record_path(self, agent: Any, pair_key: str, record_id: str) -> str:
+        pair_dir = self._get_consult_history_pair_dir(agent, pair_key)
+        if not pair_dir:
+            return ""
+        return os.path.join(pair_dir, self._consult_history_record_relpath(record_id))
+
+    def _next_consult_history_record_id(self, manifest: Dict[str, Any]) -> str:
+        seq = 0
+        try:
+            seq = int((manifest or {}).get("record_seq", 0) or 0)
+        except Exception:
+            seq = 0
+        seq = max(0, seq) + 1
+        if isinstance(manifest, dict):
+            manifest["record_seq"] = seq
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return "hist_{}_{}".format(ts, str(seq).zfill(3))
+
+    def _get_or_init_consult_history_index(self, agent: Any, pair_key: str) -> Optional[LlamaIndex]:
+        index_dir = self._get_consult_history_index_dir(agent, pair_key)
+        if not index_dir:
+            return None
+        cache_key = os.path.normpath(index_dir)
+        index_obj = self._consult_history_indexes.get(cache_key)
+        if index_obj is not None:
+            return index_obj
+        embedding_cfg = copy.deepcopy(getattr(agent, "associate_embedding_config", {}) or {})
+        if not isinstance(embedding_cfg, dict) or not embedding_cfg:
+            raise ConsultRecordError(reason="consult_history_embedding_missing", retryable=False)
+        index_obj = LlamaIndex(embedding_cfg, path=index_dir)
+        self._consult_history_indexes[cache_key] = index_obj
+        return index_obj
+
+    def _load_consult_history_record_by_id(
+        self,
+        agent: Any,
+        pair_key: str,
+        record_id: str,
+        manifest: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        current_manifest = manifest if isinstance(manifest, dict) else self._load_consult_history_manifest(agent, pair_key)
+        records_by_id = current_manifest.get("records_by_id", {}) if isinstance(current_manifest, dict) else {}
+        if not isinstance(records_by_id, dict):
+            return None
+        rel_path = str(records_by_id.get(str(record_id or "").strip(), "") or "").strip()
+        if not rel_path:
+            return None
+        pair_dir = self._get_consult_history_pair_dir(agent, pair_key)
+        if not pair_dir:
+            return None
+        abs_path = os.path.join(pair_dir, rel_path)
+        if not os.path.exists(abs_path):
+            return None
+        try:
+            loaded = utils.load_dict(abs_path)
+        except Exception:
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def _rebuild_consult_history_index_from_manifest(
+        self,
+        agent: Any,
+        pair_key: str,
+        manifest: Dict[str, Any],
+    ) -> None:
+        index_obj = self._get_or_init_consult_history_index(agent, pair_key)
+        if index_obj is None:
+            return
+        records_by_id = manifest.get("records_by_id", {}) if isinstance(manifest, dict) else {}
+        if not isinstance(records_by_id, dict):
+            return
+        rebuilt = 0
+        for record_id in records_by_id.keys():
+            record_id = str(record_id or "").strip()
+            if not record_id:
+                continue
+            if index_obj.has_node(record_id):
+                continue
+            record = self._load_consult_history_record_by_id(agent, pair_key, record_id, manifest=manifest)
+            if not isinstance(record, dict):
+                continue
+            chat_summary = str(record.get("chat_summary", "") or "").strip()
+            if not chat_summary:
+                continue
+            participants = record.get("participants", {}) if isinstance(record.get("participants", {}), dict) else {}
+            metadata = {
+                "meeting_id": str(record.get("meeting_id", "") or "").strip(),
+                "pair_key": str(record.get("pair_key", "") or "").strip(),
+                "doctor": str(participants.get("doctor", "") or "").strip(),
+                "patient": str(participants.get("patient", "") or "").strip(),
+                "session_started_at": str(record.get("session_started_at", "") or "").strip(),
+            }
+            index_obj.add_node(chat_summary, metadata=metadata, id=record_id)
+            rebuilt += 1
+        if rebuilt > 0:
+            index_obj.save()
+            self._log_highlight(
+                "CONSULT_HISTORY_INDEX_REBUILD pair_key={} rebuilt_nodes={}".format(
+                    pair_key,
+                    rebuilt,
+                )
+            )
+
+    def _append_consult_history_audit(
+        self,
+        manifest: Dict[str, Any],
+        status: str,
+        reason: str,
+        record_id: str = "",
+        meeting_id: str = "",
+        message: str = "",
+    ) -> None:
+        if not isinstance(manifest, dict):
+            return
+        audit = manifest.setdefault("write_audit", [])
+        if not isinstance(audit, list):
+            audit = []
+            manifest["write_audit"] = audit
+        audit.append(
+            {
+                "ts": self._fmt_dt(utils.get_timer().get_date()),
+                "status": str(status or ""),
+                "reason": str(reason or ""),
+                "record_id": str(record_id or ""),
+                "meeting_id": str(meeting_id or ""),
+                "message": str(message or ""),
+            }
+        )
+        if len(audit) > 2000:
+            manifest["write_audit"] = audit[-2000:]
+
+    def _write_consult_history_record(
+        self,
+        agent: Any,
+        pair_key: str,
+        record: Dict[str, Any],
+        summary: str,
+    ) -> Dict[str, Any]:
+        manifest = self._load_consult_history_manifest(agent, pair_key)
+        meeting_to_record = manifest.setdefault("meeting_to_record", {})
+        if not isinstance(meeting_to_record, dict):
+            meeting_to_record = {}
+            manifest["meeting_to_record"] = meeting_to_record
+        dedup_keys = manifest.setdefault("dedup_keys", {})
+        if not isinstance(dedup_keys, dict):
+            dedup_keys = {}
+            manifest["dedup_keys"] = dedup_keys
+        records_by_id = manifest.setdefault("records_by_id", {})
+        if not isinstance(records_by_id, dict):
+            records_by_id = {}
+            manifest["records_by_id"] = records_by_id
+
+        prepared = dict(record) if isinstance(record, dict) else {}
+        record_id = str(prepared.get("record_id", "") or "").strip() or self._next_consult_history_record_id(manifest)
+        prepared["record_id"] = record_id
+        current = validate_consult_history_record(prepared)
+
+        meeting_id = str(current.get("meeting_id", "") or "").strip()
+        dedup_key = build_dedup_key(meeting_id, summary or current.get("chat_summary", ""))
+        if meeting_id and meeting_id in meeting_to_record:
+            record_id = str(meeting_to_record.get(meeting_id, "") or "")
+            self._append_consult_history_audit(manifest, "skipped", "idempotent_hit_meeting", record_id=record_id, meeting_id=meeting_id)
+            self._save_consult_history_manifest(agent, pair_key, manifest)
+            return {"status": "skipped", "reason": "idempotent_hit_meeting", "record_id": record_id}
+        if dedup_key in dedup_keys:
+            record_id = str(dedup_keys.get(dedup_key, "") or "")
+            self._append_consult_history_audit(manifest, "skipped", "dedup_key_hit", record_id=record_id, meeting_id=meeting_id)
+            self._save_consult_history_manifest(agent, pair_key, manifest)
+            return {"status": "skipped", "reason": "dedup_key_hit", "record_id": record_id}
+
+        rel_path = self._consult_history_record_relpath(record_id)
+        abs_path = self._consult_history_record_path(agent, pair_key, record_id)
+        if not abs_path:
+            raise ConsultRecordError(reason="consult_history_record_path_missing", retryable=False)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        utils.save_dict(current, abs_path)
+
+        records_by_id[record_id] = rel_path
+        if meeting_id:
+            meeting_to_record[meeting_id] = record_id
+        dedup_keys[dedup_key] = record_id
+
+        write_reason = "write_success"
+        try:
+            index_obj = self._get_or_init_consult_history_index(agent, pair_key)
+            if index_obj is None:
+                raise ConsultRecordError(reason="consult_history_index_unavailable", retryable=False)
+            if not index_obj.has_node(record_id):
+                participants = current.get("participants", {}) if isinstance(current.get("participants", {}), dict) else {}
+                index_obj.add_node(
+                    str(current.get("chat_summary", "") or ""),
+                    metadata={
+                        "meeting_id": meeting_id,
+                        "pair_key": str(current.get("pair_key", "") or "").strip(),
+                        "doctor": str(participants.get("doctor", "") or "").strip(),
+                        "patient": str(participants.get("patient", "") or "").strip(),
+                        "session_started_at": str(current.get("session_started_at", "") or "").strip(),
+                    },
+                    id=record_id,
+                )
+                index_obj.save()
+        except Exception as exc:
+            write_reason = "write_success_index_pending"
+            self._log_highlight(
+                "CONSULT_HISTORY_INDEX_DEFER pair_key={} record_id={} detail={}".format(
+                    pair_key,
+                    record_id,
+                    str(exc),
+                )
+            )
+
+        self._append_consult_history_audit(manifest, "success", write_reason, record_id=record_id, meeting_id=meeting_id)
+        self._save_consult_history_manifest(agent, pair_key, manifest)
+        return {"status": "success", "reason": write_reason, "record_id": record_id}
+
+    def _load_consult_history_records_by_ids(
+        self,
+        agent: Any,
+        pair_key: str,
+        record_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        manifest = self._load_consult_history_manifest(agent, pair_key)
+        records: List[Dict[str, Any]] = []
+        for record_id in record_ids or []:
+            loaded = self._load_consult_history_record_by_id(agent, pair_key, str(record_id or "").strip(), manifest=manifest)
+            if isinstance(loaded, dict):
+                records.append(loaded)
+        return records
+
     def _load_prompt_txt_or_raise(self, path: str) -> str:
         file_path = str(path or "").strip()
         if not file_path:
@@ -3705,7 +4120,12 @@ class InterventionManager:
                 return None
         return None
 
-    def _call_forced_llm_json(self, prompt_text: str, retry: int) -> Dict[str, Any]:
+    def _call_forced_llm_json(
+        self,
+        prompt_text: str,
+        retry: int,
+        caller: str = "consult_record_forced_llm",
+    ) -> Dict[str, Any]:
         runtime_cfg = self.get_forced_llm_runtime_config()
         if not runtime_cfg:
             raise ConsultRecordError(reason="forced_llm_unavailable", retryable=True)
@@ -3721,10 +4141,11 @@ class InterventionManager:
             self._consult_record_llm_key = cache_key
 
         self._log_consult(
-            "LLM_CALL start provider={} model={} retry={}".format(
+            "LLM_CALL start provider={} model={} retry={} caller={}".format(
                 runtime_cfg.get("provider", ""),
                 runtime_cfg.get("model", ""),
                 retry_count,
+                str(caller or "consult_record_forced_llm"),
             )
         )
         payload = self._consult_record_llm.completion(
@@ -3732,7 +4153,7 @@ class InterventionManager:
             retry=retry_count,
             callback=self._json_loads_loose,
             failsafe=None,
-            caller="consult_record_forced_llm",
+            caller=str(caller or "consult_record_forced_llm"),
             temperature=float(runtime_cfg.get("temperature", 0.5) or 0.5),
         )
         if not isinstance(payload, dict):
@@ -3740,6 +4161,353 @@ class InterventionManager:
             raise ConsultRecordError(reason="json_parse_failed", retryable=False)
         self._log_consult("LLM_CALL end success=true")
         return payload
+
+    def _call_forced_llm_text(
+        self,
+        prompt_text: str,
+        retry: int,
+        caller: str = "consult_history_forced_llm",
+    ) -> str:
+        runtime_cfg = self.get_forced_llm_runtime_config()
+        if not runtime_cfg:
+            raise ConsultRecordError(reason="forced_llm_unavailable", retryable=True)
+        retry_count = max(1, int(retry or runtime_cfg.get("retry", 2) or 2))
+        cache_key = "{}/{}/{}".format(
+            runtime_cfg.get("provider", ""),
+            runtime_cfg.get("model", ""),
+            runtime_cfg.get("base_url", ""),
+        )
+        if self._consult_record_llm is None or self._consult_record_llm_key != cache_key:
+            self._consult_record_llm = create_llm_model(runtime_cfg)
+            self._consult_record_llm_key = cache_key
+        payload = self._consult_record_llm.completion(
+            prompt_text,
+            retry=retry_count,
+            failsafe="",
+            caller=str(caller or "consult_history_forced_llm"),
+            temperature=float(runtime_cfg.get("temperature", 0.5) or 0.5),
+        )
+        text = str(payload or "").strip()
+        if not text:
+            raise ConsultRecordError(reason="forced_llm_empty_text", retryable=False)
+        return text
+
+    def _extract_latest_other_utterance(self, chats: Any, other_name: str) -> str:
+        target = str(other_name or "").strip()
+        if not target:
+            return ""
+        for item in reversed(list(chats or [])):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            speaker = str(item[0] or "").strip()
+            text = str(item[1] or "").strip()
+            if speaker == target and text:
+                return text
+        return ""
+
+    def _normalize_consult_history_gate_output(
+        self,
+        payload: Any,
+        latest_utterance: str,
+    ) -> Dict[str, Any]:
+        raw = payload if isinstance(payload, dict) else {}
+        need = raw.get("need_retrieval")
+        if isinstance(need, bool):
+            need_retrieval = need
+        elif isinstance(need, str):
+            lowered = need.strip().lower()
+            if lowered == "true":
+                need_retrieval = True
+            elif lowered == "false":
+                need_retrieval = False
+            else:
+                need_retrieval = False
+        else:
+            need_retrieval = False
+
+        raw_query = raw.get("query", "")
+        query = raw_query.strip() if isinstance(raw_query, str) else ""
+        if need_retrieval and (not query):
+            query = str(latest_utterance or "").strip()
+        if not need_retrieval:
+            query = ""
+
+        raw_reason = raw.get("reason", "")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        return {
+            "need_retrieval": bool(need_retrieval),
+            "query": query,
+            "reason": reason,
+        }
+
+    def _consult_history_gate(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        latest_utterance: str,
+        policy: Dict[str, Any],
+        pair_key: str,
+    ) -> Dict[str, Any]:
+        prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("gate_prompt_file", "") or ""))
+        prompt_text = self._render_prompt_template(
+            prompt_tpl,
+            {
+                "speaker": str(getattr(speaker, "name", "") or ""),
+                "other": str(getattr(other, "name", "") or ""),
+                "pair_key": str(pair_key or ""),
+                "latest_utterance": str(latest_utterance or ""),
+                "conversation": to_conversation_text(chats or []),
+            },
+        )
+        try:
+            raw = self._call_think_llm_json(
+                prompt_text=prompt_text,
+                retry=int(policy.get("gate_retry", 2) or 2),
+                doctor_agent=speaker,
+                caller="consult_history_gate",
+            )
+        except ConsultRecordError as exc:
+            self._log_highlight(
+                "CONSULT_HISTORY_GATE_FALLBACK speaker={} other={} reason={}".format(
+                    getattr(speaker, "name", ""),
+                    getattr(other, "name", ""),
+                    str(exc.reason or "json_parse_failed"),
+                )
+            )
+            raw = {"need_retrieval": False, "query": "", "reason": str(exc.reason or "json_parse_failed")}
+        normalized = self._normalize_consult_history_gate_output(raw, latest_utterance)
+        self._log_highlight(
+            "CONSULT_HISTORY_GATE speaker={} other={} need_retrieval={} query_len={} reason={}".format(
+                getattr(speaker, "name", ""),
+                getattr(other, "name", ""),
+                bool(normalized.get("need_retrieval", False)),
+                len(str(normalized.get("query", "") or "")),
+                normalized.get("reason", ""),
+            )
+        )
+        return normalized
+
+    def _retrieve_consult_history_candidates(
+        self,
+        agent: Any,
+        pair_key: str,
+        query: str,
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        if not str(query or "").strip():
+            return []
+        manifest = self._load_consult_history_manifest(agent, pair_key)
+        records_by_id = manifest.get("records_by_id", {}) if isinstance(manifest, dict) else {}
+        if not isinstance(records_by_id, dict) or not records_by_id:
+            return []
+        index_obj = self._get_or_init_consult_history_index(agent, pair_key)
+        if index_obj is None:
+            return []
+        self._rebuild_consult_history_index_from_manifest(agent, pair_key, manifest)
+        node_ids = [str(rid or "").strip() for rid in records_by_id.keys() if str(rid or "").strip()]
+        if not node_ids:
+            return []
+        similarity_top_k = max(1, min(int(top_k or 1), len(node_ids)))
+        nodes = index_obj.retrieve(str(query or "").strip(), similarity_top_k=similarity_top_k, node_ids=node_ids)
+        results: List[Dict[str, Any]] = []
+        for node in nodes or []:
+            record_id = str(getattr(node, "id_", "") or "").strip()
+            if not record_id:
+                continue
+            record = self._load_consult_history_record_by_id(agent, pair_key, record_id, manifest=manifest)
+            if not isinstance(record, dict):
+                continue
+            try:
+                score = float(getattr(node, "score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            results.append({
+                "record_id": record_id,
+                "score": score,
+                "record": record,
+            })
+        self._log_highlight(
+            "CONSULT_HISTORY_RETRIEVE pair_key={} query_len={} hits={} top_k={}".format(
+                str(pair_key or ""),
+                len(str(query or "")),
+                len(results),
+                similarity_top_k,
+            )
+        )
+        return results
+
+    def _render_consult_history_hits_for_prompt(self, hits: List[Dict[str, Any]]) -> str:
+        blocks: List[str] = []
+        for idx, item in enumerate(hits or [], start=1):
+            record = item.get("record", {}) if isinstance(item, dict) else {}
+            if not isinstance(record, dict):
+                continue
+            participants = record.get("participants", {}) if isinstance(record.get("participants", {}), dict) else {}
+            blocks.append(
+                "[命中记录 {}]\nrecord_id={}\nmeeting_id={}\npair_key={}\ndoctor={}\npatient={}\nsession_started_at={}\nscore={}\nchat_summary={}\ntranscript=\n{}".format(
+                    idx,
+                    str(record.get("record_id", "") or "").strip(),
+                    str(record.get("meeting_id", "") or "").strip(),
+                    str(record.get("pair_key", "") or "").strip(),
+                    str(participants.get("doctor", "") or "").strip(),
+                    str(participants.get("patient", "") or "").strip(),
+                    str(record.get("session_started_at", "") or "").strip(),
+                    str(item.get("score", 0.0)),
+                    str(record.get("chat_summary", "") or "").strip(),
+                    str(record.get("transcript", "") or "").strip(),
+                )
+            )
+        return "\n\n".join(blocks).strip()
+
+    def _summarize_consult_history_hits(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        pair_key: str,
+        query: str,
+        hits: List[Dict[str, Any]],
+        policy: Dict[str, Any],
+    ) -> str:
+        prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("summary_prompt_file", "") or ""))
+        prompt_text = self._render_prompt_template(
+            prompt_tpl,
+            {
+                "speaker": str(getattr(speaker, "name", "") or ""),
+                "other": str(getattr(other, "name", "") or ""),
+                "pair_key": str(pair_key or ""),
+                "query": str(query or "").strip(),
+                "conversation": to_conversation_text(chats or []),
+                "consult_history_hits": self._render_consult_history_hits_for_prompt(hits),
+            },
+        )
+        route = str(policy.get("summary_route", "forced_llm") or "forced_llm").strip().lower()
+        retry = int(policy.get("summary_retry", 2) or 2)
+        if route == "think_llm":
+            text = self._call_think_llm_text(
+                prompt_text=prompt_text,
+                retry=retry,
+                doctor_agent=speaker,
+                caller="consult_history_summary",
+            )
+        else:
+            text = self._call_forced_llm_text(
+                prompt_text=prompt_text,
+                retry=retry,
+                caller="consult_history_summary_forced_llm",
+            )
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        return "<consult_history_memory>\n{}\n</consult_history_memory>".format(text)
+
+    def get_consult_history_memory_block(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        forced: bool = False,
+        turn_no: int = 1,
+        is_initiator: bool = False,
+    ) -> str:
+        del forced, is_initiator
+        policy = self.get_consult_history_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            return ""
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return ""
+        if int(turn_no or 1) <= 1:
+            return ""
+        pair_key = build_pair_key(str(getattr(doctor, "name", "") or ""), str(getattr(patient, "name", "") or ""))
+        latest_utterance = self._extract_latest_other_utterance(chats, getattr(other, "name", ""))
+        if not latest_utterance:
+            return ""
+        gate = self._consult_history_gate(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            latest_utterance=latest_utterance,
+            policy=policy,
+            pair_key=pair_key,
+        )
+        if not bool(gate.get("need_retrieval", False)):
+            return ""
+        query = str(gate.get("query", "") or "").strip()
+        if not query:
+            return ""
+        hits = self._retrieve_consult_history_candidates(
+            agent=speaker,
+            pair_key=pair_key,
+            query=query,
+            top_k=int(policy.get("retrieve_top_k", 3) or 3),
+        )
+        if not hits:
+            return ""
+        return self._summarize_consult_history_hits(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            pair_key=pair_key,
+            query=query,
+            hits=hits,
+            policy=policy,
+        )
+
+    def _handle_consult_history_after_chat(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        summary: str,
+        start_time: Any,
+        meeting_id: str,
+    ) -> None:
+        if not self._consult_history_enabled():
+            return
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return
+        pair_key = build_pair_key(str(getattr(doctor, "name", "") or ""), str(getattr(patient, "name", "") or ""))
+        transcript = to_conversation_text(chats or [])
+        chat_summary = str(summary or "").strip()
+        if not transcript or not chat_summary:
+            return
+        try:
+            record = build_consult_history_record(
+                record_id="",
+                meeting_id=str(meeting_id or "").strip(),
+                session_started_at=self._fmt_iso8601_with_tz(start_time),
+                doctor=str(getattr(doctor, "name", "") or ""),
+                patient=str(getattr(patient, "name", "") or ""),
+                pair_key=pair_key,
+                chat_summary=chat_summary,
+                transcript=transcript,
+            )
+            write_result = self._write_consult_history_record(
+                agent=speaker,
+                pair_key=pair_key,
+                record=record,
+                summary=chat_summary,
+            )
+            self._log_highlight(
+                "CONSULT_HISTORY_WRITE pair_key={} status={} reason={} record_id={} meeting_id={}".format(
+                    pair_key,
+                    write_result.get("status", ""),
+                    write_result.get("reason", ""),
+                    write_result.get("record_id", ""),
+                    str(meeting_id or ""),
+                )
+            )
+        except Exception as exc:
+            self._log_highlight(
+                "CONSULT_HISTORY_WRITE_ERROR pair_key={} meeting_id={} detail={}".format(
+                    pair_key,
+                    str(meeting_id or ""),
+                    str(exc),
+                )
+            )
 
     def _append_consult_audit(
         self,

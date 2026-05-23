@@ -248,6 +248,15 @@
                 "max_entries": 2000
             }
         },
+        "consult_history": {
+            "enabled": true,
+            "retrieve_top_k": 3,
+            "gate_prompt_file": "data/prompts/intervention/consult_history_gate.txt",
+            "gate_retry": 2,
+            "summary_route": "forced_llm",
+            "summary_prompt_file": "data/prompts/intervention/consult_history_summary.txt",
+            "summary_retry": 2
+        },
         "depression_dynamic": {
             "enabled": true,
             "normal_chain_enabled": true,

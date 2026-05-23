@@ -4,7 +4,6 @@ import argparse
 from datetime import datetime
 
 from modules.maze import Maze
-from modules import depression_dynamic_adapter as dda
 from start import personas
 
 file_markdown = "simulation.md"
@@ -36,9 +35,73 @@ def get_location(address):
     return location
 
 
+def _extract_depression_current_stage(runtime):
+    runtime = runtime if isinstance(runtime, dict) else {}
+    chain_payload = runtime.get("chain_manager", {}) if isinstance(runtime.get("chain_manager", {}), dict) else {}
+    config = chain_payload.get("config", {}) if isinstance(chain_payload.get("config", {}), dict) else {}
+    stages = config.get("stages", []) if isinstance(config.get("stages", []), list) else []
+    stage_catalog = {}
+    for item in stages:
+        if not isinstance(item, dict):
+            continue
+        stage_id = str(item.get("id", "") or "").strip()
+        if stage_id:
+            stage_catalog[stage_id] = item
+
+    planned_chain = chain_payload.get("planned_chain", []) if isinstance(chain_payload.get("planned_chain", []), list) else []
+    try:
+        stage_index = int(chain_payload.get("stage_index", 0) or 0)
+    except Exception:
+        stage_index = 0
+
+    stage_id = ""
+    if planned_chain:
+        bounded_index = min(max(stage_index, 0), len(planned_chain) - 1)
+        stage_id = str(planned_chain[bounded_index] or "").strip()
+    if not stage_id:
+        stage_id = str(config.get("initial_stage_id", "") or "").strip()
+
+    if stage_id and stage_id in stage_catalog:
+        return stage_catalog[stage_id]
+    if stage_id:
+        return {"id": stage_id, "label": stage_id}
+    return {}
+
+
 def get_depression_runtime_snapshot(agent_data):
     """提取回放所需的抑郁运行态关键字段。"""
-    return dda.get_runtime_snapshot(agent_data)
+    snapshot = {
+        "current_event_wording": "",
+        "emotion_label": "",
+        "emotion_style": "",
+        "emotion_intensity": 0.0,
+        "last_throttle_reason": "",
+        "short_term_changed": False,
+        "long_term_changed": False,
+        "changed_paths": [],
+    }
+    if not isinstance(agent_data, dict):
+        return snapshot
+
+    runtime = agent_data.get("depression_dynamic_state", {})
+    if not isinstance(runtime, dict) or not runtime:
+        return snapshot
+
+    stage = _extract_depression_current_stage(runtime)
+    for key in ("summary", "label", "core_belief", "id"):
+        text = str(stage.get(key, "") or "").strip()
+        if text:
+            snapshot["current_event_wording"] = text
+            break
+
+    emotion = runtime.get("last_emotion", {}) if isinstance(runtime.get("last_emotion", {}), dict) else {}
+    snapshot["emotion_label"] = str(emotion.get("label", "") or "")
+    snapshot["emotion_style"] = str(emotion.get("style", "") or "")
+    try:
+        snapshot["emotion_intensity"] = float(emotion.get("intensity", 0.0) or 0.0)
+    except Exception:
+        snapshot["emotion_intensity"] = 0.0
+    return snapshot
 
 
 # 插入第0帧数据（Agent的初始状态）

@@ -25,8 +25,13 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
-
-- 2026-05-17：`config.json`新增配置`xxx`，用于控制event/chat记忆描述相似去重的最近条数范围，设为0时不去重。修复chat记忆的`poignancy`值异常不计入累加而导致thought触发频率下降的问题
+- 2026-05-23：修复对比脚本`runshells/run_extra_scale_compare.py`不兼容问题，现在可以指定2个存档的`scales/scale_scores.json`进行量表差异分析对比。
+- 2026-05-22：新增医患对话历史调用模块，功能主要是：1. 每次医患对话结束时都会把完整对话记录存到【医患历史对话记忆库】里，并把node方式的chat_summary作为检索向量。2. 医生/患者发言前由gate-llm判断是否需要检索该记忆库，若需要则检索并返回若干个相关的完整对话记录。3. 若需要检索并返回成功，则调用llm进行总结，形成“记忆摘要”。【0523实验并未写入成功，待修复后二次实验】
+- 2026-05-22：修复抑郁主诉链只有4个的问题，主要触因是主诉链更新Prompt以及一致性检查函数去除未知id。实验后发现有一些问题，做了二次改造，主要是允许新增多个后续主诉节点（next_chain）的树形结构而非只有1个的线性结构。【0523实验发现还是只有4个主诉链节点，后续总结一下给学长看看怎么优化】
+- 2026-05-20：修复合并失误的问题，`modules/depression`的代码没问题，但是之前的`agent.py`里没有完全合并学长分支内容。【待测试】
+- 2026-05-19：优化一些Prompt，并且新建`data/prompts/intervention/consultation_memory_summary.txt`专门用于干预对话的“摘要”。
+- 2026-05-18：修复`merge_consultation_dialogues.py`脚本依赖`consult_record`配置开启的问题
+- 2026-05-17：`config.json`新增配置`agent.associate.recent_dedup_limit`，用于控制event/chat记忆描述相似去重的最近条数范围，设为0时不去重。修复chat记忆的`poignancy`值异常不计入累加而导致thought触发频率下降的问题
 - 2026-05-17：根据记忆服务更新，新增2个脚本并优化`visualize_external_memory_audit.py`。新脚本`recheck_memory_embedding_service.py`作用是“调用外置记忆服务的 embedding 重探活接口”，检索服务重启时使用。`inspect_memory_user_stats_by_save.py`作用是查看某存档所有角色记忆总体情况，目前看下来所有记忆在运行期间都是"raw_fallback"状态，后续问问怎么回事。
 - 2026-05-16：仿真实验脚本`runshells/run_one_experiment.py`新增可视化本地记忆、外置记忆系统的环节（相当于自动执行`visualize_agent_memory.py`和`visualize_external_memory_audit.py`）
 - 2026-05-16：完整删除旧人设系统，现在只有学长的动态抑郁人设

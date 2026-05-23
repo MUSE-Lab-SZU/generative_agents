@@ -834,15 +834,19 @@ class Scratch:
 
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
-    def prompt_summarize_chats(self, chats):
+    def prompt_summarize_chats(self, chats, prompt_file=None):
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
 
-        prompt = self.build_prompt(
-            "summarize_chats",
-            {
-                "conversation": conversation,
-            }
-        )
+        prompt_data = {
+            "conversation": conversation,
+        }
+        if prompt_file:
+            prompt = self.build_prompt_by_file(prompt_file, prompt_data)
+        else:
+            prompt = self.build_prompt(
+                "summarize_chats",
+                prompt_data,
+            )
 
         def _callback(response):
             return response.strip()

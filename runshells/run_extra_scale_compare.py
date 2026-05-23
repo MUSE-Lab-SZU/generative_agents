@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""对比 run_extra_scale_eval.py 的聚合量表结果，并输出 Markdown 报告。"""
+"""对比量表聚合结果，并输出 Markdown 报告。"""
 
 from __future__ import annotations
 
@@ -18,11 +18,17 @@ from typing import Any
 # ↓↓↓ 可调参数：直接修改这里即可（中文注释）↓↓↓
 # ============================================================
 
-RESULT_A = "results/experiment_data/sim-init-0516/scales/scale_scores_仿真后测试.json"
-RESULT_B = "results/experiment_data/sim-test-0516/scales/scale_scores_仿真后测试.json"
+RESULT_A = "results/experiment_data/sim-init-0523/scales/scale_scores.json"
+RESULT_B = "results/experiment_data/sim-test-0523/scales/scale_scores.json"
 
-LABEL_A = "初始化存档sim-init-0516"
-LABEL_B = "仿真实验后存档sim-test-0516"
+LABEL_A = "初始化存档sim-init-0523"
+LABEL_B = "仿真实验后存档sim-test-0523"
+
+# 输入来源：
+# - "auto": 自动根据 JSON 结构识别（推荐）
+# - "extra_scale_eval": runshells/run_extra_scale_eval.py 输出的 scale_scores_*.json
+# - "run_one_experiment": runshells/run_one_experiment.py 输出的 scale_scores.json
+INPUT_SOURCE = "auto"
 
 # 留空则自动写到 results/experiment_data/reports/
 OUTPUT_MD = ""
@@ -34,6 +40,7 @@ OUTPUT_MD = ""
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 REPORTS_DIR = BASE_DIR / "results" / "experiment_data" / "reports"
+SUPPORTED_INPUT_SOURCES = {"auto", "extra_scale_eval", "run_one_experiment"}
 
 PRIMARY_METRIC_SPECS = {
     "PHQ-9": [("total_score", "总分", 27.0)],
@@ -61,6 +68,7 @@ class RuntimeConfig:
     result_b: Path
     label_a: str
     label_b: str
+    input_source: str
     output_md: Path
 
 
@@ -95,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b", default=None, help="第二份聚合结果 JSON 路径")
     parser.add_argument("--label-a", default=None, help="第一份结果标签")
     parser.add_argument("--label-b", default=None, help="第二份结果标签")
+    parser.add_argument("--input-source", default=None, help="输入来源：auto / extra_scale_eval / run_one_experiment")
     parser.add_argument("--output", default=None, help="Markdown 输出路径")
     return parser.parse_args()
 
@@ -131,8 +140,12 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     result_b = resolve_path(args.b if args.b is not None else RESULT_B)
     label_a = (args.label_a if args.label_a is not None else LABEL_A).strip()
     label_b = (args.label_b if args.label_b is not None else LABEL_B).strip()
+    input_source = (args.input_source if args.input_source is not None else INPUT_SOURCE).strip()
     if not label_a or not label_b:
         raise ValueError("LABEL_A 和 LABEL_B 不能为空。")
+    if input_source not in SUPPORTED_INPUT_SOURCES:
+        allowed = ", ".join(sorted(SUPPORTED_INPUT_SOURCES))
+        raise ValueError(f"INPUT_SOURCE / --input-source 非法：{input_source}。可选值：{allowed}")
 
     if args.output is not None:
         output_md = resolve_path(args.output)
@@ -146,6 +159,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         result_b=result_b,
         label_a=label_a,
         label_b=label_b,
+        input_source=input_source,
         output_md=output_md,
     )
 
@@ -156,6 +170,66 @@ def load_json(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"文件不存在: {path}")
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+
+def detect_input_source(bundle: dict[str, Any]) -> str:
+    if isinstance(bundle.get("scales"), dict):
+        return "extra_scale_eval"
+    if isinstance(bundle.get("post"), dict):
+        return "run_one_experiment"
+    raise ValueError(
+        "无法识别输入来源：既不是 run_extra_scale_eval.py 的 scales 聚合格式，"
+        "也不是 run_one_experiment.py 的 post 聚合格式。"
+    )
+
+
+
+def infer_checkpoint_from_path(path: Path) -> str:
+    if path.parent.name == "scales" and path.parent.parent.name:
+        return path.parent.parent.name
+    return path.stem
+
+
+
+def normalize_bundle(bundle: dict[str, Any], path: Path, input_source: str) -> dict[str, Any]:
+    source = detect_input_source(bundle) if input_source == "auto" else input_source
+
+    if source == "extra_scale_eval":
+        scales = bundle.get("scales")
+        if not isinstance(scales, dict):
+            raise ValueError(f"{path} 不是 run_extra_scale_eval.py 的聚合格式：缺少 scales 字段。")
+        return bundle
+
+    phase_scores = bundle.get("post")
+    if not isinstance(phase_scores, dict):
+        raise ValueError(f"{path} 不是 run_one_experiment.py 的聚合格式：缺少 post 字段。")
+
+    normalized_scales: dict[str, dict[str, Any]] = {}
+    for scale_name, score in phase_scores.items():
+        if not isinstance(score, dict):
+            continue
+        normalized_scales[str(scale_name)] = {
+            "repeat": 1,
+            "runs": [
+                {
+                    "repeat": 1,
+                    "score": score,
+                }
+            ],
+        }
+
+    if not normalized_scales:
+        raise ValueError(f"{path} 的 post 字段中没有可用于对比的量表评分数据。")
+
+    return {
+        "phase": "post",
+        "suffix": bundle.get("suffix") or "run_one_experiment",
+        "checkpoint": bundle.get("checkpoint") or infer_checkpoint_from_path(path),
+        "snapshot": bundle.get("snapshot") or "—",
+        "agent": bundle.get("agent") or "—",
+        "scales": normalized_scales,
+    }
 
 
 
@@ -533,7 +607,7 @@ def render_report(bundle_a: dict[str, Any], bundle_b: dict[str, Any], cfg: Runti
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines: list[str] = []
-    lines.append("# 量表补充评估结果对比报告")
+    lines.append("# 量表评估结果对比报告")
     lines.append("")
     lines.append(f"生成时间：{now}")
     lines.append("")
@@ -719,8 +793,8 @@ def main() -> None:
     args = parse_args()
     cfg = resolve_runtime_config(args)
 
-    bundle_a = load_json(cfg.result_a)
-    bundle_b = load_json(cfg.result_b)
+    bundle_a = normalize_bundle(load_json(cfg.result_a), cfg.result_a, cfg.input_source)
+    bundle_b = normalize_bundle(load_json(cfg.result_b), cfg.result_b, cfg.input_source)
     report = render_report(bundle_a, bundle_b, cfg)
 
     cfg.output_md.parent.mkdir(parents=True, exist_ok=True)

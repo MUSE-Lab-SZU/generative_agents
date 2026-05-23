@@ -4,6 +4,7 @@ ${base_desc}
 ${depression_chat_block}
 ${doctor_session_prompt_injection}
 ${doctor_consult_record_injection}
+${consult_history_memory}
 
 以下是 ${agent} 的记忆：
 ${memory}

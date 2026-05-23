@@ -5,10 +5,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +99,9 @@ class ComplaintChainManager:
         self.allow_replan = self._coerce_bool(self.planner.get("allow_replan", True))
         self.allow_jump = self._coerce_bool(self.planner.get("allow_jump", True))
         self.llm_enabled = self._coerce_bool(self.planner.get("llm_enabled", True))
+        self.allow_runtime_stage_creation = self._coerce_bool(
+            self.planner.get("allow_runtime_stage_creation", True)
+        )
         self.max_dialog_history = self._bounded_int(
             self.planner.get("max_dialog_history"), 12, 4, 50
         )
@@ -126,6 +133,7 @@ class ComplaintChainManager:
         self.stage_index = 0
         self.stage_history: List[Dict[str, Any]] = []
         self.dialogue_history: List[Dict[str, Any]] = []
+        self.pending_stage_specs: Dict[str, Dict[str, Any]] = {}
         self.last_session_context: Dict[str, Any] = {}
         self.last_evaluation: Dict[str, Any] = {}
         self.stage_start_time = self._now()
@@ -148,6 +156,7 @@ class ComplaintChainManager:
         self.stage_index = 0
         self.stage_history = []
         self.dialogue_history = []
+        self.pending_stage_specs = {}
         self.last_session_context = {}
         self.last_evaluation = {}
         self.stage_start_time = self._now()
@@ -180,6 +189,8 @@ class ComplaintChainManager:
             "planned_chain": [str(item) for item in self.planned_chain],
             "stage_index": int(self.stage_index),
             "current_chain_window": self.get_current_chain_window(self.window_size + 1),
+            "current_stage_branch_options": self._get_branch_options(current_stage),
+            "pending_stage_specs": copy.deepcopy(self.pending_stage_specs),
             "stage_start_time": self.stage_start_time.isoformat(),
             "stage_history": copy.deepcopy(self.stage_history),
             "dialogue_history": copy.deepcopy(self.dialogue_history[-self.max_dialog_history :]),
@@ -195,6 +206,224 @@ class ComplaintChainManager:
 
     def get_state_duration(self) -> float:
         return (self._now() - self.stage_start_time).total_seconds() / 60.0
+
+    def _normalize_planned_chain(self, value: Any) -> List[str]:
+        items = self._to_list(value)
+        normalized: List[str] = []
+        last_id = ""
+        for item in items:
+            stage_id = ""
+            if isinstance(item, dict):
+                candidate = str(item.get("id", "") or "").strip()
+                if candidate in self.stage_catalog:
+                    stage_id = candidate
+            else:
+                candidate = str(item or "").strip()
+                if candidate in self.stage_catalog:
+                    stage_id = candidate
+            if not stage_id or stage_id == last_id:
+                continue
+            normalized.append(stage_id)
+            last_id = stage_id
+        return normalized
+
+    def _normalize_path_tokens(self, value: Any, allow_unknown: bool = True) -> List[str]:
+        items = self._to_list(value)
+        normalized: List[str] = []
+        last_token = ""
+        for item in items:
+            token = ""
+            if isinstance(item, dict):
+                token = str(item.get("id", "") or "").strip()
+            else:
+                token = str(item or "").strip()
+            if not token:
+                continue
+            if not allow_unknown and token not in self.stage_catalog and token not in self.pending_stage_specs:
+                continue
+            if token == last_token:
+                continue
+            normalized.append(token)
+            last_token = token
+        return normalized
+
+    def _normalize_candidate_ids(self, value: Any, allow_pending: bool = True) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for token in self._normalize_path_tokens(value, allow_unknown=True):
+            if token in self.stage_catalog or (allow_pending and token in self.pending_stage_specs):
+                if token in seen:
+                    continue
+                seen.add(token)
+                normalized.append(token)
+        return normalized
+
+    def _merge_candidate_ids(self, primary: Any, secondary: Any) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for token in self._normalize_path_tokens(primary, allow_unknown=True) + self._normalize_path_tokens(secondary, allow_unknown=True):
+            if token in seen:
+                continue
+            seen.add(token)
+            merged.append(token)
+        return merged
+
+    def _attach_candidate(self, predecessor_id: str, candidate_id: str, prefer_front: bool = False) -> None:
+        predecessor_key = str(predecessor_id or "").strip()
+        candidate_key = str(candidate_id or "").strip()
+        if not predecessor_key or not candidate_key:
+            return
+        stage = self.stage_catalog.get(predecessor_key)
+        if not isinstance(stage, dict):
+            return
+        current_candidates = self._normalize_candidate_ids(stage.get("next_candidates", []), allow_pending=True)
+        if prefer_front:
+            merged = [candidate_key] + [item for item in current_candidates if item != candidate_key]
+        else:
+            merged = current_candidates + [candidate_key]
+        stage["next_candidates"] = self._normalize_candidate_ids(merged, allow_pending=True)
+
+    def _build_branch_option(self, stage_id: str) -> Dict[str, Any]:
+        candidate_id = str(stage_id or "").strip()
+        if candidate_id in self.stage_catalog:
+            stage = copy.deepcopy(self.stage_catalog.get(candidate_id, {}))
+            stage["is_pending"] = False
+            return stage
+        spec = self.pending_stage_specs.get(candidate_id, {}) if isinstance(self.pending_stage_specs.get(candidate_id, {}), dict) else {}
+        return {
+            "id": candidate_id,
+            "label": str(spec.get("label", candidate_id or "待生成节点") or candidate_id or "待生成节点"),
+            "summary": str(spec.get("new_stage_brief", "待生成的新主诉节点") or "待生成的新主诉节点"),
+            "next_candidates": self._normalize_path_tokens(spec.get("remaining_tail", []), allow_unknown=True),
+            "source": "pending",
+            "is_pending": True,
+        }
+
+    def _get_branch_options(self, current_stage: Dict[str, Any]) -> List[Dict[str, Any]]:
+        current_stage = current_stage if isinstance(current_stage, dict) else {}
+        branch_ids = self._normalize_candidate_ids(current_stage.get("next_candidates", []), allow_pending=True)
+        return [self._build_branch_option(stage_id) for stage_id in branch_ids]
+
+    def _get_recent_history_summary(self, limit: int = 4) -> List[Dict[str, Any]]:
+        rows = self.stage_history[-max(0, int(limit)) :]
+        summary: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            summary.append(
+                {
+                    "from_stage_id": str(row.get("from_stage_id", "") or ""),
+                    "to_stage_id": str(row.get("to_stage_id", "") or ""),
+                    "action": str(row.get("action", "") or ""),
+                    "match_reason": str(row.get("match_reason", "") or "")[:120],
+                }
+            )
+        return summary
+
+    def _register_pending_path(self, requested_chain: List[str], new_stage_brief: str) -> List[str]:
+        normalized = self._normalize_path_tokens(requested_chain, allow_unknown=True)
+        if len(normalized) <= 1:
+            return normalized
+        for idx in range(1, len(normalized)):
+            predecessor_id = str(normalized[idx - 1] or "").strip()
+            stage_id = str(normalized[idx] or "").strip()
+            if not predecessor_id or not stage_id:
+                continue
+            tail = self._normalize_path_tokens(normalized[idx + 1 :], allow_unknown=True)
+            if stage_id in self.stage_catalog:
+                self._attach_candidate(predecessor_id, stage_id, prefer_front=True)
+                continue
+            existing = self.pending_stage_specs.get(stage_id, {}) if isinstance(self.pending_stage_specs.get(stage_id, {}), dict) else {}
+            updated = copy.deepcopy(existing)
+            updated["id"] = stage_id
+            updated["label"] = str(updated.get("label", stage_id) or stage_id)
+            updated["predecessor_id"] = predecessor_id
+            updated["new_stage_brief"] = str(new_stage_brief or updated.get("new_stage_brief", "") or "")[:180]
+            updated["remaining_tail"] = tail
+            self.pending_stage_specs[stage_id] = updated
+            self._attach_candidate(predecessor_id, stage_id, prefer_front=True)
+        return normalized
+
+    def _would_continue_short_cycle(self, current_stage_id: str, target_stage_id: str) -> bool:
+        current_id = str(current_stage_id or "").strip()
+        target_id = str(target_stage_id or "").strip()
+        if not current_id or not target_id or current_id == target_id or len(self.stage_history) < 2:
+            return False
+        last_to = str(self.stage_history[-1].get("to_stage_id", "") or "") if isinstance(self.stage_history[-1], dict) else ""
+        prev_to = str(self.stage_history[-2].get("to_stage_id", "") or "") if isinstance(self.stage_history[-2], dict) else ""
+        return bool(last_to == current_id and prev_to == target_id)
+
+    def _resolve_requested_chain(
+        self,
+        current_stage: Dict[str, Any],
+        requested_chain: List[str],
+        needs_new_stage: bool,
+        new_stage_brief: str,
+        completion_func: Optional[Callable[[str], str]],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+    ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+        current_stage = current_stage if isinstance(current_stage, dict) else {}
+        current_id = str(current_stage.get("id", "") or "").strip()
+        if not current_id:
+            return [], None
+        existing_pending_ids = set(self.pending_stage_specs.keys())
+        requested = self._normalize_next_chain(requested_chain, current_id)
+        requested = self._register_pending_path(requested, new_stage_brief)
+        resolved: List[str] = [current_id]
+        generated_stage: Optional[Dict[str, Any]] = None
+        can_generate = bool(callable(completion_func) and self.llm_enabled and self.allow_runtime_stage_creation)
+        tail_source = requested[1:] if len(requested) > 1 else self._normalize_path_tokens(current_stage.get("next_candidates", []), allow_unknown=True)
+        tail_items = list(tail_source)
+
+        for idx, token in enumerate(tail_items):
+            stage_id = str(token or "").strip()
+            if not stage_id:
+                continue
+            if stage_id in self.stage_catalog:
+                resolved.append(stage_id)
+                continue
+            spec = self.pending_stage_specs.get(stage_id, {}) if isinstance(self.pending_stage_specs.get(stage_id, {}), dict) else {}
+            can_materialize_pending = bool(
+                can_generate
+                and stage_id in self.pending_stage_specs
+                and (needs_new_stage or stage_id in existing_pending_ids)
+            )
+            if not can_materialize_pending or len(resolved) > 1:
+                break
+            remaining_tail = self._normalize_path_tokens(spec.get("remaining_tail", tail_items[idx + 1 :]), allow_unknown=True)
+            brief = str(spec.get("new_stage_brief", new_stage_brief) or new_stage_brief or "").strip()
+            runtime_stage = self._generate_runtime_stage(
+                completion_func=completion_func,
+                session_context=session_context,
+                conversation_content=conversation_content,
+                llm_cfg=llm_cfg,
+                current_stage=current_stage,
+                new_stage_brief=brief,
+                requested_stage_id=stage_id,
+                requested_tail=remaining_tail,
+            )
+            if not isinstance(runtime_stage, dict):
+                break
+            generated_stage = runtime_stage
+            generated_id = str(runtime_stage.get("id", "") or "").strip()
+            if not generated_id:
+                break
+            resolved.append(generated_id)
+            for tail_token in remaining_tail:
+                if tail_token in self.stage_catalog:
+                    resolved.append(str(tail_token))
+                    continue
+                break
+            break
+
+        if len(resolved) <= 1:
+            fallback = self._preview_future_chain(current_stage)
+            fallback = self._normalize_next_chain(fallback, current_id)
+            if len(fallback) > 1:
+                resolved = fallback
+        return self._normalize_next_chain(resolved, current_id), generated_stage
 
     def get_state_characteristics(self) -> Dict[str, float]:
         stage = self.get_current_stage()
@@ -225,6 +454,7 @@ class ComplaintChainManager:
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation = str(conversation_content or "").strip()
         current_stage = self.get_current_stage()
+        current_id = str(current_stage.get("id", "") or "").strip()
 
         normalized_signal = self._normalize_llm_signal(llm_signal)
         if callable(completion_func) and self.llm_enabled:
@@ -247,7 +477,9 @@ class ComplaintChainManager:
         match_confidence = heur_confidence
         match_reason = heur_reason
         action = "hold"
-        next_chain_ids: List[str] = self._preview_future_chain(current_stage)
+        requested_chain: List[str] = self._preview_future_chain(current_stage)
+        needs_new_stage = False
+        new_stage_brief = ""
 
         if normalized_signal:
             matched = bool(normalized_signal.get("matched", matched))
@@ -261,7 +493,9 @@ class ComplaintChainManager:
             action = str(normalized_signal.get("action", action) or action).strip().lower() or "hold"
             candidate_chain = normalized_signal.get("next_chain", [])
             if isinstance(candidate_chain, list) and candidate_chain:
-                next_chain_ids = self._normalize_next_chain(candidate_chain, current_stage["id"])
+                requested_chain = self._normalize_next_chain(candidate_chain, current_id)
+            needs_new_stage = bool(normalized_signal.get("needs_new_stage", False))
+            new_stage_brief = str(normalized_signal.get("new_stage_brief", "") or "").strip()
 
         if action not in {"hold", "advance", "replan", "jump"}:
             action = "hold"
@@ -280,15 +514,21 @@ class ComplaintChainManager:
         if action == "jump" and not self.allow_jump:
             action = "hold"
 
+        next_chain_ids, generated_stage = self._resolve_requested_chain(
+            current_stage=current_stage,
+            requested_chain=requested_chain,
+            needs_new_stage=needs_new_stage,
+            new_stage_brief=new_stage_brief,
+            completion_func=completion_func,
+            session_context=session_context,
+            conversation_content=conversation,
+            llm_cfg=llm_cfg,
+        )
+
         next_stage: Optional[Dict[str, Any]] = None
         if action in {"advance", "jump"}:
-            if len(next_chain_ids) > 1:
-                next_stage = copy.deepcopy(self.stage_catalog.get(next_chain_ids[1], {}))
-            elif current_stage.get("next_candidates"):
-                candidate_id = str(current_stage.get("next_candidates", [""])[0] or "").strip()
-                if candidate_id and candidate_id in self.stage_catalog:
-                    next_chain_ids = [current_stage["id"], candidate_id]
-                    next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
+            if len(next_chain_ids) > 1 and str(next_chain_ids[1] or "").strip() in self.stage_catalog:
+                next_stage = copy.deepcopy(self.stage_catalog.get(str(next_chain_ids[1] or "").strip(), {}))
             else:
                 action = "hold"
 
@@ -299,20 +539,24 @@ class ComplaintChainManager:
             "match_reason": self._clip_text(match_reason, limit=180),
             "current_stage": copy.deepcopy(current_stage),
             "next_stage": copy.deepcopy(next_stage) if isinstance(next_stage, dict) else None,
+            "generated_stage": copy.deepcopy(generated_stage) if isinstance(generated_stage, dict) else None,
             "next_chain": [str(item) for item in next_chain_ids],
             "session_context": copy.deepcopy(session_context),
             "conversation_excerpt": self._clip_text(conversation, limit=220),
+            "needs_new_stage": bool(needs_new_stage),
+            "new_stage_brief": self._clip_text(new_stage_brief, limit=180),
         }
         return evaluation
 
     def commit_turn(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         current_before = self.get_current_stage()
+        current_before_id = str(current_before.get("id", "") or "").strip()
         action = str(evaluation.get("action", "hold") or "hold").strip().lower()
         matched = bool(evaluation.get("matched", False))
         match_confidence = self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(evaluation.get("match_reason", "") or "")[:180]
-        next_chain = self._normalize_next_chain(evaluation.get("next_chain", []), current_before.get("id", ""))
+        next_chain = self._normalize_next_chain(evaluation.get("next_chain", []), current_before_id)
         session_context = (
             evaluation.get("session_context", {}) if isinstance(evaluation.get("session_context", {}), dict) else {}
         )
@@ -327,10 +571,17 @@ class ComplaintChainManager:
         if action in {"hold", "replan"}:
             self._replace_future_chain(next_chain)
         elif action == "advance":
-            self._replace_future_chain(next_chain)
-            if self.stage_index < len(self.planned_chain) - 1:
-                self.stage_index += 1
-                self.stage_start_time = self._now()
+            target_stage_id = str(next_chain[1] or "").strip() if len(next_chain) > 1 else ""
+            if not target_stage_id or target_stage_id not in self.stage_catalog or self._would_continue_short_cycle(current_before_id, target_stage_id):
+                action = "hold"
+                self._replace_future_chain([current_before_id] + [item for item in next_chain[1:] if str(item or "").strip() in self.stage_catalog])
+            else:
+                self._replace_future_chain(next_chain)
+                if self.stage_index < len(self.planned_chain) - 1:
+                    self.stage_index += 1
+                    self.stage_start_time = self._now()
+                else:
+                    action = "hold"
         elif action == "jump":
             target_stage = evaluation.get("next_stage") if isinstance(evaluation.get("next_stage"), dict) else None
             target_stage_id = ""
@@ -338,15 +589,28 @@ class ComplaintChainManager:
                 target_stage_id = str(target_stage.get("id", "") or "").strip()
             if not target_stage_id and len(next_chain) > 1:
                 target_stage_id = str(next_chain[1] or "").strip()
-            if target_stage_id:
-                if target_stage_id not in self.stage_catalog:
-                    self.stage_catalog[target_stage_id] = self._sanitize_stage(target_stage or {"id": target_stage_id, "label": target_stage_id}, source="jump")
+            if target_stage_id and target_stage_id in self.stage_catalog and not self._would_continue_short_cycle(current_before_id, target_stage_id):
                 self.planned_chain = [target_stage_id] + self._build_future_chain_from_stage(target_stage_id, self.window_size)
                 self.stage_index = 0
                 self.stage_start_time = self._now()
+                self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
+            else:
+                logger.info(
+                    "[DEPRESSION_DYNAMIC_STAGE_REJECT] current_stage=%s needs_new_stage=%s new_stage=%s reason=%s",
+                    str(current_before.get("id", "") or ""),
+                    bool(evaluation.get("needs_new_stage", False)),
+                    str(target_stage_id or ""),
+                    "jump_target_missing_or_cycle",
+                )
+                action = "hold"
+                next_chain = self._preview_future_chain(current_before)
+                self._replace_future_chain(next_chain)
 
         self._ensure_future_window()
+        self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
         current_after = self.get_current_stage()
+        if action == "advance" and str(current_after.get("id", "") or "") == current_before_id:
+            action = "hold"
 
         self.last_session_context = copy.deepcopy(session_context)
         self.last_evaluation = {
@@ -452,6 +716,7 @@ class ComplaintChainManager:
             },
             "planned_chain": [str(item) for item in self.planned_chain],
             "stage_index": int(self.stage_index),
+            "pending_stage_specs": copy.deepcopy(self.pending_stage_specs),
             "stage_history": history_rows,
             "dialogue_history": copy.deepcopy(self.dialogue_history),
             "last_session_context": copy.deepcopy(self.last_session_context),
@@ -468,9 +733,15 @@ class ComplaintChainManager:
         payload = payload if isinstance(payload, dict) else {}
         cfg = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else {}
         manager = cls(config={"complaint_chain": cfg}, now_provider=now_provider)
+        pending_specs = payload.get("pending_stage_specs", {}) if isinstance(payload.get("pending_stage_specs", {}), dict) else {}
+        manager.pending_stage_specs = {
+            str(key or "").strip(): copy.deepcopy(value)
+            for key, value in pending_specs.items()
+            if str(key or "").strip() and isinstance(value, dict)
+        }
         planned_chain = payload.get("planned_chain", [])
         if isinstance(planned_chain, list) and planned_chain:
-            manager.planned_chain = manager._normalize_chain_ids(planned_chain)
+            manager.planned_chain = manager._normalize_planned_chain(planned_chain)
         else:
             manager.planned_chain = manager._build_default_chain(manager.initial_stage_id)
         manager.stage_index = manager._bounded_int(
@@ -493,6 +764,7 @@ class ComplaintChainManager:
         manager.last_session_context = copy.deepcopy(payload.get("last_session_context", {})) if isinstance(payload.get("last_session_context", {}), dict) else {}
         manager.last_evaluation = copy.deepcopy(payload.get("last_evaluation", {})) if isinstance(payload.get("last_evaluation", {}), dict) else {}
         manager._ensure_future_window()
+        manager.stage_index = min(manager.stage_index, max(0, len(manager.planned_chain) - 1))
         return manager
 
     def _preview_future_chain(self, current_stage: Dict[str, Any]) -> List[str]:
@@ -509,7 +781,8 @@ class ComplaintChainManager:
     def _replace_future_chain(self, next_chain: List[str]) -> None:
         current_prefix = self.planned_chain[: self.stage_index]
         normalized = self._normalize_next_chain(next_chain, self.get_current_stage_id())
-        self.planned_chain = current_prefix + normalized
+        concrete_suffix = self._normalize_planned_chain(normalized)
+        self.planned_chain = current_prefix + concrete_suffix
         self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
 
     def _ensure_future_window(self) -> None:
@@ -523,7 +796,8 @@ class ComplaintChainManager:
         current_id = self.get_current_stage_id()
         needed = self.window_size - remaining
         self.planned_chain.extend(self._build_future_chain_from_stage(current_id, needed))
-        self.planned_chain = self._normalize_chain_ids(self.planned_chain)
+        self.planned_chain = self._normalize_planned_chain(self.planned_chain)
+        self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
 
     def _build_default_chain(self, initial_stage_id: str) -> List[str]:
         start_id = str(initial_stage_id or "").strip()
@@ -531,26 +805,32 @@ class ComplaintChainManager:
             start_id = next(iter(self.stage_catalog.keys()))
         chain = [start_id]
         chain.extend(self._build_future_chain_from_stage(start_id, self.window_size))
-        return self._normalize_chain_ids(chain)
+        return self._normalize_planned_chain(chain)
 
     def _build_future_chain_from_stage(self, stage_id: str, count: int) -> List[str]:
         results: List[str] = []
         current_id = str(stage_id or "").strip()
         seen = {current_id}
         for _ in range(max(0, int(count))):
-            stage = self.stage_catalog.get(current_id, {})
-            next_candidates = stage.get("next_candidates", []) if isinstance(stage, dict) else []
-            if not isinstance(next_candidates, list) or not next_candidates:
-                break
             next_id = ""
-            for candidate in next_candidates:
-                candidate_id = str(candidate or "").strip()
-                if candidate_id and candidate_id in self.stage_catalog:
-                    next_id = candidate_id
+            for pos in range(max(0, int(self.stage_index)), max(0, len(self.planned_chain) - 1)):
+                if str(self.planned_chain[pos] or "").strip() == current_id:
+                    planned_next = str(self.planned_chain[pos + 1] or "").strip()
+                    if planned_next and planned_next in self.stage_catalog and planned_next not in seen:
+                        next_id = planned_next
                     break
             if not next_id:
-                break
-            if next_id in seen:
+                stage = self.stage_catalog.get(current_id, {})
+                next_candidates = self._normalize_path_tokens(stage.get("next_candidates", []), allow_unknown=True) if isinstance(stage, dict) else []
+                for candidate_id in next_candidates:
+                    if candidate_id in seen:
+                        continue
+                    if candidate_id in self.stage_catalog:
+                        next_id = candidate_id
+                        break
+                    if candidate_id in self.pending_stage_specs:
+                        break
+            if not next_id:
                 break
             seen.add(next_id)
             results.append(next_id)
@@ -680,9 +960,13 @@ class ComplaintChainManager:
     ) -> str:
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        current_stage = self.get_current_stage()
         payload = {
-            "current_stage": self.get_current_stage(),
+            "current_stage": current_stage,
             "current_chain_window": self.get_current_chain_window(self.window_size + 1),
+            "current_stage_branch_options": self._get_branch_options(current_stage),
+            "recent_stage_history": self._get_recent_history_summary(limit=4),
+            "pending_stage_ids": list(self.pending_stage_specs.keys())[:8],
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
             "allowed_actions": ["hold", "advance", "replan", "jump"],
@@ -690,7 +974,8 @@ class ComplaintChainManager:
         payload_json = json.dumps(payload, ensure_ascii=False)
         return (
             "你是主诉链规划器。\n"
-            "任务：依据当前主诉节点与本轮会话，判断本轮是否实质触及当前节点，并给出主诉链动作。\n"
+            "任务：依据当前主诉节点与本轮会话，判断本轮是否实质触及当前节点，并给出一条以当前节点为锚点的活跃路径候选。\n"
+            "你只负责链路判断，不负责生成完整的新节点对象。系统会按顺序逐步物化 next_chain 里的新占位节点。\n"
             "只输出 JSON 对象，不要输出解释、markdown 或额外文本。\n"
             "输出字段固定为：\n"
             "{\n"
@@ -698,12 +983,18 @@ class ComplaintChainManager:
             '  "match_confidence": 0.0,\n'
             '  "match_reason": "10到120字",\n'
             '  "action": "hold|advance|replan|jump",\n'
-            '  "next_chain": ["当前节点id", "后续节点id"]\n'
+            '  "next_chain": ["当前节点id", "后续id1", "后续id2"],\n'
+            '  "needs_new_stage": false,\n'
+            '  "new_stage_brief": "若需要新增节点，用一句话说明本轮首先要生成的新节点为何必要；否则为空"\n'
             "}\n"
             "约束：\n"
             "1. 不要输出病情等级或严重程度。\n"
             "2. 只能围绕主诉链节点是否被触及来判断。\n"
-            "3. next_chain 必须使用已有节点 id；若无法确定，就保持当前窗口顺序。\n"
+            "3. next_chain[0] 必须是当前节点 id。\n"
+            "4. next_chain 后续可以写多个 id，既可以是已有节点 id，也可以是新节点占位 id。\n"
+            "5. 若首次引入新的占位 id，needs_new_stage 必须为 true，并给出 new_stage_brief。\n"
+            "6. 可以回退到旧节点、切换分支或继续前进，但不要制造 A↔B 式机械往返。\n"
+            "7. 不要在第一阶段输出完整 stage 对象。\n"
             f"输入：{payload_json}\n"
         )
 
@@ -731,14 +1022,12 @@ class ComplaintChainManager:
         next_chain: List[str] = []
         if isinstance(raw_next, list):
             for item in raw_next:
-                if isinstance(item, dict):
-                    stage = self._sanitize_stage(item, source="llm")
-                    self.stage_catalog[stage["id"]] = stage
-                    next_chain.append(stage["id"])
-                else:
-                    text = str(item or "").strip()
-                    if text:
-                        next_chain.append(text)
+                text = str(item or "").strip()
+                if text:
+                    next_chain.append(text)
+
+        needs_new_stage = self._coerce_bool(payload.get("needs_new_stage", False))
+        new_stage_brief = str(payload.get("new_stage_brief", "") or "").strip()[:180]
 
         if matched and match_confidence < self.min_match_confidence:
             matched = False
@@ -751,19 +1040,22 @@ class ComplaintChainManager:
             "match_reason": match_reason,
             "action": action,
             "next_chain": next_chain,
+            "needs_new_stage": bool(needs_new_stage),
+            "new_stage_brief": new_stage_brief,
         }
 
     def _normalize_next_chain(self, value: Any, current_stage_id: str) -> List[str]:
         current_id = str(current_stage_id or "").strip()
-        normalized = self._normalize_chain_ids(value)
-        if not normalized and current_id:
-            return [current_id]
+        normalized = self._normalize_path_tokens(value, allow_unknown=True)
+        if not normalized:
+            return [current_id] if current_id else []
         if current_id:
             if current_id not in normalized:
                 normalized = [current_id] + normalized
             elif normalized[0] != current_id:
-                normalized = [current_id] + [item for item in normalized if item != current_id]
-        return normalized
+                first_idx = normalized.index(current_id)
+                normalized = [current_id] + normalized[:first_idx] + normalized[first_idx + 1 :]
+        return self._normalize_path_tokens(normalized, allow_unknown=True)
 
     def _normalize_chain_ids(self, value: Any) -> List[str]:
         items = self._to_list(value)
@@ -773,8 +1065,9 @@ class ComplaintChainManager:
             stage_id = ""
             if isinstance(item, dict):
                 stage = self._sanitize_stage(item, source=str(item.get("source", "config")) if isinstance(item, dict) else "config")
-                self.stage_catalog[stage["id"]] = stage
-                stage_id = stage["id"]
+                candidate_id = str(stage.get("id", "") or "").strip()
+                if candidate_id in self.stage_catalog:
+                    stage_id = candidate_id
             else:
                 text = str(item or "").strip()
                 if text in self.stage_catalog:
@@ -784,6 +1077,154 @@ class ComplaintChainManager:
             seen.add(stage_id)
             normalized.append(stage_id)
         return normalized
+
+    def _build_stage_generation_prompt(
+        self,
+        current_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        new_stage_brief: str,
+        requested_stage_id: str = "",
+        requested_tail: Optional[List[str]] = None,
+    ) -> str:
+        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
+        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        payload = {
+            "current_stage": copy.deepcopy(current_stage),
+            "current_chain_window": self.get_current_chain_window(self.window_size + 1),
+            "current_stage_branch_options": self._get_branch_options(current_stage),
+            "recent_stage_history": self._get_recent_history_summary(limit=4),
+            "session_context": copy.deepcopy(session_context),
+            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
+            "requested_stage_id": str(requested_stage_id or "").strip(),
+            "requested_tail": self._normalize_path_tokens(requested_tail or [], allow_unknown=True),
+            "new_stage_brief": self._clip_text(new_stage_brief, limit=180),
+        }
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        return (
+            "你是主诉链新节点生成器。\n"
+            "任务：根据当前主诉节点、会话上下文和新增节点简述，生成当前应接入活跃路径的下一个新主诉节点。\n"
+            "只输出单个 JSON 对象，不要输出解释、markdown 或额外文本。\n"
+            "输出字段至少包含：\n"
+            "{\n"
+            '  "id": "new_stage_id",\n'
+            '  "label": "节点标题",\n'
+            '  "summary": "节点概述",\n'
+            '  "core_belief": "可选",\n'
+            '  "narrative_focus": ["可选"],\n'
+            '  "next_candidates": ["可选，可连接已有节点或留空"],\n'
+            '  "is_terminal_stage": false\n'
+            "}\n"
+            "约束：\n"
+            "1. 只生成当前应物化的一个新节点，不要一次展开完整子树。\n"
+            "2. 若输入中给了 requested_stage_id，就使用这个 id。\n"
+            "3. 该节点应紧接当前节点，但不必是叶子；它可以承接后续分支。\n"
+            "4. next_candidates 可以写多个，优先与输入中的 requested_tail 保持连续。\n"
+            "5. 可以把 next_candidates 连接到已有节点，也可以留空；若拿不准，宁可保守也不要生成孤立死节点。\n"
+            "6. summary 必须具体，不能只重复 label。\n"
+            f"输入：{payload_json}\n"
+        )
+
+    def _validate_runtime_stage(self, payload: Any) -> Tuple[bool, str]:
+        if not isinstance(payload, dict):
+            return False, "payload_not_dict"
+        stage_id = str(payload.get("id", "") or "").strip()
+        label = str(payload.get("label", "") or "").strip()
+        summary = str(payload.get("summary", payload.get("description", "")) or "").strip()
+        if not stage_id:
+            return False, "missing_id"
+        if not label:
+            return False, "missing_label"
+        if not summary:
+            return False, "missing_summary"
+        existing = self.stage_catalog.get(stage_id)
+        if isinstance(existing, dict) and str(existing.get("source", "") or "") == "config":
+            return False, "conflicts_with_config_stage"
+        return True, "ok"
+
+    def _log_runtime_stage_event(
+        self,
+        event: str,
+        current_stage_id: str,
+        needs_new_stage: bool,
+        stage_id: str = "",
+        reason: str = "",
+    ) -> None:
+        logger.info(
+            "[DEPRESSION_DYNAMIC_STAGE_%s] current_stage=%s needs_new_stage=%s new_stage=%s reason=%s",
+            str(event or "UNKNOWN").upper(),
+            str(current_stage_id or ""),
+            bool(needs_new_stage),
+            str(stage_id or ""),
+            str(reason or ""),
+        )
+
+    def _has_existing_followup(self, current_stage: Dict[str, Any], next_chain_ids: List[str]) -> bool:
+        if len(self._normalize_next_chain(next_chain_ids, str(current_stage.get("id", "") or ""))) > 1:
+            return True
+        next_candidates = self._normalize_candidate_ids(current_stage.get("next_candidates", []), allow_pending=True) if isinstance(current_stage, dict) else []
+        return bool(next_candidates)
+
+    def _generate_runtime_stage(
+        self,
+        completion_func: Callable[[str], str],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        current_stage: Dict[str, Any],
+        new_stage_brief: str,
+        requested_stage_id: str = "",
+        requested_tail: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        prompt = self._build_stage_generation_prompt(
+            current_stage=current_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_cfg=llm_cfg,
+            new_stage_brief=new_stage_brief,
+            requested_stage_id=requested_stage_id,
+            requested_tail=requested_tail,
+        )
+        raw = ""
+        try:
+            raw = str(completion_func(prompt) or "")
+        except Exception as exc:
+            self._log_runtime_stage_event(
+                event="reject",
+                current_stage_id=str(current_stage.get("id", "") or ""),
+                needs_new_stage=True,
+                reason="completion_error:{}".format(exc),
+            )
+            return None
+        parsed = self._parse_json_object(raw)
+        if requested_stage_id and isinstance(parsed, dict):
+            parsed["id"] = str(requested_stage_id or "").strip()
+        is_valid, reason = self._validate_runtime_stage(parsed)
+        if not is_valid:
+            stage_id = str(parsed.get("id", "") or "").strip() if isinstance(parsed, dict) else ""
+            self._log_runtime_stage_event(
+                event="reject",
+                current_stage_id=str(current_stage.get("id", "") or ""),
+                needs_new_stage=True,
+                stage_id=stage_id,
+                reason=reason,
+            )
+            return None
+        stage = self._sanitize_stage(parsed, source="llm")
+        stage_tail = self._normalize_path_tokens(requested_tail or [], allow_unknown=True)
+        stage["next_candidates"] = self._merge_candidate_ids(stage_tail, stage.get("next_candidates", []))
+        self.stage_catalog[stage["id"]] = stage
+        self.pending_stage_specs.pop(str(stage.get("id", "") or ""), None)
+        self._attach_candidate(str(current_stage.get("id", "") or ""), str(stage.get("id", "") or ""), prefer_front=True)
+        self._log_runtime_stage_event(
+            event="create",
+            current_stage_id=str(current_stage.get("id", "") or ""),
+            needs_new_stage=True,
+            stage_id=str(stage.get("id", "") or ""),
+            reason="ok",
+        )
+        return copy.deepcopy(stage)
 
     def _sanitize_stage(self, raw: Any, source: str = "config") -> Dict[str, Any]:
         payload = raw if isinstance(raw, dict) else {}
