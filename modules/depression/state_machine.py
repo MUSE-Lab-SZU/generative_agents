@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .prompt_templates import render_prompt
+
 
 @dataclass
 class ComplaintStage:
@@ -494,11 +496,9 @@ class ComplaintChainManager:
             history_rows.append(item)
         return {
             "mode": "complaint_chain",
-            "config": {
-                "planner": copy.deepcopy(self.planner),
-                "initial_stage_id": self.initial_stage_id,
-                "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
-            },
+            "planner": copy.deepcopy(self.planner),
+            "initial_stage_id": self.initial_stage_id,
+            "stage_catalog": [copy.deepcopy(item) for item in self.stage_catalog.values()],
             "planned_chain": [str(item) for item in self.planned_chain],
             "stage_index": int(self.stage_index),
             "stage_history": history_rows,
@@ -513,9 +513,25 @@ class ComplaintChainManager:
         cls,
         payload: Dict[str, Any],
         now_provider: Optional[Callable[[], datetime]] = None,
+        base_config: Optional[Dict[str, Any]] = None,
     ) -> "ComplaintChainManager":
         payload = payload if isinstance(payload, dict) else {}
-        cfg = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else {}
+        legacy_cfg = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else {}
+        base_cfg = base_config if isinstance(base_config, dict) else {}
+        stage_catalog = payload.get("stage_catalog", legacy_cfg.get("stages", base_cfg.get("stages", [])))
+        if isinstance(stage_catalog, dict):
+            stage_catalog = list(stage_catalog.values())
+        cfg = {
+            "planner": copy.deepcopy(payload.get("planner", legacy_cfg.get("planner", base_cfg.get("planner", {})))),
+            "initial_stage_id": str(
+                payload.get(
+                    "initial_stage_id",
+                    legacy_cfg.get("initial_stage_id", base_cfg.get("initial_stage_id", "")),
+                )
+                or ""
+            ),
+            "stages": copy.deepcopy(stage_catalog) if isinstance(stage_catalog, list) else [],
+        }
         manager = cls(config={"complaint_chain": cfg}, now_provider=now_provider)
         planned_chain = payload.get("planned_chain", [])
         if isinstance(planned_chain, list) and planned_chain:
@@ -768,23 +784,9 @@ class ComplaintChainManager:
             "allowed_actions": ["hold", "advance", "replan", "jump"],
         }
         payload_json = json.dumps(payload, ensure_ascii=False)
-        return (
-            "你是主诉链规划器。\n"
-            "任务：依据当前主诉节点与本轮会话，判断本轮是否实质触及当前节点，并给出主诉链动作。\n"
-            "只输出 JSON 对象，不要输出解释、markdown 或额外文本。\n"
-            "输出字段固定为：\n"
-            "{\n"
-            '  "matched_current_stage": true,\n'
-            '  "match_confidence": 0.0,\n'
-            '  "match_reason": "10到120字",\n'
-            '  "action": "hold|advance|replan|jump",\n'
-            '  "next_chain": ["当前节点id", "后续节点id"]\n'
-            "}\n"
-            "约束：\n"
-            "1. 不要输出病情等级或严重程度。\n"
-            "2. 只能围绕主诉链节点是否被触及来判断。\n"
-            "3. next_chain 必须使用已有节点 id；若无法确定，就保持当前窗口顺序。\n"
-            f"输入：{payload_json}\n"
+        return render_prompt(
+            "depression/chain_planner",
+            {"payload_json": payload_json},
         )
 
     def _normalize_llm_signal(self, payload: Any) -> Optional[Dict[str, Any]]:

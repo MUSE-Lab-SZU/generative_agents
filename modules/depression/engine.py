@@ -327,8 +327,10 @@ class DepressionSimulationEngine:
         return cls(config={"config_path": config_path, "agent_dir": agent_dir})
 
     def to_dict(self) -> Dict[str, Any]:
+        config_reference = self._state_config_reference()
         return {
-            "config": copy.deepcopy(self.raw_config),
+            "config": copy.deepcopy(config_reference),
+            "config_reference": copy.deepcopy(config_reference),
             "enabled": bool(self.enabled),
             "base_prompt": str(self.base_prompt or ""),
             "interaction_count": int(self.interaction_count),
@@ -350,7 +352,7 @@ class DepressionSimulationEngine:
         3. emotion/prompt_builder 会按最新配置重新实例化。
         """
         payload = payload if isinstance(payload, dict) else {}
-        config = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else self.raw_config
+        config = self._select_state_config(payload)
         refreshed = self._resolve_config(config)
         self.raw_config = copy.deepcopy(refreshed)
         self.config_path = str(refreshed.get("_config_path", "") or "")
@@ -371,7 +373,11 @@ class DepressionSimulationEngine:
         self.last_session_context = copy.deepcopy(payload.get("last_session_context", {})) if isinstance(payload.get("last_session_context", {}), dict) else {}
 
         chain_payload = payload.get("chain_manager", {}) if isinstance(payload.get("chain_manager", {}), dict) else {}
-        self.chain_manager = ComplaintChainManager.from_dict(chain_payload, now_provider=self._clock_provider)
+        self.chain_manager = ComplaintChainManager.from_dict(
+            chain_payload,
+            now_provider=self._clock_provider,
+            base_config=refreshed.get("complaint_chain", {}) if isinstance(refreshed.get("complaint_chain", {}), dict) else {},
+        )
         self.state_machine = self.chain_manager
 
         context_payload = payload.get("context_builder", {}) if isinstance(payload.get("context_builder", {}), dict) else {}
@@ -415,14 +421,15 @@ class DepressionSimulationEngine:
             return data
 
         config = config if isinstance(config, dict) else {}
-        if isinstance(config.get("config_path"), str) and config.get("config_path", "").strip():
-            config_path = os.path.abspath(str(config.get("config_path") or "").strip())
+        config_path_value = config.get("config_path", config.get("_config_path", ""))
+        if isinstance(config_path_value, str) and config_path_value.strip():
+            config_path = os.path.abspath(str(config_path_value or "").strip())
             if os.path.isfile(config_path):
                 data = cls._load_json_file(config_path)
                 data["_config_path"] = config_path
                 data["_agent_dir"] = os.path.dirname(config_path)
                 return data
-        agent_dir = str(config.get("agent_dir", "") or "").strip()
+        agent_dir = str(config.get("agent_dir", config.get("_agent_dir", "")) or "").strip()
         if agent_dir:
             config_path = os.path.join(os.path.abspath(agent_dir), "depression_config.json")
             if os.path.isfile(config_path):
@@ -438,6 +445,29 @@ class DepressionSimulationEngine:
             nested.setdefault("_agent_dir", str(data.get("_agent_dir", "") or ""))
             return nested
         return data
+
+    def _state_config_reference(self) -> Dict[str, Any]:
+        ref: Dict[str, Any] = {}
+        if self.config_path:
+            ref["config_path"] = str(self.config_path)
+        if self.agent_dir:
+            ref["agent_dir"] = str(self.agent_dir)
+        agent_name = self._infer_agent_name(self.raw_config)
+        if agent_name:
+            ref["agent_name"] = agent_name
+        return ref
+
+    def _select_state_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        current_ref = self._state_config_reference()
+        if current_ref.get("config_path") or current_ref.get("agent_dir"):
+            return current_ref
+
+        for key in ("config_reference", "config"):
+            value = payload.get(key, {})
+            if isinstance(value, dict) and value:
+                return copy.deepcopy(value)
+
+        return copy.deepcopy(self.raw_config if isinstance(self.raw_config, dict) and self.raw_config else current_ref)
 
     def _infer_agent_name(self, config: Dict[str, Any]) -> str:
         explicit = str(config.get("agent_name", "") or config.get("name", "") or self.profile.get("name", "") or "").strip()
