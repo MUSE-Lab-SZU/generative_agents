@@ -35,7 +35,16 @@ class ComplaintStage:
 
 
 class ComplaintChainManager:
-    """仅围绕主诉链推进的人设动态管理器。"""
+    """仅围绕主诉链推进的人设动态管理器。
+
+    它维护的不是“病情数值总表”，而是一个更离散的对象：
+    当前角色正卡在哪个主诉节点、下一步可能走向哪里、为什么推进/停留。
+
+    建议把内部状态理解为三部分：
+    - `stage_catalog`：所有可能节点的“静态字典”；
+    - `planned_chain + stage_index`：当前生效的“前瞻路径”；
+    - `stage_history + dialogue_history`：运行过程留下的“证据轨迹”。
+    """
 
     STOPWORDS = {
         "自己", "觉得", "感觉", "因为", "然后", "已经", "还是", "不是", "就是", "一个", "一种",
@@ -82,6 +91,9 @@ class ComplaintChainManager:
         now_provider: Optional[Callable[[], datetime]] = None,
     ):
         config = config if isinstance(config, dict) else {}
+        # 兼容两种传法：
+        # 1. 直接传 complaint_chain 配置本身；
+        # 2. 传整个 depression_config.json，再从中取 `complaint_chain`。
         chain_config = config.get("complaint_chain", config)
         if not isinstance(chain_config, dict):
             chain_config = {}
@@ -107,6 +119,8 @@ class ComplaintChainManager:
         raw_stages = chain_config.get("stages", [])
         if isinstance(raw_stages, list):
             for item in raw_stages:
+                # 每个 stage 都先经过 sanitize，再进入 catalog。
+                # 也就是说，JSON 配置不是直接拿来跑，而是会被统一清洗。
                 stage = self._sanitize_stage(item, source=str(item.get("source", "config")) if isinstance(item, dict) else "config")
                 self.stage_catalog[stage["id"]] = stage
 
@@ -222,12 +236,23 @@ class ComplaintChainManager:
         llm_cfg: Optional[Dict[str, Any]] = None,
         llm_signal: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """只评估，不提交。
+
+        输出的是一个 evaluation dict，类似“事务草稿”：
+        - 当前节点是否被触及；
+        - 置信度如何；
+        - 动作是 hold / advance / replan / jump；
+        - 如果要前进，下一段链条长什么样。
+        真正改状态要等 `commit_turn()`。
+        """
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation = str(conversation_content or "").strip()
         current_stage = self.get_current_stage()
 
         normalized_signal = self._normalize_llm_signal(llm_signal)
         if callable(completion_func) and self.llm_enabled:
+            # 若提供 LLM 规划器，就让它先给出结构化建议；
+            # 但后面依然会经过 normalize / allow_xxx 等约束过滤。
             inferred_signal = self._infer_chain_signal(
                 completion_func=completion_func,
                 session_context=session_context,
@@ -237,6 +262,7 @@ class ComplaintChainManager:
             if inferred_signal:
                 normalized_signal = inferred_signal
 
+        # 无论是否启用 LLM，启发式匹配都是一个重要“兜底”。
         heur_matched, heur_confidence, heur_reason = self._heuristic_match(
             current_stage=current_stage,
             session_context=session_context,
@@ -246,10 +272,14 @@ class ComplaintChainManager:
         matched = heur_matched
         match_confidence = heur_confidence
         match_reason = heur_reason
+        # 默认策略是“先不推进”，只有后续证据足够才会改成 advance / jump。
         action = "hold"
+        # 先拿当前窗口当作未来链条的缺省值。
         next_chain_ids: List[str] = self._preview_future_chain(current_stage)
 
         if normalized_signal:
+            # 一旦有 LLM/外部信号，就用它覆盖启发式默认值；
+            # 但覆盖之后仍然会接受 action 白名单、allow_replan 等约束。
             matched = bool(normalized_signal.get("matched", matched))
             match_confidence = self._bounded_float(
                 normalized_signal.get("match_confidence", match_confidence),
@@ -267,6 +297,7 @@ class ComplaintChainManager:
             action = "hold"
 
         if not normalized_signal:
+            # 只有在完全没有结构化 LLM 信号时，才纯靠规则决定动作。
             action = self._decide_action(
                 current_stage=current_stage,
                 matched=matched,
@@ -282,6 +313,8 @@ class ComplaintChainManager:
 
         next_stage: Optional[Dict[str, Any]] = None
         if action in {"advance", "jump"}:
+            # advance / jump 的共同前提：必须能推出一个“后继节点”。
+            # 如果 next_chain 不够长，就退回当前 stage 的 next_candidates。
             if len(next_chain_ids) > 1:
                 next_stage = copy.deepcopy(self.stage_catalog.get(next_chain_ids[1], {}))
             elif current_stage.get("next_candidates"):
@@ -290,8 +323,11 @@ class ComplaintChainManager:
                     next_chain_ids = [current_stage["id"], candidate_id]
                     next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
             else:
+                # 没有可去的下一个节点，就算 matched 了也只能 hold。
                 action = "hold"
 
+        # evaluation 是“提交前快照”：
+        # 后续 commit_turn() 只消费这个 dict，不再重新做一次理解。
         evaluation = {
             "action": action,
             "matched": bool(matched),
@@ -306,6 +342,13 @@ class ComplaintChainManager:
         return evaluation
 
     def commit_turn(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
+        """把 evaluation 真正写入状态机。
+
+        这里最值得审查的点是：
+        - `hold/replan` 只替换未来窗口，不切换当前节点；
+        - `advance` 将 `stage_index` 向前推进一格；
+        - `jump` 会直接重建整条 planned_chain。
+        """
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         current_before = self.get_current_stage()
         action = str(evaluation.get("action", "hold") or "hold").strip().lower()
@@ -322,13 +365,16 @@ class ComplaintChainManager:
             next_chain = self._preview_future_chain(current_before)
 
         pointer_before = int(self.stage_index)
+        # 记录在当前节点已经停留了多久，便于后续 history 分析。
         duration_minutes = self.get_state_duration()
 
         if action in {"hold", "replan"}:
+            # hold/replan 的共同点：当前节点不动，只更新后面的路线图。
             self._replace_future_chain(next_chain)
         elif action == "advance":
             self._replace_future_chain(next_chain)
             if self.stage_index < len(self.planned_chain) - 1:
+                # 只有先把未来链条写好，再 +1，才能保证“下一格”是刚更新过的。
                 self.stage_index += 1
                 self.stage_start_time = self._now()
         elif action == "jump":
@@ -340,7 +386,10 @@ class ComplaintChainManager:
                 target_stage_id = str(next_chain[1] or "").strip()
             if target_stage_id:
                 if target_stage_id not in self.stage_catalog:
+                    # jump 允许把一个运行时临时生成的 stage 写入 catalog，
+                    # 这样后续 snapshot / 恢复状态时不会丢失它。
                     self.stage_catalog[target_stage_id] = self._sanitize_stage(target_stage or {"id": target_stage_id, "label": target_stage_id}, source="jump")
+                # jump 的语义不是“在原链上跳格子”，而是“把目标节点改成新的当前起点”。
                 self.planned_chain = [target_stage_id] + self._build_future_chain_from_stage(target_stage_id, self.window_size)
                 self.stage_index = 0
                 self.stage_start_time = self._now()
@@ -496,23 +545,29 @@ class ComplaintChainManager:
         return manager
 
     def _preview_future_chain(self, current_stage: Dict[str, Any]) -> List[str]:
+        """返回“当前节点 + 未来若干节点”的窗口。"""
         current_id = str(current_stage.get("id", "") or "").strip()
         if not current_id:
             return []
         future_ids = [current_id]
         if self.stage_index < len(self.planned_chain) - 1:
+            # 优先复用现有 planned_chain 中“当前位置之后”的部分。
             future_ids.extend([str(item) for item in self.planned_chain[self.stage_index + 1 : self.stage_index + self.window_size + 1]])
         if len(future_ids) <= 1:
+            # 如果当前链太短，再按 next_candidates 临时补一段未来窗口。
             future_ids.extend(self._build_future_chain_from_stage(current_id, self.window_size))
         return self._normalize_next_chain(future_ids, current_id)
 
     def _replace_future_chain(self, next_chain: List[str]) -> None:
+        # 保留历史前缀，只更新“从当前节点往后”的规划窗口。
         current_prefix = self.planned_chain[: self.stage_index]
         normalized = self._normalize_next_chain(next_chain, self.get_current_stage_id())
         self.planned_chain = current_prefix + normalized
         self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
 
     def _ensure_future_window(self) -> None:
+        # 运行中始终尽量保证“当前节点之后还有若干可预览节点”，
+        # 这样 prompt_builder 才能展示出一个短窗口，而不是只剩当前点。
         if not self.planned_chain:
             self.planned_chain = self._build_default_chain(self.initial_stage_id)
             self.stage_index = 0
@@ -530,6 +585,7 @@ class ComplaintChainManager:
         if not start_id or start_id not in self.stage_catalog:
             start_id = next(iter(self.stage_catalog.keys()))
         chain = [start_id]
+        # 默认链不是完整剧情，只是“当前点 + 一个有限长度的前瞻窗口”。
         chain.extend(self._build_future_chain_from_stage(start_id, self.window_size))
         return self._normalize_chain_ids(chain)
 
@@ -546,11 +602,14 @@ class ComplaintChainManager:
             for candidate in next_candidates:
                 candidate_id = str(candidate or "").strip()
                 if candidate_id and candidate_id in self.stage_catalog:
+                    # 当前实现选择第一个合法候选，说明 future chain 是“弱分支”的：
+                    # 支持多个候选配置，但默认只走第一条可行路径。
                     next_id = candidate_id
                     break
             if not next_id:
                 break
             if next_id in seen:
+                # 防止 A -> B -> A 这种配置错误导致死循环。
                 break
             seen.add(next_id)
             results.append(next_id)
@@ -563,6 +622,13 @@ class ComplaintChainManager:
         session_context: Dict[str, Any],
         conversation_content: str,
     ) -> Tuple[bool, float, str]:
+        """启发式判断“本轮话语是否真的触及当前主诉节点”。
+
+        评分来源主要有三类：
+        1. 当前节点关键词与发言文本的 overlap；
+        2. 上下文识别出的 topics / speech_acts / stance；
+        3. 节点 advance / hold signals 的命中情况。
+        """
         conversation = str(conversation_content or "").strip()
         if not conversation:
             return False, 0.0, "empty_utterance"
@@ -591,22 +657,29 @@ class ComplaintChainManager:
 
         score = 0.0
         if stage_keywords:
+            # overlap 反映“文本内容是否贴着当前节点的词在说”。
             score += min(0.42, 0.10 * float(len(overlap)))
         if focus_hits:
+            # focus_hits 更像“主题级命中”，不是字面关键词命中。
             score += min(0.24, 0.12 * float(len(focus_hits)))
         if "自我暴露" in speech_acts:
             score += 0.10
         if "具体叙述" in speech_acts:
+            # 具体叙述通常意味着角色没有只停留在空泛低落，而是开始触碰细节。
             score += 0.10
         if "含蓄求助" in speech_acts or "求助尝试" in speech_acts:
             score += 0.06
         if "谨慎" in stance or "试探" in stance:
             score += 0.05
         if hold_alignment > 0:
+            # 注意：hold_signals 命中也会加分。
+            # 这里的逻辑是“更确认当前节点被触及”，而不是“更倾向 advance”。
             score += min(0.10, 0.04 * float(hold_alignment))
         if signal_hits > 0:
             score += min(0.10, 0.05 * float(signal_hits))
 
+        # threshold 会受 planner.min_match_confidence 影响，
+        # 但又被夹在 [0.32, 0.58] 范围里，避免配置极端化。
         threshold = max(0.32, min(0.58, self.min_match_confidence * 0.72))
         matched = score >= threshold
         reason = "heuristic_score={:.3f}; overlap={}; topics={}; speech_acts={}".format(
@@ -625,6 +698,7 @@ class ComplaintChainManager:
         session_context: Dict[str, Any],
         conversation_content: str,
     ) -> str:
+        """在没有显式 LLM 指令时，用启发式规则决定节点动作。"""
         if not matched:
             return "hold"
         if self._coerce_bool(current_stage.get("is_terminal_stage", False)):
@@ -639,6 +713,8 @@ class ComplaintChainManager:
         advance_hits = self._count_signal_hits(current_stage.get("advance_signals", []), conversation_content, topics)
         hold_hits = self._count_signal_hits(current_stage.get("hold_signals", []), conversation_content, topics)
 
+        # “具体叙述”被视为一个重要推进信号：
+        # 角色从抽象自责转向具体场景时，更可能真的触到了当前节点深处。
         detailed = "具体叙述" in speech_acts or len(str(conversation_content or "")) >= 36
         if advance_hits > hold_hits and (advance_hits > 0 or detailed):
             return "advance"
@@ -652,6 +728,9 @@ class ComplaintChainManager:
             text = str(signal or "").strip()
             if not text:
                 continue
+            # signal 同时支持两种命中方式：
+            # 1. 在原始对话文本里直接出现；
+            # 2. 在 context analyzer 抽出来的话题标签里出现。
             if text in conversation or any(text in topic or topic in text for topic in topics):
                 count += 1
         return count
@@ -678,6 +757,7 @@ class ComplaintChainManager:
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
     ) -> str:
+        # 给 LLM 的任务不是“诊断病情”，而是“判断当前主诉节点是否被触及”。
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
         payload = {
@@ -708,6 +788,8 @@ class ComplaintChainManager:
         )
 
     def _normalize_llm_signal(self, payload: Any) -> Optional[Dict[str, Any]]:
+        # 把 LLM 的自由输出压缩成状态机能消费的受限结构，
+        # 同时对低置信结果做降级，避免 LLM 过度推进节点。
         if not isinstance(payload, dict):
             return None
 
@@ -732,6 +814,8 @@ class ComplaintChainManager:
         if isinstance(raw_next, list):
             for item in raw_next:
                 if isinstance(item, dict):
+                    # 如果 LLM 直接吐出完整 stage dict，这里也能接住；
+                    # 但接住之后仍会 sanitize，避免字段形状失控。
                     stage = self._sanitize_stage(item, source="llm")
                     self.stage_catalog[stage["id"]] = stage
                     next_chain.append(stage["id"])
@@ -759,6 +843,8 @@ class ComplaintChainManager:
         if not normalized and current_id:
             return [current_id]
         if current_id:
+            # 无论外部给什么 next_chain，第一位都必须强制对齐当前节点。
+            # 这样 commit_turn() 才能把它理解为“当前窗口”，而不是“纯未来列表”。
             if current_id not in normalized:
                 normalized = [current_id] + normalized
             elif normalized[0] != current_id:
@@ -772,6 +858,7 @@ class ComplaintChainManager:
         for item in items:
             stage_id = ""
             if isinstance(item, dict):
+                # 允许链条里混入“完整 stage 对象”，并在这里即时注册到 catalog。
                 stage = self._sanitize_stage(item, source=str(item.get("source", "config")) if isinstance(item, dict) else "config")
                 self.stage_catalog[stage["id"]] = stage
                 stage_id = stage["id"]
@@ -786,6 +873,7 @@ class ComplaintChainManager:
         return normalized
 
     def _sanitize_stage(self, raw: Any, source: str = "config") -> Dict[str, Any]:
+        """把外部配置 / LLM 生成的 stage 清洗成统一结构。"""
         payload = raw if isinstance(raw, dict) else {}
         label = str(payload.get("label", "") or "").strip() or "未命名主诉节点"
         stage_id = str(payload.get("id", "") or "").strip() or self._make_stage_id(label)
@@ -796,6 +884,13 @@ class ComplaintChainManager:
         bias_profile = payload.get("bias_profile", {}) if isinstance(payload.get("bias_profile", {}), dict) else {}
         relation_modifiers = payload.get("relation_modifiers", {}) if isinstance(payload.get("relation_modifiers", {}), dict) else {}
 
+        # 这里就是 JSON 配置落地为运行时 stage 的关键位置。
+        # 例如你在 `depression_config.json` 里看到的：
+        # - narrative_focus
+        # - speaking_style
+        # - emotion_vector
+        # - bias_profile
+        # 最终都会被规整成下面这个 ComplaintStage 结构。
         normalized = ComplaintStage(
             id=stage_id[:80],
             label=label[:80],
@@ -844,6 +939,8 @@ class ComplaintChainManager:
         conversation_excerpt: str,
         session_context: Dict[str, Any],
     ) -> None:
+        # 对话历史是“为什么会推进到这里”的轻量证据，
+        # 供 debug / 回放 / 人工审查使用，不参与复杂推理。
         participants = session_context.get("participants", {}) if isinstance(session_context.get("participants", {}), dict) else {}
         scene = session_context.get("scene", {}) if isinstance(session_context.get("scene", {}), dict) else {}
         row = {
@@ -875,6 +972,7 @@ class ComplaintChainManager:
         pointer_after: int,
         duration_minutes: float,
     ) -> None:
+        # stage_history 更像状态迁移日志，记录 from/to/action/confidence。
         self.stage_history.append(
             {
                 "timestamp": self._now(),

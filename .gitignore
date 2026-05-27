@@ -48,5 +48,5 @@ Thumbs.db
 # Simulation runtime outputs
 results/checkpoints/
 results/compressed/
-sim-dym-severe-kbd-0404/
-sim-dym-severe-kbd-0404-2/
+
+docs/

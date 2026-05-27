@@ -23,6 +23,8 @@ class EmotionInferencer:
         payload: Dict[str, Any],
         completion_func: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
+        # 默认先构造 fallback，再尝试 LLM；
+        # 这样即使 LLM 不可用，系统也仍然能给出连续的瞬时情绪。
         payload = payload if isinstance(payload, dict) else {}
         fallback = self.build_fallback(payload)
         if not callable(completion_func) or not self.llm_enabled:
@@ -72,6 +74,7 @@ class EmotionInferencer:
         )
 
     def build_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """基于 stage + relationship + flags 的规则化情绪兜底。"""
         stage = payload.get("current_stage", {}) if isinstance(payload.get("current_stage", {}), dict) else {}
         session_context = payload.get("session_context", {}) if isinstance(payload.get("session_context", {}), dict) else {}
         previous = payload.get("previous_emotion", {}) if isinstance(payload.get("previous_emotion", {}), dict) else {}
@@ -147,6 +150,8 @@ class EmotionInferencer:
         )
 
         if previous_initialized:
+            # 这一段很关键：通过裁剪 delta，让情绪只做“小幅、可逆”波动，
+            # 避免模型一轮比一轮跳得太离谱。
             intensity = previous_intensity + self._clip_delta(intensity - previous_intensity + jitter * 0.20, self.volatility_limit)
             disclosure_level = previous_disclosure + self._clip_delta(disclosure_level - previous_disclosure + jitter * 0.12, self.volatility_limit)
             defensiveness = previous_defensiveness + self._clip_delta(defensiveness - previous_defensiveness - jitter * 0.12, self.volatility_limit)

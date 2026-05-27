@@ -13,7 +13,27 @@ from modules.memory.associate import Concept
 
 
 class Agent:
+    """游戏中的核心角色对象。
+
+    阅读这个类时，可以把它拆成四层来看：
+    1. `memory / schedule / spatial / associate`：角色“记住了什么”。
+    2. `scratch + completion()`：角色“如何向 LLM 提问”。
+    3. `think() / percept() / make_plan()`：角色“每一 tick 怎么做决定”。
+    4. `depression_dynamic`：一个可选的动态抑郁表现插件，只在少数 prompt
+       生成节点上插入额外约束，而不直接改动基础行动系统。
+    """
+
     def __init__(self, config, maze, conversation, logger):
+        """初始化角色实例。
+
+        Args:
+            config (dict): 角色配置字典，由上层组装
+            maze: 当前游戏使用的迷宫对象，用于查询 tile、地址和路径等空间信息。
+            conversation: 对话管理器或对话上下文对象，负责角色间的聊天记录与
+                对话流程协作。
+            logger: 日志记录器，用于输出角色思考、行动和 LLM 调用过程中的调试
+                与运行日志。
+        """
         self.name = config["name"]
         self.maze = maze
         self.conversation = conversation
@@ -21,41 +41,41 @@ class Agent:
         self.logger = logger
 
         # agent config
-        self.percept_config = config["percept"]
-        self.think_config = config["think"]
-        self.chat_iter = config["chat_iter"]
+        self.percept_config = config["percept"] # 角色怎么“看见/注意到”周围环境，box 表示感知范围是一个方形区域
+        self.think_config = config["think"] # 配置角色使用的 LLM
+        self.chat_iter = config["chat_iter"] # 一次对话流程里最多允许多少轮对话
 
         # memory
-        self.spatial = memory.Spatial(**config["spatial"])
-        self.schedule = memory.Schedule(**config["schedule"])
-        self.associate = memory.Associate(
+        self.spatial = memory.Spatial(**config["spatial"]) # 空间记忆：知道哪些地点、如何根据提示词找到地点
+        self.schedule = memory.Schedule(**config["schedule"]) # 日程记忆：保存/生成/拆分/修订当天计划
+        self.associate = memory.Associate( # 角色的联想记忆/长期记忆：存储并检索事件、想法和聊天
             os.path.join(config["storage_root"], "associate"), **config["associate"]
         )
-        self.concepts, self.chats = [], config.get("chats", [])
+        self.concepts, self.chats = [], config.get("chats", []) # 当前关注概念/瞬时记忆 + 最近聊天缓存
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
-        self.depression_dynamic_global = (
+        self.depression_dynamic_global = ( # 来自data/config.json，动态抑郁模块整体配置（总开关总规则
             copy.deepcopy(config.get("depression_dynamic_global", {}))
             if isinstance(config.get("depression_dynamic_global", {}), dict)
             else {}
         )
-        self.depression_dynamic = self._init_depression_dynamic(config)
+        self.depression_dynamic = self._init_depression_dynamic(config) # 给当前角色创建 动态抑郁 实例
 
-        # status
-        status = {"poignancy": 0}
-        self.status = utils.update_dict(status, config.get("status", {}))
+        # status 初始化角色状态
+        status = {"poignancy": 0} # 角色当前积累的“情绪/事件冲击值”。这个值后面会影响角色是否进入 reflect() 反思流程。
+        self.status = utils.update_dict(status, config.get("status", {})) # 用 config 里的状态去覆盖默认状态
         self.plan = config.get("plan", {})
 
-        # record
+        # record 角色上一次“记录摘要信息”的时间点，按当天经过了多少分钟来表示
         self.last_record = utils.get_timer().daily_duration()
 
-        # action and events
-        if "action" in config:
+        # action and events 这个角色当前正在做什么，以及他对应的物体/地点事件是什么。
+        if "action" in config: # 恢复旧状态
             self.action = memory.Action.from_dict(config["action"])
             tiles = self.maze.get_address_tiles(self.get_event().address)
             config["coord"] = random.choice(list(tiles))
-        else:
+        else: # 如果没有历史动作，就根据初始坐标现场创建一个默认动作
             tile = self.maze.tile_at(config["coord"])
             address = tile.get_address("game_object", as_list=True)
             self.action = memory.Action(
@@ -63,13 +83,17 @@ class Agent:
                 memory.Event(address[-1], address=address),
             )
 
-        # update maze
+        # update maze 把角色同步到地图
         self.coord, self.path = None, None
         self.move(config["coord"], config.get("path"))
         if self.coord is None:
             self.coord = config["coord"]
 
     def abstract(self):
+        """
+        把当前 Agent 的核心状态整理成一个“适合查看/打印/调试”的摘要字典。
+        """
+        # 整理基础字段
         des = {
             "name": self.name,
             "currently": self.scratch.currently,
@@ -80,6 +104,7 @@ class Agent:
             "action": self.action.abstract(),
             "associate": self.associate.abstract(),
         }
+        # 按条件补充可选字段
         if self.schedule.scheduled():
             des["schedule"] = self.schedule.abstract()
         if self.depression_dynamic:
@@ -101,24 +126,46 @@ class Agent:
         return des
 
     def __str__(self):
+        """
+        把 Agent 对象转换成一个适合打印和日志输出的可读字符串。
+        """
         return utils.dump_dict(self.abstract())
 
     def reset(self):
+        """
+        按需初始化 Agent  在思考、对话等流程中使用的 LLM 实例。
+        """
         if not self._llm:
             self._llm = create_llm_model(self.think_config["llm"])
 
     def completion(self, func_hint, *args, **kwargs):
+        """统一的 prompt -> LLM -> 结果回收入口。
+        Agent 所有 LLM 推理任务的统一中间层。
+        Args:
+            func_hint:想调用哪一种 prompt/推理任务,最终会映射到 Scratch 里的某个方法
+            *args 和 **kwargs:传给对应 Scratch.prompt_xxx(...) 的参数
+
+        这里是阅读 `Agent` 时最关键的“总闸门”：
+        - `Scratch.prompt_xxx(...)` 负责组织 prompt；
+        - `self._llm.completion(...)` 负责真正请求模型；
+        - 动态抑郁模块只在特定 `func_hint` 上做“前后置增强”。
+        """
         assert hasattr(
             self.scratch, "prompt_" + func_hint
         ), "Can not find func prompt_{} from scratch".format(func_hint)
         prompt_kwargs = dict(kwargs)
         depression_chat_ctx = None
         if func_hint == "generate_chat":
+            # 对话生成是动态抑郁模块最重要的挂载点：
+            # 先 preview 当前轮应该呈现什么“主诉节点/情绪/偏差”，
+            # 再把生成好的提示块注入原始聊天 prompt。
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
                 args=args,
                 kwargs=prompt_kwargs,
             )
         elif func_hint == "reflect_insights":
+            # 反思阶段只注入“当前主诉节点的简单摘要”，
+            # 作用比聊天时更弱，主要防止反思文本脱离人设。
             prompt_kwargs = self._prepare_depression_reflect_insights(prompt_kwargs)
         func = getattr(self.scratch, "prompt_" + func_hint)
         raw_res = func(*args, **prompt_kwargs)
@@ -145,6 +192,7 @@ class Agent:
         return output
 
     def think(self, status, agents):
+        """单轮主循环：移动 -> 排程 -> 感知 -> 决策 -> 反思。"""
         events = self.move(status["coord"], status.get("path"))
         plan, _ = self.make_schedule()
 
@@ -189,6 +237,7 @@ class Agent:
         return self.plan
 
     def move(self, coord, path=None):
+        """更新角色在迷宫中的位置，并同步 tile / object 事件。"""
         events = {}
 
         def _update_tile(coord):
@@ -219,6 +268,12 @@ class Agent:
         return events
 
     def make_schedule(self):
+        """生成或分解当天计划。
+
+        这个函数主要还是基础 generative agents 逻辑；
+        动态抑郁模块并不会直接改排程，因此阅读时可以把它当作
+        “人格/日程层”，与“症状表达层”区分开。
+        """
         if not self.schedule.scheduled():
             self.logger.info("{} is making schedule...".format(self.name))
             # update currently
@@ -309,6 +364,7 @@ class Agent:
             )
 
     def percept(self):
+        """感知周围环境并把新事件写入联想记忆。"""
         scope = self.maze.get_scope(self.coord, self.percept_config)
         # add spatial memory
         for tile in scope:
@@ -373,6 +429,7 @@ class Agent:
         return event
 
     def reflect(self):
+        """当 poignancy 积累到阈值后，对近期事件做抽象反思。"""
         def _add_thought(thought, evidence=None):
             # event = self.completion(
             #     "describe_event",
@@ -539,6 +596,7 @@ class Agent:
         return False
 
     def _chat_with(self, other, focus):
+        """尝试与另一个 Agent 展开多轮对话。"""
         if len(self.schedule.daily_schedule) < 1 or len(other.schedule.daily_schedule) < 1:
             # initializing
             return False
@@ -571,6 +629,8 @@ class Agent:
         ]
 
         for i in range(self.chat_iter):
+            # 发起方先说。此处的 `generate_chat` 会经过 completion()，
+            # 因而可能被动态抑郁模块注入额外的“说话约束层”。
             text = self.completion(
                 "generate_chat", self, other, relations[0], chats
             )
@@ -737,15 +797,20 @@ class Agent:
         return info
 
     def _init_depression_dynamic(self, config):
+        """初始化动态抑郁引擎。
+
+        这里不是“总是开启”的：它依赖 agent 目录下是否存在`depression_config.json`。
+        """
         global_cfg = (
             self.depression_dynamic_global
             if isinstance(self.depression_dynamic_global, dict)
             else {}
         )
+        # 没有global_cfg 或者 总配置开关是 False，就返回 None
         if global_cfg and not bool(global_cfg.get("enabled", True)):
             return None
 
-        explicit_config_path = str(config.get("depression_config_path", "") or "").strip()
+        explicit_config_path = str(config.get("depression_config_path", "") or "").strip() # or的作用：如果为空/None/不存在，就变成空字符串
         agent_dir = str(config.get("agent_dir", "") or "").strip()
         candidate_paths = []
         if explicit_config_path:
@@ -753,6 +818,7 @@ class Agent:
         if agent_dir:
             candidate_paths.append(os.path.join(agent_dir, "depression_config.json"))
 
+        # 动态抑郁人设配置文件路径
         config_path = ""
         for item in candidate_paths:
             path = os.path.abspath(str(item or "").strip())
@@ -760,6 +826,7 @@ class Agent:
                 config_path = path
                 break
 
+        # 对于没有配置动态抑郁人设的 agent，系统的处理策略（默认会在日志中记录 info 信息
         if not config_path:
             if global_cfg.get("on_missing_agent_config", "warn_and_disable") == "warn_and_disable":
                 if self.logger:
@@ -770,6 +837,7 @@ class Agent:
                     )
             return None
 
+        # 配置动态抑郁人设的 DepressionSimulationEngine 对象
         try:
             engine = DepressionSimulationEngine(
                 {
@@ -779,7 +847,9 @@ class Agent:
                 }
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
-            state_payload = config.get("depression_dynamic_state", {})
+
+            # 如果这个 agent 之前已经跑过动态抑郁状态机，就把上一次保存下来的内部状态恢复回来。
+            state_payload = config.get("depression_dynamic_state", {}) # 存在checkpoint文档
             if isinstance(state_payload, dict) and state_payload:
                 engine.load_state(copy.deepcopy(state_payload))
                 engine.set_base_prompt(self._build_depression_base_prompt())
@@ -806,6 +876,11 @@ class Agent:
             return str(self.scratch.currently or "")
 
     def _prepare_depression_generate_chat(self, args, kwargs):
+        """在真正生成对话前，预览“这一轮应该怎么说”。
+
+        注意这是 preview，不会直接写状态；真正的状态提交发生在
+        `_commit_depression_generate_chat()` 中。
+        """
         if not self.depression_dynamic:
             return kwargs, None
         if "depression_chat_block" in kwargs and str(kwargs.get("depression_chat_block", "")).strip():
@@ -835,6 +910,7 @@ class Agent:
         return next_kwargs, context
 
     def _prepare_depression_reflect_insights(self, kwargs):
+        """给反思 prompt 附加一个更轻量的动态主诉摘要。"""
         if not self.depression_dynamic:
             return kwargs
         if "depression_reflect_block" in kwargs and str(kwargs.get("depression_reflect_block", "")).strip():
@@ -845,6 +921,13 @@ class Agent:
         return next_kwargs
 
     def _commit_depression_generate_chat(self, context, output):
+        """在生成出本轮话语后，把“实际说出的内容”提交给动态引擎。
+
+        这意味着：
+        - preview 阶段看到的是“已有聊天上下文”；
+        - commit 阶段提交的是“角色刚刚真的说出的这句话”。
+        审查合理性时，这种 preview/commit 输入不完全相同值得重点留意。
+        """
         if not self.depression_dynamic:
             return
         utterance = str(output or "").strip()
@@ -871,6 +954,7 @@ class Agent:
                 )
 
     def _build_depression_chat_context(self, other, relation_summary, chats):
+        """把游戏世界里的对象，压缩成动态抑郁模块需要的会话上下文。"""
         location = self._dynamic_location()
         relationship = self._infer_dynamic_relationship(other, relation_summary)
         interaction_type = self._infer_dynamic_interaction_type(
@@ -910,6 +994,7 @@ class Agent:
         return "night"
 
     def _infer_dynamic_relationship(self, other, relation_summary=""):
+        """把原项目中的关系信息映射到动态抑郁模块的有限关系标签。"""
         if not self.depression_dynamic:
             return ""
         raw_config = getattr(self.depression_dynamic, "raw_config", {})
@@ -938,6 +1023,7 @@ class Agent:
         return "熟人"
 
     def _infer_dynamic_interaction_type(self, other, relationship, chats):
+        """基于地点、关系和已有对话内容，粗略推断互动类型。"""
         other_name = str(getattr(other, "name", "") or "").strip()
         location = self._dynamic_location()
         conversation_text = "\n".join(
@@ -956,6 +1042,7 @@ class Agent:
         return "日常活动"
 
     def _depression_llm_completion(self, prompt):
+        """给动态抑郁模块复用 Agent 当前的 LLM 配置。"""
         if not self.llm_available():
             return ""
         llm_cfg = self.think_config.get("llm", {}) if isinstance(self.think_config.get("llm", {}), dict) else {}

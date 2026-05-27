@@ -24,6 +24,9 @@ class DynamicPromptBuilder:
         activated_memories: List[Dict[str, Any]],
         emotion: Optional[Dict[str, Any]] = None,
     ) -> str:
+        # 层次顺序很重要：
+        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 偏差 -> 瞬时情绪。
+        # 它体现的是“稳定人设在前，当前轮波动在后”的约束方向。
         layers = [
             self._build_base_layer(base_prompt),
             self._build_stage_layer(current_stage, chain_snapshot),
@@ -41,6 +44,8 @@ class DynamicPromptBuilder:
         current_stage: Dict[str, Any],
         chain_snapshot: Optional[Dict[str, Any]] = None,
     ) -> str:
+        # simple prompt 只保留最核心的“人格 + 当前主诉节点”，
+        # 适合反思/摘要等不需要完整会话层的场景。
         return self._combine_layers(
             [
                 self._build_base_layer(base_prompt),
@@ -58,6 +63,7 @@ class DynamicPromptBuilder:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
         current_window = chain_snapshot.get("current_chain_window", []) if isinstance(chain_snapshot.get("current_chain_window", []), list) else []
 
+        # 这些字段都直接来自 complaint_chain 配置中的单个 stage。
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
         summary = str(current_stage.get("summary", "") or "").strip()
         core_belief = str(current_stage.get("core_belief", "") or "").strip()
@@ -73,10 +79,14 @@ class DynamicPromptBuilder:
         if core_belief:
             lines.append(f"核心信念：{core_belief}")
         if narrative_focus:
+            # narrative_focus 不是“必须逐字复述的关键词”，
+            # 更像给 LLM 的“优先围绕哪些痛点组织表达”的提醒。
             lines.append("当前最容易围绕这些问题组织表达：" + "、".join(narrative_focus))
 
         if speaking_style:
             lines.append("当前节点下的表达方式：")
+            # 这里把结构化风格字段翻译回自然语言提示，
+            # 让 LLM 更容易在输出中体现节奏/语气/修正模式。
             lines.append(f"- 语速/节奏：{speaking_style.get('tempo', 'slow')}")
             lines.append(f"- 暴露程度：{speaking_style.get('disclosure', 'guarded')}")
             lines.append(f"- 语气底色：{speaking_style.get('tone', 'flat')}")
@@ -97,6 +107,8 @@ class DynamicPromptBuilder:
             for idx, stage in enumerate(current_window):
                 if not isinstance(stage, dict):
                     continue
+                # idx=0 永远是当前节点；后面的节点只是“可能的后续方向”，
+                # 不是命令式要求角色立即跨过去。
                 marker = "当前" if idx == 0 else f"后续{idx}"
                 lines.append(
                     f"- [{marker}] {str(stage.get('label', '未知节点') or '未知节点')}：{str(stage.get('summary', '') or '').strip()}"
@@ -129,10 +141,13 @@ class DynamicPromptBuilder:
         speech_acts = [str(item) for item in semantic.get("speech_acts", [])[:6]] if isinstance(semantic.get("speech_acts", []), list) else []
         stance = [str(item) for item in semantic.get("stance", [])[:6]] if isinstance(semantic.get("stance", []), list) else []
         if topics:
+            # topics 是“你在围绕什么痛点说话”。
             lines.append("识别到的主诉主题：" + "、".join(topics))
         if speech_acts:
+            # speech_acts 是“你是怎么说的”，比如求助、淡化、回避。
             lines.append("这轮话语动作：" + "、".join(speech_acts))
         if stance:
+            # stance 更接近说话姿态，例如试探、防御、羞耻、低落。
             lines.append("这轮说话姿态：" + "、".join(stance))
 
         flag_texts = []
@@ -161,6 +176,7 @@ class DynamicPromptBuilder:
             "以下自动化偏差会影响你如何解释现实：",
         ]
         for item in biases:
+            # bias 层给的是“内心自动化想法”的示例，而不是要求逐字照搬。
             lines.append(f"- {item.get('name', item.get('type', '未知偏差'))}：「{item.get('thought', '')}」")
         lines.append("这些偏差会让你更容易用绝对化、自责化或悲观化的方式理解正在发生的事。")
         return "\n".join(lines) + "\n"
@@ -189,6 +205,7 @@ class DynamicPromptBuilder:
         defensiveness = float(emotion.get("defensiveness", 0.5) or 0.5)
         intensity = float(emotion.get("intensity", 0.6) or 0.6)
 
+        # 下面不是再算一次 emotion，而是把数值区间翻译成 LLM 更容易执行的语言提示。
         if intensity >= 0.72:
             lines.append("- 表达时应更容易卡住、停顿、语气压着，避免显得轻松流畅。")
         elif intensity >= 0.50:
@@ -214,6 +231,8 @@ class DynamicPromptBuilder:
             lines.append(f"- 当前节点典型的自我修正模式：{speaking_style.get('repair_pattern')}。")
 
         if activated_memories:
+            # 当前 memory_system 还是占位实现，所以这条一般不会出现；
+            # 但接口预留好了，未来启用记忆激活时这里能直接承接。
             lines.append("- 记忆层当前虽非主驱动，但如有相关旧叙事浮现，也只能作为轻微背景，不要压过主诉节点。")
 
         lines.append("\n请将以上各层综合起来，真实地表现这个角色在当前主诉节点下的说话方式。")
@@ -222,4 +241,5 @@ class DynamicPromptBuilder:
     @staticmethod
     def _combine_layers(layers: List[str]) -> str:
         separator = "\n" + "=" * 50 + "\n\n"
+        # 统一用分隔线拼层，方便人工查看 prompt，也方便 debug 时定位是哪一层出了问题。
         return separator.join([str(item or "").strip() for item in layers if str(item or "").strip()])

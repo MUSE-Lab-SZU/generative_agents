@@ -98,6 +98,8 @@ class ComplaintBiasInjector:
         session_context: Dict[str, Any],
         conversation_content: str = "",
     ) -> List[Dict[str, Any]]:
+        # dominant 偏差直接优先激活；
+        # secondary 偏差则要求当前会话上下文“支持”它出现。
         current_stage = current_stage if isinstance(current_stage, dict) else {}
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation = str(conversation_content or "")
@@ -138,6 +140,8 @@ class ComplaintBiasInjector:
         stage_templates = bias_profile.get("thought_templates", {}) if isinstance(bias_profile.get("thought_templates", {}), dict) else {}
         outputs: List[Dict[str, Any]] = []
         for index, bias_type in enumerate(selected):
+            # 输出结果除了 thought 文本，还保留 stage 来源和 confidence，
+            # 便于后续 prompt 展示与人工审查。
             thought = self._generate_biased_thought(
                 bias_type=bias_type,
                 current_stage=current_stage,
@@ -185,6 +189,7 @@ class ComplaintBiasInjector:
         session_context: Dict[str, Any],
         current_stage: Dict[str, Any],
     ) -> bool:
+        # 这里同样是规则化设计：关键词 / topic / help-context。
         bias_meta = self.bias_library.get(str(bias_type or "").strip(), {})
         keywords = [str(item) for item in self._to_list(bias_meta.get("cue_keywords", []))]
         conversation = str(conversation_content or "")

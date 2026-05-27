@@ -30,7 +30,7 @@ class Scratch:
             return ""
 
         try:
-            template_obj = Template(file_content)
+            template_obj = Template(file_content) # 可替换变量的模板对象
             filled_content = template_obj.safe_substitute(data if isinstance(data, dict) else {})
             return filled_content
         except Exception:
