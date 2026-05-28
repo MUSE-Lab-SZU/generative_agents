@@ -20,6 +20,9 @@ class TraumaMemorySystem:
         session_context: Dict[str, Any],
         conversation_content: str = "",
     ) -> List[Dict[str, Any]]:
+        # 目前是占位实现：始终返回空。
+        # 因此如果你在阅读时看到 prompt builder 支持 memory layer，
+        # 要知道当前工程里这条链路实际上还没有真正启用。
         del current_stage, session_context, conversation_content
         self.memory_context = []
         return []
@@ -29,16 +32,21 @@ class TraumaMemorySystem:
         current_context: Dict[str, Any],
         conversation_content: str = "",
     ) -> List[Dict[str, Any]]:
+        # 为兼容旧接口名而保留，底层仍然走同一个占位实现。
         return self.prepare_memory_context({}, current_context, conversation_content)
 
     def commit_turn(self, *args, **kwargs) -> None:
+        # 未来若真的实现“记忆被触发后需要写回衰减/访问痕迹”，
+        # 很可能就是从这个接口开始扩展。
         del args, kwargs
         return None
 
     def get_activated_thoughts(self) -> List[str]:
+        # 当前没有真实 memory_context，因此这里只能返回空列表。
         return []
 
     def get_physical_reactions(self) -> List[str]:
+        # 例如心悸、僵住、胃部紧缩等身体反应，本版本尚未建模。
         return []
 
     def get_memory_description(self) -> str:
@@ -57,6 +65,8 @@ class TraumaMemorySystem:
         return None
 
     def to_dict(self) -> Dict[str, Any]:
+        # 即使现在是空实现，也先把序列化接口留好，
+        # 这样以后补功能时不用改上层 checkpoint 结构。
         return {
             "config": copy.deepcopy(self.config),
             "enabled": bool(self.enabled),

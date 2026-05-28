@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Callable, Dict, Optional
 
+from .prompt_templates import render_prompt
+
 
 class EmotionInferencer:
     """推断角色在当前轮对话中的瞬时情绪风格。"""
@@ -23,6 +25,8 @@ class EmotionInferencer:
         payload: Dict[str, Any],
         completion_func: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
+        # 默认先构造 fallback，再尝试 LLM；
+        # 这样即使 LLM 不可用，系统也仍然能给出连续的瞬时情绪。
         payload = payload if isinstance(payload, dict) else {}
         fallback = self.build_fallback(payload)
         if not callable(completion_func) or not self.llm_enabled:
@@ -45,33 +49,19 @@ class EmotionInferencer:
         session_context = json.dumps(payload.get("session_context", {}) or {}, ensure_ascii=False)
         previous_emotion = json.dumps(payload.get("previous_emotion", {}) or {}, ensure_ascii=False)
         conversation_content = self._clip_text(payload.get("conversation_content", ""), limit=1200)
-        return (
-            "你是 Emotion Inferencer。\n"
-            "任务：基于当前主诉节点、当前会话上下文、对话对象关系与上一轮瞬时情绪，"
-            "推断角色这一轮说话时的情绪风格。\n"
-            "注意：\n"
-            "1. 你推断的是瞬时说话状态，不是长期病情等级。\n"
-            "2. 情绪变化必须围绕当前主诉节点做小幅、可逆、连贯的摆动。\n"
-            "3. 不得突然痊愈，不得无依据地突然彻底崩塌。\n"
-            "4. 只输出 JSON 对象，不要输出解释、markdown 或额外文本。\n"
-            "输出字段固定为：\n"
-            "{\n"
-            '  "label": "2到12字",\n'
-            '  "style": "15到120字",\n'
-            '  "intensity": 0.0,\n'
-            '  "disclosure_level": 0.0,\n'
-            '  "defensiveness": 0.0,\n'
-            '  "volatility_note": "10到80字"\n'
-            "}\n"
-            "字段约束：intensity / disclosure_level / defensiveness 必须在 0 到 1 之间。\n"
-            f"当前主诉节点：{current_stage}\n"
-            f"当前链窗口：{chain_snapshot}\n"
-            f"会话上下文：{session_context}\n"
-            f"上一轮情绪：{previous_emotion}\n"
-            f"本轮会话内容：{conversation_content if conversation_content else '（暂无明确话语内容）'}\n"
+        return render_prompt(
+            "depression/emotion_inferencer",
+            {
+                "current_stage": current_stage,
+                "chain_snapshot": chain_snapshot,
+                "session_context": session_context,
+                "previous_emotion": previous_emotion,
+                "conversation_content": conversation_content or "（暂无明确话语内容）",
+            },
         )
 
     def build_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """基于 stage + relationship + flags 的规则化情绪兜底。"""
         stage = payload.get("current_stage", {}) if isinstance(payload.get("current_stage", {}), dict) else {}
         session_context = payload.get("session_context", {}) if isinstance(payload.get("session_context", {}), dict) else {}
         previous = payload.get("previous_emotion", {}) if isinstance(payload.get("previous_emotion", {}), dict) else {}
@@ -147,6 +137,8 @@ class EmotionInferencer:
         )
 
         if previous_initialized:
+            # 这一段很关键：通过裁剪 delta，让情绪只做“小幅、可逆”波动，
+            # 避免模型一轮比一轮跳得太离谱。
             intensity = previous_intensity + self._clip_delta(intensity - previous_intensity + jitter * 0.20, self.volatility_limit)
             disclosure_level = previous_disclosure + self._clip_delta(disclosure_level - previous_disclosure + jitter * 0.12, self.volatility_limit)
             defensiveness = previous_defensiveness + self._clip_delta(defensiveness - previous_defensiveness - jitter * 0.12, self.volatility_limit)

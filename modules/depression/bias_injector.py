@@ -6,82 +6,24 @@ import copy
 import random
 from typing import Any, Dict, List, Optional
 
+from .prompt_templates import load_prompt_json
+
 
 class ComplaintBiasInjector:
     """根据当前主诉节点与会话上下文选择认知偏差。"""
 
-    DEFAULT_BIASES: Dict[str, Dict[str, Any]] = {
-        "catastrophizing": {
-            "name": "灾难化思维",
-            "templates": [
-                "这件事不会只是暂时的，它大概会把我后面的一切都拖垮。",
-                "一旦这里出问题，后面只会越来越糟。",
-                "我已经能想到最坏的结果了，而且多半躲不过去。",
-            ],
-            "cue_keywords": ["未来", "前途", "不会好", "越来越糟", "后面"],
-        },
-        "all_or_nothing": {
-            "name": "全或无思维",
-            "templates": [
-                "既然这件事都做不好，那我整体就是失败的。",
-                "我不是做得不够好，而是根本就不行。",
-                "只要出了这个问题，就说明我整个人都站不住。",
-            ],
-            "cue_keywords": ["失败", "彻底", "根本", "整个人", "不行"],
-        },
-        "personalization": {
-            "name": "个人化",
-            "templates": [
-                "不管表面原因是什么，最后还是能绕回我自己的问题。",
-                "如果我不是这样，事情大概就不会变成这样。",
-                "别人再怎么说，我还是会觉得问题主要在我。",
-            ],
-            "cue_keywords": ["都是我", "怪我", "如果我", "拖累", "负担"],
-        },
-        "mental_filter": {
-            "name": "心理过滤",
-            "templates": [
-                "就算有一点好的地方，也很快会被坏的那部分盖过去。",
-                "我脑子里最后留下的总是最差的那一块。",
-                "别人说的那些好话，好像都压不过那个失败的事实。",
-            ],
-            "cue_keywords": ["好的不重要", "只记得坏的", "压不过", "好话"],
-        },
-        "should_statements": {
-            "name": "应该陈述",
-            "templates": [
-                "我本来就应该自己扛住，而不是这样。",
-                "我不该这么脆弱，也不该把这些话说出来。",
-                "我应该更像个能处理好事情的人。",
-            ],
-            "cue_keywords": ["应该", "不该", "必须", "自己扛", "更坚强"],
-        },
-        "fortune_telling": {
-            "name": "预言式推断",
-            "templates": [
-                "我大概已经知道接下来会怎么烂下去了。",
-                "就算现在有人帮我，结果多半也不会好。",
-                "我很难相信这件事后面会出现什么真正不同的走向。",
-            ],
-            "cue_keywords": ["接下来", "多半", "不会好", "结果", "以后"],
-        },
-        "emotional_reasoning": {
-            "name": "情绪推理",
-            "templates": [
-                "我现在这样难受，所以事情大概真的已经糟到没法看了。",
-                "既然我心里一直过不去，那就说明问题根本不小。",
-                "我会这么压着自己，应该是因为事情本身就没有什么余地。",
-            ],
-            "cue_keywords": ["难受", "压着", "过不去", "糟", "没有余地"],
-        },
-    }
+    PROMPT_CONFIG: Dict[str, Any] = load_prompt_json("depression/depression_prompt_config", {})
+    DEFAULT_BIASES: Dict[str, Dict[str, Any]] = (
+        PROMPT_CONFIG.get("bias_library", {}) if isinstance(PROMPT_CONFIG.get("bias_library", {}), dict) else {}
+    )
 
     def __init__(
         self,
         library_override: Optional[Dict[str, Any]] = None,
         selection_policy: Optional[Dict[str, Any]] = None,
     ):
-        self.bias_library = copy.deepcopy(self.DEFAULT_BIASES)
+        base_library = self.DEFAULT_BIASES if isinstance(self.DEFAULT_BIASES, dict) else {}
+        self.bias_library = copy.deepcopy(base_library)
         if isinstance(library_override, dict):
             for key, value in library_override.items():
                 if not isinstance(value, dict):
@@ -98,6 +40,8 @@ class ComplaintBiasInjector:
         session_context: Dict[str, Any],
         conversation_content: str = "",
     ) -> List[Dict[str, Any]]:
+        # dominant 偏差直接优先激活；
+        # secondary 偏差则要求当前会话上下文“支持”它出现。
         current_stage = current_stage if isinstance(current_stage, dict) else {}
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation = str(conversation_content or "")
@@ -138,6 +82,8 @@ class ComplaintBiasInjector:
         stage_templates = bias_profile.get("thought_templates", {}) if isinstance(bias_profile.get("thought_templates", {}), dict) else {}
         outputs: List[Dict[str, Any]] = []
         for index, bias_type in enumerate(selected):
+            # 输出结果除了 thought 文本，还保留 stage 来源和 confidence，
+            # 便于后续 prompt 展示与人工审查。
             thought = self._generate_biased_thought(
                 bias_type=bias_type,
                 current_stage=current_stage,
@@ -185,6 +131,7 @@ class ComplaintBiasInjector:
         session_context: Dict[str, Any],
         current_stage: Dict[str, Any],
     ) -> bool:
+        # 这里同样是规则化设计：关键词 / topic / help-context。
         bias_meta = self.bias_library.get(str(bias_type or "").strip(), {})
         keywords = [str(item) for item in self._to_list(bias_meta.get("cue_keywords", []))]
         conversation = str(conversation_content or "")

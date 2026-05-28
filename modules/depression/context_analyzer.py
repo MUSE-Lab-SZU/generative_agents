@@ -36,6 +36,8 @@ class SessionContextBuilder:
         interaction_type: Optional[str] = None,
         conversation_content: str = "",
     ) -> Dict[str, Any]:
+        # 这里是一个明显的“规则系统”，不是语义理解模型：
+        # 所有 topic / speech_act / stance 都来自关键词匹配。
         conversation = str(conversation_content or "").strip()
         scene = {
             "location": str(location or "").strip(),
@@ -113,6 +115,8 @@ class SessionContextBuilder:
         relationship: str,
         interaction_type: str,
     ) -> Dict[str, Any]:
+        # 语义线索的目标不是精确 NLP，而是给后续状态机提供
+        # “足够稳定、可解释”的粗粒度标签。
         conversation = str(conversation_content or "")
         topics: List[str] = []
         for topic, keywords in self.TOPIC_RULES.items():

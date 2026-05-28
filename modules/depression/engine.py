@@ -17,7 +17,19 @@ from .state_machine import ComplaintChainManager
 
 
 class DepressionSimulationEngine:
-    """由主诉链驱动的动态抑郁表现引擎。"""
+    """由主诉链驱动的动态抑郁表现引擎。
+
+    可以把本类理解成一个“编排器”：
+    - `SessionContextBuilder`：先把对话场景整理成结构化上下文；
+    - `ComplaintChainManager`：判断当前是否仍处在同一主诉节点，是否推进；
+    - `ComplaintBiasInjector`：决定本轮要显性呈现哪些认知偏差；
+    - `EmotionInferencer`：给出本轮瞬时情绪；
+    - `DynamicPromptBuilder`：把以上内容拼回 prompt。
+
+    最重要的接口有两个：
+    - `preview_interaction_prompt()`：只预览，不落盘状态；
+    - `commit_interaction()`：真正提交本轮并推进内部状态。
+    """
 
     def __init__(
         self,
@@ -78,6 +90,8 @@ class DepressionSimulationEngine:
         interaction_type: Optional[str] = None,
         conversation_content: str = "",
     ) -> str:
+        # 这个接口会直接 commit，因此更适合“确认发生过的互动”；
+        # 如果只是为了生成 prompt 预览，优先看 `preview_interaction_prompt()`。
         runtime = self.commit_interaction(
             location=location,
             time_of_day=time_of_day,
@@ -114,6 +128,7 @@ class DepressionSimulationEngine:
         if not self.enabled:
             return self.base_prompt
 
+        # 第 1 步：把调用方传来的碎片信息整理成统一的 session_context。
         session_context = self.context_builder.build_context(
             location=location,
             time_of_day=time_of_day,
@@ -122,6 +137,7 @@ class DepressionSimulationEngine:
             interaction_type=interaction_type,
             conversation_content=conversation_content,
         )
+        # 第 2 步：先在当前状态上做“如果这轮发生，会怎样”的评估。
         evaluation = self.chain_manager.evaluate_turn(
             session_context=session_context,
             conversation_content=conversation_content,
@@ -129,11 +145,13 @@ class DepressionSimulationEngine:
             llm_cfg=roadmap_llm_cfg,
             llm_signal=llm_transition_signal,
         )
+        # 第 3 步：克隆一个 manager 做 preview commit，避免污染真实状态。
         preview_manager = ComplaintChainManager.from_dict(
             self.chain_manager.to_dict(), now_provider=self._clock_provider
         )
         preview_chain = preview_manager.commit_turn(copy.deepcopy(evaluation))
         current_stage = preview_manager.get_current_stage()
+        # 第 4 步：在 preview 后的节点上推断偏差、记忆和瞬时情绪。
         biases = self.bias_injector.inject_bias(current_stage, session_context, conversation_content)
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
         emotion = self._infer_emotion(
@@ -174,6 +192,8 @@ class DepressionSimulationEngine:
                 "session_context": {},
             }
 
+        # commit 版本与 preview 共享同一条流水线，
+        # 差别在于这里会真正修改 `chain_manager` / `interaction_count`。
         session_context = self.context_builder.build_context(
             location=location,
             time_of_day=time_of_day,
@@ -230,6 +250,8 @@ class DepressionSimulationEngine:
         conversation_content: str,
         completion_func: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
+        # 情绪推断刻意使用“上一轮情绪 + 本轮上下文”的组合，
+        # 目的是让说话状态连续变化，而不是每轮都从头随机生成。
         payload = {
             "current_stage": copy.deepcopy(current_stage),
             "chain_snapshot": copy.deepcopy(chain_snapshot),
@@ -305,8 +327,10 @@ class DepressionSimulationEngine:
         return cls(config={"config_path": config_path, "agent_dir": agent_dir})
 
     def to_dict(self) -> Dict[str, Any]:
+        config_reference = self._state_config_reference()
         return {
-            "config": copy.deepcopy(self.raw_config),
+            "config": copy.deepcopy(config_reference),
+            "config_reference": copy.deepcopy(config_reference),
             "enabled": bool(self.enabled),
             "base_prompt": str(self.base_prompt or ""),
             "interaction_count": int(self.interaction_count),
@@ -320,8 +344,15 @@ class DepressionSimulationEngine:
         }
 
     def load_state(self, payload: Dict[str, Any]) -> None:
+        """从序列化结果恢复引擎状态。
+
+        阅读时可重点留意：
+        1. 配置会被重新解析；
+        2. chain/context/bias/memory 都会分别恢复；
+        3. emotion/prompt_builder 会按最新配置重新实例化。
+        """
         payload = payload if isinstance(payload, dict) else {}
-        config = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else self.raw_config
+        config = self._select_state_config(payload)
         refreshed = self._resolve_config(config)
         self.raw_config = copy.deepcopy(refreshed)
         self.config_path = str(refreshed.get("_config_path", "") or "")
@@ -342,7 +373,11 @@ class DepressionSimulationEngine:
         self.last_session_context = copy.deepcopy(payload.get("last_session_context", {})) if isinstance(payload.get("last_session_context", {}), dict) else {}
 
         chain_payload = payload.get("chain_manager", {}) if isinstance(payload.get("chain_manager", {}), dict) else {}
-        self.chain_manager = ComplaintChainManager.from_dict(chain_payload, now_provider=self._clock_provider)
+        self.chain_manager = ComplaintChainManager.from_dict(
+            chain_payload,
+            now_provider=self._clock_provider,
+            base_config=refreshed.get("complaint_chain", {}) if isinstance(refreshed.get("complaint_chain", {}), dict) else {},
+        )
         self.state_machine = self.chain_manager
 
         context_payload = payload.get("context_builder", {}) if isinstance(payload.get("context_builder", {}), dict) else {}
@@ -386,14 +421,15 @@ class DepressionSimulationEngine:
             return data
 
         config = config if isinstance(config, dict) else {}
-        if isinstance(config.get("config_path"), str) and config.get("config_path", "").strip():
-            config_path = os.path.abspath(str(config.get("config_path") or "").strip())
+        config_path_value = config.get("config_path", config.get("_config_path", ""))
+        if isinstance(config_path_value, str) and config_path_value.strip():
+            config_path = os.path.abspath(str(config_path_value or "").strip())
             if os.path.isfile(config_path):
                 data = cls._load_json_file(config_path)
                 data["_config_path"] = config_path
                 data["_agent_dir"] = os.path.dirname(config_path)
                 return data
-        agent_dir = str(config.get("agent_dir", "") or "").strip()
+        agent_dir = str(config.get("agent_dir", config.get("_agent_dir", "")) or "").strip()
         if agent_dir:
             config_path = os.path.join(os.path.abspath(agent_dir), "depression_config.json")
             if os.path.isfile(config_path):
@@ -409,6 +445,29 @@ class DepressionSimulationEngine:
             nested.setdefault("_agent_dir", str(data.get("_agent_dir", "") or ""))
             return nested
         return data
+
+    def _state_config_reference(self) -> Dict[str, Any]:
+        ref: Dict[str, Any] = {}
+        if self.config_path:
+            ref["config_path"] = str(self.config_path)
+        if self.agent_dir:
+            ref["agent_dir"] = str(self.agent_dir)
+        agent_name = self._infer_agent_name(self.raw_config)
+        if agent_name:
+            ref["agent_name"] = agent_name
+        return ref
+
+    def _select_state_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        current_ref = self._state_config_reference()
+        if current_ref.get("config_path") or current_ref.get("agent_dir"):
+            return current_ref
+
+        for key in ("config_reference", "config"):
+            value = payload.get(key, {})
+            if isinstance(value, dict) and value:
+                return copy.deepcopy(value)
+
+        return copy.deepcopy(self.raw_config if isinstance(self.raw_config, dict) and self.raw_config else current_ref)
 
     def _infer_agent_name(self, config: Dict[str, Any]) -> str:
         explicit = str(config.get("agent_name", "") or config.get("name", "") or self.profile.get("name", "") or "").strip()
