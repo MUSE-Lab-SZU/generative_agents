@@ -31,11 +31,12 @@ CHECKPOINTS_ROOT = BASE_DIR / "results" / "checkpoints"
 # =========================
 # 配置区（按需修改）
 # =========================
-CHECKPOINT_DIR = Path("results/checkpoints/sim-test-0515-2")
-SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20250529-1530.json"
+CHECKPOINT_DIR = Path("results/checkpoints/sim-test-0525")
+SNAPSHOT_FILE = CHECKPOINT_DIR / "simulate-20260527-1530.json"
 AGENT_NAME = "卡布达"  # 设为 None 则自动取快照里的第一个角色
 
-OUTPUT_DIR = CHECKPOINT_DIR / "memory_visualization"
+# OUTPUT_DIR = CHECKPOINT_DIR / "memory_visualization"
+OUTPUT_DIR = "results/experiment_data/sim-test-0525/visualizations"
 OUTPUT_NAME_PREFIX = ""  # 留空则自动生成
 
 SORT_BY = "create"  # 可选: create / access / node_id / snapshot

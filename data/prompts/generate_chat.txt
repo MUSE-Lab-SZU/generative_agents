@@ -2,6 +2,7 @@
 ${base_desc}
 
 ${depression_chat_block}
+${meeting_prompt_injection}
 ${doctor_session_prompt_injection}
 ${doctor_consult_record_injection}
 ${consult_history_memory}

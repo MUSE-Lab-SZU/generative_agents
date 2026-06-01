@@ -1,0 +1,51 @@
+{
+  "intervention": {
+    "enabled": true,
+    "doctor": "",
+    "patients": [
+      "卡布达"
+    ],
+    "meeting_rules": [],
+    "resident_chat_scheduler": {
+      "enabled": true,
+      "rules": [
+        {
+          "rule_id": "g5_random_negative_chat",
+          "type": "interval_steps",
+          "interval_steps": 4,
+          "step_phase": 2,
+          "target_patient": "卡布达",
+          "resident_candidates": [
+            "田德莉娜",
+            "呱呱蛙",
+            "蟑螂恶霸"
+          ],
+          "selection_strategy": "random_no_repeat",
+          "duration": 1440,
+          "prompt_file": "data/prompts/intervention/resident_chat_negative_support.txt"
+        }
+      ]
+    },
+    "session_prompt_injection": {
+      "enabled": false
+    },
+    "dialog_judge": {
+      "enabled": false
+    },
+    "session_eval": {
+      "enabled": false
+    },
+    "consult_record": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": false
+    },
+    "order_extract": {
+      "enabled": false
+    },
+    "forced_llm": {
+      "enabled": true
+    }
+  }
+}

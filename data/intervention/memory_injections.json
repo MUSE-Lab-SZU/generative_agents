@@ -18,6 +18,51 @@
             "stress",
             "bootstrap"
           ]
+        },
+        {
+          "item_id": "kbd_stress_event_002",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因跟不上同龄人进度而感到羞耻",
+          "describe": "看到同龄人按部就班毕业和找工作时，卡布达会因为自己休学而感到落后，不敢主动回应别人问近况。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_thought_003",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我可能回不到正常的学习和工作节奏",
+          "describe": "卡布达常担心自己即使现在努力调整作息和状态，也很难恢复到稳定的学习与工作节律。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_004",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "一想到重新回到学校或承担稳定工作就会紧张",
+          "describe": "每当想到重新回到学校、继续完成学业或承担更稳定的工作时，卡布达就会担心自己再次撑不住，最后证明自己根本做不好。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
         }
       ]
     },

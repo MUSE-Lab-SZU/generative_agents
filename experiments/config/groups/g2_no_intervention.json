@@ -1,0 +1,39 @@
+{
+  "intervention": {
+    "enabled": false,
+    "meeting_queue": {
+      "enabled": false
+    },
+    "meeting_rules": [],
+    "order_extract": {
+      "enabled": false
+    },
+    "session_prompt_injection": {
+      "enabled": false
+    },
+    "chat_controls": {
+      "enabled": false
+    },
+    "forced_llm": {
+      "enabled": false
+    },
+    "dialog_judge": {
+      "enabled": false
+    },
+    "session_eval": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": false
+    },
+    "depression_dynamic": {
+      "enabled": true
+    },
+    "memory_injection": {
+      "enabled": true
+    },
+    "memory_policy": {
+      "enabled": true
+    }
+  }
+}

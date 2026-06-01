@@ -2,14 +2,14 @@
 """
 抑郁症治疗遍历实验自动化脚本。
 
-遍历 3(severity) × 2(dynamic/static) = 6 个实验条件，
-每个条件依次：替换配置 → 运行模拟 → 合并记录 → 收集数据。
+第一阶段遍历 2(group) × 3(severity) = 6 个实验条件，
+每个条件依次：替换配置 → 运行模拟 → 合并记录 → 收集数据 → 前后量表 → compress → 可视化。
 
 用法：
-  python runshells/run_experiment.py                    # 完整遍历
-  python runshells/run_experiment.py --dry-run          # 只打印操作
-  python runshells/run_experiment.py --condition Counsel-MOD-DYN  # 只跑单个条件
-  python runshells/run_experiment.py --skip-simulation  # 跳过模拟，只收集已有数据
+  python runshells/run_experiment.py                     # 完整遍历
+  python runshells/run_experiment.py --dry-run           # 只打印操作
+  python runshells/run_experiment.py --condition Counsel-G1-MILD  # 只跑单个条件
+  python runshells/run_experiment.py --skip-simulation   # 跳过模拟，只收集已有数据
 """
 
 from __future__ import annotations
@@ -36,10 +36,14 @@ DEPRESSION_CONFIG = os.path.join(
     BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "depression_config.json"
 )
 GLOBAL_CONFIG = os.path.join(BASE_DIR, "data", "config.json")
+EXPERIMENT_GROUP_DIR = os.path.join(BASE_DIR, "experiments", "config", "groups")
 
 # ─── 外部脚本 ─────────────────────────────────────────────────
 START_SCRIPT = os.path.join(BASE_DIR, "start.py")
 MERGE_SCRIPT = os.path.join(BASE_DIR, "merge_consultation_dialogues.py")
+COMPRESS_SCRIPT = os.path.join(BASE_DIR, "compress.py")
+AGENT_MEMORY_VIS_SCRIPT = os.path.join(BASE_DIR, "visualize_agent_memory.py")
+EXTERNAL_MEMORY_AUDIT_SCRIPT = os.path.join(BASE_DIR, "visualize_external_memory_audit.py")
 
 # ─── 数据目录 ─────────────────────────────────────────────────
 CHECKPOINTS_ROOT = os.path.join(BASE_DIR, "results", "checkpoints")
@@ -48,55 +52,44 @@ EXPERIMENT_DATA_ROOT = os.path.join(BASE_DIR, "results", "experiment_data")
 # ─── 备份目录 ─────────────────────────────────────────────────
 BACKUP_DIR = os.path.join(tempfile.gettempdir(), "generative_agents_config_backup")
 
-# ─── Case 文件路径（三种严重程度） ──────────────────────────────
-CASE_FILES = {
-    "mild": os.path.join(BASE_DIR, "data", "depression_cases", "mild-depression-case.json"),
-    "moderate": os.path.join(BASE_DIR, "data", "depression_cases", "moderate-depression-case.json"),
-    "severe": os.path.join(BASE_DIR, "data", "depression_cases", "severe-depression-case.json"),
-}
+# ============================================================
+# ↓↓↓ 可调参数：直接修改这里即可（中文注释）↓↓↓
+# ============================================================
 
-# ─── 动态配置按严重程度的参数映射 ────────────────────────────────
-DYNAMIC_SEVERITY_PARAMS = {
-    "mild": {
-        "initial_state": "mild_episode",
-        "initial_stage": {
-            "label": "将低落和疲惫归因于环境和疲劳",
-            "description": "你倾向于将情绪低落和兴趣减退解释为'最近太忙了'或'没休息好'，虽然偶尔承认可能有心理层面的问题，但主要还是用外部原因来合理化自己的状态。",
-            "distress_level": 0.4,
-            "openness_level": 0.55,
-            "hopefulness_level": 0.5,
-            "terminal_recovery": False,
-        },
-    },
-    "moderate": {
-        "initial_state": "moderate_episode",
-        "initial_stage": {
-            "label": "把学业受挫和低落感当成人生失败",
-            "description": "你很容易把休学、效率下降和持续疲惫解释成'我这个人本来就不行'，既害怕让人失望，又不相信自己真的能好起来。",
-            "distress_level": 0.75,
-            "openness_level": 0.25,
-            "hopefulness_level": 0.15,
-            "terminal_recovery": False,
-        },
-    },
-    "severe": {
-        "initial_state": "severe_episode",
-        "initial_stage": {
-            "label": "深陷绝望与自我否定的泥沼",
-            "description": "你感到彻底的绝望和无价值感，认为自己的存在只会给他人带来痛苦。对未来完全没有期待，甚至觉得死亡是一种解脱。你对治疗持怀疑态度，认为没有什么能帮到你。",
-            "distress_level": 0.95,
-            "openness_level": 0.08,
-            "hopefulness_level": 0.03,
-            "terminal_recovery": False,
-        },
-    },
+RUN_NAME = ""
+START_TIME = "20260530-09:30"
+STEP = 48
+STRIDE = 360
+LOG_FILE = "run_experiment.log"
+
+RUN_SIMULATION = True
+RUN_MERGE = True
+RUN_POST_SCALE = True
+RUN_COMPRESS = True
+RUN_AGENT_MEMORY_VIS = True
+RUN_EXTERNAL_MEMORY_AUDIT = True
+DRY_RUN = False
+
+# ============================================================
+# ↑↑↑ 可调参数：直接修改这里即可（中文注释）↑↑↑
+# ============================================================
+
+# ─── Severity 配置文件（第一阶段仅使用卡布达现有三份配置） ─────────
+SEVERITY_CONFIG_FILES = {
+    "mild": os.path.join(BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "depression_config_mild.json"),
+    "moderate": os.path.join(BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "depression_config_moderate.json"),
+    "severe": os.path.join(BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "depression_config_severe.json"),
+}
+GROUP_OVERLAY_FILES = {
+    "g1": os.path.join(EXPERIMENT_GROUP_DIR, "g1_doctor_intervention.json"),
+    "g2": os.path.join(EXPERIMENT_GROUP_DIR, "g2_no_intervention.json"),
 }
 
 # ─── 实验参数 ─────────────────────────────────────────────────
+GROUPS = ["g1", "g2"]
 SEVERITIES = ["mild", "moderate", "severe"]
-PERSONAS = ["dynamic", "static"]
-SIM_STEP = 60
-SIM_STRIDE = 360
+SIM_STEP = STEP
+SIM_STRIDE = STRIDE
 
 # 需要备份的文件列表
 BACKUP_FILES = {
@@ -107,12 +100,12 @@ BACKUP_FILES = {
 
 # ─── 实验条件列表 ─────────────────────────────────────────────
 ALL_CONDITIONS: List[Tuple[str, str, str]] = []
-for _sev in SEVERITIES:
-    for _per in PERSONAS:
+for _group in GROUPS:
+    for _sev in SEVERITIES:
         _sev_short = {"mild": "MILD", "moderate": "MOD", "severe": "SEV"}[_sev]
-        _per_short = {"dynamic": "DYN", "static": "STA"}[_per]
-        _name = f"Counsel-{_sev_short}-{_per_short}"
-        ALL_CONDITIONS.append((_name, _sev, _per))
+        _group_short = _group.upper()
+        _name = f"Counsel-{_group_short}-{_sev_short}"
+        ALL_CONDITIONS.append((_name, _group, _sev))
 
 
 # ─── 旧报告恢复数据（session_eval only）─────────────────────
@@ -153,19 +146,19 @@ RECOVERED_SESSION_EVAL = {
 # ─── 三量表配置 ───────────────────────────────────────────────
 SCALES: Dict[str, dict] = {
     "PHQ-9": {
-        "question_file": "PHQ-9.jsonl",
+        "question_file": "PHQ-9-v2.jsonl",
         "scoring_prompt": "PHQ-9评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 9,
     },
     "BDI-II": {
-        "question_file": "BDI-II.jsonl",
+        "question_file": "BDI-II-v2.jsonl",
         "scoring_prompt": "BDI-II评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 21,
     },
     "SDS": {
-        "question_file": "SDS.jsonl",
+        "question_file": "SDS-v2.jsonl",
         "scoring_prompt": "SDS评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 20,
@@ -177,137 +170,66 @@ SCALES: Dict[str, dict] = {
 # 配置文件替换接口（预留，后续逐个实现）
 # ═══════════════════════════════════════════════════════════════
 
-def prepare_agent_config(severity: str, dry_run: bool = False) -> None:
-    """根据严重程度替换 agent.json 的 depression_profile 部分。
-
-    从 {severity}-depression-case.json 读取 case_config、render_order、
-    dialogue_protocol、important_notice、current_event，写入 agent.json。
-    同时更新 currently 和 scratch（三种严重程度统一）。
-    """
-    case_file = CASE_FILES.get(severity)
-    if not case_file or not os.path.exists(case_file):
-        print(f"  [ERROR] case 文件不存在: {case_file}")
-        return
-
-    with open(case_file, "r", encoding="utf-8") as f:
-        case_data = json.load(f)
-
-    # case 文件以 severity 为顶层 key
-    severity_data = case_data.get(severity, case_data)
-
-    if dry_run:
-        print(f"  [DRY-RUN] prepare_agent_config(severity={severity})")
-        print(f"    case_config keys: {list(severity_data.get('case_config', {}).keys())}")
-        print(f"    render_order keys: {list(severity_data.get('render_order', {}).keys())}")
-        print(f"    currently: {severity_data.get('currently', '(unchanged)')}")
-        return
-
-    with open(AGENT_JSON, "r", encoding="utf-8") as f:
-        agent = json.load(f)
-
-    # depression_profile
-    dp = agent.setdefault("depression_profile", {})
-    dp["severity"] = severity
-    dp["case_config"] = severity_data["case_config"]
-    dp["render_order"] = severity_data["render_order"]
-    dp["dialogue_protocol"] = severity_data.get("dialogue_protocol", [])
-    dp["important_notice"] = severity_data.get(
-        "important_notice",
-        dp.get("important_notice", ""),
-    )
-
-    # current_event → runtime.current_event
-    ce = severity_data.get("current_event")
-    if ce:
-        dp.setdefault("runtime", {})["current_event"] = ce
-
-    # currently + scratch（统一更新）
-    if "currently" in severity_data:
-        agent["currently"] = severity_data["currently"]
-    if "scratch" in severity_data:
-        agent["scratch"] = severity_data["scratch"]
-
-    with open(AGENT_JSON, "w", encoding="utf-8") as f:
-        json.dump(agent, f, ensure_ascii=False, indent=2)
-
-    print(f"  [OK] agent.json depression_profile → severity={severity}")
+def load_json_file(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def prepare_depression_config(severity: str, persona: str, dry_run: bool = False) -> None:
-    """根据严重程度和人设类型替换 depression_config.json。
 
-    - dynamic: 替换为对应严重程度的完整配置（depression_simulation.enabled: true）
-    - static:  替换为 {"depression_simulation": {"enabled": false}}
-
-    后续确认每种 severity 的动态配置具体内容后实现 dynamic 部分。
-    """
-    if persona == "static":
-        static_config = {"depression_simulation": {"enabled": False}}
-        if not dry_run:
-            with open(DEPRESSION_CONFIG, "w", encoding="utf-8") as f:
-                json.dump(static_config, f, ensure_ascii=False, indent=2)
-            print(f"  [OK] 写入静态 depression_config.json (enabled=false)")
+def deep_merge_dict(base: dict, overlay: dict) -> dict:
+    merged = json.loads(json.dumps(base, ensure_ascii=False))
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dict(merged[key], value)
         else:
-            print(f"  [DRY-RUN] 写入静态 depression_config.json: {static_config}")
-        return
+            merged[key] = value
+    return merged
 
-    # dynamic: 基于当前 depression_config.json 结构，替换 complaint_roadmap
-    params = DYNAMIC_SEVERITY_PARAMS.get(severity)
-    if not params:
-        print(f"  [ERROR] 未知的 severity: {severity}")
-        return
+
+
+def prepare_agent_config(severity: str, dry_run: bool = False) -> None:
+    del severity
+    if dry_run:
+        print("  [DRY-RUN] prepare_agent_config(no-op)")
+
+
+
+def prepare_depression_config(severity: str, dry_run: bool = False) -> None:
+    """直接用现成的 severity 配置覆盖默认 depression_config.json。"""
+    source_path = SEVERITY_CONFIG_FILES.get(severity)
+    if not source_path or not os.path.exists(source_path):
+        raise FileNotFoundError(f"severity 配置不存在: {source_path}")
 
     if dry_run:
-        print(f"  [DRY-RUN] prepare_depression_config(severity={severity}, persona=dynamic)")
-        print(f"    initial_state: {params['initial_state']}")
-        print(f"    distress: {params['initial_stage']['distress_level']}, "
-              f"openness: {params['initial_stage']['openness_level']}, "
-              f"hope: {params['initial_stage']['hopefulness_level']}")
+        print(f"  [DRY-RUN] prepare_depression_config(severity={severity})")
+        print(f"    source: {source_path}")
+        print(f"    target: {DEPRESSION_CONFIG}")
         return
 
-    with open(DEPRESSION_CONFIG, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    sim = config.setdefault("depression_simulation", {})
-    sim["enabled"] = True
-
-    roadmap = sim.setdefault("complaint_roadmap", {})
-    roadmap["initial_state"] = params["initial_state"]
-    roadmap["initial_stage"] = params["initial_stage"]
-
-    with open(DEPRESSION_CONFIG, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-    print(f"  [OK] depression_config.json → severity={severity}, enabled=true")
+    shutil.copy2(source_path, DEPRESSION_CONFIG)
+    print(f"  [OK] depression_config.json → severity={severity}")
 
 
-def prepare_global_config(persona: str, dry_run: bool = False, local_llm: bool = False) -> None:
-    """根据人设类型修改 data/config.json 的全局开关。
 
-    - dynamic: depression_dynamic.enabled=true, depression_update.enabled=false
-    - static:  depression_dynamic.enabled=false, depression_update.enabled=false
-    """
-    if persona == "dynamic":
-        dynamic_enabled = True
-    else:
-        dynamic_enabled = False
+def prepare_global_config(group: str, dry_run: bool = False, local_llm: bool = False) -> str:
+    """根据 group overlay 修改 data/config.json。"""
+    overlay_path = GROUP_OVERLAY_FILES.get(group)
+    if not overlay_path or not os.path.exists(overlay_path):
+        raise FileNotFoundError(f"group overlay 不存在: {overlay_path}")
 
     if dry_run:
-        print(f"  [DRY-RUN] prepare_global_config(persona={persona})")
-        print(f"    depression_dynamic.enabled → {dynamic_enabled}")
-        print(f"    depression_update.enabled → false")
+        print(f"  [DRY-RUN] prepare_global_config(group={group})")
+        print(f"    overlay: {overlay_path}")
         if local_llm:
             print("    forced_llm → Ollama qwen3:32b")
-        return
+        return overlay_path
 
-    with open(GLOBAL_CONFIG, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    intervention = config.setdefault("intervention", {})
-    intervention.setdefault("depression_dynamic", {})["enabled"] = dynamic_enabled
-    intervention.setdefault("depression_update", {})["enabled"] = False
+    config = load_json_file(GLOBAL_CONFIG)
+    overlay = load_json_file(overlay_path)
+    merged = deep_merge_dict(config, overlay)
 
     if local_llm:
+        intervention = merged.setdefault("intervention", {})
         forced_llm = intervention.setdefault("forced_llm", {})
         forced_llm.update({
             "provider": "ollama",
@@ -317,11 +239,12 @@ def prepare_global_config(persona: str, dry_run: bool = False, local_llm: bool =
         forced_llm.pop("api_key_env", None)
 
     with open(GLOBAL_CONFIG, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+        json.dump(merged, f, ensure_ascii=False, indent=2)
 
-    print(f"  [OK] config.json → depression_dynamic.enabled={dynamic_enabled}")
+    print(f"  [OK] config.json → group={group} overlay={os.path.basename(overlay_path)}")
     if local_llm:
         print("  [OK] config.json → forced_llm = Ollama qwen3:32b")
+    return overlay_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -330,6 +253,12 @@ def prepare_global_config(persona: str, dry_run: bool = False, local_llm: bool =
 
 def backup_configs(dry_run: bool = False) -> None:
     """备份当前配置文件到临时目录。"""
+    if dry_run:
+        print(f"  [DRY-RUN] backup dir: {BACKUP_DIR}")
+        for label, path in BACKUP_FILES.items():
+            print(f"  [DRY-RUN] backup {label}: {path}")
+        return
+
     if os.path.exists(BACKUP_DIR):
         shutil.rmtree(BACKUP_DIR)
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -337,20 +266,24 @@ def backup_configs(dry_run: bool = False) -> None:
         if os.path.exists(path):
             dest = os.path.join(BACKUP_DIR, label)
             shutil.copy2(path, dest)
-            if not dry_run:
-                print(f"  [BACKUP] {label} → {dest}")
+            print(f"  [BACKUP] {label} → {dest}")
         else:
             print(f"  [WARN] 备份源文件不存在: {path}")
 
 
 def restore_configs(dry_run: bool = False) -> None:
     """从临时目录恢复原始配置文件。"""
+    if dry_run:
+        print(f"  [DRY-RUN] restore dir: {BACKUP_DIR}")
+        for label, path in BACKUP_FILES.items():
+            print(f"  [DRY-RUN] restore {label}: {path}")
+        return
+
     for label, path in BACKUP_FILES.items():
         src = os.path.join(BACKUP_DIR, label)
         if os.path.exists(src):
             shutil.copy2(src, path)
-            if not dry_run:
-                print(f"  [RESTORE] {label} → {path}")
+            print(f"  [RESTORE] {label} → {path}")
         else:
             print(f"  [WARN] 备份文件不存在: {src}")
 
@@ -359,15 +292,36 @@ def restore_configs(dry_run: bool = False) -> None:
 # 模拟运行
 # ═══════════════════════════════════════════════════════════════
 
-def run_simulation(trial_name: str, dry_run: bool = False, sim_step: int = SIM_STEP, local_llm: bool = False) -> bool:
+def build_trial_run_name(trial_name: str, run_name_base: str = "") -> str:
+    suffix = f"{trial_name}-{time.strftime('%m%d-%H%M')}"
+    base = str(run_name_base or "").strip()
+    if not base:
+        return suffix
+    return f"{base}-{suffix}"
+
+
+
+def run_simulation(
+    trial_name: str,
+    run_name_base: str = "",
+    start_time: str = START_TIME,
+    stride: int = STRIDE,
+    log_file: str = LOG_FILE,
+    dry_run: bool = False,
+    sim_step: int = SIM_STEP,
+    local_llm: bool = False,
+) -> Tuple[bool, str]:
     """调用 start.py 运行模拟。自动添加时间后缀避免名称冲突。"""
-    run_name = f"{trial_name}-{time.strftime('%m%d-%H%M')}"
+    run_name = build_trial_run_name(trial_name, run_name_base)
     cmd = [
         sys.executable, START_SCRIPT,
         "--name", run_name,
+        "--start", str(start_time),
         "--step", str(sim_step),
-        "--stride", str(SIM_STRIDE),
+        "--stride", str(stride),
     ]
+    if str(log_file or "").strip():
+        cmd.extend(["--log", str(log_file).strip()])
     print(f"  [RUN] {' '.join(cmd)}")
     if dry_run:
         return True, run_name
@@ -387,6 +341,7 @@ def run_simulation(trial_name: str, dry_run: bool = False, sim_step: int = SIM_S
     except Exception as e:
         print(f"  [ERROR] 模拟异常: {e}")
         return False, run_name
+
 
 
 def merge_dialogues(trial_name: str, dry_run: bool = False) -> bool:
@@ -410,6 +365,68 @@ def merge_dialogues(trial_name: str, dry_run: bool = False) -> bool:
         return True
 
 
+
+def run_compress(trial_name: str, dry_run: bool = False) -> bool:
+    cmd = [sys.executable, COMPRESS_SCRIPT, "--name", trial_name]
+    print(f"  [RUN] {' '.join(cmd)}")
+    if dry_run:
+        return True
+    try:
+        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
+        if result.returncode != 0:
+            print(f"  [WARN] compress 返回非零退出码: {result.returncode}")
+        return True
+    except Exception as e:
+        print(f"  [WARN] compress 异常: {e}")
+        return True
+
+
+
+def run_agent_memory_visualization(trial_name: str, agent_name: str = "卡布达", dry_run: bool = False) -> bool:
+    output_dir = os.path.join(EXPERIMENT_DATA_ROOT, trial_name, "visualizations", "agent_memory")
+    cmd = [
+        sys.executable,
+        AGENT_MEMORY_VIS_SCRIPT,
+        "--cp-name", trial_name,
+        "--agent", agent_name,
+        "--output-dir", output_dir,
+    ]
+    print(f"  [RUN] {' '.join(cmd)}")
+    if dry_run:
+        return True
+    try:
+        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
+        if result.returncode != 0:
+            print(f"  [WARN] agent memory visualization 返回非零退出码: {result.returncode}")
+        return True
+    except Exception as e:
+        print(f"  [WARN] agent memory visualization 异常: {e}")
+        return True
+
+
+
+def run_external_memory_audit(trial_name: str, agent_name: str = "卡布达", dry_run: bool = False) -> bool:
+    output_root = os.path.join(EXPERIMENT_DATA_ROOT, trial_name, "visualizations", "external_memory_audit")
+    cmd = [
+        sys.executable,
+        EXTERNAL_MEMORY_AUDIT_SCRIPT,
+        "--cp-name", trial_name,
+        "--agent", agent_name,
+        "--output-root", output_root,
+    ]
+    print(f"  [RUN] {' '.join(cmd)}")
+    if dry_run:
+        return True
+    try:
+        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
+        if result.returncode != 0:
+            print(f"  [WARN] external memory audit 返回非零退出码: {result.returncode}")
+        return True
+    except Exception as e:
+        print(f"  [WARN] external memory audit 异常: {e}")
+        return True
+
+
 # ═══════════════════════════════════════════════════════════════
 # 数据收集
 # ═══════════════════════════════════════════════════════════════
@@ -428,10 +445,23 @@ def _analyze_session_eval(judge_file: str, trial_name: str) -> None:
         print(f"  [SESSION-EVAL] {trial_name}: 未找到 efficacy_score 数据")
 
 
-def collect_trial_data(trial_name: str, severity: str, persona: str, dry_run: bool = False, round_idx: int = 1) -> None:
+def collect_trial_data(
+    run_name: str,
+    group: str,
+    severity: str,
+    overlay_path: str,
+    condition_name: str = "",
+    run_name_base: str = "",
+    start_time: str = START_TIME,
+    step_count: int = SIM_STEP,
+    stride: int = SIM_STRIDE,
+    log_file: str = LOG_FILE,
+    dry_run: bool = False,
+    round_idx: int = 1,
+) -> None:
     """从 checkpoint 收集试验数据到 experiment_data 目录。"""
-    checkpoint_dir = os.path.join(CHECKPOINTS_ROOT, trial_name)
-    output_dir = os.path.join(EXPERIMENT_DATA_ROOT, trial_name)
+    checkpoint_dir = os.path.join(CHECKPOINTS_ROOT, run_name)
+    output_dir = os.path.join(EXPERIMENT_DATA_ROOT, run_name)
 
     if not os.path.exists(checkpoint_dir):
         print(f"  [SKIP] checkpoint 目录不存在: {checkpoint_dir}")
@@ -443,70 +473,87 @@ def collect_trial_data(trial_name: str, severity: str, persona: str, dry_run: bo
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 创建子目录
     configs_dir = os.path.join(output_dir, "configs")
     traces_dir = os.path.join(output_dir, "traces")
     scales_dir = os.path.join(output_dir, "scales")
-    expert_dir = os.path.join(output_dir, "scales", "expert")
+    expert_dir = os.path.join(scales_dir, "expert")
     for d in [configs_dir, traces_dir, scales_dir, expert_dir]:
         os.makedirs(d, exist_ok=True)
 
-    # 复制配置快照 → configs/
-    for label, path in BACKUP_FILES.items():
-        if os.path.exists(path):
-            shutil.copy2(path, os.path.join(configs_dir, f"original_{label}"))
-
-    # 复制当前使用的配置（已在 restore 前调用，所以是试验时的配置）
-    for label, src_path in [
-        ("agent.json", AGENT_JSON),
-        ("depression_config.json", DEPRESSION_CONFIG),
-        ("config.json", GLOBAL_CONFIG),
-    ]:
+    for label in BACKUP_FILES:
         backup_src = os.path.join(BACKUP_DIR, label)
         if os.path.exists(backup_src):
-            pass  # 原始配置已在 restore 前 copy 过了
+            shutil.copy2(backup_src, os.path.join(configs_dir, f"original_{label}"))
 
-    # 写入试验元数据
+    active_config_sources = {
+        "used_agent.json": AGENT_JSON,
+        "used_depression_config.json": DEPRESSION_CONFIG,
+        "used_config.json": GLOBAL_CONFIG,
+    }
+    for dst_name, src_path in active_config_sources.items():
+        if os.path.exists(src_path):
+            shutil.copy2(src_path, os.path.join(configs_dir, dst_name))
+    if overlay_path and os.path.exists(overlay_path):
+        shutil.copy2(overlay_path, os.path.join(configs_dir, os.path.basename(overlay_path)))
+
+    active_global_config = load_json_file(GLOBAL_CONFIG)
     meta = {
-        "trial_name": trial_name,
+        "trial_name": run_name,
+        "run_name": run_name,
+        "condition_name": str(condition_name or run_name),
+        "run_name_base": str(run_name_base or ""),
+        "group": group,
         "severity": severity,
-        "persona": persona,
         "therapy": "CBT",
-        "sim_step": SIM_STEP,
-        "sim_stride": SIM_STRIDE,
+        "start_time": str(start_time or ""),
+        "sim_step": int(step_count),
+        "sim_stride": int(stride),
+        "log_file": str(log_file or ""),
         "round": round_idx,
+        "group_overlay_file": os.path.basename(overlay_path) if overlay_path else "",
+        "staged_eval": active_global_config.get("staged_eval", {}),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with open(os.path.join(output_dir, "trial_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # 提取 judge_conversation → traces/
     judge_file = os.path.join(checkpoint_dir, "judge_traces", "judge_conversation.json")
     if os.path.exists(judge_file):
         shutil.copy2(judge_file, os.path.join(traces_dir, "judge_conversation.json"))
-        print(f"  [COLLECT] judge_conversation.json → traces/")
+        print("  [COLLECT] judge_conversation.json → traces/")
     else:
-        print(f"  [WARN] judge_conversation.json 不存在")
+        print("  [WARN] judge_conversation.json 不存在")
 
-    # 复制 forced_prompt_traces → traces/
     fpt_dir = os.path.join(checkpoint_dir, "forced_prompt_traces")
     if os.path.isdir(fpt_dir):
         dst_fpt = os.path.join(traces_dir, "forced_prompt_traces")
         if os.path.exists(dst_fpt):
             shutil.rmtree(dst_fpt)
         shutil.copytree(fpt_dir, dst_fpt)
-        print(f"  [COLLECT] forced_prompt_traces/ → traces/")
+        print("  [COLLECT] forced_prompt_traces/ → traces/")
 
-    # 复制 merge_consultation_dialogues → traces/
+    conv_file = os.path.join(checkpoint_dir, "conversation.json")
+    if os.path.exists(conv_file):
+        shutil.copy2(conv_file, os.path.join(output_dir, "conversation.json"))
+        print("  [COLLECT] conversation.json → experiment_data/")
+
+    staged_eval_dir = os.path.join(checkpoint_dir, "staged_eval")
+    if os.path.isdir(staged_eval_dir):
+        dst_staged = os.path.join(scales_dir, "staged")
+        if os.path.exists(dst_staged):
+            shutil.rmtree(dst_staged)
+        shutil.copytree(staged_eval_dir, dst_staged)
+        print("  [COLLECT] staged_eval/ → scales/staged/")
+
     merge_file = os.path.join(output_dir, "traces", "merge_consultation_dialogues.json")
     if os.path.exists(merge_file):
-        print(f"  [COLLECT] merge_consultation_dialogues.json 已在 traces/")
+        print("  [COLLECT] merge_consultation_dialogues.json 已在 traces/")
     else:
         legacy_merge_dir = os.path.join(checkpoint_dir, "merge_consultation_dialogues")
         legacy_merge_file = os.path.join(legacy_merge_dir, "merge_consultation_dialogues.json")
         if os.path.exists(legacy_merge_file):
             shutil.copy2(legacy_merge_file, os.path.join(traces_dir, "merge_consultation_dialogues.json"))
-            print(f"  [COLLECT] legacy merge_consultation_dialogues.json → traces/")
+            print("  [COLLECT] legacy merge_consultation_dialogues.json → traces/")
 
     print(f"  [OK] 数据已收集到 {output_dir}")
 
@@ -618,26 +665,20 @@ def generate_report(dry_run: bool = False) -> None:
     os.makedirs(EXPERIMENT_DATA_ROOT, exist_ok=True)
 
     # ── 收集所有试验数据 ──
-    all_dirs = [d for d in os.listdir(EXPERIMENT_DATA_ROOT)
-                if os.path.isdir(os.path.join(EXPERIMENT_DATA_ROOT, d))
-                and d.startswith("Counsel-")]
+    all_dirs = [
+        d for d in os.listdir(EXPERIMENT_DATA_ROOT)
+        if os.path.isdir(os.path.join(EXPERIMENT_DATA_ROOT, d))
+    ]
 
     def _find_trial_dirs(trial_name: str) -> List[str]:
-        """找到匹配的所有试验目录（按时间戳排序，支持多轮）。
-
-        只返回带时间戳后缀的目录（正式实验数据），排除旧试跑数据。
-        带时间戳格式: NAME-MMDD-HHMM
-        """
-        # 只匹配以 trial_name- 开头的目录（带时间戳后缀）
-        ts_dirs = sorted(
-            [d for d in all_dirs if d.startswith(trial_name + "-")],
-        )
-        if ts_dirs:
-            return [os.path.join(EXPERIMENT_DATA_ROOT, d) for d in ts_dirs]
-        # 回退：如果没有时间戳目录，检查精确匹配（兼容旧数据）
-        if trial_name in all_dirs:
-            return [os.path.join(EXPERIMENT_DATA_ROOT, trial_name)]
-        return []
+        """找到匹配的所有试验目录（按时间戳排序，支持多轮）。"""
+        candidates = sorted([d for d in all_dirs if _matches_trial_run_name(d, trial_name)])
+        if not candidates:
+            return []
+        with_ts = [d for d in candidates if d != trial_name]
+        if with_ts:
+            return [os.path.join(EXPERIMENT_DATA_ROOT, d) for d in with_ts]
+        return [os.path.join(EXPERIMENT_DATA_ROOT, trial_name)]
 
     def _find_single_trial_dir(trial_name: str) -> Optional[str]:
         """找到最新匹配的试验目录（兼容旧逻辑）。"""
@@ -646,7 +687,7 @@ def generate_report(dry_run: bool = False) -> None:
 
     # 按条件名收集数据，支持多轮
     condition_data = {}  # key = trial_name, value = list of round dicts
-    for trial_name, severity, persona in ALL_CONDITIONS:
+    for trial_name, group, severity in ALL_CONDITIONS:
         trial_dirs = _find_trial_dirs(trial_name)
         if not trial_dirs:
             print(f"  [SKIP] 试验目录不存在: {trial_name}")
@@ -657,8 +698,8 @@ def generate_report(dry_run: bool = False) -> None:
             rd = {
                 "dir": td,
                 "dir_name": os.path.basename(td),
+                "group": group,
                 "severity": severity,
-                "persona": persona,
                 "trial_name": trial_name,
                 "session_eval": None,
                 "conversation": None,
@@ -797,19 +838,19 @@ def generate_report(dry_run: bool = False) -> None:
     lines.append("系统包含两个核心角色：")
     lines.append("- **卡布达**（患者）：23 岁，因长期宠物狗去世引发抑郁症状的年轻女性")
     lines.append("- **蜻蜓队长**（医生）：CBT 认知行为治疗师\n")
-    lines.append(f"采用 **3(severity) x 2(persona) 因子设计**，共 {len(condition_data)} 个实验条件：")
+    lines.append(f"采用 **2(group) x 3(severity) 因子设计**，共 {len(condition_data)} 个实验条件：")
     lines.append("")
     lines.append("| 因子 | 水平 | 说明 |")
     lines.append("|------|------|------|")
+    lines.append("| 实验组别 | g1 | 医生干预组：启用 intervention 主链、session prompt injection、dialog judge、session eval 等模块 |")
+    lines.append("| | g2 | 无医生干预组：关闭 intervention 主链，但保留 depression_dynamic / memory_injection / memory_policy |")
     lines.append("| 抑郁严重程度 | mild | 轻度：日常功能基本保留，情绪有正向反应性，社交退缩轻微 |")
     lines.append("| | moderate | 中度：基本活动需努力维持，明显疲乏/睡眠/食欲障碍，快感缺失但未完全丧失 |")
     lines.append("| | severe | 重度：极端功能损害，完全社交退缩，存在被动自杀意念，基本自理困难 |")
-    lines.append("| 抑郁人设类型 | dynamic | 动态人设：抑郁状态随对话/事件实时演化（depression_dynamic 引擎） |")
-    lines.append("| | static | 静态人设：抑郁状态固定不变，仅通过 prompt 注入静态描述 |")
     lines.append("")
     lines.append(f"共 {len(condition_data)} 个条件：")
-    for tn, sev, per in ALL_CONDITIONS:
-        lines.append(f"- `{tn}`：{sev} + {per}")
+    for tn, grp, sev in ALL_CONDITIONS:
+        lines.append(f"- `{tn}`：{grp} + {sev}")
     lines.append("")
 
     lines.append("### 1.2 仿真参数\n")
@@ -881,7 +922,7 @@ def generate_report(dry_run: bool = False) -> None:
 
         for trial_name, rds in condition_data.items():
             severity = rds[0]["severity"]
-            persona = rds[0]["persona"]
+            group = rds[0].get("group", "unknown")
             for scale_name in SCALES:
                 pre_totals = []
                 post_totals = []
@@ -1198,8 +1239,8 @@ def generate_report(dry_run: bool = False) -> None:
 
     # 4.1 分别评估汇总
     lines.append("### 4.1 三量表分别评估\n")
-    header = "| 条件 | 严重程度 | 人设 | 平均efficacy |"
-    sep = "|------|----------|------|-------------|"
+    header = "| 条件 | 组别 | 严重程度 | 平均efficacy |"
+    sep = "|------|------|----------|-------------|"
     for scale_name in SCALES:
         header += f" {scale_name} 前→后(Δ) | {scale_name} 程度 |"
         sep += "-------------------|-------------|"
@@ -1210,7 +1251,7 @@ def generate_report(dry_run: bool = False) -> None:
 
     for trial_name, rds in condition_data.items():
         severity = rds[0]["severity"]
-        persona = rds[0]["persona"]
+        group = rds[0].get("group", "unknown")
 
         avg_scores = [rd["session_eval"]["avg"] for rd in rds if rd["session_eval"]]
         conv_turns = [rd["conversation"]["turns"] for rd in rds if rd["conversation"]]
@@ -1281,7 +1322,7 @@ def generate_report(dry_run: bool = False) -> None:
             rounds_str += " (含recovered)"
 
         lines.append(
-            f"| {trial_name} | {severity} | {persona} "
+            f"| {trial_name} | {group} | {severity} "
             f"| {efficacy_str} {scale_cols}| "
             f"{sessions_str} | {turns_str} | {rounds_str} |"
         )
@@ -1414,33 +1455,33 @@ def generate_report(dry_run: bool = False) -> None:
             lines.append(f"| {sev} | — | 0 |")
     lines.append("")
 
-    # 5.2 人设类型效应
-    lines.append("### 5.2 人设类型效应 (dynamic vs static)\n")
-    lines.append("| 人设类型 | 平均 efficacy | 条件数 |")
-    lines.append("|----------|-------------|--------|")
-    for per in PERSONAS:
+    # 5.2 组别效应
+    lines.append("### 5.2 组别效应 (G1 vs G2)\n")
+    lines.append("| 组别 | 平均 efficacy | 条件数 |")
+    lines.append("|------|-------------|--------|")
+    for grp in GROUPS:
         group_avgs = []
         for tn, rds in condition_data.items():
-            if rds[0]["persona"] == per:
+            if rds[0].get("group") == grp:
                 for rd in rds:
                     if rd["session_eval"]:
                         group_avgs.append(rd["session_eval"]["avg"])
         if group_avgs:
-            lines.append(f"| {per} | {_fmt_mean_sd(group_avgs)} | {len(group_avgs)} |")
+            lines.append(f"| {grp} | {_fmt_mean_sd(group_avgs)} | {len(group_avgs)} |")
         else:
-            lines.append(f"| {per} | — | 0 |")
+            lines.append(f"| {grp} | — | 0 |")
     lines.append("")
 
     # 5.3 交互效应矩阵
-    lines.append("### 5.3 交互效应 (严重程度 × 人设类型)\n")
-    lines.append("| | dynamic | static |")
-    lines.append("|---|---------|--------|")
+    lines.append("### 5.3 交互效应 (严重程度 × 组别)\n")
+    lines.append("| | g1 | g2 |")
+    lines.append("|---|----|----|")
     for sev in SEVERITIES:
         row = f"| **{sev}** |"
-        for per in PERSONAS:
+        for grp in GROUPS:
             avgs = []
             for tn, rds in condition_data.items():
-                if rds[0]["severity"] == sev and rds[0]["persona"] == per:
+                if rds[0]["severity"] == sev and rds[0].get("group") == grp:
                     for rd in rds:
                         if rd["session_eval"]:
                             avgs.append(rd["session_eval"]["avg"])
@@ -1527,16 +1568,27 @@ SCALE_WORKER_SCRIPT = os.path.join(BASE_DIR, "runshells", "run_scale_worker.py")
 WORKER_PYTHON = os.environ.get("GA_WORKER_PYTHON") or sys.executable
 
 
+def _matches_trial_run_name(dir_name: str, trial_name: str) -> bool:
+    name = str(dir_name or "")
+    trial = str(trial_name or "")
+    return bool(
+        name == trial
+        or name.startswith(trial + "-")
+        or ("-" + trial + "-") in name
+    )
+
+
+
 def _find_checkpoint_dir(trial_name: str) -> Optional[str]:
     """找到匹配的 checkpoint 目录（带时间戳后缀的最新目录）。"""
     if not os.path.isdir(CHECKPOINTS_ROOT):
         return None
     all_dirs = [
         d for d in os.listdir(CHECKPOINTS_ROOT)
-        if os.path.isdir(os.path.join(CHECKPOINTS_ROOT, d)) and d.startswith("Counsel-")
+        if os.path.isdir(os.path.join(CHECKPOINTS_ROOT, d))
     ]
     candidates = sorted(
-        [d for d in all_dirs if d == trial_name or d.startswith(trial_name + "-")],
+        [d for d in all_dirs if _matches_trial_run_name(d, trial_name)],
         reverse=True,
     )
     if not candidates:
@@ -1573,8 +1625,8 @@ def run_scale_evaluation(
     print(f"  Agent: {agent_name}")
     print(f"  条件数: {len(conditions)}\n")
 
-    for trial_name, severity, persona in conditions:
-        print(f"--- {trial_name} ({severity}/{persona}) ---")
+    for trial_name, group, severity in conditions:
+        print(f"--- {trial_name} ({group}/{severity}) ---")
 
         cp_dir = _find_checkpoint_dir(trial_name)
         if not cp_dir:
@@ -1615,10 +1667,10 @@ def _find_trial_dir_in_experiment_data(trial_name: str) -> Optional[str]:
         return None
     all_dirs = [
         d for d in os.listdir(EXPERIMENT_DATA_ROOT)
-        if os.path.isdir(os.path.join(EXPERIMENT_DATA_ROOT, d)) and d.startswith("Counsel-")
+        if os.path.isdir(os.path.join(EXPERIMENT_DATA_ROOT, d))
     ]
     candidates = sorted(
-        [d for d in all_dirs if d == trial_name or d.startswith(trial_name + "-")],
+        [d for d in all_dirs if _matches_trial_run_name(d, trial_name)],
         reverse=True,
     )
     if not candidates:
@@ -1907,8 +1959,8 @@ def run_30q_evaluation(
     print(f"  条件数: {len(conditions)}")
     print(f"{'='*60}")
 
-    for trial_name, severity, persona in conditions:
-        print(f"\n--- {trial_name} ({severity}/{persona}) ---")
+    for trial_name, group, severity in conditions:
+        print(f"\n--- {trial_name} ({group}/{severity}) ---")
 
         cp_dir = _find_checkpoint_dir(trial_name)
         if not cp_dir:
@@ -1998,51 +2050,100 @@ def _get_severity_label(scored_result: dict) -> str:
 
 def run_single_trial(
     trial_name: str,
+    group: str,
     severity: str,
-    persona: str,
+    run_name_base: str = "",
+    start_time: str = START_TIME,
+    stride: int = STRIDE,
+    log_file: str = LOG_FILE,
     dry_run: bool = False,
-    skip_simulation: bool = False,
+    run_simulation_enabled: bool = True,
+    run_merge_enabled: bool = True,
+    run_post_scale_enabled: bool = True,
+    run_compress_enabled: bool = True,
+    run_agent_memory_vis_enabled: bool = True,
+    run_external_memory_audit_enabled: bool = True,
     sim_step: int = SIM_STEP,
     round_idx: int = 1,
     local_llm: bool = False,
 ) -> None:
     """执行一次完整试验。"""
     print(f"\n{'='*60}")
-    print(f"Trial: {trial_name}  |  severity={severity}  |  persona={persona}  |  round={round_idx}")
+    print(f"Trial: {trial_name}  |  group={group}  |  severity={severity}  |  round={round_idx}")
+    print(f"run_name_base={run_name_base or '(empty)'} | start={start_time} | step={sim_step} | stride={stride} | log={log_file or '(empty)'}")
     print(f"{'='*60}")
 
-    # 1. 替换配置
-    print(f"\n--- 配置替换 ---")
+    print("\n--- 配置替换 ---")
     prepare_agent_config(severity, dry_run=dry_run)
-    prepare_depression_config(severity, persona, dry_run=dry_run)
-    prepare_global_config(persona, dry_run=dry_run, local_llm=local_llm)
+    prepare_depression_config(severity, dry_run=dry_run)
+    overlay_path = prepare_global_config(group, dry_run=dry_run, local_llm=local_llm)
 
-    # 2. 运行模拟
-    run_name = trial_name  # fallback
-    if not skip_simulation:
-        print(f"\n--- 运行模拟 ---")
-        success, run_name = run_simulation(trial_name, dry_run=dry_run, sim_step=sim_step, local_llm=local_llm)
+    existing_run_dir = _find_checkpoint_dir(trial_name)
+    run_name = os.path.basename(existing_run_dir) if existing_run_dir else build_trial_run_name(trial_name, run_name_base)
+    if run_simulation_enabled:
+        print("\n--- 运行模拟 ---")
+        success, run_name = run_simulation(
+            trial_name,
+            run_name_base=run_name_base,
+            start_time=start_time,
+            stride=stride,
+            log_file=log_file,
+            dry_run=dry_run,
+            sim_step=sim_step,
+            local_llm=local_llm,
+        )
         if not success and not dry_run:
-            print(f"  [WARN] 模拟未成功完成，继续后续步骤...")
+            print("  [WARN] 模拟未成功完成，继续后续步骤...")
 
-        # 3. 合并咨询记录
-        print(f"\n--- 合并咨询记录 ---")
-        merge_dialogues(run_name, dry_run=dry_run)
+        if run_merge_enabled:
+            print("\n--- 合并咨询记录 ---")
+            merge_dialogues(run_name, dry_run=dry_run)
+        else:
+            print("\n--- 跳过合并咨询记录 ---")
     else:
-        print(f"\n--- 跳过模拟 ---")
+        print("\n--- 跳过模拟 ---")
 
-    # 4. 收集数据（在 restore 之前，这样当前试验的配置还没被覆盖）
-    print(f"\n--- 收集数据 ---")
-    collect_trial_data(run_name, severity, persona, dry_run=dry_run, round_idx=round_idx)
+    print("\n--- 收集数据 ---")
+    collect_trial_data(
+        run_name,
+        group=group,
+        severity=severity,
+        overlay_path=overlay_path,
+        condition_name=trial_name,
+        run_name_base=run_name_base,
+        start_time=start_time,
+        step_count=sim_step,
+        stride=stride,
+        log_file=log_file,
+        dry_run=dry_run,
+        round_idx=round_idx,
+    )
 
-    # 5. 前后量表评估
-    if not skip_simulation:
+    if run_simulation_enabled and run_post_scale_enabled:
+        print("\n--- 运行治疗前后量表 ---")
         run_pre_post_scale(run_name, agent_name="卡布达", dry_run=dry_run)
     else:
-        print(f"\n--- 跳过量表评估（skip-simulation 模式）---")
+        print("\n--- 跳过治疗前后量表 ---")
 
-    # 6. 恢复原始配置
-    print(f"\n--- 恢复配置 ---")
+    if run_simulation_enabled and run_compress_enabled:
+        print("\n--- 运行 compress ---")
+        run_compress(run_name, dry_run=dry_run)
+    else:
+        print("\n--- 跳过 compress ---")
+
+    if run_simulation_enabled and run_agent_memory_vis_enabled:
+        print("\n--- 运行角色记忆可视化 ---")
+        run_agent_memory_visualization(run_name, agent_name="卡布达", dry_run=dry_run)
+    else:
+        print("\n--- 跳过角色记忆可视化 ---")
+
+    if run_simulation_enabled and run_external_memory_audit_enabled:
+        print("\n--- 运行外置记忆审计可视化 ---")
+        run_external_memory_audit(run_name, agent_name="卡布达", dry_run=dry_run)
+    else:
+        print("\n--- 跳过外置记忆审计可视化 ---")
+
+    print("\n--- 恢复配置 ---")
     restore_configs(dry_run=dry_run)
 
     print(f"\n--- Trial {trial_name} (Round {round_idx}) 完成 ---")
@@ -2060,8 +2161,8 @@ def recover_old_trial_data():
     recovered_count = 0
 
     for trial_name, data in RECOVERED_SESSION_EVAL.items():
-        severity = next((s for t, s, p in ALL_CONDITIONS if t == trial_name), "unknown")
-        persona = next((p for t, s, p in ALL_CONDITIONS if t == trial_name), "unknown")
+        group = next((g for t, g, s in ALL_CONDITIONS if t == trial_name), "unknown")
+        severity = next((s for t, g, s in ALL_CONDITIONS if t == trial_name), "unknown")
 
         dir_name = f"{trial_name}-0512-recovered"
         data_dir = os.path.join(EXPERIMENT_DATA_ROOT, dir_name)
@@ -2074,8 +2175,8 @@ def recover_old_trial_data():
 
         meta = {
             "trial_name": trial_name,
+            "group": group,
             "severity": severity,
-            "persona": persona,
             "round": 1,
             "data_source": "recovered_from_report",
             "recovered_at": datetime.now().isoformat(),
@@ -2108,22 +2209,30 @@ def recover_old_trial_data():
 
 def main():
     parser = argparse.ArgumentParser(description="抑郁症治疗遍历实验")
+    parser.add_argument("--name", default=None, help="覆盖脚本前面的 RUN_NAME（作为批量实验基础名）")
+    parser.add_argument("--start", default=None, help="覆盖脚本前面的 START_TIME")
+    parser.add_argument("--step", type=int, default=None, help=f"模拟步数（默认: {STEP}）")
+    parser.add_argument("--stride", type=int, default=None, help=f"步间隔分钟数（默认: {STRIDE}）")
+    parser.add_argument("--log", default=None, help="覆盖脚本前面的 LOG_FILE")
     parser.add_argument(
         "--condition", type=str, default=None,
-        help="只跑指定条件（如 Counsel-MOD-DYN）",
+        help="只跑指定条件（如 Counsel-G1-MILD）",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="只打印操作，不实际执行",
     )
     parser.add_argument(
-        "--skip-simulation", action="store_true",
+        "--skip-simulation", "--skip-sim", action="store_true",
         help="跳过模拟运行，只收集已有数据",
     )
-    parser.add_argument(
-        "--step", type=int, default=None,
-        help=f"模拟步数（默认: {SIM_STEP}）",
-    )
+    parser.add_argument("--skip-merge", action="store_true", help="跳过 merge 阶段")
+    parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗前后量表")
+    parser.add_argument("--skip-compress", action="store_true", help="跳过 compress.py")
+    parser.add_argument("--run-agent-memory-vis", action="store_true", help="显式开启角色记忆可视化")
+    parser.add_argument("--skip-agent-memory-vis", action="store_true", help="跳过角色记忆可视化")
+    parser.add_argument("--run-external-memory-audit", action="store_true", help="显式开启外置记忆审计可视化")
+    parser.add_argument("--skip-external-memory-audit", action="store_true", help="跳过外置记忆审计可视化")
     parser.add_argument(
         "--report-only", action="store_true",
         help="只生成分析报告（基于已有数据）",
@@ -2166,55 +2275,58 @@ def main():
     )
     args = parser.parse_args()
 
-    # 恢复旧数据模式
+    dry_run = bool(DRY_RUN or args.dry_run)
+    run_name_base = str(args.name if args.name is not None else RUN_NAME).strip()
+    start_time = str(args.start if args.start is not None else START_TIME).strip()
+    sim_step = int(args.step if args.step is not None else STEP)
+    stride = int(args.stride if args.stride is not None else STRIDE)
+    log_file = str(args.log if args.log is not None else LOG_FILE)
+    run_simulation_enabled = bool(RUN_SIMULATION and not args.skip_simulation)
+    run_merge_enabled = bool(RUN_MERGE and not args.skip_merge)
+    run_post_scale_enabled = bool(RUN_POST_SCALE and not args.skip_post_scale)
+    run_compress_enabled = bool(RUN_COMPRESS and not args.skip_compress)
+    run_agent_memory_vis_enabled = bool((RUN_AGENT_MEMORY_VIS or args.run_agent_memory_vis) and not args.skip_agent_memory_vis)
+    run_external_memory_audit_enabled = bool((RUN_EXTERNAL_MEMORY_AUDIT or args.run_external_memory_audit) and not args.skip_external_memory_audit)
+
     if args.recover_old_data:
         recover_old_trial_data()
         return
 
-    # 仅生成报告模式
     if args.report_only:
-        generate_report(dry_run=args.dry_run)
+        generate_report(dry_run=dry_run)
         return
 
-    # 仅量表评估模式（旧接口，保持兼容）
     if args.scale_only:
         run_scale_evaluation(
             scale_file=args.scale_file,
             agent_name=args.scale_agent,
-            dry_run=args.dry_run,
+            dry_run=dry_run,
             condition_filter=args.condition,
         )
         return
 
-    # 前后量表评估模式（对已有 checkpoint，不重新模拟）
     if args.pre_post_scale:
         conditions = ALL_CONDITIONS
         if args.condition:
             conditions = [c for c in conditions if c[0] == args.condition]
-        for trial_name, severity, persona in conditions:
+        for trial_name, group, severity in conditions:
+            del group, severity
             cp_dir = _find_checkpoint_dir(trial_name)
             if not cp_dir:
                 print(f"[SKIP] checkpoint 不存在: {trial_name}")
                 continue
             cp_name = os.path.basename(cp_dir)
-            run_pre_post_scale(cp_name, agent_name=args.scale_agent, dry_run=args.dry_run)
+            run_pre_post_scale(cp_name, agent_name=args.scale_agent, dry_run=dry_run)
         return
 
-    # 30Q 合并评估模式
     if getattr(args, "run_30q", False):
         run_30q_evaluation(
             agent_name=args.scale_agent,
-            dry_run=args.dry_run,
+            dry_run=dry_run,
             condition_filter=args.condition,
         )
         return
 
-    # 步数覆盖
-    sim_step = SIM_STEP
-    if args.step is not None:
-        sim_step = args.step
-
-    # 筛选条件
     conditions = ALL_CONDITIONS
     if args.condition:
         matched = [c for c in conditions if c[0] == args.condition]
@@ -2232,13 +2344,22 @@ def main():
     total_trials = len(conditions) * (rounds - start_round + 1)
     print(f"实验计划: {len(conditions)} 个条件 × {rounds - start_round + 1} 轮 (R{start_round}-R{rounds}) = {total_trials} 次试验")
     print(f"条件列表: {[c[0] for c in conditions]}")
-    print(f"轮数: {rounds}")
-    print(f"Dry run: {args.dry_run}")
-    print(f"Skip simulation: {args.skip_simulation}")
+    print(f"run_name_base: {run_name_base or '(empty)'}")
+    print(f"start: {start_time}")
+    print(f"step: {sim_step}")
+    print(f"stride: {stride}")
+    print(f"log: {log_file or '(empty)'}")
+    print(f"rounds: {rounds}")
+    print(f"run_simulation: {run_simulation_enabled}")
+    print(f"run_merge: {run_merge_enabled}")
+    print(f"run_post_scale: {run_post_scale_enabled}")
+    print(f"run_compress: {run_compress_enabled}")
+    print(f"run_agent_memory_vis: {run_agent_memory_vis_enabled}")
+    print(f"run_external_memory_audit: {run_external_memory_audit_enabled}")
+    print(f"dry_run: {dry_run}")
 
-    # 备份原始配置
     print(f"\n--- 备份原始配置 ---")
-    backup_configs(dry_run=args.dry_run)
+    backup_configs(dry_run=dry_run)
 
     # 多轮循环
     completed = []
@@ -2250,15 +2371,26 @@ def main():
                 print(f"= Round {round_idx}/{rounds}")
                 print(f"{'='*60}")
 
-            for i, (trial_name, severity, persona) in enumerate(conditions):
+            for i, (trial_name, group, severity) in enumerate(conditions):
                 print(f"\n{'#'*60}")
                 print(f"# [R{round_idx} {i+1}/{len(conditions)}] {trial_name}")
                 print(f"{'#'*60}")
                 try:
                     run_single_trial(
-                        trial_name, severity, persona,
-                        dry_run=args.dry_run,
-                        skip_simulation=args.skip_simulation,
+                        trial_name,
+                        group,
+                        severity,
+                        run_name_base=run_name_base,
+                        start_time=start_time,
+                        stride=stride,
+                        log_file=log_file,
+                        dry_run=dry_run,
+                        run_simulation_enabled=run_simulation_enabled,
+                        run_merge_enabled=run_merge_enabled,
+                        run_post_scale_enabled=run_post_scale_enabled,
+                        run_compress_enabled=run_compress_enabled,
+                        run_agent_memory_vis_enabled=run_agent_memory_vis_enabled,
+                        run_external_memory_audit_enabled=run_external_memory_audit_enabled,
                         sim_step=sim_step,
                         round_idx=round_idx,
                         local_llm=args.local_llm,
@@ -2267,10 +2399,10 @@ def main():
                 except Exception as e:
                     print(f"  [ERROR] Trial {trial_name} R{round_idx} 异常: {e}")
                     failed.append((trial_name, round_idx))
-                    restore_configs(dry_run=args.dry_run)
+                    restore_configs(dry_run=dry_run)
     finally:
         print(f"\n--- 最终恢复配置 ---")
-        restore_configs(dry_run=args.dry_run)
+        restore_configs(dry_run=dry_run)
 
     # 总结
     print(f"\n{'='*60}")
@@ -2288,9 +2420,8 @@ def main():
             print(f"  失败: {[c[0] for c in failed]}")
     print(f"{'='*60}")
 
-    # 生成分析报告
     if completed:
-        generate_report(dry_run=args.dry_run)
+        print("默认不自动生成 analysis_report；如需报告请手动运行 --report-only。")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from dotenv import load_dotenv, find_dotenv
 from modules.game import create_game, get_game
 from modules import utils
 from modules.intervention_manager import InterventionManager
+from modules.staged_eval_manager import StagedEvalManager
 
 personas = [
     "卡布达",  # 抑郁症患者
@@ -51,6 +52,7 @@ class SimulateServer:
         self.game = get_game()
         self.intervention = InterventionManager(config=self.config, logger=self.logger)
         self.game.set_intervention_manager(self.intervention)
+        self.staged_eval = StagedEvalManager(name, checkpoints_folder, self.config, logger=self.logger)
         self.tile_size = self.game.maze.tile_size
         self.agent_status = {}
         if "agent_base" in config:
@@ -69,12 +71,35 @@ class SimulateServer:
         )
         self.start_step = start_step
 
+    def _build_runtime_eval_config(self, step_no=None, sim_time=None):
+        runtime_config = copy.deepcopy(self.config)
+        if step_no is not None:
+            runtime_config["step"] = int(step_no)
+        if sim_time is not None:
+            runtime_config["time"] = {"start": sim_time}
+        for agent_name, agent in self.game.agents.items():
+            runtime_config.setdefault("agents", {}).setdefault(agent_name, {})
+            runtime_config["agents"][agent_name].update(agent.to_dict())
+            status = self.agent_status.get(agent_name, {}) if isinstance(self.agent_status, dict) else {}
+            if "coord" in status:
+                runtime_config["agents"][agent_name]["coord"] = status["coord"]
+        return runtime_config
+
     def simulate(self, step, stride=0):
         timer = utils.get_timer()
         for i in range(self.start_step, self.start_step + step):
-            title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
+            step_no = i + 1
+            title = "Simulate Step[{}/{}, time: {}]".format(step_no, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
             self.intervention.on_step_start(self.game, timer.get_date())
+            if self.start_step == 0 and i == self.start_step:
+                t0_sim_time = timer.get_date("%Y%m%d-%H:%M")
+                self.staged_eval.maybe_run_t0(
+                    runtime_config=self._build_runtime_eval_config(step_no=step_no, sim_time=t0_sim_time),
+                    conversation=copy.deepcopy(self.game.conversation),
+                    step_no=step_no,
+                    sim_time=t0_sim_time,
+                )
             for name, status in self.agent_status.items():
                 plan = self.game.agent_think(name, status)["plan"]
                 agent = self.game.get_agent(name)
@@ -92,11 +117,12 @@ class SimulateServer:
             self.config.update(
                 {
                     "time": sim_time,
-                    "step": i + 1,
+                    "step": step_no,
                 }
             )
+            snapshot_name = f"simulate-{sim_time.replace(':', '')}.json"
             # 保存Agent活动数据
-            with open(f"{self.checkpoints_folder}/simulate-{sim_time.replace(':', '')}.json", "w", encoding="utf-8") as f:
+            with open(f"{self.checkpoints_folder}/{snapshot_name}", "w", encoding="utf-8") as f:
                 f.write(json.dumps(self.config, indent=2, ensure_ascii=False))
             # 保存对话数据
             with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
@@ -168,6 +194,14 @@ class SimulateServer:
                     )
                 )
 
+            self.staged_eval.maybe_run_post_step_eval(
+                runtime_config=copy.deepcopy(self.config),
+                conversation=copy.deepcopy(self.game.conversation),
+                step_no=step_no,
+                sim_time=sim_time,
+                snapshot_name=snapshot_name,
+            )
+
             if stride > 0:
                 timer.forward(stride)
 
@@ -208,6 +242,7 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
         json_data = json.load(f)
         agent_config = json_data["agent"]
         intervention_config = copy.deepcopy(json_data.get("intervention", {}))
+        staged_eval_config = copy.deepcopy(json_data.get("staged_eval", {}))
 
     assets_root = os.path.join("assets", "village")
     config = {
@@ -219,6 +254,8 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
     }
     if intervention_config:
         config["intervention"] = intervention_config
+    if staged_eval_config:
+        config["staged_eval"] = staged_eval_config
     for a in agents:
         config["agents"][a] = {
             "config_path": os.path.join(

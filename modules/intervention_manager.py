@@ -36,6 +36,7 @@ from modules.intervention_consult_record import (
     validate_soap_only,
 )
 from modules.model import create_llm_model
+from modules.resident_chat_scheduler import ResidentChatScheduler
 from modules.session_prompt_injection_manager import SessionPromptInjectionManager
 from modules.storage.index import LlamaIndex
 
@@ -66,6 +67,7 @@ class InterventionManager:
         self.doctor = intervention_cfg.get("doctor", "")
         self.patients = intervention_cfg.get("patients", []) or []
         self.meeting_rules = intervention_cfg.get("meeting_rules", []) or []
+        self.resident_chat_scheduler_cfg = intervention_cfg.get("resident_chat_scheduler", {}) or {}
         self.meeting_queue_cfg = intervention_cfg.get("meeting_queue", {}) or {}
         self.meeting_queue_enabled = bool(self.meeting_queue_cfg.get("enabled", False))
         self.meeting_queue_max_per_doctor = self._safe_int(
@@ -107,6 +109,11 @@ class InterventionManager:
             logger=self.logger,
         )
         self.session_prompt_injection = SessionPromptInjectionManager(
+            config=self.config,
+            state=self.state,
+            logger=self.logger,
+        )
+        self.resident_chat_scheduler = ResidentChatScheduler(
             config=self.config,
             state=self.state,
             logger=self.logger,
@@ -203,6 +210,24 @@ class InterventionManager:
             if self._should_trigger(rule_id, rule, now):
                 self._trigger_meeting(game, rule_id, rule, now)
 
+        scheduler = getattr(self, "resident_chat_scheduler", None)
+        if scheduler:
+            try:
+                for payload in scheduler.collect_triggered_meetings(
+                    now=now,
+                    agents=game_agents,
+                    should_trigger=self._should_trigger,
+                ):
+                    payload_rule_id = str(payload.get("rule_id", "") or "resident_chat")
+                    self._trigger_meeting(game, payload_rule_id, payload, now)
+            except Exception as exc:
+                self._log_highlight(
+                    "RESIDENT_CHAT_SCHEDULER_ERROR step={} detail={}".format(
+                        step_no,
+                        str(exc),
+                    )
+                )
+
         if self.meeting_queue_enabled:
             self._promote_all_doctors(game, now)
 
@@ -291,6 +316,7 @@ class InterventionManager:
         meeting_id_s = lock_s.get("meeting_id", "")
         meeting_id_o = lock_o.get("meeting_id", "")
         closed_meeting_id = ""
+        closed_meeting_kind = ""
 
         # 双方 meeting_id 一致时认为会面闭环达成
         if meeting_id_s and meeting_id_s == meeting_id_o:
@@ -298,6 +324,7 @@ class InterventionManager:
             meeting_snapshot = self.state.get("active_meetings", {}).get(meeting_id_s, {}) or {}
             meeting_doctor = str(meeting_snapshot.get("doctor", "") or "")
             meeting_patient = str(meeting_snapshot.get("patient", "") or "")
+            closed_meeting_kind = str(meeting_snapshot.get("meeting_kind", "doctor_consult") or "doctor_consult")
             pair_key = "{}<->{}".format(meeting_doctor or getattr(speaker, "name", ""), meeting_patient or getattr(other, "name", ""))
             self._clear_lock(speaker)
             self._clear_lock(other)
@@ -323,6 +350,16 @@ class InterventionManager:
                 step_phase=meeting_snapshot.get("step_phase", ""),
                 reason="chat_finished",
             )
+
+        if closed_meeting_kind == "resident_chat":
+            self._log_highlight(
+                "RESIDENT_CHAT_AFTER_CHAT_SKIP meeting_id={} speaker={} other={}".format(
+                    closed_meeting_id,
+                    getattr(speaker, "name", ""),
+                    getattr(other, "name", ""),
+                )
+            )
+            return
 
         # 医患会话后尝试抽取医嘱并写入患者 forced_tasks
         self._log_highlight(
@@ -1786,16 +1823,48 @@ class InterventionManager:
                 )
             )
             return ""
-        marker = "=== 当前任务指令层 ==="
-        idx = prompt_text.find(marker)
-        if idx <= 0:
+
+        legacy_marker = "=== 当前任务指令层 ==="
+        legacy_idx = prompt_text.find(legacy_marker)
+        if legacy_idx > 0:
+            return str(prompt_text[:legacy_idx].strip() or "")
+
+        start_idx = -1
+        for marker in (
+            "=== 基础人格层 ===",
+            "=== 当前主诉节点层 ===",
+            "=== 会话上下文层 ===",
+        ):
+            idx = prompt_text.find(marker)
+            if idx >= 0 and (start_idx < 0 or idx < start_idx):
+                start_idx = idx
+
+        if start_idx < 0:
             self._log_highlight(
-                "[DIALOG_JUDGE_PATIENT_STATE_EMPTY] level=warning patient={} reason=marker_not_found".format(
+                "[DIALOG_JUDGE_PATIENT_STATE_EMPTY] level=warning patient={} reason=state_boundary_not_found".format(
                     patient_name
                 )
             )
             return ""
-        return str(prompt_text[:idx].strip() or "")
+
+        end_idx = -1
+        end_markers = []
+        if patient_name:
+            end_markers.append("以下是 {} 的记忆：".format(patient_name))
+        end_markers.extend([
+            "的记忆：",
+            "当前位置：",
+            "背景：",
+            "<对话记录>",
+        ])
+        for marker in end_markers:
+            idx = prompt_text.find(marker, start_idx)
+            if idx > start_idx and (end_idx < 0 or idx < end_idx):
+                end_idx = idx
+
+        if end_idx > start_idx:
+            return str(prompt_text[start_idx:end_idx].strip() or "")
+        return str(prompt_text[start_idx:].strip() or "")
 
     def _strip_text_code_fence(self, text: str) -> str:
         raw = str(text or "").strip()
@@ -2425,6 +2494,7 @@ class InterventionManager:
         counts = {
             "patient": 0,
             "doctor": 0,
+            "consult_history": 0,
             "judge_llm": 0,
             "session_eval_llm": 0,
             "unknown": 0,
@@ -2495,6 +2565,7 @@ class InterventionManager:
                 "",
                 "- patient_count: `{}`".format(counts["patient"]),
                 "- doctor_count: `{}`".format(counts["doctor"]),
+                "- consult_history_count: `{}`".format(counts["consult_history"]),
                 "- judge_count: `{}`".format(counts["judge_llm"]),
                 "- session_eval_count: `{}`".format(counts["session_eval_llm"]),
                 "- unknown_count: `{}`".format(counts["unknown"]),
@@ -2710,7 +2781,32 @@ class InterventionManager:
                 )
             )
 
-    def _resolve_doctor_patient_pair(self, a: Any, b: Any):
+    def _resolve_active_meeting(self, a: Any, b: Any) -> Optional[Dict[str, Any]]:
+        self._ensure_state_schema()
+        active = self.state.setdefault("active_meetings", {})
+        meeting_ids = []
+        for agent in (a, b):
+            if not agent:
+                continue
+            self._ensure_agent_state(agent)
+            lock = agent.status.get("intervention", {}).get("lock", {})
+            if not isinstance(lock, dict):
+                continue
+            meeting_id = str(lock.get("meeting_id", "") or "").strip()
+            if meeting_id and meeting_id not in meeting_ids:
+                meeting_ids.append(meeting_id)
+        for meeting_id in meeting_ids:
+            meeting = active.get(meeting_id)
+            if not isinstance(meeting, dict):
+                continue
+            doctor_name = str(meeting.get("doctor", "") or "").strip()
+            patient_name = str(meeting.get("patient", "") or "").strip()
+            pair = {doctor_name, patient_name}
+            if pair and {str(getattr(a, "name", "") or ""), str(getattr(b, "name", "") or "")} == pair:
+                return meeting
+        return None
+
+    def _resolve_global_doctor_patient_pair(self, a: Any, b: Any):
         doctor_name = self.doctor
         patient_candidates = set(self.patients)
 
@@ -2719,6 +2815,91 @@ class InterventionManager:
         if doctor_name and b.name == doctor_name and (not patient_candidates or a.name in patient_candidates):
             return b, a
         return None, None
+
+    def resolve_meeting_context(self, speaker: Any, other: Any, forced: bool = False) -> Dict[str, Any]:
+        meeting = self._resolve_active_meeting(speaker, other)
+        if isinstance(meeting, dict):
+            return meeting
+        if bool(forced):
+            return {}
+        doctor, patient = self._resolve_global_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return {}
+        return {
+            "meeting_id": "",
+            "doctor": doctor.name,
+            "patient": patient.name,
+            "meeting_kind": "doctor_consult",
+            "prompt_file": "",
+            "meeting_source": "global_fallback",
+        }
+
+    def is_meeting_doctor(self, speaker: Any, other: Any, forced: bool = False) -> bool:
+        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
+        if not isinstance(meeting, dict):
+            return False
+        return str(getattr(speaker, "name", "") or "") == str(meeting.get("doctor", "") or "")
+
+    def get_meeting_kind(self, speaker: Any, other: Any, forced: bool = False) -> str:
+        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
+        if not isinstance(meeting, dict):
+            return ""
+        return str(meeting.get("meeting_kind", "") or "")
+
+    def get_meeting_prompt_file(self, speaker: Any, other: Any, forced: bool = False) -> str:
+        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
+        if not isinstance(meeting, dict):
+            return ""
+        return str(meeting.get("prompt_file", "") or "").strip()
+
+    def get_meeting_prompt_injection(self, speaker: Any, other: Any, forced: bool = False) -> str:
+        if not self.enabled or (not bool(forced)):
+            return ""
+        prompt_file = self.get_meeting_prompt_file(speaker, other, forced=forced)
+        if not prompt_file:
+            return ""
+        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
+        if not isinstance(meeting, dict):
+            return ""
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(prompt_file)
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {
+                    "speaker": str(getattr(speaker, "name", "") or ""),
+                    "other": str(getattr(other, "name", "") or ""),
+                    "doctor": str(meeting.get("doctor", "") or ""),
+                    "patient": str(meeting.get("patient", "") or ""),
+                    "meeting_kind": str(meeting.get("meeting_kind", "") or ""),
+                    "meeting_id": str(meeting.get("meeting_id", "") or ""),
+                    "current_time": self._resolve_trace_step_time(),
+                },
+            )
+        except Exception as exc:
+            self._log_highlight(
+                "MEETING_PROMPT_LOAD_ERROR speaker={} other={} prompt_file={} detail={}".format(
+                    getattr(speaker, "name", ""),
+                    getattr(other, "name", ""),
+                    prompt_file,
+                    str(exc),
+                )
+            )
+            return ""
+        prompt_text = str(prompt_text or "").strip()
+        if not prompt_text:
+            return ""
+        return "<MEETING_PROMPT_INJECTION>\n{}\n</MEETING_PROMPT_INJECTION>".format(prompt_text)
+
+    def _resolve_doctor_patient_pair(self, a: Any, b: Any):
+        meeting = self._resolve_active_meeting(a, b)
+        if isinstance(meeting, dict):
+            doctor_name = str(meeting.get("doctor", "") or "")
+            patient_name = str(meeting.get("patient", "") or "")
+            if str(getattr(a, "name", "") or "") == doctor_name and str(getattr(b, "name", "") or "") == patient_name:
+                return a, b
+            if str(getattr(b, "name", "") or "") == doctor_name and str(getattr(a, "name", "") or "") == patient_name:
+                return b, a
+        return self._resolve_global_doctor_patient_pair(a, b)
 
     def _resolve_latest_chat_node_id(self, agent: Any) -> str:
         try:
@@ -2836,6 +3017,12 @@ class InterventionManager:
             self.state["doctor_current_meeting"] = {}
         if not isinstance(self.state.get("meeting_dedup"), dict):
             self.state["meeting_dedup"] = {}
+        resident_chat_state = self.state.get("resident_chat_state", {})
+        if not isinstance(resident_chat_state, dict):
+            resident_chat_state = {}
+            self.state["resident_chat_state"] = resident_chat_state
+        if not isinstance(resident_chat_state.get("rules"), dict):
+            resident_chat_state["rules"] = {}
         meeting_seq = self.state.get("meeting_seq", 0)
         try:
             meeting_seq = int(meeting_seq)
@@ -3034,6 +3221,9 @@ class InterventionManager:
                 "start_at": self._fmt_dt(now),
                 "dedup_key": dedup_key,
                 "step_phase": rule.get("step_phase", ""),
+                "meeting_kind": str(rule.get("meeting_kind", "doctor_consult") or "doctor_consult"),
+                "prompt_file": str(rule.get("prompt_file", "") or ""),
+                "meeting_source": str(rule.get("meeting_source", "meeting_rules") or "meeting_rules"),
             }
             queue.append(meeting_id)
             dedup_map[dedup_key] = meeting_id
@@ -3362,6 +3552,9 @@ class InterventionManager:
             "start_at": self._fmt_dt(now),
             "expire_at": self._fmt_dt(expire_at),
             "priority": "hard",
+            "meeting_kind": str(rule.get("meeting_kind", "doctor_consult") or "doctor_consult"),
+            "prompt_file": str(rule.get("prompt_file", "") or ""),
+            "meeting_source": str(rule.get("meeting_source", "meeting_rules") or "meeting_rules"),
         }
         self.state.setdefault("rule_last_trigger", {})[rule_id] = self._fmt_dt(now)
 
@@ -4240,7 +4433,7 @@ class InterventionManager:
             "reason": reason,
         }
 
-    def _consult_history_gate(
+    def _consult_history_gate_with_trace(
         self,
         speaker: Any,
         other: Any,
@@ -4286,7 +4479,30 @@ class InterventionManager:
                 normalized.get("reason", ""),
             )
         )
-        return normalized
+        return {
+            "prompt_text": str(prompt_text or ""),
+            "gate_output": copy.deepcopy(normalized if isinstance(normalized, dict) else {}),
+        }
+
+    def _consult_history_gate(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        latest_utterance: str,
+        policy: Dict[str, Any],
+        pair_key: str,
+    ) -> Dict[str, Any]:
+        trace = self._consult_history_gate_with_trace(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            latest_utterance=latest_utterance,
+            policy=policy,
+            pair_key=pair_key,
+        )
+        gate_output = trace.get("gate_output", {}) if isinstance(trace, dict) else {}
+        return copy.deepcopy(gate_output if isinstance(gate_output, dict) else {})
 
     def _retrieve_consult_history_candidates(
         self,
@@ -4360,7 +4576,30 @@ class InterventionManager:
             )
         return "\n\n".join(blocks).strip()
 
-    def _summarize_consult_history_hits(
+    def _build_consult_history_trace_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        trace_hits: List[Dict[str, Any]] = []
+        for idx, item in enumerate(hits or [], start=1):
+            item_dict = item if isinstance(item, dict) else {}
+            record = item_dict.get("record", {})
+            if not isinstance(record, dict):
+                continue
+            score = item_dict.get("score", 0.0)
+            try:
+                score = float(score or 0.0)
+            except Exception:
+                score = 0.0
+            trace_hits.append(
+                {
+                    "rank": idx,
+                    "record_id": str(record.get("record_id", "") or item_dict.get("record_id", "") or "").strip(),
+                    "session_started_at": str(record.get("session_started_at", "") or "").strip(),
+                    "chat_summary": str(record.get("chat_summary", "") or "").strip(),
+                    "score": score,
+                }
+            )
+        return trace_hits
+
+    def _summarize_consult_history_hits_with_trace(
         self,
         speaker: Any,
         other: Any,
@@ -4369,7 +4608,7 @@ class InterventionManager:
         query: str,
         hits: List[Dict[str, Any]],
         policy: Dict[str, Any],
-    ) -> str:
+    ) -> Dict[str, Any]:
         prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("summary_prompt_file", "") or ""))
         prompt_text = self._render_prompt_template(
             prompt_tpl,
@@ -4398,9 +4637,118 @@ class InterventionManager:
                 caller="consult_history_summary_forced_llm",
             )
         text = str(text or "").strip()
-        if not text:
-            return ""
-        return "<consult_history_memory>\n{}\n</consult_history_memory>".format(text)
+        memory_block = ""
+        if text:
+            memory_block = "<consult_history_memory>\n{}\n</consult_history_memory>".format(text)
+        return {
+            "prompt_text": str(prompt_text or ""),
+            "summary_output": text,
+            "memory_block": memory_block,
+        }
+
+    def _summarize_consult_history_hits(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        pair_key: str,
+        query: str,
+        hits: List[Dict[str, Any]],
+        policy: Dict[str, Any],
+    ) -> str:
+        trace = self._summarize_consult_history_hits_with_trace(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            pair_key=pair_key,
+            query=query,
+            hits=hits,
+            policy=policy,
+        )
+        return str(trace.get("memory_block", "") or "") if isinstance(trace, dict) else ""
+
+    def _build_consult_history_trace_context(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        forced: bool = False,
+        turn_no: int = 1,
+        is_initiator: bool = False,
+    ) -> Dict[str, Any]:
+        del forced, is_initiator
+        trace_context: Dict[str, Any] = {
+            "evaluated": False,
+            "memory_block": "",
+            "trace_prompt_text": "",
+            "gate_prompt_text": "",
+            "summary_prompt_text": "",
+            "gate_output": {},
+            "retrieval_hits": [],
+            "summary_output": "",
+        }
+        policy = self.get_consult_history_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            return trace_context
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return trace_context
+        if int(turn_no or 1) <= 1:
+            return trace_context
+        pair_key = build_pair_key(str(getattr(doctor, "name", "") or ""), str(getattr(patient, "name", "") or ""))
+        latest_utterance = self._extract_latest_other_utterance(chats, getattr(other, "name", ""))
+        if not latest_utterance:
+            return trace_context
+        gate_trace = self._consult_history_gate_with_trace(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            latest_utterance=latest_utterance,
+            policy=policy,
+            pair_key=pair_key,
+        )
+        gate_output = gate_trace.get("gate_output", {}) if isinstance(gate_trace, dict) else {}
+        gate_prompt_text = str(gate_trace.get("prompt_text", "") or "") if isinstance(gate_trace, dict) else ""
+        trace_context["evaluated"] = True
+        trace_context["gate_output"] = copy.deepcopy(gate_output if isinstance(gate_output, dict) else {})
+        trace_context["gate_prompt_text"] = gate_prompt_text
+        trace_prompt_sections = []
+        if gate_prompt_text:
+            trace_prompt_sections.append("[consult_history_gate_prompt]\n{}".format(gate_prompt_text))
+        if not bool((gate_output or {}).get("need_retrieval", False)):
+            trace_context["trace_prompt_text"] = "\n\n".join(trace_prompt_sections).strip()
+            return trace_context
+        query = str((gate_output or {}).get("query", "") or "").strip()
+        if not query:
+            trace_context["trace_prompt_text"] = "\n\n".join(trace_prompt_sections).strip()
+            return trace_context
+        hits = self._retrieve_consult_history_candidates(
+            agent=speaker,
+            pair_key=pair_key,
+            query=query,
+            top_k=int(policy.get("retrieve_top_k", 3) or 3),
+        )
+        trace_context["retrieval_hits"] = self._build_consult_history_trace_hits(hits)
+        if not hits:
+            trace_context["trace_prompt_text"] = "\n\n".join(trace_prompt_sections).strip()
+            return trace_context
+        summary_trace = self._summarize_consult_history_hits_with_trace(
+            speaker=speaker,
+            other=other,
+            chats=chats,
+            pair_key=pair_key,
+            query=query,
+            hits=hits,
+            policy=policy,
+        )
+        summary_prompt_text = str(summary_trace.get("prompt_text", "") or "") if isinstance(summary_trace, dict) else ""
+        if summary_prompt_text:
+            trace_prompt_sections.append("[consult_history_summary_prompt]\n{}".format(summary_prompt_text))
+        trace_context["summary_prompt_text"] = summary_prompt_text
+        trace_context["summary_output"] = str(summary_trace.get("summary_output", "") or "") if isinstance(summary_trace, dict) else ""
+        trace_context["memory_block"] = str(summary_trace.get("memory_block", "") or "") if isinstance(summary_trace, dict) else ""
+        trace_context["trace_prompt_text"] = "\n\n".join(trace_prompt_sections).strip()
+        return trace_context
 
     def get_consult_history_memory_block(
         self,
@@ -4411,49 +4759,15 @@ class InterventionManager:
         turn_no: int = 1,
         is_initiator: bool = False,
     ) -> str:
-        del forced, is_initiator
-        policy = self.get_consult_history_runtime_policy()
-        if not bool(policy.get("enabled", False)):
-            return ""
-        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
-        if not doctor or not patient:
-            return ""
-        if int(turn_no or 1) <= 1:
-            return ""
-        pair_key = build_pair_key(str(getattr(doctor, "name", "") or ""), str(getattr(patient, "name", "") or ""))
-        latest_utterance = self._extract_latest_other_utterance(chats, getattr(other, "name", ""))
-        if not latest_utterance:
-            return ""
-        gate = self._consult_history_gate(
+        trace_context = self._build_consult_history_trace_context(
             speaker=speaker,
             other=other,
             chats=chats,
-            latest_utterance=latest_utterance,
-            policy=policy,
-            pair_key=pair_key,
+            forced=forced,
+            turn_no=turn_no,
+            is_initiator=is_initiator,
         )
-        if not bool(gate.get("need_retrieval", False)):
-            return ""
-        query = str(gate.get("query", "") or "").strip()
-        if not query:
-            return ""
-        hits = self._retrieve_consult_history_candidates(
-            agent=speaker,
-            pair_key=pair_key,
-            query=query,
-            top_k=int(policy.get("retrieve_top_k", 3) or 3),
-        )
-        if not hits:
-            return ""
-        return self._summarize_consult_history_hits(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            pair_key=pair_key,
-            query=query,
-            hits=hits,
-            policy=policy,
-        )
+        return str(trace_context.get("memory_block", "") or "") if isinstance(trace_context, dict) else ""
 
     def _handle_consult_history_after_chat(
         self,

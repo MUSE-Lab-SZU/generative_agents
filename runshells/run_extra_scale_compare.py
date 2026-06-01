@@ -19,10 +19,10 @@ from typing import Any
 # ============================================================
 
 RESULT_A = "results/experiment_data/sim-init-0523/scales/scale_scores.json"
-RESULT_B = "results/experiment_data/sim-test-0523/scales/scale_scores.json"
+RESULT_B = "results/experiment_data/sim-test-0523-2/scales/scale_scores.json"
 
 LABEL_A = "初始化存档sim-init-0523"
-LABEL_B = "仿真实验后存档sim-test-0523"
+LABEL_B = "仿真实验后存档sim-test-0523-2"
 
 # 输入来源：
 # - "auto": 自动根据 JSON 结构识别（推荐）

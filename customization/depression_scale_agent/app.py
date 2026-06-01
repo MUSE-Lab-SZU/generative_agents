@@ -14,8 +14,6 @@ if BASE_DIR not in sys.path:
 from modules.game import create_game  # noqa: E402
 from modules.memory import Event  # noqa: E402
 from modules import utils  # noqa: E402
-from modules import depression_runtime_manager as drm  # noqa: E402
-from modules import depression_dynamic_adapter as dda  # noqa: E402
 from modules.intervention_manager import InterventionManager  # noqa: E402
 from modules.model.llm_model import create_llm_model  # noqa: E402
 from customization.depression_scale_agent.ExpertLLM import ExpertLLM  # type: ignore
@@ -34,15 +32,11 @@ TRACE_MD_SUFFIX = "_prompt_trace.md"
 _ENV_LOADED = False
 
 CHAIN_MODE_AUTO = "auto"
-CHAIN_MODE_UPDATE = "depression_update"
 CHAIN_MODE_DYNAMIC = "depression_dynamic"
-CHAIN_MODE_BOTH = "both"
 
 CHAIN_MODE_CHOICES = {
     CHAIN_MODE_AUTO,
-    CHAIN_MODE_UPDATE,
     CHAIN_MODE_DYNAMIC,
-    CHAIN_MODE_BOTH,
 }
 
 DEFAULT_CHAIN_MODE = str(
@@ -124,14 +118,21 @@ class UserStub:
 
 
 class ChatSession:
-    def __init__(self, sim_name, snapshot_file=None):
+    def __init__(self, sim_name, snapshot_file=None, runtime_config=None, conversation=None):
         _load_env_file_once()
         self.sim_name = sim_name
-        self.snapshot_file = resolve_snapshot_file(sim_name, snapshot_file)
-        self.config = load_config(sim_name, self.snapshot_file)
+        if runtime_config is not None:
+            self.snapshot_file = str(snapshot_file or "")
+            self.config = _clone_json_safe(runtime_config)
+            self.conversation = _clone_json_safe(conversation or {})
+        else:
+            self.snapshot_file = resolve_snapshot_file(sim_name, snapshot_file)
+            self.config = load_config(sim_name, self.snapshot_file)
+            self.conversation = load_conversation(sim_name)
         if self.config is None:
             raise ValueError(f"找不到存档: {sim_name}")
-        self.conversation = load_conversation(sim_name)
+        if isinstance(self.config.get("time"), str):
+            self.config["time"] = {"start": self.config.get("time")}
         self.logger = utils.create_io_logger("info")
         self.game = create_game(
             sim_name,
@@ -150,7 +151,6 @@ class ChatSession:
         self.chats = []
         self.doctor_name = self._resolve_doctor_name()
         self.chain_mode = self._resolve_chain_mode()
-        self._agent_dynamic_cfg_overrides = {}
         self._last_generate_route = "default"
         self._last_answer_trace = {}
         if self.snapshot_file:
@@ -168,9 +168,8 @@ class ChatSession:
                 )
             )
         self.logger.info(
-            "[DEPR_SCALE][CHAIN_MODE] mode={} update_chain={} dynamic_chain={}".format(
+            "[DEPR_SCALE][CHAIN_MODE] mode={} legacy_update_chain=false dynamic_chain={}".format(
                 self.chain_mode,
-                self._chain_uses_update(),
                 self._chain_uses_dynamic(),
             )
         )
@@ -201,110 +200,41 @@ class ChatSession:
             requested_mode = CHAIN_MODE_AUTO
         if requested_mode != CHAIN_MODE_AUTO:
             return requested_mode
-
-        update_cfg = intervention_cfg.get("depression_update", {}) or {}
-        dynamic_cfg = intervention_cfg.get("depression_dynamic", {}) or {}
-        update_enabled = bool(update_cfg.get("enabled", False))
-        dynamic_enabled = bool(dynamic_cfg.get("enabled", False))
-        if update_enabled and dynamic_enabled:
-            return CHAIN_MODE_BOTH
-        if dynamic_enabled:
-            return CHAIN_MODE_DYNAMIC
-        return CHAIN_MODE_UPDATE
-
-    def _chain_uses_update(self):
-        return self.chain_mode in {CHAIN_MODE_UPDATE, CHAIN_MODE_BOTH}
+        return CHAIN_MODE_DYNAMIC
 
     def _chain_uses_dynamic(self):
-        return self.chain_mode in {CHAIN_MODE_DYNAMIC, CHAIN_MODE_BOTH}
-
-    def _resolve_intervention_depression_update_cfg(self):
-        if (
-            getattr(self, "intervention", None)
-            and isinstance(getattr(self.intervention, "config", None), dict)
-        ):
-            cfg = (
-                ((self.intervention.config.get("intervention", {}) or {}).get("depression_update", {}) or {})
-            )
-            return cfg if isinstance(cfg, dict) else {}
-        return {}
+        return self.chain_mode == CHAIN_MODE_DYNAMIC
 
     def _sync_agent_chain_switch(self):
         if not self.agent:
             return
-        cfg = getattr(self.agent, "depression_dynamic_cfg", None)
-        if not isinstance(cfg, dict):
-            return
-
-        agent_key = str(getattr(self.agent, "name", "") or id(self.agent))
-        original_cfg = self._agent_dynamic_cfg_overrides.get(agent_key)
-        if original_cfg is None:
-            original_cfg = {
-                "normal_chain_enabled": cfg.get("normal_chain_enabled", True),
-                "forced_chain_enabled": cfg.get("forced_chain_enabled", True),
-                "prompt_injection_enabled": cfg.get("prompt_injection_enabled", True),
-                "event_commit_enabled": cfg.get("event_commit_enabled", True),
-            }
-            self._agent_dynamic_cfg_overrides[agent_key] = dict(original_cfg)
-
-        if self._chain_uses_dynamic():
-            cfg.update(original_cfg)
-        else:
-            cfg["normal_chain_enabled"] = False
-            cfg["forced_chain_enabled"] = False
-            cfg["prompt_injection_enabled"] = False
-            cfg["event_commit_enabled"] = False
-
         self.logger.info(
-            "[DEPR_SCALE][CHAIN_SWITCH] agent={} mode={} update_chain={} dynamic_chain={} dynamic_runtime_enabled={}".format(
+            "[DEPR_SCALE][CHAIN_SWITCH] agent={} mode={} dynamic_chain={} dynamic_runtime_enabled={}".format(
                 self.agent.name,
                 self.chain_mode,
-                self._chain_uses_update(),
                 self._chain_uses_dynamic(),
-                bool(getattr(self.agent, "depression_dynamic_enabled", False)),
+                bool(getattr(self.agent, "depression_dynamic", None)),
             )
         )
 
     def _patch_prompt_for_forced_dynamic(self, prompt_payload, user, relation, chats, prompt_kwargs):
-        if (not self.agent) or (not self._chain_uses_dynamic()):
-            return prompt_payload
+        del user, relation, chats, prompt_kwargs
         if not isinstance(prompt_payload, dict):
             return prompt_payload
-        prev_ctx = getattr(self.agent, "_chat_route_ctx", None)
-        try:
-            self.agent._chat_route_ctx = {
-                "forced": True,
-                "peer_name": getattr(user, "name", ""),
-                "peer_agent": user,
-            }
-            patched = dda.patch_prompt(
-                self.agent,
-                "generate_chat",
-                dict(prompt_payload),
-                (self.agent, user, relation, chats),
-                dict(prompt_kwargs),
-            )
-            return patched if isinstance(patched, dict) else prompt_payload
-        except Exception as exc:
-            self.logger.warning("[DEPR_SCALE][DYNAMIC_PROMPT] patch_error={}".format(exc))
-            return prompt_payload
-        finally:
-            self.agent._chat_route_ctx = prev_ctx
+        return dict(prompt_payload)
 
     def _dump_dynamic_state_for_trace(self):
         if not self.agent:
             return {}
         state_payload = {}
+        engine = getattr(self.agent, "depression_dynamic", None)
         try:
-            state_payload = dda.dump_state(self.agent)
+            if engine is not None and callable(getattr(engine, "to_dict", None)):
+                state_payload = engine.to_dict()
         except Exception as exc:
             state_payload = {"error": "dump_failed", "detail": str(exc)}
-        cfg = getattr(self.agent, "depression_dynamic_cfg", None)
-        hints = getattr(self.agent, "depression_dynamic_target_hints", None)
         trace_payload = {
-            "enabled_runtime": bool(getattr(self.agent, "depression_dynamic_enabled", False)),
-            "cfg": cfg if isinstance(cfg, dict) else {},
-            "target_hints": sorted([str(x) for x in list(hints or [])]),
+            "enabled_runtime": bool(engine),
             "state_dump": state_payload if isinstance(state_payload, dict) else {},
             "chain_mode": self.chain_mode,
             "chain_uses_dynamic": self._chain_uses_dynamic(),
@@ -343,30 +273,32 @@ class ChatSession:
     def _build_forced_alignment_trace(self, prompt_route):
         return {
             "forced_context_enabled": True,
-            "uses_same_dynamic_patch_api": True,
+            "uses_same_direct_engine_helpers": True,
             "uses_same_prompt_templates": True,
             "prompt_route": str(prompt_route or ""),
             "known_differences": [
                 "depression_scale_app 直接调用 scratch 构建 prompt，不经过 Agent.completion 包装层。",
-                "depression_scale_app 为保持动态人设注入稳定，统一按 generate_chat 语义执行动态 patch。",
+                "depression_scale_app 通过 Agent 的 direct-engine helper 预先生成 depression_chat_block。",
             ],
         }
 
     def get_last_answer_trace(self):
         return _clone_json_safe(self._last_answer_trace)
 
-    def _commit_dynamic_chat_event(self, chats, user_name):
+    def _commit_dynamic_chat_event(self, user, relation, chats_before_reply, reply_text):
         if (not self.agent) or (not self._chain_uses_dynamic()):
             return
-        forced_route = bool(self._last_generate_route == "forced_llm")
-        dda.commit_event(
-            self.agent,
-            event_key="chat_event",
-            forced=forced_route,
-            fallback_hint="generate_chat",
-            other_agent=str(user_name or ""),
-            conversation_content=dda.serialize_conversation(chats),
-        )
+        if not bool(getattr(self.agent, "depression_dynamic", None)):
+            return
+        try:
+            context = self.agent._build_depression_chat_context(
+                other=user,
+                relation_summary=relation,
+                chats=chats_before_reply,
+            )
+            self.agent._commit_depression_generate_chat(context, reply_text)
+        except Exception as exc:
+            self.logger.warning("[DEPR_SCALE][DYNAMIC_COMMIT] commit_error={}".format(exc))
 
     def _relation_text(self, relation):
         return str(relation or "").strip()
@@ -374,15 +306,16 @@ class ChatSession:
     def _get_runtime_emotion_snapshot(self):
         if not self.agent:
             return {}
-        profile = getattr(self.agent, "depression_profile", {})
-        if not isinstance(profile, dict):
+        engine = getattr(self.agent, "depression_dynamic", None)
+        if engine is None or not callable(getattr(engine, "get_current_state_info", None)):
             return {}
-        runtime = profile.get("runtime", {})
-        if not isinstance(runtime, dict):
+        try:
+            info = engine.get_current_state_info()
+        except Exception:
             return {}
-        emotion = runtime.get("emotion", {})
-        if not isinstance(emotion, dict):
+        if not isinstance(info, dict):
             return {}
+        emotion = info.get("emotion", {}) if isinstance(info.get("emotion", {}), dict) else {}
         return _clone_json_safe(emotion)
 
     def _build_depression_chat_block(self, user, relation, chats):
@@ -397,43 +330,31 @@ class ChatSession:
             emotion_trace["reason"] = "agent_missing"
             return "", emotion_trace
         emotion_trace["emotion_before"] = self._get_runtime_emotion_snapshot()
-        dynamic_emotion_enabled = bool(
+        dynamic_runtime_enabled = bool(
             self._chain_uses_dynamic()
-            and bool(getattr(self.agent, "depression_dynamic_enabled", False))
+            and bool(getattr(self.agent, "depression_dynamic", None))
         )
-        if dynamic_emotion_enabled:
-            try:
-                self.agent.depression_profile = drm.infer_chat_emotion(
-                    patient_agent=self.agent,
-                    profile=self.agent.depression_profile,
-                    now_step=utils.get_timer().daily_duration(),
-                    static_profile=getattr(self.agent, "profile", {}),
-                    other_agent=getattr(user, "name", ""),
-                    relationship=emotion_trace["relationship"],
-                    conversation_content=dda.serialize_conversation(chats),
-                )
-                emotion_trace["applied"] = True
-                emotion_trace["reason"] = "ok"
-            except Exception as exc:
-                self.logger.warning("[DEPR_SCALE][EMOTION] infer_error={}".format(exc))
-                emotion_trace["reason"] = "infer_error:{}".format(exc)
-        else:
-            emotion_trace["reason"] = "dynamic_emotion_disabled"
-        emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
-        update_cfg = self._resolve_intervention_depression_update_cfg()
+        if not dynamic_runtime_enabled:
+            emotion_trace["reason"] = "dynamic_runtime_disabled"
+            emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
+            return "", emotion_trace
         try:
-            view = drm.build_intermediate_view(
-                self.agent.depression_profile,
-                utils.get_timer().daily_duration(),
-                stage="chat",
-                update_cfg=update_cfg,
-                static_profile=getattr(self.agent, "profile", {}),
+            prompt_kwargs, _ = self.agent._prepare_depression_generate_chat(
+                args=(self.agent, user, relation, chats),
+                kwargs={},
             )
-            block = view.get("chat_block", "")
-            return (block if isinstance(block, str) else ""), emotion_trace
+            depression_chat_block = str(
+                prompt_kwargs.get("depression_chat_block", "") or ""
+            )
+            emotion_trace["applied"] = bool(depression_chat_block)
+            emotion_trace["reason"] = (
+                "direct_engine_preview_ok" if depression_chat_block else "direct_engine_preview_empty"
+            )
+            emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
+            return depression_chat_block, emotion_trace
         except Exception as exc:
-            self.logger.warning("[DEPR_SCALE][CHAT_BLOCK] build_error={}".format(exc))
-            emotion_trace["reason"] = "build_error:{}".format(exc)
+            emotion_trace["reason"] = "direct_engine_preview_error:{}".format(exc)
+            emotion_trace["emotion_after"] = self._get_runtime_emotion_snapshot()
             return "", emotion_trace
 
     def _get_forced_llm_runtime(self):
@@ -716,7 +637,7 @@ class ChatSession:
             address=self.agent.get_tile().get_address(),
         )
         self.agent._add_concept("chat", event)
-        self._commit_dynamic_chat_event(chats, user_name)
+        self._commit_dynamic_chat_event(user, relation, chats[:-1], reply)
         self._append_conversation(chats, user_name)
         return reply
 

@@ -695,13 +695,18 @@ class Scratch:
         relation,
         chats,
         depression_chat_block="",
+        meeting_prompt_injection="",
         doctor_session_prompt_injection="",
         doctor_consult_record_injection="",
+        consult_history_memory="",
         retrieval_profile=None,
         chat_history_target_name=None,
         memory_source="local",
         external_memory_context="",
     ):
+        def _normalize_prompt_text(text):
+            return " ".join(str(text or "").split())
+
         recent_turn_focus_n = 4
         if hasattr(agent, "get_chat_recent_turn_focus_n"):
             recent_turn_focus_n = agent.get_chat_recent_turn_focus_n()
@@ -724,7 +729,14 @@ class Scratch:
                 focus_retrieve_max,
                 retrieval_profile=retrieval_profile,
             )
-            memory = "\n- " + "\n- ".join([n.describe for n in nodes])
+            memory_lines, seen_memory_lines = [], set()
+            for n in nodes:
+                normalized_line = _normalize_prompt_text(getattr(n, "describe", ""))
+                if not normalized_line or normalized_line in seen_memory_lines:
+                    continue
+                seen_memory_lines.add(normalized_line)
+                memory_lines.append(n.describe)
+            memory = "\n- " + "\n- ".join(memory_lines) if memory_lines else ""
         address = agent.get_tile().get_address()
         if memory_mode == "external":
             prev_context = ""
@@ -745,10 +757,15 @@ class Scratch:
                 summary_window_minutes = agent.get_chat_summary_window_minutes()
             pass_context = ""
             kept_context_num = 0
+            seen_chat_context = set()
             for n in chat_nodes:
                 delta = utils.get_timer().get_delta(n.create)
                 if summary_window_minutes != -1 and delta > summary_window_minutes:
                     continue
+                normalized_chat = _normalize_prompt_text(getattr(n, "describe", ""))
+                if not normalized_chat or normalized_chat in seen_chat_context:
+                    continue
+                seen_chat_context.add(normalized_chat)
                 kept_context_num += 1
                 pass_context += f"{delta} 分钟前，{agent.name} 和 {other.name} 进行过对话。{n.describe}\n"
 
@@ -786,8 +803,10 @@ class Scratch:
                 "agent": agent.name,
                 "base_desc": self._base_desc(),
                 "depression_chat_block": depression_chat_block or "",
+                "meeting_prompt_injection": meeting_prompt_injection or "",
                 "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
                 "doctor_consult_record_injection": doctor_consult_record_injection or "",
+                "consult_history_memory": consult_history_memory or "",
                 "memory": memory,
                 "address": f"{address[-2]}，{address[-1]}",
                 "current_time": utils.get_timer().get_date("%H:%M"),

@@ -8,11 +8,12 @@ ${base_prompt}
 @@ stage_layer
 === 当前主诉节点层 ===
 当前节点：${label}
-${optional_sections}推进原则：
+${optional_sections}回复原则：
 - 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。
 - 即使出现一点松动，也应表现为试探性的、会反复的变化。
-- 若当前对话没有真正触及这个节点，就不要跨越到下一个节点。
-${chain_window_section}
+- 当医生追问“最近最压着你的是什么”“为什么这件事这么难受”这类问题时，若当前节点已指向较明确的核心压力源，应优先自然回应到这个压力源。
+- 如果你先提到的是整理、发呆、拖延、身体沉重等表层入口，下一句应尽量补出背后更压着自己的事。
+- 不要生硬复述“节点名”或像在背设定；要用患者自己的口吻，把更核心的压力自然说出来。
 
 @@ dynamic_stage_summary_section
 节点概述：${summary}
@@ -32,8 +33,6 @@ ${chain_window_section}
 
 @@ stage_chain_window_section
 
-当前窗口中的主诉走向：
-${chain_window_items}${next_limit_section}
 
 @@ dynamic_stage_chain_window_item
 - [${marker}] ${label}：${summary}

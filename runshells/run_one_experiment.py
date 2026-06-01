@@ -27,7 +27,7 @@ from typing import Optional
 # ============================================================
 
 # 实验名称；留空则自动生成，例如 sim-one-0514-1830
-RUN_NAME = "sim-init-0516"
+RUN_NAME = "sim-test-0529"
 
 # 是否续跑已有实验（对应 start.py 的 --resume）
 # - False：新开一个实验
@@ -36,10 +36,10 @@ RESUME_RUN = False
 
 # 仿真起始时间（对应 start.py 的 --start）
 # 仅在 RESUME_RUN=False 时生效
-START_TIME = "20250516-09:30"
+START_TIME = "20260529-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 1
+STEP = 48
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 360
@@ -48,7 +48,7 @@ STRIDE = 360
 VERBOSE = "info"
 
 # 日志文件名（对应 start.py 的 --log）；留空表示不额外写文件日志
-LOG_FILE = "sim-init-0516.log"
+LOG_FILE = "sim-test-0529.log"
 
 # 量表评估的目标角色
 SCALE_AGENT = "卡布达"
@@ -241,6 +241,7 @@ def collect_core_outputs(name: str, *, dry_run: bool) -> None:
     checkpoint_dir = CHECKPOINTS_ROOT / name
     output_dir = ensure_experiment_dirs(name, dry_run=dry_run)
     traces_dir = output_dir / "traces"
+    scales_dir = output_dir / "scales"
 
     judge_src = checkpoint_dir / "judge_traces" / "judge_conversation.json"
     if judge_src.exists():
@@ -264,6 +265,15 @@ def collect_core_outputs(name: str, *, dry_run: bool) -> None:
         print(f"[COLLECT] {conv_src} -> {dst}")
         if not dry_run:
             shutil.copy2(conv_src, dst)
+
+    staged_src = checkpoint_dir / "staged_eval"
+    if staged_src.is_dir():
+        dst = scales_dir / "staged"
+        print(f"[COLLECT] {staged_src} -> {dst}")
+        if not dry_run:
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(staged_src, dst)
 
     merge_dst = traces_dir / "merge_consultation_dialogues.json"
     if merge_dst.exists():

@@ -1,16 +1,28 @@
 import os
-os.environ["OPENAI_API_KEY"] = "sk-6cb4c63b197d463d94969ec253cec887"  ### DeepSeek API Key ###
+
+from dotenv import find_dotenv, load_dotenv
+
+load_dotenv(find_dotenv())
+
 
 class ExpertLLM:
-    def __init__(self, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com", timeout=60):
+    def __init__(self, api_key=None, model=None, base_url=None, timeout=60):
         from openai import OpenAI
 
-        resolved_key = api_key or os.getenv("OPENAI_API_KEY")
+        resolved_key = (
+            api_key
+            or os.getenv("EXPERT_LLM_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
         if not resolved_key:
-            raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass api_key.")
+            raise ValueError("Missing API key. Set DEEPSEEK_API_KEY/OPENAI_API_KEY or pass api_key.")
 
-        self._model = model
-        self._client = OpenAI(api_key=resolved_key, base_url=base_url, timeout=timeout)
+        resolved_model = model or os.getenv("EXPERT_LLM_MODEL") or "deepseek-chat"
+        resolved_base_url = base_url or os.getenv("EXPERT_LLM_BASE_URL") or "https://api.deepseek.com"
+
+        self._model = resolved_model
+        self._client = OpenAI(api_key=resolved_key, base_url=resolved_base_url, timeout=timeout)
 
     def generate(self, user_prompt, system_prompt=None, temperature=0.2, **kwargs):
         messages = []

@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-05-17
+> 更新时间：2026-05-25
 
 ## 关键测试结果速查
 
@@ -25,6 +25,18 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-05-31：新增正常/负面聊天提示词前缀（`data/prompts/intervention/resident_chat_neutral_social.txt`和`data/prompts/intervention/resident_chat_negative_support.txt`），结合“定期随机居民聊天”模块使用。
+- 2026-05-31：新增定期随机居民聊天功能，复用“定期医患对话”相关功能实现，作为对照组。具体逻辑在`modules/resident_chat_scheduler.py`里。
+- 2026-05-30：新增`runshells/run_batch_experiment.py`脚本，用于批量实验。新增`experiment`文件夹存放不同实验组的配置文件。
+- 2026-05-30：仿真过程中增加评估环节（与app.py同功能），为了方便实现计划中的“阶段评估”，不需要人工打断再resume。具体逻辑在`modules/staged_eval_manager.py`里
+- 2026-05-29：改善聊天没聊到“压力源”问题：新增卡布达初始化记忆注入条数，修改session1的Prompt，删除session_loop配置，给judge-llm总结患者状态时的Prompt中增加压力源约束，给judge-llm提示词增加软约束，**调整患者提示词**`data/prompts/depression/dynamic_prompt_layers.txt`
+  - 关于`dynamic_prompt_layers.txt`改造：如果想再收干净一点，下一步可以把 modules/depression/prompt_builder.py:129-163 这段 chain_window_section 的构建也裁掉，但这不是必须项。
+- 2026-05-29：修复<患者状态>总结给judge-llm时，因患者Prompt结构更新而引起空缺的问题。增加若干初始记忆注入`data/intervention/memory_injections.json`
+- 2026-05-28：合并动态抑郁人设的更新。
+- 2026-05-27：修复`customization/depression_scale_agent/ExpertLLM.py `读取api-key的问题。
+- 2026-05-26：新增可视化，把“医患对话历史调用模块”中gate_llm和summary_llm输出融进Prompt可视化里
+- 2026-05-25：外置记忆服务中，拉长ingest后立马升级L2/里程碑的重试时间，避免服务解析时间太长而超时
+- 2026-05-25：修复chat记忆和某些thought记忆重复写入的问题。
 - 2026-05-23：修复对比脚本`runshells/run_extra_scale_compare.py`不兼容问题，现在可以指定2个存档的`scales/scale_scores.json`进行量表差异分析对比。
 - 2026-05-22：新增医患对话历史调用模块，功能主要是：1. 每次医患对话结束时都会把完整对话记录存到【医患历史对话记忆库】里，并把node方式的chat_summary作为检索向量。2. 医生/患者发言前由gate-llm判断是否需要检索该记忆库，若需要则检索并返回若干个相关的完整对话记录。3. 若需要检索并返回成功，则调用llm进行总结，形成“记忆摘要”。【0523实验并未写入成功，待修复后二次实验】
 - 2026-05-22：修复抑郁主诉链只有4个的问题，主要触因是主诉链更新Prompt以及一致性检查函数去除未知id。实验后发现有一些问题，做了二次改造，主要是允许新增多个后续主诉节点（next_chain）的树形结构而非只有1个的线性结构。【0523实验发现还是只有4个主诉链节点，后续总结一下给学长看看怎么优化】

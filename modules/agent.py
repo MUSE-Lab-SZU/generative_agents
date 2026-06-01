@@ -573,6 +573,7 @@ class Agent:
 
     def percept(self):
         scope = self.maze.get_scope(self.coord, self.percept_config)
+        chat_dedup_marker = self._get_chat_dedup_marker()
         # add spatial memory
         for tile in scope:
             if tile.has_address("game_object"):
@@ -617,10 +618,30 @@ class Agent:
                             )
                         )
                         continue
+                    if (
+                        chat_dedup_marker
+                        and event.fit(self.name, "对话")
+                        and self._chat_dedup_marker_matches_event(chat_dedup_marker, event)
+                    ):
+                        self.logger.info(
+                            "[CHAT_WRITE_DEDUP] agent={} source={} node_id={} event_subject={} event_object={} create={}".format(
+                                self.name,
+                                chat_dedup_marker.get("source", ""),
+                                chat_dedup_marker.get("node_id", ""),
+                                event.subject,
+                                event.object,
+                                chat_dedup_marker.get("create", ""),
+                            )
+                        )
+                        self._clear_chat_dedup_marker()
+                        chat_dedup_marker = None
+                        continue
                     node_type = "chat" if event.fit(self.name, "对话") else "event"
                     node = self._add_concept(node_type, event)
                     self.status["poignancy"] += node.poignancy
                 self.concepts.append(node)
+        if chat_dedup_marker:
+            self._clear_chat_dedup_marker()
         self.concepts = [c for c in self.concepts if c.event.subject != self.name]
         self.logger.info(
             "{} percept {}/{} concepts".format(self.name, valid_num, len(self.concepts))
@@ -652,7 +673,25 @@ class Agent:
         return event
 
     def reflect(self):
+        recent_thought_limit = 16
+        recent_thought_texts = set(
+            self._normalize_dedup_text(n.describe)
+            for n in self.associate.retrieve_thoughts(limit=recent_thought_limit)
+        )
+        seen_thoughts = set()
+
         def _add_thought(thought, evidence=None):
+            normalized_thought = self._normalize_dedup_text(thought)
+            if not normalized_thought:
+                return None
+            if normalized_thought in seen_thoughts or normalized_thought in recent_thought_texts:
+                self.logger.info(
+                    "[THOUGHT_WRITE_DEDUP] agent={} thought={}".format(
+                        self.name,
+                        normalized_thought,
+                    )
+                )
+                return None
             # event = self.completion(
             #     "describe_event",
             #     self.name,
@@ -660,7 +699,10 @@ class Agent:
             #     address=self.get_tile().get_address(),
             # )
             event = self.make_event(self.name, thought, self.get_tile().get_address())
-            return self._add_concept("thought", event, filling=evidence)
+            node = self._add_concept("thought", event, filling=evidence)
+            seen_thoughts.add(normalized_thought)
+            recent_thought_texts.add(normalized_thought)
+            return node
 
         if self.status["poignancy"] < self.think_config["poignancy_max"]:
             return
@@ -999,7 +1041,12 @@ class Agent:
         if not bool(forced):
             return []
         mgr = getattr(self, "intervention", None)
-        doctor_name = str(getattr(mgr, "doctor", "") or "")
+        if not mgr or not hasattr(mgr, "resolve_meeting_context"):
+            return []
+        meeting = mgr.resolve_meeting_context(self, other, forced=True)
+        if not isinstance(meeting, dict):
+            return []
+        doctor_name = str(meeting.get("doctor", "") or "")
         if not doctor_name:
             return []
         if str(self.name or "") == doctor_name:
@@ -1257,10 +1304,16 @@ class Agent:
                     len(chats),
                 )
             )
+            meeting_prompt_injection = ""
             doctor_session_prompt_injection = ""
             doctor_consult_record_injection = ""
             judge_session_prompt_injection = ""
             if self.intervention:
+                meeting_prompt_injection = self.intervention.get_meeting_prompt_injection(
+                    self,
+                    other,
+                    forced,
+                )
                 doctor_consult_record_injection = self.intervention.get_doctor_consult_record_injection(
                     self,
                     other,
@@ -1273,7 +1326,7 @@ class Agent:
                 )
             self_is_doctor_turn = bool(
                 self.intervention
-                and str(self.name or "") == str(getattr(self.intervention, "doctor", "") or "")
+                and self.intervention.is_meeting_doctor(self, other, forced=forced)
             )
             if (
                 dialog_judge_enabled
@@ -1318,6 +1371,7 @@ class Agent:
                 other=other,
                 relation=relations[0],
                 chats=chats,
+                meeting_prompt_injection=meeting_prompt_injection,
                 doctor_session_prompt_injection=doctor_session_prompt_injection,
                 doctor_consult_record_injection=doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
@@ -1464,10 +1518,16 @@ class Agent:
                     )
                     break
 
+            other_meeting_prompt_injection = ""
             other_doctor_session_prompt_injection = ""
             other_doctor_consult_record_injection = ""
             other_judge_session_prompt_injection = ""
             if self.intervention:
+                other_meeting_prompt_injection = self.intervention.get_meeting_prompt_injection(
+                    other,
+                    self,
+                    forced,
+                )
                 other_doctor_consult_record_injection = self.intervention.get_doctor_consult_record_injection(
                     other,
                     self,
@@ -1480,7 +1540,7 @@ class Agent:
                 )
             other_is_doctor_turn = bool(
                 self.intervention
-                and str(other.name or "") == str(getattr(self.intervention, "doctor", "") or "")
+                and self.intervention.is_meeting_doctor(other, self, forced=forced)
             )
             if (
                 dialog_judge_enabled
@@ -1525,6 +1585,7 @@ class Agent:
                 other=self,
                 relation=relations[1],
                 chats=chats,
+                meeting_prompt_injection=other_meeting_prompt_injection,
                 doctor_session_prompt_injection=other_doctor_session_prompt_injection,
                 doctor_consult_record_injection=other_doctor_consult_record_injection,
                 retrieval_profile=retrieval_profile,
@@ -1792,6 +1853,7 @@ class Agent:
         relation,
         chats,
         depression_chat_block="",
+        meeting_prompt_injection="",
         doctor_session_prompt_injection="",
         doctor_consult_record_injection="",
         retrieval_profile=None,
@@ -1799,14 +1861,15 @@ class Agent:
         turn_no=1,
     ):
         consult_history_memory = ""
-        if self.intervention and hasattr(self.intervention, "get_consult_history_memory_block"):
+        consult_history_trace_context = {}
+        forced = bool(
+            isinstance(self._chat_route_ctx, dict)
+            and self._chat_route_ctx.get("forced", False)
+        )
+        if self.intervention:
             try:
-                forced = bool(
-                    isinstance(self._chat_route_ctx, dict)
-                    and self._chat_route_ctx.get("forced", False)
-                )
-                consult_history_memory = str(
-                    self.intervention.get_consult_history_memory_block(
+                if hasattr(self.intervention, "_build_consult_history_trace_context"):
+                    consult_history_trace_context = self.intervention._build_consult_history_trace_context(
                         speaker=self,
                         other=other,
                         chats=chats,
@@ -1814,9 +1877,25 @@ class Agent:
                         turn_no=turn_no,
                         is_initiator=is_initiator,
                     )
-                    or ""
-                )
+                    if not isinstance(consult_history_trace_context, dict):
+                        consult_history_trace_context = {}
+                    consult_history_memory = str(
+                        consult_history_trace_context.get("memory_block", "") or ""
+                    )
+                elif hasattr(self.intervention, "get_consult_history_memory_block"):
+                    consult_history_memory = str(
+                        self.intervention.get_consult_history_memory_block(
+                            speaker=self,
+                            other=other,
+                            chats=chats,
+                            forced=forced,
+                            turn_no=turn_no,
+                            is_initiator=is_initiator,
+                        )
+                        or ""
+                    )
             except Exception as exc:
+                consult_history_trace_context = {}
                 self.logger.warning(
                     "[CONSULT_HISTORY_BLOCK_FAIL] agent={} other={} turn_no={} error={}".format(
                         self.name,
@@ -1825,6 +1904,58 @@ class Agent:
                         exc,
                     )
                 )
+        try:
+            if (
+                forced
+                and self.intervention
+                and isinstance(consult_history_trace_context, dict)
+                and bool(consult_history_trace_context.get("evaluated", False))
+                and hasattr(self.intervention, "append_forced_prompt_trace_record")
+            ):
+                self.intervention.append_forced_prompt_trace_record(
+                    speaker=self,
+                    other=other,
+                    role="consult_history",
+                    prompt_text=str(consult_history_trace_context.get("trace_prompt_text", "") or ""),
+                    output={
+                        "gate_output": copy.deepcopy(
+                            consult_history_trace_context.get("gate_output", {})
+                            if isinstance(consult_history_trace_context.get("gate_output", {}), dict)
+                            else {}
+                        ),
+                        "retrieval_hits": copy.deepcopy(
+                            consult_history_trace_context.get("retrieval_hits", [])
+                            if isinstance(consult_history_trace_context.get("retrieval_hits", []), list)
+                            else []
+                        ),
+                        "summary_output": str(consult_history_trace_context.get("summary_output", "") or ""),
+                    },
+                    turn_no=turn_no,
+                    meta={
+                        "source": "consult_history_pre_reply",
+                        "speaker": str(self.name or ""),
+                        "other": str(getattr(other, "name", "") or ""),
+                        "is_initiator": bool(is_initiator),
+                        "need_retrieval": bool(
+                            ((consult_history_trace_context.get("gate_output", {}) if isinstance(consult_history_trace_context, dict) else {}) or {}).get("need_retrieval", False)
+                        ),
+                        "hit_count": len(
+                            consult_history_trace_context.get("retrieval_hits", [])
+                            if isinstance(consult_history_trace_context.get("retrieval_hits", []), list)
+                            else []
+                        ),
+                        "summary_included": bool(str(consult_history_trace_context.get("summary_output", "") or "").strip()),
+                    },
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "[CONSULT_HISTORY_TRACE_APPEND_FAIL] agent={} other={} turn_no={} error={}".format(
+                    self.name,
+                    getattr(other, "name", ""),
+                    turn_no,
+                    exc,
+                )
+            )
         bridge = getattr(self, "external_memory_bridge", None)
         if bridge and bridge.enabled_for_chat_read():
             retrieval = bridge.retrieve_chat_context(
@@ -1862,6 +1993,7 @@ class Agent:
                     relation,
                     chats,
                     depression_chat_block=depression_chat_block,
+                    meeting_prompt_injection=meeting_prompt_injection,
                     doctor_session_prompt_injection=doctor_session_prompt_injection,
                     doctor_consult_record_injection=doctor_consult_record_injection,
                     consult_history_memory=consult_history_memory,
@@ -1886,6 +2018,7 @@ class Agent:
             relation,
             chats,
             depression_chat_block=depression_chat_block,
+            meeting_prompt_injection=meeting_prompt_injection,
             doctor_session_prompt_injection=doctor_session_prompt_injection,
             doctor_consult_record_injection=doctor_consult_record_injection,
             consult_history_memory=consult_history_memory,
@@ -1985,6 +2118,13 @@ class Agent:
                 create=start,
                 expire=expire,
             )
+            self._set_chat_dedup_marker(
+                node_id=getattr(node, "node_id", ""),
+                event=event,
+                create=start,
+                source="schedule_chat_immediate",
+                write_mode=self.chat_memory_write_mode,
+            )
             self.status["poignancy"] += node.poignancy
             self.logger.info(
                 "[CHAT_MEMORY_WRITE_IMMEDIATE] agent={} other={} node_id={} create={} expire={} meta={}".format(
@@ -2011,6 +2151,74 @@ class Agent:
                 )
             )
             return False
+
+    def _normalize_dedup_text(self, text):
+        return " ".join(str(text or "").split())
+
+    def _build_chat_dedup_fingerprint(self, event):
+        if event is None:
+            return ""
+        parts = [
+            str(getattr(event, "subject", "") or ""),
+            str(getattr(event, "predicate", "") or ""),
+            str(getattr(event, "object", "") or ""),
+            self._normalize_dedup_text(
+                event.get_describe() if hasattr(event, "get_describe") else ""
+            ),
+        ]
+        return "||".join(parts)
+
+    def _chat_dedup_marker_window_minutes(self):
+        return 720
+
+    def _clear_chat_dedup_marker(self):
+        if isinstance(getattr(self, "status", None), dict):
+            self.status.pop("_chat_dedup_marker", None)
+
+    def _get_chat_dedup_marker(self):
+        if not isinstance(getattr(self, "status", None), dict):
+            return None
+        marker = self.status.get("_chat_dedup_marker")
+        if not isinstance(marker, dict):
+            self._clear_chat_dedup_marker()
+            return None
+        create_raw = str(marker.get("create", "") or "").strip()
+        if create_raw:
+            try:
+                create_dt = utils.to_date(create_raw)
+                delta = utils.get_timer().get_delta(create_dt)
+                if delta < 0 or delta > self._chat_dedup_marker_window_minutes():
+                    self._clear_chat_dedup_marker()
+                    return None
+            except Exception:
+                self._clear_chat_dedup_marker()
+                return None
+        return marker
+
+    def _set_chat_dedup_marker(self, node_id, event, create, source, write_mode):
+        if write_mode not in {"immediate", "hybrid"} or event is None:
+            return
+        create_dt = create if isinstance(create, datetime.datetime) else utils.get_timer().get_date()
+        self.status["_chat_dedup_marker"] = {
+            "kind": "chat",
+            "node_id": str(node_id or ""),
+            "fingerprint": self._build_chat_dedup_fingerprint(event),
+            "write_mode": str(write_mode or ""),
+            "source": str(source or ""),
+            "create": create_dt.strftime("%Y%m%d-%H:%M:%S"),
+        }
+
+    def _chat_dedup_marker_matches_event(self, marker, event):
+        if not isinstance(marker, dict) or event is None:
+            return False
+        if str(marker.get("kind", "") or "") != "chat":
+            return False
+        if str(marker.get("write_mode", "") or "") not in {"immediate", "hybrid"}:
+            return False
+        marker_fingerprint = str(marker.get("fingerprint", "") or "")
+        if not marker_fingerprint:
+            return False
+        return marker_fingerprint == self._build_chat_dedup_fingerprint(event)
 
     def _add_concept(
         self,
