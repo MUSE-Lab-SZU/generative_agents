@@ -207,6 +207,11 @@ class StagedEvalManager:
     def _compute_completed_session_count(self, runtime_config: Dict[str, Any]) -> int:
         if not isinstance(runtime_config, dict):
             return 0
+        if self._use_resident_chat_completed_count():
+            return self._compute_resident_chat_completed_count(runtime_config)
+        return self._compute_session_prompt_completed_count(runtime_config)
+
+    def _compute_session_prompt_completed_count(self, runtime_config: Dict[str, Any]) -> int:
         intervention_cfg = runtime_config.get("intervention", {}) or {}
         pair_state = self._resolve_target_pair_state(runtime_config)
         if not pair_state:
@@ -223,6 +228,24 @@ class StagedEvalManager:
                 return len(order)
             return current_index
         return current_index
+
+    def _compute_resident_chat_completed_count(self, runtime_config: Dict[str, Any]) -> int:
+        if not isinstance(runtime_config, dict):
+            return 0
+        state = runtime_config.get("intervention_state", {}) or {}
+        if not isinstance(state, dict):
+            return 0
+        resident_chat_state = state.get("resident_chat_state", {}) or {}
+        if not isinstance(resident_chat_state, dict):
+            return 0
+        completed_counts = resident_chat_state.get("completed_counts_by_patient", {}) or {}
+        if not isinstance(completed_counts, dict):
+            return 0
+        target_agent = self._target_agent()
+        if not target_agent:
+            return 0
+        count = self._safe_int(completed_counts.get(target_agent, 0), 0)
+        return max(0, count)
 
     def _maybe_run_session_interval_trigger(
         self,
@@ -344,6 +367,9 @@ class StagedEvalManager:
 
     def _target_agent(self) -> str:
         return str(self._cfg().get("target_agent", "") or "").strip()
+
+    def _use_resident_chat_completed_count(self) -> bool:
+        return bool(self._cfg().get("use_resident_chat_completed_count", False))
 
     def _scales(self) -> List[str]:
         scales = self._cfg().get("scales", []) or []

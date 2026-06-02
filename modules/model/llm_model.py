@@ -5,7 +5,8 @@ import re
 import requests
 
 
-OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
+DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
+DEFAULT_LLM_RETRY = 10
 
 
 class LLMModel:
@@ -15,6 +16,10 @@ class LLMModel:
         self._model = config["model"]
         self._meta_responses = []
         self._summary = {"total": [0, 0, 0]}
+        self._default_retry = config.get("retry", DEFAULT_LLM_RETRY)
+        self._request_timeout_seconds = config.get(
+            "request_timeout_seconds", DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS
+        )
 
         self._handle = self.setup(config)
         self._enabled = True
@@ -27,12 +32,13 @@ class LLMModel:
     def completion(
         self,
         prompt,
-        retry=10,
+        retry=None,
         callback=None,
         failsafe=None,
         caller="llm_normal",
         **kwargs
     ):
+        retry = self._default_retry if retry is None else retry
         response, self._meta_responses = None, []
         self._summary.setdefault(caller, [0, 0, 0])
         for _ in range(retry):
@@ -117,14 +123,14 @@ class OllamaLLMModel(LLMModel):
                 headers=headers,
                 json=params,
                 stream=False,
-                timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+                timeout=self._request_timeout_seconds,
             )
         except requests.exceptions.Timeout as exc:
             print(
                 "[OLLAMA_TIMEOUT] model={} url={} timeout={}s error={}".format(
                     self._model,
                     request_url,
-                    OLLAMA_REQUEST_TIMEOUT_SECONDS,
+                    self._request_timeout_seconds,
                     exc,
                 )
             )

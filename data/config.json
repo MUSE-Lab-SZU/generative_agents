@@ -14,7 +14,9 @@
         "provider": "ollama",
         "model": "qwen3:8b-q4_K_M",
         "base_url": "http://127.0.0.1:11434/v1",
-        "api_key": ""
+        "api_key": "",
+        "retry": 3,
+        "request_timeout_seconds": 120
       },
       "interval": 1000,
       "poignancy_max": 30,
@@ -353,6 +355,7 @@
     "enabled": true,
     "target_agent": "卡布达",
     "include_t0": true,
+    "use_resident_chat_completed_count": false,
     "session_interval": 2,
     "max_completed_sessions": 10,
     "t4_enabled": true,

@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -91,6 +93,10 @@ SUMMARY_ONLY = False
 
 # 是否只打印命令，不实际执行
 DRY_RUN = False
+
+SIMULATION_LOG_POLL_SECONDS = 300
+SIMULATION_LOG_STALE_SECONDS = 10 * 60
+SIMULATION_MAX_RESTARTS = 3
 
 # ============================================================
 # ↑↑↑ 可调参数：直接修改这里即可（中文注释）↑↑↑
@@ -323,6 +329,117 @@ def find_latest_trial_run_dir(batch_name: str, condition_name: str) -> Path | No
     return candidates[-1]
 
 
+def checkpoint_dir_for_run(run_name: str) -> Path:
+    return BASE_DIR / "results" / "checkpoints" / run_name
+
+
+def archive_blocked_checkpoint_dir(run_name: str) -> None:
+    checkpoint_dir = checkpoint_dir_for_run(run_name)
+    if not checkpoint_dir.exists():
+        return
+    blocked_root = checkpoint_dir.parent / "_blocked_attempts"
+    blocked_root.mkdir(parents=True, exist_ok=True)
+    archived_dir = blocked_root / f"{run_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    shutil.move(str(checkpoint_dir), str(archived_dir))
+    print(f"[ARCHIVE] {checkpoint_dir} -> {archived_dir}")
+
+
+def has_snapshot(run_name: str) -> bool:
+    checkpoint_dir = checkpoint_dir_for_run(run_name)
+    if not checkpoint_dir.is_dir():
+        return False
+    return any(
+        path.name.startswith("simulate-") and path.name.endswith(".json")
+        for path in checkpoint_dir.iterdir()
+    )
+
+
+def simulation_log_path(run_name: str, cfg: RuntimeConfig) -> Path:
+    if not cfg.log_file:
+        raise ValueError("日志静默恢复模式要求 start.py 写入日志文件，请设置 log_file。")
+    return checkpoint_dir_for_run(run_name) / cfg.log_file
+
+
+def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(START_SCRIPT),
+        "--name",
+        run_name,
+        "--step",
+        str(cfg.step),
+        "--stride",
+        str(cfg.stride),
+        "--verbose",
+        cfg.verbose,
+        "--start",
+        cfg.start,
+    ]
+    if resume:
+        cmd.append("--resume")
+    if cfg.log_file:
+        cmd.extend(["--log", cfg.log_file])
+    return cmd
+
+
+def terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def run_simulation_with_recovery(run_name: str, cfg: RuntimeConfig) -> None:
+    ensure_checkpoint_state(run_name, resume=False, dry_run=cfg.dry_run)
+    if cfg.dry_run:
+        print(f"[DRY-RUN] monitored simulation for {run_name}")
+        return
+
+    restart_count = 0
+    resume = False
+    while True:
+        cmd = build_simulation_cmd(run_name, cfg, resume=resume)
+        print(f"[RUN] {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, cwd=BASE_DIR)
+        log_path = simulation_log_path(run_name, cfg)
+        last_log_mtime = None
+        stale_since = time.time()
+
+        while True:
+            if proc.poll() is not None:
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, cmd)
+                return
+
+            if log_path.exists():
+                current_mtime = log_path.stat().st_mtime
+                if last_log_mtime is None or current_mtime > last_log_mtime:
+                    last_log_mtime = current_mtime
+                    stale_since = time.time()
+
+            if time.time() - stale_since >= SIMULATION_LOG_STALE_SECONDS:
+                terminate_process(proc)
+                restart_count += 1
+                if restart_count > SIMULATION_MAX_RESTARTS:
+                    raise TimeoutError(
+                        f"simulation log stayed stale for {SIMULATION_LOG_STALE_SECONDS}s after {SIMULATION_MAX_RESTARTS} restarts: {run_name}"
+                    )
+                if has_snapshot(run_name):
+                    print(f"[RESTART] resume simulation after stale log: {run_name}")
+                    resume = True
+                else:
+                    archive_blocked_checkpoint_dir(run_name)
+                    print(f"[RESTART] restart simulation from scratch after stale log: {run_name}")
+                    resume = False
+                break
+
+            time.sleep(SIMULATION_LOG_POLL_SECONDS)
+
+
 def summary_output_stem(cfg: RuntimeConfig) -> str:
     if len(cfg.conditions) == len(ALL_CONDITIONS):
         return cfg.name
@@ -496,24 +613,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
 
 
 def run_simulation(run_name: str, cfg: RuntimeConfig) -> None:
-    ensure_checkpoint_state(run_name, resume=False, dry_run=cfg.dry_run)
-    cmd = [
-        sys.executable,
-        str(START_SCRIPT),
-        "--name",
-        run_name,
-        "--step",
-        str(cfg.step),
-        "--stride",
-        str(cfg.stride),
-        "--verbose",
-        cfg.verbose,
-        "--start",
-        cfg.start,
-    ]
-    if cfg.log_file:
-        cmd.extend(["--log", cfg.log_file])
-    run_cmd(cmd, dry_run=cfg.dry_run, timeout=3600)
+    run_simulation_with_recovery(run_name, cfg)
 
 
 def run_merge(run_name: str, cfg: RuntimeConfig) -> None:

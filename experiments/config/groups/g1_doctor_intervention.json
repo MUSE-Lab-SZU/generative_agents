@@ -34,5 +34,8 @@
     "memory_policy": {
       "enabled": true
     }
+  },
+  "staged_eval": {
+    "use_resident_chat_completed_count": false
   }
 }

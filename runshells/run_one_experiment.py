@@ -193,7 +193,7 @@ def run_cmd(cmd: list[str], *, dry_run: bool, timeout: Optional[int] = None) -> 
     print(f"[RUN] {' '.join(cmd)}")
     if dry_run:
         return
-    subprocess.run(cmd, cwd=BASE_DIR, check=True)
+    subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=timeout)
 
 
 def ensure_checkpoint_state(name: str, *, resume: bool, dry_run: bool) -> None:

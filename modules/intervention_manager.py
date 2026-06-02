@@ -317,15 +317,29 @@ class InterventionManager:
         meeting_id_o = lock_o.get("meeting_id", "")
         closed_meeting_id = ""
         closed_meeting_kind = ""
+        closed_meeting_snapshot = {}
+        closed_doctor_name = ""
+        closed_patient_name = ""
+        closed_pair_key = ""
+        doctor_for_session = None
+        patient_for_session = None
 
         # 双方 meeting_id 一致时认为会面闭环达成
         if meeting_id_s and meeting_id_s == meeting_id_o:
             closed_meeting_id = str(meeting_id_s or "")
             meeting_snapshot = self.state.get("active_meetings", {}).get(meeting_id_s, {}) or {}
-            meeting_doctor = str(meeting_snapshot.get("doctor", "") or "")
-            meeting_patient = str(meeting_snapshot.get("patient", "") or "")
-            closed_meeting_kind = str(meeting_snapshot.get("meeting_kind", "doctor_consult") or "doctor_consult")
-            pair_key = "{}<->{}".format(meeting_doctor or getattr(speaker, "name", ""), meeting_patient or getattr(other, "name", ""))
+            closed_meeting_snapshot = meeting_snapshot if isinstance(meeting_snapshot, dict) else {}
+            closed_doctor_name = str(closed_meeting_snapshot.get("doctor", "") or "")
+            closed_patient_name = str(closed_meeting_snapshot.get("patient", "") or "")
+            closed_meeting_kind = str(closed_meeting_snapshot.get("meeting_kind", "doctor_consult") or "doctor_consult")
+            closed_pair_key = "{}<->{}".format(
+                closed_doctor_name or getattr(speaker, "name", ""),
+                closed_patient_name or getattr(other, "name", ""),
+            )
+            if str(getattr(speaker, "name", "") or "") == closed_doctor_name and str(getattr(other, "name", "") or "") == closed_patient_name:
+                doctor_for_session, patient_for_session = speaker, other
+            elif str(getattr(other, "name", "") or "") == closed_doctor_name and str(getattr(speaker, "name", "") or "") == closed_patient_name:
+                doctor_for_session, patient_for_session = other, speaker
             self._clear_lock(speaker)
             self._clear_lock(other)
             if self.meeting_queue_enabled:
@@ -344,57 +358,58 @@ class InterventionManager:
             )
             self._log_queue_event(
                 event="meeting_finished",
-                doctor=meeting_doctor,
+                doctor=closed_doctor_name,
                 meeting_id=meeting_id_s,
-                pair_key=pair_key,
-                step_phase=meeting_snapshot.get("step_phase", ""),
+                pair_key=closed_pair_key,
+                step_phase=closed_meeting_snapshot.get("step_phase", ""),
                 reason="chat_finished",
             )
 
-        if closed_meeting_kind == "resident_chat":
+        skip_consult_artifacts = closed_meeting_kind == "resident_chat"
+        if skip_consult_artifacts and closed_meeting_id:
+            self._mark_resident_chat_completed(closed_patient_name)
+        if skip_consult_artifacts:
             self._log_highlight(
-                "RESIDENT_CHAT_AFTER_CHAT_SKIP meeting_id={} speaker={} other={}".format(
+                "RESIDENT_CHAT_AFTER_CHAT_SKIP_CONSULT meeting_id={} speaker={} other={}".format(
                     closed_meeting_id,
                     getattr(speaker, "name", ""),
                     getattr(other, "name", ""),
                 )
             )
-            return
-
-        # 医患会话后尝试抽取医嘱并写入患者 forced_tasks
-        self._log_highlight(
-            "ORDER_EXTRACT_START speaker={} other={} chats={}".format(
-                getattr(speaker, "name", ""),
-                getattr(other, "name", ""),
-                len(chats or []),
+        else:
+            # 医患会话后尝试抽取医嘱并写入患者 forced_tasks
+            self._log_highlight(
+                "ORDER_EXTRACT_START speaker={} other={} chats={}".format(
+                    getattr(speaker, "name", ""),
+                    getattr(other, "name", ""),
+                    len(chats or []),
+                )
             )
-        )
-        self._extract_and_queue_orders(speaker, other, chats)
+            self._extract_and_queue_orders(speaker, other, chats)
 
-        self._handle_consult_history_after_chat(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            summary=summary,
-            start_time=start_time,
-            meeting_id=closed_meeting_id,
-        )
+            self._handle_consult_history_after_chat(
+                speaker=speaker,
+                other=other,
+                chats=chats,
+                summary=summary,
+                start_time=start_time,
+                meeting_id=closed_meeting_id,
+            )
 
-        self._handle_consult_record_after_chat(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            summary=summary,
-            start_time=start_time,
-            meeting_id=closed_meeting_id,
-        )
+            self._handle_consult_record_after_chat(
+                speaker=speaker,
+                other=other,
+                chats=chats,
+                summary=summary,
+                start_time=start_time,
+                meeting_id=closed_meeting_id,
+            )
 
         if self.session_prompt_injection and self.enabled:
-            doctor_for_session, patient_for_session = self._resolve_doctor_patient_pair(speaker, other)
+            if not (doctor_for_session and patient_for_session):
+                doctor_for_session, patient_for_session = self._resolve_doctor_patient_pair(speaker, other)
             if doctor_for_session and patient_for_session:
-                lock_s_meeting_id = str(lock_s.get("meeting_id", "") or "")
-                lock_o_meeting_id = str(lock_o.get("meeting_id", "") or "")
-                meeting_id_for_session = lock_s_meeting_id or lock_o_meeting_id or str(closed_meeting_id or "")
+                meeting_id_for_session = str(closed_meeting_id or meeting_id_s or meeting_id_o or "")
                 if meeting_id_for_session:
                     session_eval_payload = self.evaluate_session_after_chat(
                         doctor=doctor_for_session,
@@ -3023,6 +3038,8 @@ class InterventionManager:
             self.state["resident_chat_state"] = resident_chat_state
         if not isinstance(resident_chat_state.get("rules"), dict):
             resident_chat_state["rules"] = {}
+        if not isinstance(resident_chat_state.get("completed_counts_by_patient"), dict):
+            resident_chat_state["completed_counts_by_patient"] = {}
         meeting_seq = self.state.get("meeting_seq", 0)
         try:
             meeting_seq = int(meeting_seq)
@@ -3035,6 +3052,25 @@ class InterventionManager:
         self._ensure_dialog_judge_trace_state_schema()
         self._ensure_session_eval_state_schema()
         self._ensure_forced_prompt_trace_state_schema()
+
+    def _mark_resident_chat_completed(self, patient_name: str) -> None:
+        patient = str(patient_name or "").strip()
+        if not patient:
+            return
+        self._ensure_state_schema()
+        resident_chat_state = self.state.setdefault("resident_chat_state", {})
+        completed_counts = resident_chat_state.setdefault("completed_counts_by_patient", {})
+        if not isinstance(completed_counts, dict):
+            completed_counts = {}
+            resident_chat_state["completed_counts_by_patient"] = completed_counts
+        current = self._safe_int(completed_counts.get(patient, 0), 0)
+        completed_counts[patient] = max(0, current) + 1
+        self._log_highlight(
+            "RESIDENT_CHAT_COMPLETED_COUNT patient={} count={}".format(
+                patient,
+                completed_counts[patient],
+            )
+        )
 
     def _ensure_consult_record_state_schema(self) -> None:
         state = self.state.setdefault("consult_record_state", {})

@@ -406,6 +406,8 @@ class Agent:
         return output
 
     def think(self, status, agents):
+        self._refresh_expired_chat_action()
+        self._normalize_stale_forced_chat_action()
         events = self.move(status["coord"], status.get("path"))
         plan, _ = self.make_schedule()
 
@@ -564,6 +566,8 @@ class Agent:
         return self.schedule.current_plan()
 
     def revise_schedule(self, event, start, duration):
+        if not event or not event.fit(predicate="对话"):
+            self._clear_chat_action_state()
         self.action = memory.Action(event, start=start, duration=duration)
         plan, _ = self.schedule.current_plan()
         if len(plan["decompose"]) > 0:
@@ -1055,6 +1059,134 @@ class Agent:
             return self._normalize_address_list(other.get_tile().get_address())
         return []
 
+    def _get_chat_action_state(self):
+        status = self.status if isinstance(self.status, dict) else {}
+        payload = status.get("chat_action_state", {})
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def _clear_chat_action_state(self):
+        if not isinstance(self.status, dict):
+            return
+        self.status["chat_action_state"] = {}
+
+    def _set_chat_action_state(
+        self,
+        other_name,
+        start,
+        duration,
+        forced=False,
+        meeting_id="",
+    ):
+        if not isinstance(self.status, dict):
+            return
+        end_time = None
+        if isinstance(start, datetime.datetime):
+            try:
+                end_time = start + datetime.timedelta(minutes=int(duration or 0))
+            except Exception:
+                end_time = None
+        self.status["chat_action_state"] = {
+            "other": str(other_name or ""),
+            "forced": bool(forced),
+            "meeting_id": str(meeting_id or ""),
+            "start": start.strftime("%Y%m%d-%H:%M:%S") if isinstance(start, datetime.datetime) else "",
+            "end": end_time.strftime("%Y%m%d-%H:%M:%S") if isinstance(end_time, datetime.datetime) else "",
+            "duration": int(duration or 0),
+        }
+
+    def _normalize_stale_forced_chat_action(self):
+        mgr = getattr(self, "intervention", None)
+        if not mgr:
+            return False
+        if not getattr(self, "action", None):
+            return False
+        try:
+            current_event = self.get_event()
+        except Exception:
+            current_event = None
+        if not current_event or not current_event.fit(predicate="对话"):
+            return False
+
+        lock = self.status.get("intervention", {}).get("lock", {}) if isinstance(self.status, dict) else {}
+        if not isinstance(lock, dict) or (not bool(lock.get("enabled", False))):
+            return False
+
+        lock_meeting_id = str(lock.get("meeting_id", "") or "").strip()
+        if not lock_meeting_id:
+            return False
+
+        chat_state = self._get_chat_action_state()
+        chat_meeting_id = str(chat_state.get("meeting_id", "") or "").strip()
+        if chat_meeting_id and chat_meeting_id != lock_meeting_id:
+            self.logger.info(
+                "========== [INTERVENTION][STALE_CHAT_ACTION_CLEAR] agent={} reason=meeting_id_mismatch old_meeting_id={} new_meeting_id={} ==========".format(
+                    self.name,
+                    chat_meeting_id,
+                    lock_meeting_id,
+                )
+            )
+            self._clear_chat_action_state()
+            self.action = self._determine_action()
+            return True
+
+        parse_dt = getattr(mgr, "_parse_dt", None)
+        state = getattr(mgr, "state", {}) if mgr else {}
+        active_meetings = state.get("active_meetings", {}) if isinstance(state, dict) else {}
+        meeting = active_meetings.get(lock_meeting_id, {}) if isinstance(active_meetings, dict) else {}
+        activated_text = ""
+        if isinstance(meeting, dict):
+            activated_text = str(meeting.get("activated_at", "") or meeting.get("start_at", "") or "").strip()
+        activated_at = None
+        if callable(parse_dt) and activated_text:
+            try:
+                activated_at = parse_dt(activated_text)
+            except Exception:
+                activated_at = None
+        action_start = getattr(self.action, "start", None)
+        if (
+            (not chat_meeting_id)
+            and (
+            isinstance(action_start, datetime.datetime)
+            and isinstance(activated_at, datetime.datetime)
+            and action_start < activated_at
+            )
+        ):
+            self.logger.info(
+                "========== [INTERVENTION][STALE_CHAT_ACTION_CLEAR] agent={} reason=action_before_lock action_start={} activated_at={} meeting_id={} ==========".format(
+                    self.name,
+                    action_start.strftime("%Y%m%d-%H:%M:%S"),
+                    activated_at.strftime("%Y%m%d-%H:%M:%S"),
+                    lock_meeting_id,
+                )
+            )
+            self._clear_chat_action_state()
+            self.action = self._determine_action()
+            return True
+
+        return False
+
+    def _refresh_expired_chat_action(self):
+        if not getattr(self, "action", None):
+            return
+        try:
+            current_event = self.get_event()
+        except Exception:
+            current_event = None
+        if not current_event or not current_event.fit(predicate="对话"):
+            return
+        if not self.action.finished():
+            return
+        self.logger.info(
+            "========== [CHAT_CORE][EXPIRED_CHAT_ACTION_REFRESH] agent={} other={} ==========".format(
+                self.name,
+                getattr(current_event, "object", ""),
+            )
+        )
+        self._clear_chat_action_state()
+        self.action = self._determine_action()
+
     def _should_normalize_forced_persona_event(self, event):
         if not event:
             return False
@@ -1107,6 +1239,12 @@ class Agent:
                 )
             )
             return False
+        self._refresh_expired_chat_action()
+        if hasattr(other, "_refresh_expired_chat_action"):
+            other._refresh_expired_chat_action()
+        self._normalize_stale_forced_chat_action()
+        if hasattr(other, "_normalize_stale_forced_chat_action"):
+            other._normalize_stale_forced_chat_action()
         if self.get_event().fit(predicate="对话") or other.get_event().fit(predicate="对话"):
             self.logger.info(
                 "========== [{}][CHAT_BLOCKED] reason=already_chatting self={} other={} forced={} ==========".format(
@@ -1797,6 +1935,14 @@ class Agent:
         }
         if doctor_memory_address:
             chat_meta_common["memory_address_override"] = doctor_memory_address
+        forced_meeting_id = ""
+        if forced and self.intervention and hasattr(self.intervention, "resolve_meeting_context"):
+            try:
+                meeting_ctx = self.intervention.resolve_meeting_context(self, other, forced=True)
+                if isinstance(meeting_ctx, dict):
+                    forced_meeting_id = str(meeting_ctx.get("meeting_id", "") or "")
+            except Exception:
+                forced_meeting_id = ""
 
         self.schedule_chat(
             chats,
@@ -1806,6 +1952,7 @@ class Agent:
             other,
             chat_expire=chat_expire,
             chat_meta=copy.deepcopy(chat_meta_common),
+            meeting_id=forced_meeting_id,
         )
         other.schedule_chat(
             chats,
@@ -1815,6 +1962,7 @@ class Agent:
             self,
             chat_expire=chat_expire,
             chat_meta=copy.deepcopy(chat_meta_common),
+            meeting_id=forced_meeting_id,
         )
         self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
         if self.intervention:
@@ -2060,6 +2208,7 @@ class Agent:
         address=None,
         chat_expire=None,
         chat_meta=None,
+        meeting_id="",
     ):
         self.chats.extend(chats)
         event = memory.Event(
@@ -2106,6 +2255,13 @@ class Agent:
             )
         if persisted_now:
             self._pending_chat_memory_meta = None
+        self._set_chat_action_state(
+            other_name=getattr(other, "name", ""),
+            start=start,
+            duration=duration,
+            forced=bool((chat_meta or {}).get("forced", False)),
+            meeting_id=meeting_id,
+        )
         self.revise_schedule(event, start, duration)
 
     def _persist_chat_memory_now(

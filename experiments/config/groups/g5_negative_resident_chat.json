@@ -47,5 +47,8 @@
     "forced_llm": {
       "enabled": true
     }
+  },
+  "staged_eval": {
+    "use_resident_chat_completed_count": true
   }
 }

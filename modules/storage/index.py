@@ -11,6 +11,10 @@ from llama_index.core import Settings
 from modules import utils
 
 
+STORAGE_RETRY_MAX = 3
+STORAGE_RETRY_SLEEP_SECONDS = 5
+
+
 class LlamaIndex:
     def __init__(self, embedding_config, path=None):
         self._config = {"max_nodes": 0}
@@ -53,6 +57,19 @@ class LlamaIndex:
             self._index = index_core.VectorStoreIndex([], show_progress=True)
         self._path = path
 
+    def _run_with_retry(self, op_name, callback, error_formatter):
+        last_error = None
+        for retry_count in range(1, STORAGE_RETRY_MAX + 1):
+            try:
+                return callback()
+            except Exception as e:
+                last_error = e
+                print(error_formatter(retry_count, e))
+                if retry_count >= STORAGE_RETRY_MAX:
+                    raise
+                time.sleep(STORAGE_RETRY_SLEEP_SECONDS)
+        raise last_error
+
     def add_node(
         self,
         text,
@@ -61,35 +78,39 @@ class LlamaIndex:
         exclude_embedding_keys=None,
         id=None,
     ):
-        retry_count = 0
-        while True:
-            try:
-                metadata = metadata or {}
-                exclude_llm_keys = exclude_llm_keys or list(metadata.keys())
-                exclude_embedding_keys = exclude_embedding_keys or list(metadata.keys())
-                id = id or "node_" + str(self._config["max_nodes"])
+        metadata = metadata or {}
+        exclude_llm_keys = exclude_llm_keys or list(metadata.keys())
+        exclude_embedding_keys = exclude_embedding_keys or list(metadata.keys())
+        auto_id = id is None
+        node_id = id or "node_" + str(self._config["max_nodes"])
+
+        def _insert_node():
+            node = TextNode(
+                text=text,
+                id_=node_id,
+                metadata=metadata,
+                excluded_llm_metadata_keys=exclude_llm_keys,
+                excluded_embed_metadata_keys=exclude_embedding_keys,
+            )
+            self._index.insert_nodes([node])
+            if auto_id:
                 self._config["max_nodes"] += 1
-                node = TextNode(
-                    text=text,
-                    id_=id,
-                    metadata=metadata,
-                    excluded_llm_metadata_keys=exclude_llm_keys,
-                    excluded_embed_metadata_keys=exclude_embedding_keys,
+            return node
+
+        return self._run_with_retry(
+            "add_node",
+            _insert_node,
+            lambda retry_count, error: (
+                "[LlamaIndex.add_node][retry={}] node_id={} text_len={} metadata_keys={} error={}"
+                .format(
+                    retry_count,
+                    node_id,
+                    len(text or ""),
+                    list(metadata.keys()),
+                    error,
                 )
-                self._index.insert_nodes([node])
-                return node
-            except Exception as e:
-                retry_count += 1
-                print(
-                    "[LlamaIndex.add_node][retry={}] node_id={} text_len={} metadata_keys={} error={}".format(
-                        retry_count,
-                        id,
-                        len(text or ""),
-                        list((metadata or {}).keys()),
-                        e,
-                    )
-                )
-                time.sleep(5)
+            ),
+        )
 
     def has_node(self, node_id):
         return node_id in self._index.docstore.docs
@@ -153,16 +174,23 @@ class LlamaIndex:
             "refine_template": refine_template,
             "filters": filters,
         }
-        while True:
-            try:
-                if query_creator:
-                    query_engine = query_creator(retriever=self._index.as_retriever(**kwargs))
-                else:
-                    query_engine = self._index.as_query_engine(**kwargs)
-                return query_engine.query(text)
-            except Exception as e:
-                print(f"LlamaIndex.query() caused an error: {e}")
-                time.sleep(5)
+
+        def _run_query():
+            if query_creator:
+                query_engine = query_creator(retriever=self._index.as_retriever(**kwargs))
+            else:
+                query_engine = self._index.as_query_engine(**kwargs)
+            return query_engine.query(text)
+
+        return self._run_with_retry(
+            "query",
+            _run_query,
+            lambda retry_count, error: "LlamaIndex.query()[retry={}] text_len={} error={}".format(
+                retry_count,
+                len(text or ""),
+                error,
+            ),
+        )
 
     def save(self, path=None):
         path = path or self._path
