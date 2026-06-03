@@ -743,12 +743,18 @@ class Scratch:
         conversation = (
             conversation or "[对话尚未开始]"
         )
+        base_desc_block = ""
+        if not str(depression_chat_block or "").strip():
+            base_desc_block = "以下是对 {} 的简要描述：\n{}\n".format(
+                agent.name,
+                self._base_desc(),
+            )
 
         prompt = self.build_prompt(
             "generate_chat",
             {
                 "agent": agent.name,
-                "base_desc": self._base_desc(),
+                "base_desc_block": base_desc_block,
                 "depression_chat_block": depression_chat_block or "",
                 "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
                 "memory": memory,

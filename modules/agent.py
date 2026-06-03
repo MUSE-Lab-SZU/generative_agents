@@ -137,6 +137,7 @@ class Agent:
         """
         if not self._llm:
             self._llm = create_llm_model(self.think_config["llm"])
+        self._initialize_depression_chain_window()
 
     def completion(self, func_hint, *args, **kwargs):
         """统一的 prompt -> LLM -> 结果回收入口。
@@ -457,12 +458,20 @@ class Agent:
             : self.associate.max_importance
         ]
         # summary thought
+        reflection_entries = []
         focus = self.completion("reflect_focus", nodes, 3)
         retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
         for r_nodes in retrieved.values():
             thoughts = self.completion("reflect_insights", r_nodes, 5)
             for thought, evidence in thoughts:
-                _add_thought(thought, evidence)
+                node = _add_thought(thought, evidence)
+                reflection_entries.append(
+                    {
+                        "thought": thought,
+                        "evidence": evidence,
+                        "node_id": getattr(node, "node_id", ""),
+                    }
+                )
         # summary chats
         if self.chats:
             recorded, evidence = set(), []
@@ -474,9 +483,26 @@ class Agent:
                     node = res[-1]
                     evidence.append(node.node_id)
             thought = self.completion("reflect_chat_planing", self.chats)
-            _add_thought(f"对于 {self.name} 的计划：{thought}", evidence)
+            plan_thought = f"对于 {self.name} 的计划：{thought}"
+            node = _add_thought(plan_thought, evidence)
+            reflection_entries.append(
+                {
+                    "thought": plan_thought,
+                    "evidence": evidence,
+                    "node_id": getattr(node, "node_id", ""),
+                }
+            )
             thought = self.completion("reflect_chat_memory", self.chats)
-            _add_thought(f"{self.name} {thought}", evidence)
+            memory_thought = f"{self.name} {thought}"
+            node = _add_thought(memory_thought, evidence)
+            reflection_entries.append(
+                {
+                    "thought": memory_thought,
+                    "evidence": evidence,
+                    "node_id": getattr(node, "node_id", ""),
+                }
+            )
+        self._commit_depression_reflection(focus, reflection_entries)
         self.status["poignancy"] = 0
         self.chats = []
 
@@ -875,6 +901,26 @@ class Agent:
         except Exception:
             return str(self.scratch.currently or "")
 
+    def _initialize_depression_chain_window(self):
+        """启动/恢复时让 LLM 补足运行态主诉链窗口。"""
+        if not self.depression_dynamic or not self.llm_available():
+            return None
+        try:
+            self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+            return self.depression_dynamic.initialize_chain_window(
+                location=self._dynamic_location(),
+                time_of_day=self._dynamic_time_of_day(),
+                roadmap_completion_func=self._depression_llm_completion,
+            )
+        except Exception as exc:
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} chain window init failed: {}".format(
+                        self.name, exc
+                    )
+                )
+        return None
+
     def _prepare_depression_generate_chat(self, args, kwargs):
         """在真正生成对话前，预览“这一轮应该怎么说”。
 
@@ -920,6 +966,124 @@ class Agent:
         next_kwargs["depression_reflect_block"] = self.depression_dynamic.get_simple_prompt()
         return next_kwargs
 
+    def _commit_depression_event(
+        self,
+        source,
+        location,
+        time_of_day,
+        interaction_type,
+        content,
+        other_agent="",
+        relationship="",
+        metadata=None,
+    ):
+        """统一提交会影响主诉链的事件，仅允许对话和反思。"""
+        if not self.depression_dynamic:
+            return None
+        event_source = str(source or "").strip()
+        if event_source not in {"chat", "reflection"}:
+            return None
+        event_content = str(content or "").strip()
+        if not event_content:
+            return None
+
+        self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+        try:
+            return self.depression_dynamic.commit_event(
+                source=event_source,
+                location=location,
+                time_of_day=time_of_day,
+                other_agent=other_agent,
+                relationship=relationship,
+                interaction_type=interaction_type,
+                content=event_content,
+                metadata=metadata if isinstance(metadata, dict) else {},
+                roadmap_completion_func=self._depression_llm_completion,
+                emotion_completion_func=self._depression_llm_completion,
+            )
+        except Exception as exc:
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} {} commit failed: {}".format(
+                        self.name, event_source, exc
+                    )
+                )
+        return None
+
+    def _commit_depression_reflection(self, focus, entries):
+        """把一次 reflect() 中生成的 thought 合并成一次动态状态提交。"""
+        if not entries:
+            return None
+        content, metadata = self._build_depression_reflection_payload(focus, entries)
+        return self._commit_depression_event(
+            source="reflection",
+            location=self._dynamic_location(),
+            time_of_day=self._dynamic_time_of_day(),
+            interaction_type="内在反思",
+            content=content,
+            other_agent="",
+            relationship="",
+            metadata=metadata,
+        )
+
+    def _build_depression_reflection_payload(self, focus, entries):
+        focus_items = self._normalize_depression_text_list(focus, limit=5)
+        thoughts, evidence_ids, thought_node_ids = [], [], []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            thought = str(entry.get("thought", "") or "").strip()
+            if thought:
+                thoughts.append(thought)
+            thought_node_id = str(entry.get("node_id", "") or "").strip()
+            if thought_node_id:
+                thought_node_ids.append(thought_node_id)
+            evidence_ids.extend(self._normalize_depression_text_list(entry.get("evidence", []), limit=20))
+
+        thoughts = self._dedupe_depression_texts(thoughts, limit=8)
+        evidence_ids = self._dedupe_depression_texts(evidence_ids, limit=20)
+        thought_node_ids = self._dedupe_depression_texts(thought_node_ids, limit=20)
+
+        rows = []
+        if focus_items:
+            rows.append("反思焦点：" + "；".join(focus_items[:3]))
+        if thoughts:
+            rows.append("反思结论：" + "；".join(thoughts[:5]))
+        rows.append("证据数量：{}".format(len(evidence_ids)))
+        if evidence_ids:
+            rows.append("证据线索：" + "，".join(evidence_ids[:8]))
+
+        metadata = {
+            "focus": focus_items,
+            "thought_count": len(thoughts),
+            "thoughts": thoughts,
+            "evidence_ids": evidence_ids,
+            "thought_node_ids": thought_node_ids,
+        }
+        return "\n".join(rows), metadata
+
+    def _normalize_depression_text_list(self, value, limit=20):
+        if value is None:
+            items = []
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+        return self._dedupe_depression_texts([str(item or "").strip() for item in items], limit=limit)
+
+    @staticmethod
+    def _dedupe_depression_texts(values, limit=20):
+        results, seen = [], set()
+        for item in values or []:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            results.append(text[:160])
+            if len(results) >= int(limit):
+                break
+        return results
+
     def _commit_depression_generate_chat(self, context, output):
         """在生成出本轮话语后，把“实际说出的内容”提交给动态引擎。
 
@@ -933,25 +1097,16 @@ class Agent:
         utterance = str(output or "").strip()
         if not utterance:
             return
-        self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
-        try:
-            self.depression_dynamic.commit_interaction(
-                location=context["location"],
-                time_of_day=context["time_of_day"],
-                other_agent=context["other_agent"],
-                relationship=context["relationship"],
-                interaction_type=context["interaction_type"],
-                conversation_content=utterance,
-                roadmap_completion_func=self._depression_llm_completion,
-                emotion_completion_func=self._depression_llm_completion,
-            )
-        except Exception as exc:
-            if self.logger:
-                self.logger.info(
-                    "[DEPRESSION_DYNAMIC] agent={} commit failed: {}".format(
-                        self.name, exc
-                    )
-                )
+        self._commit_depression_event(
+            source="chat",
+            location=context["location"],
+            time_of_day=context["time_of_day"],
+            other_agent=context["other_agent"],
+            relationship=context["relationship"],
+            interaction_type=context["interaction_type"],
+            content=utterance,
+            metadata={"origin": "generate_chat", "evidence_ids": []},
+        )
 
     def _build_depression_chat_context(self, other, relation_summary, chats):
         """把游戏世界里的对象，压缩成动态抑郁模块需要的会话上下文。"""

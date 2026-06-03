@@ -53,6 +53,12 @@ class ComplaintChainManager:
         "有点", "这样", "那种", "事情", "问题", "别人", "什么", "没有", "不会", "如果", "真的",
         "可能", "一直", "最近", "现在", "让我", "我们", "他们", "只是", "还有", "其实", "一下",
     }
+    LEGACY_PLACEHOLDER_SOURCES = {
+        "runtime_bootstrap",
+        "runtime_planned",
+        "runtime_inferred",
+        "runtime_fallback",
+    }
 
     DEFAULT_STAGE: Dict[str, Any] = {
         "id": "unconfigured_stage",
@@ -307,6 +313,20 @@ class ComplaintChainManager:
                 session_context=session_context,
                 conversation_content=conversation,
             )
+        elif action == "replan" and not self._is_chain_window_init_context(session_context):
+            heuristic_action = self._decide_action(
+                current_stage=current_stage,
+                matched=matched,
+                match_confidence=match_confidence,
+                session_context=session_context,
+                conversation_content=conversation,
+            )
+            if heuristic_action == "advance" and len(next_chain_ids) > 1:
+                action = "advance"
+                match_reason = self._clip_text(
+                    "{}；规则判定本轮已满足推进信号，replan 升级为 advance".format(match_reason),
+                    limit=180,
+                )
 
         if action == "replan" and not self.allow_replan:
             action = "hold"
@@ -325,7 +345,8 @@ class ComplaintChainManager:
                     next_chain_ids = [current_stage["id"], candidate_id]
                     next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
             else:
-                # 没有可去的下一个节点，就算 matched 了也只能 hold。
+                # 没有 LLM 生成的完整后续节点，也没有配置内已存在的候选时，
+                # 不凭规则臆造主诉节点。
                 action = "hold"
 
         # evaluation 是“提交前快照”：
@@ -362,6 +383,8 @@ class ComplaintChainManager:
             evaluation.get("session_context", {}) if isinstance(evaluation.get("session_context", {}), dict) else {}
         )
         conversation_excerpt = str(evaluation.get("conversation_excerpt", "") or "")
+        runtime_event = self._runtime_event_from_context(session_context)
+        source = str(runtime_event.get("source", "chat") or "chat")
 
         if not next_chain:
             next_chain = self._preview_future_chain(current_before)
@@ -392,7 +415,12 @@ class ComplaintChainManager:
                     # 这样后续 snapshot / 恢复状态时不会丢失它。
                     self.stage_catalog[target_stage_id] = self._sanitize_stage(target_stage or {"id": target_stage_id, "label": target_stage_id}, source="jump")
                 # jump 的语义不是“在原链上跳格子”，而是“把目标节点改成新的当前起点”。
-                self.planned_chain = [target_stage_id] + self._build_future_chain_from_stage(target_stage_id, self.window_size)
+                # 如果 LLM 同时给了目标之后的窗口，保留这段运行态图路径。
+                jump_chain = [item for item in next_chain[1:] if item in self.stage_catalog]
+                if not jump_chain or jump_chain[0] != target_stage_id:
+                    jump_chain = [target_stage_id] + [item for item in jump_chain if item != target_stage_id]
+                self._link_chain_edges(jump_chain)
+                self.planned_chain = jump_chain + self._build_future_chain_from_stage(target_stage_id, self.window_size)
                 self.stage_index = 0
                 self.stage_start_time = self._now()
 
@@ -405,6 +433,7 @@ class ComplaintChainManager:
             "matched": matched,
             "match_confidence": round(float(match_confidence), 4),
             "match_reason": match_reason,
+            "source": source,
         }
 
         self._track_dialogue(
@@ -423,6 +452,7 @@ class ComplaintChainManager:
             pointer_before=pointer_before,
             pointer_after=int(self.stage_index),
             duration_minutes=duration_minutes,
+            source=source,
         )
         return self.get_chain_snapshot()
 
@@ -451,6 +481,66 @@ class ComplaintChainManager:
         self.commit_turn(evaluation)
         return str(evaluation.get("action", "hold")) in {"advance", "jump"}
 
+    def initialize_chain_window(
+        self,
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        completion_func: Optional[Callable[[str], str]] = None,
+        llm_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """用 LLM 补足运行态主诉链窗口，但不推进当前节点。
+
+        这个方法只接受 LLM 返回的已知 stage id 或完整 stage 对象。
+        如果 LLM 只给未知字符串 id，`_normalize_chain_ids()` 会过滤掉，
+        因而不会生成无语义的占位节点。
+        """
+        self._drop_legacy_placeholder_stages()
+        if not callable(completion_func) or not self.llm_enabled:
+            return self.get_chain_snapshot()
+        if len(self.get_current_chain_window(self.window_size + 1)) >= self.window_size + 1:
+            return self.get_chain_snapshot()
+
+        target_width = self.window_size + 1
+        max_attempts = max(1, int(self.window_size))
+        for _ in range(max_attempts):
+            before_width = len(self.get_current_chain_window(target_width))
+            before_catalog_size = len(self.stage_catalog)
+            if before_width >= target_width:
+                break
+
+            evaluation = self.evaluate_turn(
+                session_context=session_context if isinstance(session_context, dict) else {},
+                conversation_content=str(conversation_content or ""),
+                completion_func=completion_func,
+                llm_cfg=llm_cfg,
+            )
+            next_chain = self._normalize_next_chain(
+                evaluation.get("next_chain", []),
+                self.get_current_stage_id(),
+            )
+            if len(next_chain) > 1:
+                self._replace_future_chain(next_chain)
+                self._ensure_future_window()
+                self.last_session_context = copy.deepcopy(
+                    evaluation.get("session_context", {})
+                    if isinstance(evaluation.get("session_context", {}), dict)
+                    else {}
+                )
+                self.last_evaluation = {
+                    "action": "replan",
+                    "matched": bool(evaluation.get("matched", False)),
+                    "match_confidence": self._bounded_float(
+                        evaluation.get("match_confidence"), 0.0, 0.0, 1.0
+                    ),
+                    "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
+                    "source": "chain_window_init",
+                }
+
+            after_width = len(self.get_current_chain_window(target_width))
+            if after_width <= before_width and len(self.stage_catalog) <= before_catalog_size:
+                break
+        return self.get_chain_snapshot()
+
     def force_stage(self, stage_id: str, reason: str = "manual") -> None:
         stage_key = str(stage_id or "").strip()
         if not stage_key:
@@ -476,6 +566,7 @@ class ComplaintChainManager:
             pointer_before=0,
             pointer_after=0,
             duration_minutes=duration_minutes,
+            source="manual",
         )
 
     def force_transition(self, new_state: Any, reason: str = "manual") -> None:
@@ -557,6 +648,8 @@ class ComplaintChainManager:
             manager.dialogue_history = manager.dialogue_history[-manager.max_dialog_history :]
         manager.last_session_context = copy.deepcopy(payload.get("last_session_context", {})) if isinstance(payload.get("last_session_context", {}), dict) else {}
         manager.last_evaluation = copy.deepcopy(payload.get("last_evaluation", {})) if isinstance(payload.get("last_evaluation", {}), dict) else {}
+        manager._drop_legacy_placeholder_stages()
+        manager._link_chain_edges(manager.planned_chain)
         manager._ensure_future_window()
         return manager
 
@@ -578,6 +671,7 @@ class ComplaintChainManager:
         # 保留历史前缀，只更新“从当前节点往后”的规划窗口。
         current_prefix = self.planned_chain[: self.stage_index]
         normalized = self._normalize_next_chain(next_chain, self.get_current_stage_id())
+        self._link_chain_edges(normalized)
         self.planned_chain = current_prefix + normalized
         self.stage_index = min(self.stage_index, max(0, len(self.planned_chain) - 1))
 
@@ -631,6 +725,100 @@ class ComplaintChainManager:
             results.append(next_id)
             current_id = next_id
         return results
+
+    def _drop_legacy_placeholder_stages(self) -> None:
+        legacy_ids = {
+            stage_id
+            for stage_id, stage in self.stage_catalog.items()
+            if self._is_legacy_placeholder_stage(stage_id, stage)
+        }
+        if not legacy_ids:
+            return
+
+        old_index = min(max(0, int(self.stage_index)), max(0, len(self.planned_chain) - 1))
+        filtered: List[str] = []
+        next_index = 0
+        for idx, stage_id in enumerate(self.planned_chain):
+            stage_key = str(stage_id or "").strip()
+            if not stage_key or stage_key in legacy_ids or stage_key not in self.stage_catalog:
+                continue
+            if idx <= old_index:
+                next_index = len(filtered)
+            filtered.append(stage_key)
+
+        for stage_id in legacy_ids:
+            self.stage_catalog.pop(stage_id, None)
+
+        self.planned_chain = self._normalize_chain_ids(filtered)
+        if not self.planned_chain:
+            self.planned_chain = self._build_default_chain(self.initial_stage_id)
+            next_index = 0
+        self.stage_index = min(max(0, next_index), max(0, len(self.planned_chain) - 1))
+
+    def _is_legacy_placeholder_stage(self, stage_id: str, stage: Dict[str, Any]) -> bool:
+        stage_key = str(stage_id or "").strip()
+        if re.search(r"_runtime_next_\d+(?:$|_)", stage_key):
+            return True
+        source = str(stage.get("source", "") or "").strip()
+        return source in self.LEGACY_PLACEHOLDER_SOURCES
+
+    def _link_chain_edges(self, chain_ids: List[str]) -> None:
+        ids = self._normalize_chain_ids(chain_ids)
+        for idx in range(len(ids) - 1):
+            from_id = str(ids[idx] or "").strip()
+            to_id = str(ids[idx + 1] or "").strip()
+            if not from_id or not to_id or from_id == to_id:
+                continue
+            if from_id not in self.stage_catalog or to_id not in self.stage_catalog:
+                continue
+            stage = self.stage_catalog[from_id]
+            next_candidates = stage.get("next_candidates", [])
+            if not isinstance(next_candidates, list):
+                next_candidates = []
+            normalized_candidates: List[str] = []
+            seen = set()
+            for item in next_candidates + [to_id]:
+                candidate_id = str(item or "").strip()
+                if (
+                    not candidate_id
+                    or candidate_id == from_id
+                    or candidate_id in seen
+                    or candidate_id not in self.stage_catalog
+                ):
+                    continue
+                seen.add(candidate_id)
+                normalized_candidates.append(candidate_id[:80])
+                if len(normalized_candidates) >= 8:
+                    break
+            stage["next_candidates"] = normalized_candidates
+        self._prune_unknown_next_candidates(ids)
+
+    def _prune_unknown_next_candidates(self, stage_ids: Optional[List[str]] = None) -> None:
+        ids = self._normalize_chain_ids(stage_ids) if stage_ids else list(self.stage_catalog.keys())
+        for stage_id in ids:
+            stage = self.stage_catalog.get(stage_id)
+            if not isinstance(stage, dict):
+                continue
+            next_candidates = stage.get("next_candidates", [])
+            if not isinstance(next_candidates, list):
+                stage["next_candidates"] = []
+                continue
+            normalized_candidates: List[str] = []
+            seen = set()
+            for item in next_candidates:
+                candidate_id = str(item or "").strip()
+                if (
+                    not candidate_id
+                    or candidate_id == stage_id
+                    or candidate_id in seen
+                    or candidate_id not in self.stage_catalog
+                ):
+                    continue
+                seen.add(candidate_id)
+                normalized_candidates.append(candidate_id[:80])
+                if len(normalized_candidates) >= 8:
+                    break
+            stage["next_candidates"] = normalized_candidates
 
     def _heuristic_match(
         self,
@@ -720,8 +908,6 @@ class ComplaintChainManager:
         if self._coerce_bool(current_stage.get("is_terminal_stage", False)):
             return "hold"
         next_candidates = current_stage.get("next_candidates", []) if isinstance(current_stage.get("next_candidates", []), list) else []
-        if not next_candidates:
-            return "hold"
 
         semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
         topics = [str(item) for item in self._to_list(semantic.get("topics", []))]
@@ -736,6 +922,8 @@ class ComplaintChainManager:
             return "advance"
         if detailed and match_confidence >= max(0.46, self.min_match_confidence * 0.80):
             return "advance"
+        if not next_candidates:
+            return "hold"
         return "hold"
 
     def _count_signal_hits(self, signals: Any, conversation: str, topics: List[str]) -> int:
@@ -776,9 +964,12 @@ class ComplaintChainManager:
         # 给 LLM 的任务不是“诊断病情”，而是“判断当前主诉节点是否被触及”。
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        current_chain_window = self.get_current_chain_window(self.window_size + 1)
         payload = {
             "current_stage": self.get_current_stage(),
-            "current_chain_window": self.get_current_chain_window(self.window_size + 1),
+            "current_chain_window": current_chain_window,
+            "window_size": int(self.window_size),
+            "needs_chain_expansion": len(current_chain_window) < self.window_size + 1,
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
             "allowed_actions": ["hold", "advance", "replan", "jump"],
@@ -934,6 +1125,46 @@ class ComplaintChainManager:
             safe = "stage"
         return f"{safe[:24]}_{digest}"
 
+    def _runtime_event_from_context(self, session_context: Dict[str, Any]) -> Dict[str, Any]:
+        runtime_event = (
+            session_context.get("runtime_event", {})
+            if isinstance(session_context.get("runtime_event", {}), dict)
+            else {}
+        )
+        metadata = (
+            copy.deepcopy(runtime_event.get("metadata", {}))
+            if isinstance(runtime_event.get("metadata", {}), dict)
+            else {}
+        )
+        raw_evidence = runtime_event.get("evidence_ids", metadata.get("evidence_ids", []))
+        evidence_ids: List[str] = []
+        seen = set()
+        for item in self._to_list(raw_evidence):
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            evidence_ids.append(text[:80])
+            if len(evidence_ids) >= 20:
+                break
+        metadata["evidence_ids"] = evidence_ids
+        source = str(runtime_event.get("source", "") or "").strip() or "chat"
+        return {
+            "source": source[:32],
+            "evidence_ids": evidence_ids,
+            "metadata": metadata,
+        }
+
+    def _is_chain_window_init_context(self, session_context: Dict[str, Any]) -> bool:
+        scene = (
+            session_context.get("scene", {})
+            if isinstance(session_context.get("scene", {}), dict)
+            else {}
+        )
+        interaction_type = str(scene.get("interaction_type", "") or "").strip()
+        runtime_source = str(self._runtime_event_from_context(session_context).get("source", "") or "").strip()
+        return interaction_type == "主诉链初始化" or runtime_source == "chain_window_init"
+
     def _track_dialogue(
         self,
         current_stage: Dict[str, Any],
@@ -945,6 +1176,7 @@ class ComplaintChainManager:
         # 供 debug / 回放 / 人工审查使用，不参与复杂推理。
         participants = session_context.get("participants", {}) if isinstance(session_context.get("participants", {}), dict) else {}
         scene = session_context.get("scene", {}) if isinstance(session_context.get("scene", {}), dict) else {}
+        runtime_event = self._runtime_event_from_context(session_context)
         row = {
             "timestamp": self._now().isoformat(),
             "stage_id": str(current_stage.get("id", "") or ""),
@@ -957,6 +1189,9 @@ class ComplaintChainManager:
             "other_agent": str(participants.get("other_agent", "") or ""),
             "relationship": str(participants.get("relationship", "") or ""),
             "interaction_type": str(scene.get("interaction_type", "") or ""),
+            "source": str(runtime_event.get("source", "chat") or "chat"),
+            "evidence_ids": copy.deepcopy(runtime_event.get("evidence_ids", [])),
+            "metadata": copy.deepcopy(runtime_event.get("metadata", {})),
         }
         self.dialogue_history.append(row)
         if len(self.dialogue_history) > self.max_dialog_history:
@@ -973,12 +1208,14 @@ class ComplaintChainManager:
         pointer_before: int,
         pointer_after: int,
         duration_minutes: float,
+        source: str = "chat",
     ) -> None:
         # stage_history 更像状态迁移日志，记录 from/to/action/confidence。
         self.stage_history.append(
             {
                 "timestamp": self._now(),
                 "action": str(action or "hold"),
+                "source": str(source or "chat")[:32],
                 "from_stage_id": str(from_stage.get("id", "") or ""),
                 "from_stage_label": str(from_stage.get("label", "") or ""),
                 "to_stage_id": str(to_stage.get("id", "") or ""),

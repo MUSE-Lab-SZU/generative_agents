@@ -77,10 +77,7 @@
             "defensiveness_delta": 0.12
           }
         },
-        "next_candidates": [
-          "admits_exhaustion_but_downplays",
-          "wants_help_but_retreats"
-        ],
+        "next_candidates": [],
         "is_terminal_stage": false
       }
     ]

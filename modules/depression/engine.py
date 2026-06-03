@@ -185,12 +185,7 @@ class DepressionSimulationEngine:
         emotion_completion_func: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
         if not self.enabled:
-            return {
-                "enabled": False,
-                "current_stage": self.chain_manager.get_current_stage(),
-                "chain": self.chain_manager.get_chain_snapshot(),
-                "session_context": {},
-            }
+            return self._disabled_runtime()
 
         # commit 版本与 preview 共享同一条流水线，
         # 差别在于这里会真正修改 `chain_manager` / `interaction_count`。
@@ -202,6 +197,86 @@ class DepressionSimulationEngine:
             interaction_type=interaction_type,
             conversation_content=conversation_content,
         )
+        return self._commit_context(
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_transition_signal=llm_transition_signal,
+            roadmap_completion_func=roadmap_completion_func,
+            roadmap_llm_cfg=roadmap_llm_cfg,
+            emotion_completion_func=emotion_completion_func,
+        )
+
+    def commit_event(
+        self,
+        source: str,
+        location: str,
+        time_of_day: str,
+        interaction_type: str,
+        content: str,
+        other_agent: Optional[str] = None,
+        relationship: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        llm_transition_signal: Optional[Dict[str, Any]] = None,
+        roadmap_completion_func: Optional[Callable[[str], str]] = None,
+        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
+        emotion_completion_func: Optional[Callable[[str], str]] = None,
+    ) -> Dict[str, Any]:
+        """提交一个会影响主诉链的运行时事件。
+
+        事件仍复用 interaction 管线，只是在 session_context 中额外标记
+        `runtime_event`，让状态记录能区分对话与反思等来源。
+        """
+        if not self.enabled:
+            return self._disabled_runtime()
+
+        event_source = str(source or "").strip()
+        event_content = str(content or "").strip()
+        if not event_source or not event_content:
+            return self._current_runtime(enabled=True)
+
+        session_context = self.context_builder.build_context(
+            location=location,
+            time_of_day=time_of_day,
+            other_agent=other_agent,
+            relationship=relationship,
+            interaction_type=interaction_type,
+            conversation_content=event_content,
+        )
+        self._attach_runtime_event(
+            session_context=session_context,
+            source=event_source,
+            metadata=metadata,
+        )
+        return self._commit_context(
+            session_context=session_context,
+            conversation_content=event_content,
+            llm_transition_signal=llm_transition_signal,
+            roadmap_completion_func=roadmap_completion_func,
+            roadmap_llm_cfg=roadmap_llm_cfg,
+            emotion_completion_func=emotion_completion_func,
+            disallow_jump=(event_source == "reflection"),
+        )
+
+    def _commit_context(
+        self,
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_transition_signal: Optional[Dict[str, Any]] = None,
+        roadmap_completion_func: Optional[Callable[[str], str]] = None,
+        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
+        emotion_completion_func: Optional[Callable[[str], str]] = None,
+        disallow_jump: bool = False,
+    ) -> Dict[str, Any]:
+        if not self.enabled:
+            return self._disabled_runtime()
+
+        session_context = session_context if isinstance(session_context, dict) else {}
+        conversation_content = str(conversation_content or "")
+        stage_catalog_before = (
+            copy.deepcopy(self.chain_manager.stage_catalog)
+            if disallow_jump
+            else None
+        )
         evaluation = self.chain_manager.evaluate_turn(
             session_context=session_context,
             conversation_content=conversation_content,
@@ -209,6 +284,10 @@ class DepressionSimulationEngine:
             llm_cfg=roadmap_llm_cfg,
             llm_signal=llm_transition_signal,
         )
+        if disallow_jump and str(evaluation.get("action", "") or "").strip().lower() == "jump":
+            if isinstance(stage_catalog_before, dict):
+                self.chain_manager.stage_catalog = stage_catalog_before
+            evaluation = self._downgrade_jump_evaluation(evaluation)
         chain_snapshot = self.chain_manager.commit_turn(evaluation)
         current_stage = self.chain_manager.get_current_stage()
 
@@ -241,6 +320,120 @@ class DepressionSimulationEngine:
             "interaction_count": self.interaction_count,
             "last_update": self.last_update_time.isoformat(),
         }
+
+    def _disabled_runtime(self) -> Dict[str, Any]:
+        return {
+            "enabled": False,
+            "current_stage": self.chain_manager.get_current_stage(),
+            "chain": self.chain_manager.get_chain_snapshot(),
+            "session_context": {},
+        }
+
+    def _current_runtime(self, enabled: bool = True) -> Dict[str, Any]:
+        return {
+            "enabled": bool(enabled),
+            "current_stage": self.chain_manager.get_current_stage(),
+            "chain": self.chain_manager.get_chain_snapshot(),
+            "session_context": copy.deepcopy(self.last_session_context),
+            "emotion": copy.deepcopy(self.last_emotion),
+            "interaction_count": self.interaction_count,
+            "last_update": self.last_update_time.isoformat(),
+        }
+
+    def initialize_chain_window(
+        self,
+        location: str = "",
+        time_of_day: str = "",
+        interaction_type: str = "主诉链初始化",
+        roadmap_completion_func: Optional[Callable[[str], str]] = None,
+        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """用 LLM 初始化运行态主诉链窗口，不改变当前 stage。"""
+        if not self.enabled:
+            return self._disabled_runtime()
+        if not callable(roadmap_completion_func):
+            return self._current_runtime(enabled=True)
+        session_context = self.context_builder.build_context(
+            location=location,
+            time_of_day=time_of_day,
+            other_agent="",
+            relationship="",
+            interaction_type=interaction_type,
+            conversation_content="初始化主诉链窗口：请基于当前主诉节点，规划自然、保守、可推进的后续主诉链节点。",
+        )
+        chain_snapshot = self.chain_manager.initialize_chain_window(
+            session_context=session_context,
+            conversation_content=session_context.get("conversation", {}).get("content", ""),
+            completion_func=roadmap_completion_func,
+            llm_cfg=roadmap_llm_cfg,
+        )
+        self.last_session_context = copy.deepcopy(session_context)
+        self.last_update_time = self._now()
+        return {
+            "enabled": True,
+            "current_stage": self.chain_manager.get_current_stage(),
+            "chain": chain_snapshot,
+            "session_context": session_context,
+            "interaction_count": self.interaction_count,
+            "last_update": self.last_update_time.isoformat(),
+        }
+
+    def _attach_runtime_event(
+        self,
+        session_context: Dict[str, Any],
+        source: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        payload = self._normalize_runtime_event(source=source, metadata=metadata)
+        session_context["runtime_event"] = payload
+        self.context_builder.current_context = copy.deepcopy(session_context)
+        if self.context_builder.context_history:
+            self.context_builder.context_history[-1] = copy.deepcopy(session_context)
+
+    def _normalize_runtime_event(
+        self,
+        source: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        meta = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
+        evidence_ids = meta.get("evidence_ids", [])
+        if not isinstance(evidence_ids, list):
+            evidence_ids = [evidence_ids] if evidence_ids else []
+        normalized_evidence = []
+        seen = set()
+        for item in evidence_ids:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized_evidence.append(text[:80])
+            if len(normalized_evidence) >= 20:
+                break
+        meta["evidence_ids"] = normalized_evidence
+        return {
+            "source": str(source or "").strip()[:32],
+            "metadata": meta,
+            "evidence_ids": normalized_evidence,
+        }
+
+    def _downgrade_jump_evaluation(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
+        payload = copy.deepcopy(evaluation if isinstance(evaluation, dict) else {})
+        if str(payload.get("action", "") or "").strip().lower() != "jump":
+            return payload
+        current_chain = self.chain_manager.get_current_chain_window(
+            getattr(self.chain_manager, "window_size", 3) + 1
+        )
+        payload["action"] = "hold"
+        payload["next_stage"] = None
+        payload["next_chain"] = [
+            str(stage.get("id", "") or "")
+            for stage in current_chain
+            if isinstance(stage, dict) and str(stage.get("id", "") or "").strip()
+        ]
+        reason = str(payload.get("match_reason", "") or "").strip()
+        suffix = "reflection_disallows_jump"
+        payload["match_reason"] = "{}; {}".format(reason, suffix) if reason else suffix
+        return payload
 
     def _infer_emotion(
         self,
