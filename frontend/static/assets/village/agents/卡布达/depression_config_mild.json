@@ -13,7 +13,7 @@
       "functional_impairment": "mild"
     }
   },
-  "complaint_chain": {
+  "complaint_graph": {
     "initial_stage_id": "mild_job_loss_self_doubt",
     "planner": {
       "window_size": 3,

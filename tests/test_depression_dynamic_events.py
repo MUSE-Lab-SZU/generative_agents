@@ -20,7 +20,7 @@ def _engine_config():
     return {
         "enabled": True,
         "agent_name": "测试角色",
-        "complaint_chain": {
+        "complaint_graph": {
             "initial_stage_id": "stage_a",
             "planner": {
                 "llm_enabled": False,
@@ -56,7 +56,7 @@ def _jump_signal():
         "match_confidence": 1.0,
         "match_reason": "测试跳转",
         "action": "jump",
-        "next_chain": ["stage_a", "stage_b"],
+        "next_graph": ["stage_a", "stage_b"],
     }
 
 
@@ -64,7 +64,7 @@ def _single_stage_empty_candidates_config():
     return {
         "enabled": True,
         "agent_name": "测试角色",
-        "complaint_chain": {
+        "complaint_graph": {
             "initial_stage_id": "stage_a",
             "planner": {
                 "llm_enabled": False,
@@ -85,6 +85,12 @@ def _single_stage_empty_candidates_config():
         "emotion": {"llm_enabled": False},
         "memory": {"enabled": False},
     }
+
+
+def _legacy_complaint_chain_config():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_chain"] = config.pop("complaint_graph")
+    return config
 
 
 def test_generate_chat_template_keeps_persona_description_single_source():
@@ -121,6 +127,15 @@ def test_generate_chat_template_keeps_persona_description_single_source():
     assert "以下是对 卡布达 的简要描述：" not in dynamic_prompt
     assert dynamic_prompt.count("动态基础描述") == 1
     assert dynamic_prompt.count("=== 基础人格层 ===") == 1
+
+
+def test_legacy_complaint_chain_config_is_loaded_as_graph():
+    engine = DepressionSimulationEngine(_legacy_complaint_chain_config())
+    state = engine.get_current_state_info()
+
+    assert state["chain"]["mode"] == "complaint_graph"
+    assert state["current_stage"]["id"] == "stage_a"
+    assert state["chain"]["current_graph_window"][0]["id"] == "stage_a"
 
 
 def test_chat_event_keeps_existing_jump_behavior():
@@ -191,9 +206,9 @@ def test_empty_candidate_stage_without_llm_stage_holds_current_stage():
     assert state["chain"]["stage_index"] == 0
 
     saved = engine.to_dict()
-    assert len(engine.raw_config["complaint_chain"]["stages"]) == 1
-    assert len(saved["chain_manager"]["stage_catalog"]) == 1
-    assert saved["chain_manager"]["planned_chain"] == ["stage_a"]
+    assert len(engine.raw_config["complaint_graph"]["stages"]) == 1
+    assert len(saved["complaint_graph_manager"]["stages"]) == 1
+    assert saved["complaint_graph_manager"]["planned_chain"] == ["stage_a"]
 
 
 def test_llm_id_only_next_chain_does_not_materialize_unknown_stage():
@@ -212,7 +227,7 @@ def test_llm_id_only_next_chain_does_not_materialize_unknown_stage():
             "match_confidence": 1.0,
             "match_reason": "只返回后续 id 的测试信号",
             "action": "advance",
-            "next_chain": ["stage_a", "stage_b"],
+            "next_graph": ["stage_a", "stage_b"],
         },
     )
 
@@ -238,7 +253,7 @@ def test_llm_full_stage_extends_empty_candidate_chain():
             "match_confidence": 1.0,
             "match_reason": "完整节点测试信号",
             "action": "advance",
-            "next_chain": [
+            "next_graph": [
                 "stage_a",
                 {
                     "id": "stage_b",
@@ -259,7 +274,7 @@ def test_llm_full_stage_extends_empty_candidate_chain():
 
 def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
     config = _single_stage_empty_candidates_config()
-    config["complaint_chain"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
 
     def completion(_prompt):
@@ -269,7 +284,7 @@ def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
                 "match_confidence": 0.9,
                 "match_reason": "补足起始主诉链窗口",
                 "action": "replan",
-                "next_chain": [
+                "next_graph": [
                     "stage_a",
                     {
                         "id": "stage_b",
@@ -299,7 +314,7 @@ def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
 
 def test_llm_chain_window_links_generated_stages_as_graph_edges():
     config = _single_stage_empty_candidates_config()
-    config["complaint_chain"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
 
     def completion(_prompt):
@@ -309,7 +324,7 @@ def test_llm_chain_window_links_generated_stages_as_graph_edges():
                 "match_confidence": 0.9,
                 "match_reason": "补足多节点窗口",
                 "action": "replan",
-                "next_chain": [
+                "next_graph": [
                     "stage_a",
                     {
                         "id": "stage_b",
@@ -338,7 +353,7 @@ def test_llm_chain_window_links_generated_stages_as_graph_edges():
 
 def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
     config = _single_stage_empty_candidates_config()
-    config["complaint_chain"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
 
     def completion(_prompt):
@@ -348,7 +363,7 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
                 "match_confidence": 0.9,
                 "match_reason": "补足窗口但只给了一个完整节点",
                 "action": "replan",
-                "next_chain": [
+                "next_graph": [
                     "stage_a",
                     {
                         "id": "stage_b",
@@ -374,7 +389,7 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
 
 def test_initialize_chain_window_retries_until_window_target_is_reached():
     config = _single_stage_empty_candidates_config()
-    config["complaint_chain"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
     responses = [
         {
@@ -382,7 +397,7 @@ def test_initialize_chain_window_retries_until_window_target_is_reached():
             "match_confidence": 0.9,
             "match_reason": "第一次只补一个节点",
             "action": "replan",
-            "next_chain": [
+            "next_graph": [
                 "stage_a",
                 {
                     "id": "stage_b",
@@ -396,7 +411,7 @@ def test_initialize_chain_window_retries_until_window_target_is_reached():
             "match_confidence": 0.9,
             "match_reason": "第二次补足窗口",
             "action": "replan",
-            "next_chain": [
+            "next_graph": [
                 "stage_a",
                 "stage_b",
                 {
@@ -424,6 +439,83 @@ def test_initialize_chain_window_retries_until_window_target_is_reached():
     assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
 
 
+def test_initialize_graph_window_maintains_window_size_future_nodes():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["window_size"] = 3
+    engine = DepressionSimulationEngine(config)
+
+    def completion(_prompt):
+        return json.dumps(
+            {
+                "matched_current_stage": True,
+                "match_confidence": 0.9,
+                "match_reason": "补足三个未来节点",
+                "action": "replan",
+                "next_graph": [
+                    "stage_a",
+                    {"id": "stage_b", "label": "阶段 B", "summary": "第一段自然延续。"},
+                    {"id": "stage_c", "label": "阶段 C", "summary": "第二段自然延续。"},
+                    {"id": "stage_d", "label": "阶段 D", "summary": "第三段自然延续。"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    state = engine.initialize_chain_window(
+        location="家",
+        time_of_day="morning",
+        roadmap_completion_func=completion,
+    )
+
+    assert [stage["id"] for stage in state["chain"]["current_graph_window"]] == [
+        "stage_a",
+        "stage_b",
+        "stage_c",
+        "stage_d",
+    ]
+    assert engine.chain_manager.stage_catalog["stage_c"]["next_candidates"] == ["stage_d"]
+
+
+def test_preview_interaction_prompt_does_not_materialize_llm_graph_updates():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
+    engine = DepressionSimulationEngine(config)
+
+    def completion(_prompt):
+        return json.dumps(
+            {
+                "matched_current_stage": True,
+                "match_confidence": 1.0,
+                "match_reason": "预览生成完整节点",
+                "action": "advance",
+                "next_graph": [
+                    "stage_a",
+                    {
+                        "id": "stage_b",
+                        "label": "预览阶段 B",
+                        "summary": "只应出现在 preview clone 中。",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    engine.preview_interaction_prompt(
+        location="家",
+        time_of_day="morning",
+        other_agent="朋友",
+        relationship="朋友",
+        interaction_type="闲聊",
+        conversation_content="我开始能说出失业后具体卡住的地方。",
+        roadmap_completion_func=completion,
+    )
+
+    assert list(engine.chain_manager.stage_catalog.keys()) == ["stage_a"]
+    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == []
+    assert engine.get_current_state_info()["current_stage"]["id"] == "stage_a"
+
+
 def test_chat_replan_with_advance_evidence_moves_to_next_stage():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
 
@@ -440,7 +532,7 @@ def test_chat_replan_with_advance_evidence_moves_to_next_stage():
             "match_confidence": 0.95,
             "match_reason": "补充后续路线图",
             "action": "replan",
-            "next_chain": [
+            "next_graph": [
                 "stage_a",
                 {
                     "id": "stage_b",
@@ -457,10 +549,65 @@ def test_chat_replan_with_advance_evidence_moves_to_next_stage():
     assert state["chain"]["last_evaluation"]["action"] == "advance"
 
 
+def test_commit_advance_then_expands_new_current_stage_future_window():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["planner"]["window_size"] = 3
+    engine = DepressionSimulationEngine(config)
+    responses = [
+        {
+            "matched_current_stage": True,
+            "match_confidence": 1.0,
+            "match_reason": "先推进到阶段 B",
+            "action": "advance",
+            "next_graph": [
+                "stage_a",
+                {"id": "stage_b", "label": "阶段 B", "summary": "推进后的当前节点。"},
+            ],
+        },
+        {
+            "matched_current_stage": True,
+            "match_confidence": 0.9,
+            "match_reason": "给新当前节点补足未来窗口",
+            "action": "replan",
+            "next_graph": [
+                "stage_b",
+                {"id": "stage_c", "label": "阶段 C", "summary": "B 后的第一段。"},
+                {"id": "stage_d", "label": "阶段 D", "summary": "B 后的第二段。"},
+                {"id": "stage_e", "label": "阶段 E", "summary": "B 后的第三段。"},
+            ],
+        },
+    ]
+
+    def completion(_prompt):
+        return json.dumps(responses.pop(0), ensure_ascii=False)
+
+    state = engine.commit_event(
+        source="chat",
+        location="家",
+        time_of_day="morning",
+        interaction_type="闲聊",
+        content="我开始能说出失业后具体卡住的地方。",
+        other_agent="朋友",
+        relationship="朋友",
+        roadmap_completion_func=completion,
+    )
+
+    assert state["current_stage"]["id"] == "stage_b"
+    assert [stage["id"] for stage in state["chain"]["current_graph_window"]] == [
+        "stage_b",
+        "stage_c",
+        "stage_d",
+        "stage_e",
+    ]
+    assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
+    assert state["chain"]["last_evaluation"]["action"] == "advance"
+
+
 def test_legacy_runtime_next_placeholders_are_removed_on_restore():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
     payload = engine.to_dict()
-    payload["chain_manager"]["stage_catalog"].append(
+    payload["complaint_graph_manager"]["stages"].append(
         {
             "id": "stage_a_runtime_next_1",
             "label": "stage_a_runtime_next_1",
@@ -468,7 +615,7 @@ def test_legacy_runtime_next_placeholders_are_removed_on_restore():
             "source": "runtime_bootstrap",
         }
     )
-    payload["chain_manager"]["planned_chain"] = ["stage_a", "stage_a_runtime_next_1"]
+    payload["complaint_graph_manager"]["planned_chain"] = ["stage_a", "stage_a_runtime_next_1"]
 
     restored = DepressionSimulationEngine.from_dict(payload)
     state = restored.get_current_state_info()
@@ -480,7 +627,7 @@ def test_legacy_runtime_next_placeholders_are_removed_on_restore():
 def test_restore_links_existing_planned_chain_edges():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
     payload = engine.to_dict()
-    payload["chain_manager"]["stage_catalog"].append(
+    payload["complaint_graph_manager"]["stages"].append(
         {
             "id": "stage_b",
             "label": "阶段 B",
@@ -489,7 +636,7 @@ def test_restore_links_existing_planned_chain_edges():
             "next_candidates": [],
         }
     )
-    payload["chain_manager"]["planned_chain"] = ["stage_a", "stage_b"]
+    payload["complaint_graph_manager"]["planned_chain"] = ["stage_a", "stage_b"]
 
     restored = DepressionSimulationEngine.from_dict(payload)
 

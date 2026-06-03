@@ -11,7 +11,7 @@
       "self_blame": true
     }
   },
-  "complaint_chain": {
+  "complaint_graph": {
     "initial_stage_id": "job_loss_equals_self_failure",
     "planner": {
       "window_size": 3,

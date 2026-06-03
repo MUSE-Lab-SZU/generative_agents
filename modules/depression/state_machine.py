@@ -1,4 +1,4 @@
-"""主诉链管理器。"""
+"""主诉图管理器。"""
 
 from __future__ import annotations
 
@@ -37,13 +37,13 @@ class ComplaintStage:
 
 
 class ComplaintChainManager:
-    """仅围绕主诉链推进的人设动态管理器。
+    """仅围绕主诉图推进的人设动态管理器。
 
     它维护的不是“病情数值总表”，而是一个更离散的对象：
     当前角色正卡在哪个主诉节点、下一步可能走向哪里、为什么推进/停留。
 
     建议把内部状态理解为三部分：
-    - `stage_catalog`：所有可能节点的“静态字典”；
+    - `stage_catalog`：所有可能节点的运行态图索引；
     - `planned_chain + stage_index`：当前生效的“前瞻路径”；
     - `stage_history + dialogue_history`：运行过程留下的“证据轨迹”。
     """
@@ -99,15 +99,14 @@ class ComplaintChainManager:
         now_provider: Optional[Callable[[], datetime]] = None,
     ):
         config = config if isinstance(config, dict) else {}
-        # 兼容两种传法：
-        # 1. 直接传 complaint_chain 配置本身；
-        # 2. 传整个 depression_config.json，再从中取 `complaint_chain`。
-        chain_config = config.get("complaint_chain", config)
-        if not isinstance(chain_config, dict):
-            chain_config = {}
+        # 兼容三种传法：
+        # 1. 直接传 complaint_graph 配置本身；
+        # 2. 传整个 depression_config.json，并优先取 `complaint_graph`；
+        # 3. 读取旧配置/旧 checkpoint 中的 `complaint_chain`。
+        graph_config = self._select_graph_config(config)
 
-        self._raw_chain_config = copy.deepcopy(chain_config)
-        self.planner: Dict[str, Any] = copy.deepcopy(chain_config.get("planner", {}))
+        self._raw_chain_config = copy.deepcopy(graph_config)
+        self.planner: Dict[str, Any] = copy.deepcopy(graph_config.get("planner", {}))
         self.window_size = self._bounded_int(self.planner.get("window_size"), 3, 1, 8)
         self.min_match_confidence = self._bounded_float(
             self.planner.get("min_match_confidence"), 0.60, 0.0, 1.0
@@ -124,7 +123,7 @@ class ComplaintChainManager:
         )
 
         self.stage_catalog: Dict[str, Dict[str, Any]] = {}
-        raw_stages = chain_config.get("stages", [])
+        raw_stages = graph_config.get("stages", graph_config.get("stage_catalog", []))
         if isinstance(raw_stages, list):
             for item in raw_stages:
                 # 每个 stage 都先经过 sanitize，再进入 catalog。
@@ -137,7 +136,8 @@ class ComplaintChainManager:
             self.stage_catalog[default_stage["id"]] = default_stage
 
         initial_stage_id = str(
-            chain_config.get("initial_stage_id")
+            graph_config.get("initial_stage_id")
+            or graph_config.get("current_stage_id")
             or next(iter(self.stage_catalog.keys()))
         ).strip()
         if initial_stage_id not in self.stage_catalog:
@@ -153,6 +153,14 @@ class ComplaintChainManager:
         self.stage_start_time = self._now()
 
         self.reset()
+
+    @staticmethod
+    def _select_graph_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        if "complaint_graph" in config and isinstance(config.get("complaint_graph", {}), dict):
+            return copy.deepcopy(config.get("complaint_graph", {}))
+        if "complaint_chain" in config and isinstance(config.get("complaint_chain", {}), dict):
+            return copy.deepcopy(config.get("complaint_chain", {}))
+        return copy.deepcopy(config if isinstance(config, dict) else {})
 
     def _now(self) -> datetime:
         try:
@@ -192,16 +200,24 @@ class ComplaintChainManager:
         ids = self.planned_chain[start : start + width]
         return [copy.deepcopy(self.stage_catalog.get(stage_id, {})) for stage_id in ids]
 
+    def get_current_graph_window(self, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        return self.get_current_chain_window(count)
+
     def get_chain_snapshot(self) -> Dict[str, Any]:
         current_stage = self.get_current_stage()
+        graph_window = self.get_current_graph_window(self.window_size + 1)
+        stages = [copy.deepcopy(item) for item in self.stage_catalog.values()]
         return {
-            "mode": "complaint_chain",
+            "mode": "complaint_graph",
             "current_stage_id": str(current_stage.get("id", "")),
             "current_stage_label": str(current_stage.get("label", "")),
             "current_stage": current_stage,
+            "stages": stages,
+            "current_graph_window": graph_window,
+            "window_size": int(self.window_size),
             "planned_chain": [str(item) for item in self.planned_chain],
             "stage_index": int(self.stage_index),
-            "current_chain_window": self.get_current_chain_window(self.window_size + 1),
+            "current_chain_window": graph_window,
             "stage_start_time": self.stage_start_time.isoformat(),
             "stage_history": copy.deepcopy(self.stage_history),
             "dialogue_history": copy.deepcopy(self.dialogue_history[-self.max_dialog_history :]),
@@ -284,6 +300,7 @@ class ComplaintChainManager:
         action = "hold"
         # 先拿当前窗口当作未来链条的缺省值。
         next_chain_ids: List[str] = self._preview_future_chain(current_stage)
+        stage_updates: List[Dict[str, Any]] = []
 
         if normalized_signal:
             # 一旦有 LLM/外部信号，就用它覆盖启发式默认值；
@@ -297,9 +314,14 @@ class ComplaintChainManager:
             )
             match_reason = str(normalized_signal.get("match_reason", match_reason) or match_reason)
             action = str(normalized_signal.get("action", action) or action).strip().lower() or "hold"
-            candidate_chain = normalized_signal.get("next_chain", [])
+            stage_updates = self._normalize_stage_updates(normalized_signal.get("stage_updates", []))
+            candidate_chain = normalized_signal.get("next_graph", normalized_signal.get("next_chain", []))
             if isinstance(candidate_chain, list) and candidate_chain:
-                next_chain_ids = self._normalize_next_chain(candidate_chain, current_stage["id"])
+                next_chain_ids = self._normalize_next_graph(
+                    candidate_chain,
+                    current_stage["id"],
+                    stage_updates,
+                )
 
         if action not in {"hold", "advance", "replan", "jump"}:
             action = "hold"
@@ -338,13 +360,13 @@ class ComplaintChainManager:
             # advance / jump 的共同前提：必须能推出一个“后继节点”。
             # 如果 next_chain 不够长，就退回当前 stage 的 next_candidates。
             if len(next_chain_ids) > 1:
-                next_stage = copy.deepcopy(self.stage_catalog.get(next_chain_ids[1], {}))
+                next_stage = self._lookup_stage(next_chain_ids[1], stage_updates)
             elif current_stage.get("next_candidates"):
                 candidate_id = str(current_stage.get("next_candidates", [""])[0] or "").strip()
                 if candidate_id and candidate_id in self.stage_catalog:
                     next_chain_ids = [current_stage["id"], candidate_id]
                     next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
-            else:
+            if not next_stage:
                 # 没有 LLM 生成的完整后续节点，也没有配置内已存在的候选时，
                 # 不凭规则臆造主诉节点。
                 action = "hold"
@@ -359,6 +381,8 @@ class ComplaintChainManager:
             "current_stage": copy.deepcopy(current_stage),
             "next_stage": copy.deepcopy(next_stage) if isinstance(next_stage, dict) else None,
             "next_chain": [str(item) for item in next_chain_ids],
+            "next_graph": [str(item) for item in next_chain_ids],
+            "stage_updates": copy.deepcopy(stage_updates),
             "session_context": copy.deepcopy(session_context),
             "conversation_excerpt": self._clip_text(conversation, limit=220),
         }
@@ -378,7 +402,9 @@ class ComplaintChainManager:
         matched = bool(evaluation.get("matched", False))
         match_confidence = self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(evaluation.get("match_reason", "") or "")[:180]
-        next_chain = self._normalize_next_chain(evaluation.get("next_chain", []), current_before.get("id", ""))
+        self._materialize_stage_updates(evaluation.get("stage_updates", []))
+        next_graph_value = evaluation.get("next_graph", evaluation.get("next_chain", []))
+        next_chain = self._normalize_next_chain(next_graph_value, current_before.get("id", ""))
         session_context = (
             evaluation.get("session_context", {}) if isinstance(evaluation.get("session_context", {}), dict) else {}
         )
@@ -488,16 +514,32 @@ class ComplaintChainManager:
         completion_func: Optional[Callable[[str], str]] = None,
         llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """用 LLM 补足运行态主诉链窗口，但不推进当前节点。
+        """用 LLM 补足运行态主诉图窗口，但不推进当前节点。"""
+        return self.ensure_graph_window(
+            session_context=session_context,
+            conversation_content=conversation_content,
+            completion_func=completion_func,
+            llm_cfg=llm_cfg,
+            source="chain_window_init",
+            record_evaluation=True,
+        )
 
-        这个方法只接受 LLM 返回的已知 stage id 或完整 stage 对象。
-        如果 LLM 只给未知字符串 id，`_normalize_chain_ids()` 会过滤掉，
-        因而不会生成无语义的占位节点。
-        """
+    def ensure_graph_window(
+        self,
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        completion_func: Optional[Callable[[str], str]] = None,
+        llm_cfg: Optional[Dict[str, Any]] = None,
+        source: str = "graph_window_expansion",
+        record_evaluation: bool = False,
+    ) -> Dict[str, Any]:
+        """按需补足“当前节点 + window_size 个未来节点”的运行态图窗口。"""
         self._drop_legacy_placeholder_stages()
         if not callable(completion_func) or not self.llm_enabled:
             return self.get_chain_snapshot()
         if len(self.get_current_chain_window(self.window_size + 1)) >= self.window_size + 1:
+            return self.get_chain_snapshot()
+        if self._coerce_bool(self.get_current_stage().get("is_terminal_stage", False)):
             return self.get_chain_snapshot()
 
         target_width = self.window_size + 1
@@ -509,32 +551,37 @@ class ComplaintChainManager:
                 break
 
             evaluation = self.evaluate_turn(
-                session_context=session_context if isinstance(session_context, dict) else {},
+                session_context=self._graph_expansion_context(session_context),
                 conversation_content=str(conversation_content or ""),
                 completion_func=completion_func,
                 llm_cfg=llm_cfg,
             )
-            next_chain = self._normalize_next_chain(
-                evaluation.get("next_chain", []),
+            stage_updates = self._normalize_stage_updates(evaluation.get("stage_updates", []))
+            next_chain = self._normalize_next_graph(
+                evaluation.get("next_graph", evaluation.get("next_chain", [])),
                 self.get_current_stage_id(),
+                stage_updates,
             )
             if len(next_chain) > 1:
+                self._materialize_stage_updates(stage_updates)
+                next_chain = self._normalize_next_chain(next_chain, self.get_current_stage_id())
                 self._replace_future_chain(next_chain)
                 self._ensure_future_window()
-                self.last_session_context = copy.deepcopy(
-                    evaluation.get("session_context", {})
-                    if isinstance(evaluation.get("session_context", {}), dict)
-                    else {}
-                )
-                self.last_evaluation = {
-                    "action": "replan",
-                    "matched": bool(evaluation.get("matched", False)),
-                    "match_confidence": self._bounded_float(
-                        evaluation.get("match_confidence"), 0.0, 0.0, 1.0
-                    ),
-                    "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
-                    "source": "chain_window_init",
-                }
+                if record_evaluation:
+                    self.last_session_context = copy.deepcopy(
+                        evaluation.get("session_context", {})
+                        if isinstance(evaluation.get("session_context", {}), dict)
+                        else {}
+                    )
+                    self.last_evaluation = {
+                        "action": "replan",
+                        "matched": bool(evaluation.get("matched", False)),
+                        "match_confidence": self._bounded_float(
+                            evaluation.get("match_confidence"), 0.0, 0.0, 1.0
+                        ),
+                        "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
+                        "source": str(source or "graph_window_expansion")[:32],
+                    }
 
             after_width = len(self.get_current_chain_window(target_width))
             if after_width <= before_width and len(self.stage_catalog) <= before_catalog_size:
@@ -586,10 +633,11 @@ class ComplaintChainManager:
                 item["timestamp"] = ts.isoformat()
             history_rows.append(item)
         return {
-            "mode": "complaint_chain",
+            "mode": "complaint_graph",
             "planner": copy.deepcopy(self.planner),
             "initial_stage_id": self.initial_stage_id,
-            "stage_catalog": [copy.deepcopy(item) for item in self.stage_catalog.values()],
+            "current_stage_id": self.get_current_stage_id(),
+            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
             "planned_chain": [str(item) for item in self.planned_chain],
             "stage_index": int(self.stage_index),
             "stage_history": history_rows,
@@ -609,7 +657,10 @@ class ComplaintChainManager:
         payload = payload if isinstance(payload, dict) else {}
         legacy_cfg = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else {}
         base_cfg = base_config if isinstance(base_config, dict) else {}
-        stage_catalog = payload.get("stage_catalog", legacy_cfg.get("stages", base_cfg.get("stages", [])))
+        stage_catalog = payload.get(
+            "stages",
+            payload.get("stage_catalog", legacy_cfg.get("stages", base_cfg.get("stages", []))),
+        )
         if isinstance(stage_catalog, dict):
             stage_catalog = list(stage_catalog.values())
         cfg = {
@@ -617,13 +668,16 @@ class ComplaintChainManager:
             "initial_stage_id": str(
                 payload.get(
                     "initial_stage_id",
-                    legacy_cfg.get("initial_stage_id", base_cfg.get("initial_stage_id", "")),
+                    payload.get(
+                        "current_stage_id",
+                        legacy_cfg.get("initial_stage_id", base_cfg.get("initial_stage_id", "")),
+                    ),
                 )
                 or ""
             ),
             "stages": copy.deepcopy(stage_catalog) if isinstance(stage_catalog, list) else [],
         }
-        manager = cls(config={"complaint_chain": cfg}, now_provider=now_provider)
+        manager = cls(config={"complaint_graph": cfg}, now_provider=now_provider)
         planned_chain = payload.get("planned_chain", [])
         if isinstance(planned_chain, list) and planned_chain:
             manager.planned_chain = manager._normalize_chain_ids(planned_chain)
@@ -964,12 +1018,15 @@ class ComplaintChainManager:
         # 给 LLM 的任务不是“诊断病情”，而是“判断当前主诉节点是否被触及”。
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        current_chain_window = self.get_current_chain_window(self.window_size + 1)
+        current_graph_window = self.get_current_graph_window(self.window_size + 1)
         payload = {
             "current_stage": self.get_current_stage(),
-            "current_chain_window": current_chain_window,
+            "current_graph_window": current_graph_window,
+            "current_chain_window": current_graph_window,
+            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
             "window_size": int(self.window_size),
-            "needs_chain_expansion": len(current_chain_window) < self.window_size + 1,
+            "needs_graph_expansion": len(current_graph_window) < self.window_size + 1,
+            "needs_chain_expansion": len(current_graph_window) < self.window_size + 1,
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
             "allowed_actions": ["hold", "advance", "replan", "jump"],
@@ -1002,20 +1059,22 @@ class ComplaintChainManager:
         if action not in {"hold", "advance", "replan", "jump"}:
             action = "hold"
 
-        raw_next = payload.get("next_chain", payload.get("next_stages", []))
-        next_chain: List[str] = []
+        raw_next = payload.get(
+            "next_graph",
+            payload.get("next_chain", payload.get("next_stages", [])),
+        )
+        stage_updates = self._normalize_stage_updates(payload.get("stage_updates", []))
+        next_graph: List[str] = []
         if isinstance(raw_next, list):
             for item in raw_next:
                 if isinstance(item, dict):
-                    # 如果 LLM 直接吐出完整 stage dict，这里也能接住；
-                    # 但接住之后仍会 sanitize，避免字段形状失控。
                     stage = self._sanitize_stage(item, source="llm")
-                    self.stage_catalog[stage["id"]] = stage
-                    next_chain.append(stage["id"])
+                    stage_updates = self._merge_stage_update(stage_updates, stage)
+                    next_graph.append(stage["id"])
                 else:
                     text = str(item or "").strip()
                     if text:
-                        next_chain.append(text)
+                        next_graph.append(text)
 
         if matched and match_confidence < self.min_match_confidence:
             matched = False
@@ -1027,8 +1086,88 @@ class ComplaintChainManager:
             "match_confidence": round(float(match_confidence), 4),
             "match_reason": match_reason,
             "action": action,
-            "next_chain": next_chain,
+            "next_graph": next_graph,
+            "next_chain": next_graph,
+            "stage_updates": stage_updates,
         }
+
+    def _normalize_stage_updates(self, value: Any) -> List[Dict[str, Any]]:
+        updates: List[Dict[str, Any]] = []
+        seen = set()
+        for item in self._to_list(value):
+            if not isinstance(item, dict):
+                continue
+            stage = self._sanitize_stage(item, source=str(item.get("source", "llm") or "llm"))
+            stage_id = str(stage.get("id", "") or "").strip()
+            if not stage_id or stage_id in seen:
+                continue
+            seen.add(stage_id)
+            updates.append(stage)
+        return updates
+
+    def _merge_stage_update(self, updates: List[Dict[str, Any]], stage: Dict[str, Any]) -> List[Dict[str, Any]]:
+        stage_id = str(stage.get("id", "") or "").strip() if isinstance(stage, dict) else ""
+        if not stage_id:
+            return updates
+        results = [copy.deepcopy(item) for item in updates if str(item.get("id", "") or "").strip() != stage_id]
+        results.append(copy.deepcopy(stage))
+        return results
+
+    def _lookup_stage(self, stage_id: str, stage_updates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        stage_key = str(stage_id or "").strip()
+        if not stage_key:
+            return {}
+        if stage_key in self.stage_catalog:
+            return copy.deepcopy(self.stage_catalog[stage_key])
+        for stage in stage_updates or []:
+            if isinstance(stage, dict) and str(stage.get("id", "") or "").strip() == stage_key:
+                return copy.deepcopy(stage)
+        return {}
+
+    def _materialize_stage_updates(self, value: Any) -> None:
+        updates = self._normalize_stage_updates(value)
+        if not updates:
+            return
+        for stage in updates:
+            self.stage_catalog[stage["id"]] = copy.deepcopy(stage)
+        self._prune_unknown_next_candidates([stage["id"] for stage in updates])
+
+    def _normalize_next_graph(
+        self,
+        value: Any,
+        current_stage_id: str,
+        stage_updates: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
+        pending_ids = {
+            str(stage.get("id", "") or "").strip()
+            for stage in self._normalize_stage_updates(stage_updates or [])
+            if isinstance(stage, dict)
+        }
+        normalized: List[str] = []
+        seen = set()
+        for item in self._to_list(value):
+            stage_id = ""
+            if isinstance(item, dict):
+                stage = self._sanitize_stage(item, source=str(item.get("source", "llm") or "llm"))
+                stage_id = stage["id"]
+                pending_ids.add(stage_id)
+            else:
+                text = str(item or "").strip()
+                if text in self.stage_catalog or text in pending_ids:
+                    stage_id = text
+            if not stage_id or stage_id in seen:
+                continue
+            seen.add(stage_id)
+            normalized.append(stage_id)
+        current_id = str(current_stage_id or "").strip()
+        if not normalized and current_id:
+            return [current_id]
+        if current_id:
+            if current_id not in normalized:
+                normalized = [current_id] + normalized
+            elif normalized[0] != current_id:
+                normalized = [current_id] + [item for item in normalized if item != current_id]
+        return normalized
 
     def _normalize_next_chain(self, value: Any, current_stage_id: str) -> List[str]:
         current_id = str(current_stage_id or "").strip()
@@ -1155,6 +1294,18 @@ class ComplaintChainManager:
             "metadata": metadata,
         }
 
+    def _graph_expansion_context(self, session_context: Dict[str, Any]) -> Dict[str, Any]:
+        payload = copy.deepcopy(session_context if isinstance(session_context, dict) else {})
+        payload.setdefault("scene", {})
+        if isinstance(payload.get("scene", {}), dict):
+            payload["scene"]["interaction_type"] = "主诉图补足"
+        payload["runtime_event"] = {
+            "source": "graph_window_expansion",
+            "metadata": {"purpose": "maintain_complaint_graph_window"},
+            "evidence_ids": [],
+        }
+        return payload
+
     def _is_chain_window_init_context(self, session_context: Dict[str, Any]) -> bool:
         scene = (
             session_context.get("scene", {})
@@ -1163,7 +1314,10 @@ class ComplaintChainManager:
         )
         interaction_type = str(scene.get("interaction_type", "") or "").strip()
         runtime_source = str(self._runtime_event_from_context(session_context).get("source", "") or "").strip()
-        return interaction_type == "主诉链初始化" or runtime_source == "chain_window_init"
+        return interaction_type in {"主诉链初始化", "主诉图补足"} or runtime_source in {
+            "chain_window_init",
+            "graph_window_expansion",
+        }
 
     def _track_dialogue(
         self,

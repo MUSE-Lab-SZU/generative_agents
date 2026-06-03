@@ -1,4 +1,4 @@
-"""主诉链驱动的动态 Prompt 构建器。"""
+"""主诉图驱动的动态 Prompt 构建器。"""
 
 from __future__ import annotations
 
@@ -77,9 +77,10 @@ class DynamicPromptBuilder:
 
     def _build_stage_layer(self, current_stage: Dict[str, Any], chain_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        current_window = chain_snapshot.get("current_chain_window", []) if isinstance(chain_snapshot.get("current_chain_window", []), list) else []
+        current_window = chain_snapshot.get("current_graph_window", chain_snapshot.get("current_chain_window", []))
+        current_window = current_window if isinstance(current_window, list) else []
 
-        # 这些字段都直接来自 complaint_chain 配置中的单个 stage。
+        # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
         summary = str(current_stage.get("summary", "") or "").strip()
         core_belief = str(current_stage.get("core_belief", "") or "").strip()

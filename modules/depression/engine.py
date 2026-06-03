@@ -1,4 +1,4 @@
-"""主诉链化后的动态抑郁模块主引擎。"""
+"""主诉图化后的动态抑郁模块主引擎。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .state_machine import ComplaintChainManager
 
 
 class DepressionSimulationEngine:
-    """由主诉链驱动的动态抑郁表现引擎。
+    """由主诉图驱动的动态抑郁表现引擎。
 
     可以把本类理解成一个“编排器”：
     - `SessionContextBuilder`：先把对话场景整理成结构化上下文；
@@ -289,6 +289,14 @@ class DepressionSimulationEngine:
                 self.chain_manager.stage_catalog = stage_catalog_before
             evaluation = self._downgrade_jump_evaluation(evaluation)
         chain_snapshot = self.chain_manager.commit_turn(evaluation)
+        if callable(roadmap_completion_func):
+            chain_snapshot = self.chain_manager.ensure_graph_window(
+                session_context=session_context,
+                conversation_content=conversation_content,
+                completion_func=roadmap_completion_func,
+                llm_cfg=roadmap_llm_cfg,
+                record_evaluation=False,
+            )
         current_stage = self.chain_manager.get_current_stage()
 
         biases = self.bias_injector.inject_bias(current_stage, session_context, conversation_content)
@@ -348,7 +356,7 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """用 LLM 初始化运行态主诉链窗口，不改变当前 stage。"""
+        """用 LLM 初始化运行态主诉图窗口，不改变当前 stage。"""
         if not self.enabled:
             return self._disabled_runtime()
         if not callable(roadmap_completion_func):
@@ -359,7 +367,7 @@ class DepressionSimulationEngine:
             other_agent="",
             relationship="",
             interaction_type=interaction_type,
-            conversation_content="初始化主诉链窗口：请基于当前主诉节点，规划自然、保守、可推进的后续主诉链节点。",
+            conversation_content="初始化主诉图窗口：请基于当前主诉节点，规划自然、保守、可推进的后续主诉图节点。",
         )
         chain_snapshot = self.chain_manager.initialize_chain_window(
             session_context=session_context,
@@ -420,16 +428,18 @@ class DepressionSimulationEngine:
         payload = copy.deepcopy(evaluation if isinstance(evaluation, dict) else {})
         if str(payload.get("action", "") or "").strip().lower() != "jump":
             return payload
-        current_chain = self.chain_manager.get_current_chain_window(
+        current_chain = self.chain_manager.get_current_graph_window(
             getattr(self.chain_manager, "window_size", 3) + 1
         )
         payload["action"] = "hold"
         payload["next_stage"] = None
+        payload["stage_updates"] = []
         payload["next_chain"] = [
             str(stage.get("id", "") or "")
             for stage in current_chain
             if isinstance(stage, dict) and str(stage.get("id", "") or "").strip()
         ]
+        payload["next_graph"] = copy.deepcopy(payload["next_chain"])
         reason = str(payload.get("match_reason", "") or "").strip()
         suffix = "reflection_disallows_jump"
         payload["match_reason"] = "{}; {}".format(reason, suffix) if reason else suffix
@@ -477,8 +487,30 @@ class DepressionSimulationEngine:
             "last_update": self.last_update_time.isoformat(),
         }
 
-    def force_stage(self, stage_id: str, reason: str = "manual") -> None:
+    def force_stage(
+        self,
+        stage_id: str,
+        reason: str = "manual",
+        roadmap_completion_func: Optional[Callable[[str], str]] = None,
+        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.chain_manager.force_stage(stage_id, reason=reason)
+        if callable(roadmap_completion_func):
+            session_context = self.context_builder.build_context(
+                location="",
+                time_of_day="",
+                other_agent="",
+                relationship="",
+                interaction_type="手动主诉图切换",
+                conversation_content=str(reason or "manual"),
+            )
+            self.chain_manager.ensure_graph_window(
+                session_context=session_context,
+                conversation_content=str(reason or "manual"),
+                completion_func=roadmap_completion_func,
+                llm_cfg=roadmap_llm_cfg,
+                record_evaluation=False,
+            )
         self.last_update_time = self._now()
 
     def force_state_transition(self, new_state: Any, reason: str = "manual") -> None:
@@ -530,6 +562,7 @@ class DepressionSimulationEngine:
             "last_update_time": self.last_update_time.isoformat(),
             "last_emotion": copy.deepcopy(self.last_emotion),
             "last_session_context": copy.deepcopy(self.last_session_context),
+            "complaint_graph_manager": self.chain_manager.to_dict(),
             "chain_manager": self.chain_manager.to_dict(),
             "context_builder": self.context_builder.to_dict(),
             "bias_injector": self.bias_injector.to_dict(),
@@ -565,11 +598,24 @@ class DepressionSimulationEngine:
         self.last_emotion = copy.deepcopy(payload.get("last_emotion", {})) if isinstance(payload.get("last_emotion", {}), dict) else {}
         self.last_session_context = copy.deepcopy(payload.get("last_session_context", {})) if isinstance(payload.get("last_session_context", {}), dict) else {}
 
-        chain_payload = payload.get("chain_manager", {}) if isinstance(payload.get("chain_manager", {}), dict) else {}
+        chain_payload = (
+            payload.get("complaint_graph_manager", {})
+            if isinstance(payload.get("complaint_graph_manager", {}), dict)
+            else payload.get("chain_manager", {})
+            if isinstance(payload.get("chain_manager", {}), dict)
+            else {}
+        )
+        base_graph_config = (
+            refreshed.get("complaint_graph", {})
+            if isinstance(refreshed.get("complaint_graph", {}), dict)
+            else refreshed.get("complaint_chain", {})
+            if isinstance(refreshed.get("complaint_chain", {}), dict)
+            else {}
+        )
         self.chain_manager = ComplaintChainManager.from_dict(
             chain_payload,
             now_provider=self._clock_provider,
-            base_config=refreshed.get("complaint_chain", {}) if isinstance(refreshed.get("complaint_chain", {}), dict) else {},
+            base_config=base_graph_config,
         )
         self.state_machine = self.chain_manager
 

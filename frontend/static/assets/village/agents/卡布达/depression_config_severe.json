@@ -13,7 +13,7 @@
       "functional_impairment": "severe"
     }
   },
-  "complaint_chain": {
+  "complaint_graph": {
     "initial_stage_id": "severe_job_loss_total_collapse",
     "planner": {
       "window_size": 3,

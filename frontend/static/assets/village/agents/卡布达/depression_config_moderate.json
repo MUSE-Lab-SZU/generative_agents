@@ -13,7 +13,7 @@
       "functional_impairment": "moderate"
     }
   },
-  "complaint_chain": {
+  "complaint_graph": {
     "initial_stage_id": "moderate_job_loss_equals_self_failure",
     "planner": {
       "window_size": 3,
