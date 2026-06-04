@@ -108,7 +108,7 @@ GLOBAL_CONFIG = BASE_DIR / "data" / "config.json"
 GROUP_OVERLAY_DIR = BASE_DIR / "experiments" / "config" / "groups"
 EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
 REPORTS_DIR = EXPERIMENT_DATA_ROOT / "reports"
-BACKUP_DIR = Path(tempfile.gettempdir()) / "generative_agents_batch_config_backup"
+BACKUP_DIR = Path(tempfile.gettempdir()) / "generative_agents_batch_config_backup_zxou"
 
 SEVERITY_CONFIG_FILES = {
     "mild": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_mild.json",
@@ -117,10 +117,7 @@ SEVERITY_CONFIG_FILES = {
 }
 
 GROUP_OVERLAY_FILES = {
-    "g1": GROUP_OVERLAY_DIR / "g1_doctor_intervention.json",
-    "g2": GROUP_OVERLAY_DIR / "g2_no_intervention.json",
-    "g3": GROUP_OVERLAY_DIR / "g3_random_resident_chat.json",
-    "g5": GROUP_OVERLAY_DIR / "g5_negative_resident_chat.json",
+    "g4": GROUP_OVERLAY_DIR / "g4_counseling_room.json",
 }
 
 SEVERITY_SHORT_NAMES = {
@@ -129,9 +126,9 @@ SEVERITY_SHORT_NAMES = {
     "severe": "SEV",
 }
 SEVERITIES = ["mild", "moderate", "severe"]
-GROUPS = ["g1", "g2", "g3", "g5"]
+GROUPS = ["g4"]
 WILDCARD_TOKENS = {"*", "ALL"}
-GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
+GROUP_SELECTOR_ALIASES = {"G4": "g4"}
 SEVERITY_SELECTOR_ALIASES = {
     "MILD": "mild",
     "MOD": "moderate",
@@ -533,7 +530,7 @@ def backup_configs(*, dry_run: bool) -> None:
         return
 
     if BACKUP_DIR.exists():
-        shutil.rmtree(BACKUP_DIR)
+        shutil.rmtree(BACKUP_DIR, ignore_errors=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
     for label, path in BACKUP_FILES.items():

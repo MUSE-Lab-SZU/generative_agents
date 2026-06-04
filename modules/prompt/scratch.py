@@ -627,7 +627,7 @@ class Scratch:
         def _status_des(a):
             event, loc = a.get_event(), ""
             if event.address:
-                loc = " 在 {} 的 {}".format(event.address[-2], event.address[-1])
+                loc = " 在 {}".format(" 的 ".join(event.address[-2:])) if len(event.address) >= 2 else (" 在 " + event.address[-1] if event.address else "")
             if not a.path:
                 return f"{a.name} 已经在 {event.get_describe(False)}{loc}"
             return f"{a.name} 正要去 {event.get_describe(False)}{loc}"
@@ -808,7 +808,7 @@ class Scratch:
                 "doctor_consult_record_injection": doctor_consult_record_injection or "",
                 "consult_history_memory": consult_history_memory or "",
                 "memory": memory,
-                "address": f"{address[-2]}，{address[-1]}",
+                "address": "，".join(address[-2:]) if len(address) >= 2 else (address[-1] if address else ""),
                 "current_time": utils.get_timer().get_date("%H:%M"),
                 "previous_context": prev_context,
                 "current_context": curr_context,

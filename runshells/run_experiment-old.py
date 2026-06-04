@@ -40,9 +40,6 @@ GLOBAL_CONFIG = os.path.join(BASE_DIR, "data", "config.json")
 # ─── 外部脚本 ─────────────────────────────────────────────────
 START_SCRIPT = os.path.join(BASE_DIR, "start.py")
 MERGE_SCRIPT = os.path.join(BASE_DIR, "merge_consultation_dialogues.py")
-COMPRESS_SCRIPT = os.path.join(BASE_DIR, "compress.py")
-AGENT_MEMORY_VIS_SCRIPT = os.path.join(BASE_DIR, "visualize_agent_memory.py")
-EXTERNAL_MEMORY_AUDIT_SCRIPT = os.path.join(BASE_DIR, "visualize_external_memory_audit.py")
 
 # ─── 数据目录 ─────────────────────────────────────────────────
 CHECKPOINTS_ROOT = os.path.join(BASE_DIR, "results", "checkpoints")
@@ -156,19 +153,19 @@ RECOVERED_SESSION_EVAL = {
 # ─── 三量表配置 ───────────────────────────────────────────────
 SCALES: Dict[str, dict] = {
     "PHQ-9": {
-        "question_file": "PHQ-9-v2.jsonl",
+        "question_file": "PHQ-9.jsonl",
         "scoring_prompt": "PHQ-9评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 9,
     },
     "BDI-II": {
-        "question_file": "BDI-II-v2.jsonl",
+        "question_file": "BDI-II.jsonl",
         "scoring_prompt": "BDI-II评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 21,
     },
     "SDS": {
-        "question_file": "SDS-v2.jsonl",
+        "question_file": "SDS.jsonl",
         "scoring_prompt": "SDS评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 20,
@@ -411,77 +408,6 @@ def merge_dialogues(trial_name: str, dry_run: bool = False) -> bool:
     except Exception as e:
         print(f"  [WARN] 合并异常: {e}")
         return True
-
-
-def run_compress(trial_name: str, dry_run: bool = False) -> None:
-    """调用 compress.py 生成回放资源。"""
-    if not os.path.exists(COMPRESS_SCRIPT):
-        print(f"  [SKIP] compress script not found: {COMPRESS_SCRIPT}")
-        return
-
-    cmd = [sys.executable, COMPRESS_SCRIPT, "--name", trial_name]
-    print(f"  [RUN] {' '.join(cmd)}")
-    if dry_run:
-        return
-
-    try:
-        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
-        if result.returncode != 0:
-            print(f"  [WARN] compress 返回非零退出码: {result.returncode}")
-    except Exception as e:
-        print(f"  [WARN] compress 异常: {e}")
-
-
-def run_agent_memory_visualization(trial_name: str, agent_name: str, dry_run: bool = False) -> None:
-    """调用 visualize_agent_memory.py 生成角色记忆可视化。"""
-    if not os.path.exists(AGENT_MEMORY_VIS_SCRIPT):
-        print(f"  [SKIP] agent memory vis script not found: {AGENT_MEMORY_VIS_SCRIPT}")
-        return
-
-    output_dir = os.path.join(EXPERIMENT_DATA_ROOT, trial_name, "visualizations", "agent_memory")
-    cmd = [
-        sys.executable, AGENT_MEMORY_VIS_SCRIPT,
-        "--cp-name", trial_name,
-        "--agent", agent_name,
-        "--output-dir", output_dir,
-    ]
-    print(f"  [RUN] {' '.join(cmd)}")
-    if dry_run:
-        return
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
-        if result.returncode != 0:
-            print(f"  [WARN] agent memory vis 返回非零退出码: {result.returncode}")
-    except Exception as e:
-        print(f"  [WARN] agent memory vis 异常: {e}")
-
-
-def run_external_memory_audit(trial_name: str, agent_name: str, dry_run: bool = False) -> None:
-    """调用 visualize_external_memory_audit.py 生成外置记忆审计可视化。"""
-    if not os.path.exists(EXTERNAL_MEMORY_AUDIT_SCRIPT):
-        print(f"  [SKIP] external memory audit script not found: {EXTERNAL_MEMORY_AUDIT_SCRIPT}")
-        return
-
-    output_root = os.path.join(EXPERIMENT_DATA_ROOT, trial_name, "visualizations", "external_memory_audit")
-    cmd = [
-        sys.executable, EXTERNAL_MEMORY_AUDIT_SCRIPT,
-        "--cp-name", trial_name,
-        "--agent", agent_name,
-        "--output-root", output_root,
-    ]
-    print(f"  [RUN] {' '.join(cmd)}")
-    if dry_run:
-        return
-
-    try:
-        os.makedirs(output_root, exist_ok=True)
-        result = subprocess.run(cmd, cwd=BASE_DIR, timeout=1800)
-        if result.returncode != 0:
-            print(f"  [WARN] external memory audit 返回非零退出码: {result.returncode}")
-    except Exception as e:
-        print(f"  [WARN] external memory audit 异常: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2079,9 +2005,6 @@ def run_single_trial(
     sim_step: int = SIM_STEP,
     round_idx: int = 1,
     local_llm: bool = False,
-    skip_compress: bool = False,
-    skip_agent_memory_vis: bool = False,
-    skip_external_memory_audit: bool = False,
 ) -> None:
     """执行一次完整试验。"""
     print(f"\n{'='*60}")
@@ -2118,28 +2041,7 @@ def run_single_trial(
     else:
         print(f"\n--- 跳过量表评估（skip-simulation 模式）---")
 
-    # 6. 压缩回放资源
-    if not skip_simulation and not skip_compress:
-        print(f"\n--- 压缩回放资源 ---")
-        run_compress(run_name, dry_run=dry_run)
-    else:
-        print(f"\n--- 跳过压缩回放资源 ---")
-
-    # 7. 角色记忆可视化
-    if not skip_simulation and not skip_agent_memory_vis:
-        print(f"\n--- 角色记忆可视化 ---")
-        run_agent_memory_visualization(run_name, agent_name="卡布达", dry_run=dry_run)
-    else:
-        print(f"\n--- 跳过角色记忆可视化 ---")
-
-    # 8. 外置记忆审计可视化
-    if not skip_simulation and not skip_external_memory_audit:
-        print(f"\n--- 外置记忆审计可视化 ---")
-        run_external_memory_audit(run_name, agent_name="卡布达", dry_run=dry_run)
-    else:
-        print(f"\n--- 跳过外置记忆审计可视化 ---")
-
-    # 9. 恢复原始配置
+    # 6. 恢复原始配置
     print(f"\n--- 恢复配置 ---")
     restore_configs(dry_run=dry_run)
 
@@ -2262,18 +2164,6 @@ def main():
         "--local-llm", action="store_true",
         help="使用本地 Ollama qwen3:32b 替代 DeepSeek API",
     )
-    parser.add_argument(
-        "--skip-compress", action="store_true",
-        help="跳过 compress.py 回放资源生成",
-    )
-    parser.add_argument(
-        "--skip-agent-memory-vis", action="store_true",
-        help="跳过角色记忆可视化",
-    )
-    parser.add_argument(
-        "--skip-external-memory-audit", action="store_true",
-        help="跳过外置记忆审计可视化",
-    )
     args = parser.parse_args()
 
     # 恢复旧数据模式
@@ -2372,9 +2262,6 @@ def main():
                         sim_step=sim_step,
                         round_idx=round_idx,
                         local_llm=args.local_llm,
-                        skip_compress=args.skip_compress,
-                        skip_agent_memory_vis=args.skip_agent_memory_vis,
-                        skip_external_memory_audit=args.skip_external_memory_audit,
                     )
                     completed.append((trial_name, round_idx))
                 except Exception as e:
