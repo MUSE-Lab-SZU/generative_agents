@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-02
+> 更新时间：2026-06-04
 
 ## 关键测试结果速查
 
@@ -9,16 +9,19 @@
 1. **Prompt使用情况（调用LLM时的Prompt可视化）**：`results/experiment_data/xxx/traces/forced_prompt_traces/`文件夹可以看到所有对话的所有Prompt使用情况，包括患者、判断LLM、医生、评估LLM的Prompt。
    - 作用：最直观观察患者状态变化、各种Prompt使用是否合理。
    - 生成：运行完仿真实验后由 `run_experiment.py` 收集。（另：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成）
-2. app.py评估脚本：`results/experiment_data/xxx/scales`存放了app.py评估脚本的输出结果，包括量表回答、单量表评估和汇总（**scale_scores.json**）。
+2. **仿真内阶段评估（staged_eval）**：`results/checkpoints/xxx/staged_eval/`保存原始阶段评估结果；`results/experiment_data/xxx/scales/staged/`保存收集后的结果与评分文件。
+   - 作用：在仿真过程中自动触发 PHQ-9 / BDI-II / SDS 评估，适合做基线、阶段点、结束后一段时间（T4）的纵向对比。
+   - 生成：`start.py` 在仿真过程中自动调用 `modules/staged_eval_manager.py` 生成；使用 `runshells/run_one_experiment.py` / `runshells/run_batch_experiment.py` 时会自动收集。
+3. app.py评估脚本：`results/experiment_data/xxx/scales`存放了app.py评估脚本的输出结果，包括量表回答、单量表评估和汇总（**scale_scores.json**）。
    - 作用：使用三种自评量表评估患者抑郁程度，包括SDS、BDI-II、PHQ-9。因为上次心理医生反馈说最好就使用自评量表，所以没使用联合量表。
    - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
-3. 医患对话、判断LLM、会后评估LLM、咨询记录：`results/experiment_data/xxx/traces/merge_consultation_dialogues.json`文件。
-   - 作用：可视化所有医患干预对话，包括患者、判断LLM、医生、评估LLM的输出。适合给心理专业人员查看、分析。
+4. 医患对话、判断LLM、会后评估LLM：`results/experiment_data/xxx/traces/merge_consultation_dialogues.json`文件。
+   - 作用：可视化所有医患干预对话，包括患者、判断LLM、医生、评估LLM的输出。适合给心理专业人员查看、分析。若 `consult_record.enabled=false`，这里不会额外附带 SOAP 咨询记录。
    - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
-4. 记忆可视化：`results/experiment_data/xxx/visualizations/agent_memory/memory_view_卡布达_xxx.csv`可以查看某角色的所有记忆
+5. 记忆可视化：`results/experiment_data/xxx/visualizations/agent_memory/memory_view_卡布达_xxx.csv`可以查看某角色的所有记忆
    - 作用：可视化某角色的所有记忆，可以筛选chat记忆查看对话情况、筛选thought记忆查看反思结果、筛选event记忆查看遇到的事件。
    - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
-5. 外置记忆系统存储情况：`results\external_memory_audit\xxx\report.html`文件。
+6. 外置记忆系统存储情况：`results\external_memory_audit\xxx\report.html`文件。
    - 作用：可视化某存档的所有agent在外置记忆系统中的存储情况，包括记忆数量、记忆层级情况等。
    - 生成：使用`runshells/run_one_experiment.py`运行仿真实验后自动生成
 
@@ -26,7 +29,12 @@
 
 以下为 README 内维护的近期更新摘要：
 
-- 2026-06-02：修复“定期医患对话”只触发1次的bug，新增“定期随机居民聊天”也能触发staged_eval【后者待实验】
+- 2026-06-04：修改`staged_eval`的实施逻辑，从仿真内改成外挂子进程，避免影响仿真实验的内部状态
+- 2026-06-03：修改`staged_eval`的判断条件，统一为对话次数。
+- 2026-06-03：同步 README，补充`consult_history`（医患历史摘要）与`staged_eval`说明，更新流程图并移除主流程里对`consult_record`的默认启用描述。
+- 2026-06-03：瘦身json快照，把`forced_prompt_traces`和`dialog_judge_trace`放到外面json文件了。
+- 2026-06-02：新增`staged_eval`的判定条件，走“定期随机居民对话”时按照对话次数累计判断条件，从而触发阶段性评估
+- 2026-06-02：修复“定期医患对话”只触发1次的bug，新增“定期随机居民聊天”也能触发staged_eval
 - 2026-06-01：优化llm请求机制、实验脚本增加重试机制，当ollama请求卡住时间过长时中断并重新运行。
 - 2026-05-31：新增正常/负面聊天提示词前缀（`data/prompts/intervention/resident_chat_neutral_social.txt`和`data/prompts/intervention/resident_chat_negative_support.txt`），结合“定期随机居民聊天”模块使用。
 - 2026-05-31：新增定期随机居民聊天功能，复用“定期医患对话”相关功能实现，作为对照组。具体逻辑在`modules/resident_chat_scheduler.py`里。
@@ -118,7 +126,7 @@ data/config.json
 │       ├── enabled -> true（开启外置记忆系统）
 │       ├── short_term_recent_n -> 20（控制近期记忆数量）
 │       └── updata_to_milestone_apply_scenes -> ["session2.3_completed", "session3.3-A_completed", "session4.2_completed"]（哪些session对话记忆升级L2）
-└── intervention
+├── intervention
     ├── enabled -> true
     ├── doctor -> 蜻蜓队长
     ├── patients -> [卡布达, 金龟次郎]（后者暂时无设置人设）
@@ -147,19 +155,29 @@ data/config.json
     │   ├── enabled -> true
     │   ├── route -> forced_llm
     │   └── history_recent_n -> 3
+    ├── consult_history
+    │   ├── enabled -> true（当前主线医患对话建议开启）
+    │   ├── retrieve_top_k -> 3
+    │   └── summary_route -> forced_llm
     ├── consult_record.enabled -> false（咨询记录模块，感觉没什么用暂时关闭了）
     ├── depression_dynamic
     │   ├── enabled -> true（当前主线建议开启）
     │   └── target_hints -> （详情看config.json，人设使用范围）
     ├── memory_injection.enabled -> true（记忆注入功能）
     └── memory_policy.enabled -> true（使用了小镇自带记忆系统，不用理会）
+└── staged_eval
+    ├── enabled -> true（仿真内自动量表评估）
+    ├── include_t0 -> true（初始基线）
+    ├── session_interval -> 2（每完成 2 次对话触发一次阶段评估）
+    ├── t4_enabled -> true（治疗结束后延迟观察点）
+    └── max_completed_sessions -> 10（阶段评估最多统计到第 10 次完成对话）
 ```
 
 补充说明：
 
 - 若你本地分支仍保留 `intervention.depression_update` 旧配置，建议继续保持 `enabled=false`，不要与 `depression_dynamic` 同时启用。
 - `doctor`、`patients`、`meeting_rules[*].doctor/patient`、`chat_controls.agent_overrides` 里的角色名必须完全一致。
-- 推荐先确认 `external_memory`、`forced_llm`、`dialog_judge`、`session_eval`、`depression_dynamic` 这 5 条链路都通，再微调 `meeting_rules`、`chat_controls`、`recent_dedup_limit` 等细项。
+- 推荐先确认 `external_memory`、`forced_llm`、`dialog_judge`、`consult_history`、`session_eval`、`depression_dynamic` 这 6 条链路都通；若要做评估实验，再额外确认 `staged_eval` 触发是否符合预期。
 
 ## 1. 项目简介
 
@@ -167,7 +185,8 @@ data/config.json
 
 - 会诊调度与强制会话（Intervention）
 - 会话判定与终止检测（Dialog Judge）
-- 会后评估与咨询记录（Session Eval / Consult Record）
+- 医患历史检索与摘要（Consult History）
+- 会后评估与阶段评估（Session Eval / Staged Eval）
 - 本地记忆与外置记忆协同（External Memory）
 - 抑郁动态链路（Depression Dynamic）
 
@@ -175,15 +194,17 @@ data/config.json
 
 ## 2. 代码目录结构
 
-| 路径          | 说明                                                              |
-| ------------- | ----------------------------------------------------------------- |
-| `start.py`    | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
-| `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
-| `replay.py`   | 回放 Web 服务入口（Flask）                                        |
-| `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
-| `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
-| `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
-| `results/`    | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
+| 路径           | 说明                                                              |
+| -------------- | ----------------------------------------------------------------- |
+| `start.py`     | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
+| `compress.py`  | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
+| `replay.py`    | 回放 Web 服务入口（Flask）                                        |
+| `runshells/`   | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
+| `experiments/` | 分组实验 overlay 配置（如 g1/g2/g3/g5）                           |
+| `modules/`     | 核心逻辑模块（agent、intervention、memory、depression 等）        |
+| `data/`        | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
+| `frontend/`    | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
+| `results/`     | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
 
 ## 3. 快速使用说明
 
@@ -269,7 +290,59 @@ python -u customization/depression_scale_agent/app.py
 | `*_answered_prompt_trace.json` | 完整 Prompt 注入追踪（JSON）               |
 | `*_answered_prompt_trace.md`   | 完整 Prompt 注入追踪（Markdown，可读性好） |
 
-## 3.6 结果目录
+这条链路适合做“手动指定存档 / 快照”的单次评估；如果要看仿真过程中的自动阶段评估，见下方 `staged_eval`。
+
+## 3.6 批量实验与仿真内自动评估
+
+### `runshells/run_batch_experiment.py` 在做什么
+
+这个脚本面向“按实验组批量跑仿真并自动汇总评估结果”的场景，主流程是：
+
+1. 根据 `group × severity` 组合替换配置。
+2. 逐条件调用 `start.py` 跑仿真。
+3. 收集 `judge_conversation.json`、`forced_prompt_traces/`、`conversation.json`、`staged_eval/` 等核心产物。
+4. 对 `scales/staged/` 下的阶段评估结果自动补齐评分文件。
+5. 汇总到 `results/experiment_data/reports/*_summary.json` 和 `*_summary.md`。
+
+直接运行：
+
+```bash
+python3 runshells/run_batch_experiment.py
+```
+
+常见筛选方式：
+
+```bash
+python3 runshells/run_batch_experiment.py --condition Counsel-G1-MILD
+python3 runshells/run_batch_experiment.py --condition Counsel-G1-ALL
+python3 runshells/run_batch_experiment.py --condition Counsel-ALL-MOD
+```
+
+脚本顶部常量可以直接改当前批次的 `RUN_NAME`、`STEP`、`STRIDE`、`SCALE_AGENT`，以及是否执行 `merge`、`post_scale`、`compress`、记忆可视化、外置记忆审计。
+
+### `staged_eval` 是怎么触发的
+
+- `start.py` 在首个 step 内先调用 `StagedEvalManager.maybe_run_t0(...)`，用于生成初始基线评估（`T0`）。
+- 每个 step 写完快照与对话后，再调用 `maybe_run_post_step_eval(...)` 检查是否触发阶段评估。
+- 当完成对话次数命中 `session_interval` 倍数时，会生成 `session_2`、`session_4` 这类阶段点。
+- `session_N` 仍然沿用历史目录命名，但这里的 `N` 现在表示“第 N 次完成对话”。
+- 当目标医患 session 全部完成后，若开启 `t4_enabled`，会在 `t4_after_steps` 个仿真步之后再补一个 `T4` 观察点。
+
+阶段评估原始文件位于：
+
+- `results/checkpoints/<name>/staged_eval/<trigger>/`
+
+收集后的实验目录位于：
+
+- `results/experiment_data/<name>/scales/staged/<trigger>/`
+
+每个 trigger 目录下通常包含：
+
+- `{SCALE}_answered.jsonl`：量表逐题回答
+- `{SCALE}_trace.json`：逐题回答时的 trace
+- `metadata.json`：触发标签、完成 session 数、快照名、仿真时间等元信息
+
+## 3.7 结果目录
 
 ### results/checkpoints/（仿真原始产物）
 
@@ -277,18 +350,21 @@ start.py 直接输出的仿真数据：
 
 - `results/checkpoints/<name>/simulate-*.json`：每步快照
 - `results/checkpoints/<name>/conversation.json`：所有对话记录
+- `results/checkpoints/<name>/consult_history/`：医患历史对话记忆库与检索索引
+- `results/checkpoints/<name>/staged_eval/`：仿真内自动阶段评估原始结果
 - `results/checkpoints/<name>/storage/`：agent 向量存储
 
 ### results/experiment_data/（实验分析产物）
 
-由 `run_experiment.py` 收集和分析的实验数据：
+由 `run_experiment.py` / `runshells/run_one_experiment.py` / `runshells/run_batch_experiment.py` 收集和分析的实验数据：
 
 - `results/experiment_data/<name>/configs/`：实验输入配置（`original_agent.json`、`original_config.json`、`original_depression_config.json`）
 - `results/experiment_data/<name>/traces/`：仿真后处理产物
   - `judge_conversation.json`：[患者-判断LLM-医生] + 评估LLM 输出
-  - `forced_prompt_traces/`：每次干预的完整 Prompt 追踪
-  - `merge_consultation_dialogues.json`：合并对话及咨询记录（需运行 `merge_consultation_dialogues.py`）
+  - `forced_prompt_traces/`：每次干预的完整 Prompt 追踪；若开启 `consult_history`，其中会包含 gate / summary 的提示词与输出
+  - `merge_consultation_dialogues.json`：合并对话结果；仅在 `consult_record.enabled=true` 时额外附带咨询记录
 - `results/experiment_data/<name>/scales/`：量表评估数据
+  - `staged/<trigger>/`：仿真内自动阶段评估（如 `T0`、`session_2`、`T4`）
   - `{SCALE}_{phase}_answered.jsonl`：量表问答结果
   - `{SCALE}_{phase}_scored.json`：量表评分结果
   - `scale_scores.json`：汇总评分
@@ -343,6 +419,7 @@ start.py 直接输出的仿真数据：
 - `forced_llm`：强制干预对话模型；当前为 `deepseek-v4-flash`，需在 `.env` 配置 `DEEPSEEK_API_KEY`
 - `dialog_judge`：会话中判断 LLM；当前保持 `enabled=true` 且 `force_forced_llm=true`
 - `session_eval`：会话后评估 LLM；当前 `route=forced_llm`，`history_recent_n=3`
+- `consult_history`：医患历史摘要模块；通过 gate 判断是否检索历史对话，再把检索命中的完整对话总结成 `consult_history_memory` 注入当前回复
 - `consult_record`：咨询记录生成；当前主线为 `enabled=false`，要看 SOAP 记录时再开启
 - `depression_dynamic`：动态抑郁人设主链路；当前主线建议保持 `enabled=true`
   - `normal_chain_enabled=true`
@@ -359,11 +436,23 @@ start.py 直接输出的仿真数据：
 - `session_prompt_injection.order` 必须与提示词文件中的 session id 对齐。
 - 若本地分支仍保留 `intervention.depression_update` 旧配置，建议继续保持 `enabled=false`，不要与 `depression_dynamic` 同时启用。
 - 若启用外置记忆，请确认 `agent.external_memory.base_url` 可访问，且服务端接口就绪；可运行 `test/live_ec_doll_memory_service_health_ready.py` 检查。
-- 建议优先确认 `external_memory`、`forced_llm`、`dialog_judge`、`session_eval`、`depression_dynamic` 这 5 条链路都正常，再去微调 `meeting_rules`、`chat_controls`、`recent_dedup_limit` 等细项。
+- `staged_eval` 的阶段触发现在统一按“完成对话次数”累计；`session_N` 只是历史命名，不再表示 CBT session 数。
+- 建议优先确认 `external_memory`、`forced_llm`、`dialog_judge`、`consult_history`、`session_eval`、`depression_dynamic` 这 6 条链路都正常，再去微调 `meeting_rules`、`chat_controls`、`recent_dedup_limit` 等细项。
+
+## 4.4 staged_eval 配置
+
+- `enabled`：是否开启仿真内自动阶段评估
+- `target_agent`：被评估的患者角色
+- `include_t0`：是否在首个 step 生成基线评估 `T0`
+- `session_interval`：每完成多少次对话，触发一次阶段评估
+- `max_completed_sessions`：阶段评估最多统计到多少次完成对话数
+- `t4_enabled`：是否在治疗完成后再补一个延迟观察点 `T4`
+- `t4_after_steps`：治疗完成后再等待多少个 step 触发 `T4`
+- `scales`：当前要跑的量表，默认是 `PHQ-9`、`BDI-II`、`SDS`
 
 ## 5. 运行流程图总览
 
-下面用“时间推进 -> 整体主循环 -> 强制干预对话中的 LLM 协作”三个视角说明当前工作区的核心流程。
+下面用“时间推进 -> 整体主循环 -> 强制干预对话中的 LLM 协作 -> 仿真内自动评估”四个视角说明当前工作区的核心流程。
 
 ### 5.1 step / stride 的时间流逝机制
 
@@ -411,9 +500,9 @@ flowchart TD
 
 可以把它理解为：**每个 step 先做完整轮业务，再统一推进一次仿真时间**。
 
-### 5.3 强制干预对话期间，哪些 LLM 在工作
+### 5.3 强制干预对话期间，哪些 LLM / 模块在工作
 
-这里的“强制干预对话”是指：命中 `intervention lock` 后，`before_agent_think(...)` 会把医生当前行动目标重写为 `&lt;persona, patient&gt;`，随后进入 `Agent._chat_with(..., forced=True)`。
+这里的“强制干预对话”是指：命中 `intervention lock` 后，`before_agent_think(...)` 会把医生当前行动目标重写为 `<persona, patient>`，随后进入 `Agent._chat_with(..., forced=True)`。
 
 ```mermaid
 flowchart TD
@@ -421,33 +510,36 @@ flowchart TD
     B --> C["Agent._chat_with(..., forced=True)"]
     C --> D["可选：ExternalMemoryBridge.retrieve_chat_context<br/>输出 external_memory_context"]
     C --> E["think.llm：患者状态摘要<br/>输入：患者最近一次 generate_chat Prompt 缓存<br/>输出：patient_state_summary"]
-    E --> F["judge_llm / forced_llm：会话中判断<br/>输入：patient_state_summary + conversation + session_prompt + prev_session_eval_reason<br/>输出：terminate / advice"]
-    D --> G["医生 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
-    F --> G
-    G --> H["患者 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
-    H --> I{"是否结束?"}
-    I -- 否 --> F
-    I -- 是 --> J["after_chat 收尾：清 lock / 更新队列"]
-    J --> K["session_eval LLM<br/>输出：efficacy_score / session_end / reason"]
-    J --> L["consult_record LLM<br/>输出：结构化咨询记录"]
+    E --> F["judge_llm ：会话中判断<br/>输入：patient_state_summary + conversation + session_prompt + prev_session_eval_reason<br/>输出：terminate / advice"]
+    C --> G["consult_history：gate -> 检索 -> 摘要<br/>输出：consult_history_memory"]
+    D --> H["医生 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
+    F --> H
+    G --> H
+    H --> I["患者 utterance 生成<br/>优先 forced_llm，失败时回退 think.llm"]
+    G --> I
+    I --> J{"是否结束?"}
+    J -- 否 --> F
+    J -- 是 --> K["after_chat 收尾：清 lock / 更新队列"]
+    K --> L["session_eval LLM<br/>输出：efficacy_score / session_end / reason"]
 ```
 
 #### 5.3.1 强制对话里的 LLM 分工速查
 
-| 环节                                  | 主要模型路由                                                      | 主要输入                                                                                                             | 主要输出 / 作用                           |
-| ------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                             | 给 judge 用的 `patient_state_summary`     |
-| 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                               | `terminate`、`advice`                     |
-| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context` | 医生自然语言回复                          |
-| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`                                                         | 患者自然语言回复                          |
-| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                             | 是否出现复读，用于提前结束                |
-| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`           | 当前对话历史                                                                                                         | 是否结束对话                              |
-| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`         | session prompt、历史 eval reason、usage log、完整对话                                                                | `efficacy_score`、`session_end`、`reason` |
-| 咨询记录 `consult_record`             | `forced_llm`                                                      | 医生、患者、完整对话                                                                                                 | 结构化咨询记录（SOAP）                    |
+| 环节                                  | 主要模型路由                                                      | 主要输入                                                                                                                                       | 主要输出 / 作用                           |
+| ------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                                                       | 给 judge 用的 `patient_state_summary`     |
+| 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                                                         | `terminate`、`advice`                     |
+| 医患历史摘要 `consult_history`        | gate 默认走 `forced_llm`；summary 由 `summary_route` 决定         | 最新一轮对方发言、当前对话历史、命中的历史完整对话记录                                                                                         | `consult_history_memory`                  |
+| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
+| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                                                         | 患者自然语言回复                          |
+| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                                                       | 是否出现复读，用于提前结束                |
+| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`           | 当前对话历史                                                                                                                                   | 是否结束对话                              |
+| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`         | session prompt、历史 eval reason、usage log、完整对话                                                                                          | `efficacy_score`、`session_end`、`reason` |
 
 #### 5.3.2 关于模型路由，最容易混淆的点
 
 - `Agent.completion(...)` 在 `forced=True` 的上下文里，不只是 `generate_chat`，很多 agent 侧 Prompt（例如 `summarize_relation`、`generate_chat_check_repeat`、`summarize_chats`，以及在关闭 `dialog_judge` 时的 `decide_chat_terminate`）都会**先尝试走 `intervention.forced_llm`**。
+- `consult_history` 不是每轮必跑：当前要求模块开启、角色能解析成医患对、`turn_no > 1`，并且 gate 判断 `need_retrieval=true` 后才会继续检索和摘要。
 - 是否真的走 `forced_llm`，要同时满足：
   - `intervention.forced_llm.enabled = true`
   - 当前确实是医生-患者配对
@@ -459,20 +551,50 @@ flowchart TD
 配置与链路映射速查：
 
 - 调度阶段：`meeting_rules`
-- 强制对话阶段：`chat_controls` / `forced_llm` / `dialog_judge`
-- 会后阶段：`session_eval` / `consult_record` / `memory_injection` / `depression_dynamic`
+- 强制对话阶段：`chat_controls` / `forced_llm` / `dialog_judge` / `consult_history`
+- 会后阶段：`session_eval` / `memory_injection` / `depression_dynamic` / `consult_record`（可选，默认关闭）
+
+### 5.4 仿真内自动评估（staged_eval）
+
+`staged_eval` 不依赖人工暂停仿真。`start.py` 会在仿真过程中自动检查触发条件，并把每个评估点单独落盘。
+
+```mermaid
+flowchart TD
+    A["start.py 进入首个 step"] --> B{"include_t0 ?"}
+    B -- 是 --> C["执行 T0 评估<br/>写 checkpoints/&lt;name&gt;/staged_eval/T0/"]
+    B -- 否 --> D["继续正常仿真"]
+    C --> D
+    D --> E["每个 step 正常写快照 / conversation"]
+    E --> F["maybe_run_post_step_eval(...)"]
+    F --> G{"完成对话数是否命中 session_interval ?"}
+    G -- 是 --> H["写 session_N 评估目录"]
+    G -- 否 --> I{"目标 session 是否已完成且满足 T4 ?"}
+    H --> I
+    I -- 是 --> J["写 T4 评估目录"]
+    I -- 否 --> K["进入下一步仿真"]
+    J --> K
+```
+
+常见 trigger 含义：
+
+- `T0`：初始基线
+- `session_2` / `session_4`：阶段性评估点（历史命名，对应第 2 / 4 次完成对话）
+- `T4`：治疗结束后一段时间的延迟观察点
 
 ## 6. 运行结果与回放
 
 ## 6.1 关键输出文件
 
 - `results/checkpoints/<name>/`：仿真原始产物（快照、对话记录、storage）
+- `results/checkpoints/<name>/consult_history/`：医患历史对话记忆库与索引
+- `results/checkpoints/<name>/staged_eval/`：仿真内自动阶段评估原始结果
 - `results/experiment_data/<name>/configs/`：实验输入配置
 - `results/experiment_data/<name>/traces/judge_conversation.json`：[患者-判断LLM-医生] + 评估LLM 的输出结果
 - `results/experiment_data/<name>/traces/forced_prompt_traces/`：每次干预的完整 Prompt 追踪
 - `results/experiment_data/<name>/traces/merge_consultation_dialogues.json`：合并对话及咨询记录（需运行 `merge_consultation_dialogues.py`）
-- `results/experiment_data/<name>/scales/`：量表评估问答、评分、专家分析
-- `results/experiment_data/analysis_report.md`：综合分析报告
+- `results/experiment_data/<name>/scales/`：量表评估问答、评分、专家分析；其中 `scales/staged/` 是仿真内自动评估
+- `results/experiment_data/reports/analysis_report.md`：综合分析报告
+- `results/experiment_data/reports/*_summary.{json,md}`：批量实验的汇总结果
 - `results/compressed/<name>/`：回放资源（`movement.json`、`simulation.md`）
 
 ## 6.2 conversation.json 说明
@@ -525,6 +647,9 @@ python visualize_agent_memory.py
 
 - 输出产物：
   - `merge_consultation_dialogues.json`
+- 补充说明：
+  - 默认主线里 `consult_record=false`，因此合并结果主要包含患者、判断LLM、医生、会后评估理由。
+  - 若显式开启 `consult_record`，则会额外合并 SOAP 结构化咨询记录。
 - 基本使用方式：基本同上
 -
 
@@ -572,7 +697,7 @@ python visualize_agent_memory.py
 - 判定轨迹：`judge_traces/judge_conversation.json`
 - 全链路审计：`results/checkpoints/<name>/<name>.log`
 - 外置记忆审核：`results/external_memory_audit/<name>/`
-- 强制干预会话对话记录及中间产物：`results/checkpoints/<name>/merge_consultation_dialogues/merge_consultation_dialogues.json`
+- 强制干预会话对话记录及中间产物：`results/experiment_data/<name>/traces/merge_consultation_dialogues.json`
 
 ## 8. 维护约定（建议）
 

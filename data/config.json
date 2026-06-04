@@ -71,79 +71,34 @@
   },
   "intervention": {
     "enabled": true,
-    "doctor": "蜻蜓队长",
+    "doctor": "",
     "patients": [
-      "卡布达",
-      "金龟次郎"
+      "卡布达"
     ],
     "meeting_queue": {
       "enabled": true,
       "max_queue_per_doctor": 128
     },
-    "meeting_rules": [
-      {
-        "rule_id": "weekly_followup",
-        "type": "weekly",
-        "weekday": 1,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "every_7_days_followup",
-        "type": "interval_days",
-        "interval_days": 7,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "fast_every_6h",
-        "type": "interval_minutes",
-        "interval_minutes": 360,
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "fast_every_4step",
-        "type": "interval_steps",
-        "interval_steps": 4,
-        "step_phase": 2,
-        "duration": 1440,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": true
-      },
-      {
-        "rule_id": "fast_every_2step_jgcl",
-        "type": "interval_steps",
-        "interval_steps": 2,
-        "step_phase": 0,
-        "duration": 1440,
-        "doctor": "蜻蜓队长",
-        "patient": "金龟次郎",
-        "enabled": false
-      },
-      {
-        "rule_id": "prod_weekly_monday_1400",
-        "type": "weekly",
-        "weekday": 1,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      }
-    ],
+    "meeting_rules": [],
     "resident_chat_scheduler": {
-      "enabled": false,
-      "rules": []
+      "enabled": true,
+      "rules": [
+        {
+          "rule_id": "g3_random_resident_chat",
+          "type": "interval_steps",
+          "interval_steps": 4,
+          "step_phase": 2,
+          "target_patient": "卡布达",
+          "resident_candidates": [
+            "田德莉娜",
+            "呱呱蛙",
+            "蟑螂恶霸"
+          ],
+          "selection_strategy": "random_no_repeat",
+          "duration": 1440,
+          "prompt_file": "data/prompts/intervention/resident_chat_neutral_social.txt"
+        }
+      ]
     },
     "order_extract": {
       "enabled": true,
@@ -355,11 +310,13 @@
     "enabled": true,
     "target_agent": "卡布达",
     "include_t0": true,
-    "use_resident_chat_completed_count": false,
-    "session_interval": 2,
+    "session_interval": 3,
     "max_completed_sessions": 10,
     "t4_enabled": true,
     "t4_after_steps": 8,
+    "worker_script": "runshells/run_staged_eval_worker.py",
+    "worker_timeout_seconds": 1800,
+    "cleanup_tmp_storage": true,
     "scales": [
       "PHQ-9",
       "BDI-II",

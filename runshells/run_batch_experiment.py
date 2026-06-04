@@ -56,10 +56,10 @@ from run_one_experiment import (
 RUN_NAME = ""
 
 # 仿真起始时间（对应 start.py 的 --start）
-START_TIME = "20260529-09:30"
+START_TIME = "20260603-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 48
+STEP = 60
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 360

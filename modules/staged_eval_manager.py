@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
+import sys
+import time
 from typing import Any, Dict, List
-
-from customization.depression_scale_agent.app import ChatSession, iter_jsonl, resolve_question
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -16,6 +17,7 @@ QUESTIONS_ROOT = os.path.join(
     "questions",
     "templates",
 )
+DEFAULT_WORKER_SCRIPT = "runshells/run_staged_eval_worker.py"
 SCALE_QUESTION_FILES = {
     "PHQ-9": "PHQ-9-v2.jsonl",
     "BDI-II": "BDI-II-v2.jsonl",
@@ -112,94 +114,80 @@ class StagedEvalManager:
             raise ValueError(f"target agent not found in runtime config: {target_agent}")
 
         os.makedirs(self.output_dir, exist_ok=True)
-        trigger_dir = os.path.join(self.output_dir, trigger_label)
-        os.makedirs(trigger_dir, exist_ok=True)
+        trigger_dir = self._build_trigger_dir(trigger_label)
+        worker_paths = self._build_worker_paths(trigger_dir)
+        worker_cfg = self._worker_cfg()
+        scale_question_files = self._resolve_scale_question_files()
 
-        session = ChatSession(
-            self.run_name,
-            snapshot_file=snapshot_name or trigger_label,
-            runtime_config=copy.deepcopy(runtime_config),
-            conversation=copy.deepcopy(conversation or {}),
+        job_payload = self._build_worker_job_payload(
+            trigger_label=trigger_label,
+            completed_session_count=completed_session_count,
+            runtime_config=runtime_config,
+            conversation=conversation,
+            step_no=step_no,
+            sim_time=sim_time,
+            snapshot_name=snapshot_name,
+            target_agent=target_agent,
+            trigger_dir=trigger_dir,
+            worker_result_path=worker_paths["result"],
+            scale_question_files=scale_question_files,
+            worker_cfg=worker_cfg,
         )
-        session.set_agent(target_agent)
+        self._write_json(worker_paths["job"], job_payload)
 
-        scale_summaries: Dict[str, Any] = {}
-        external_memory_read = False
-        for scale_name in self._scales():
-            question_file = SCALE_QUESTION_FILES.get(scale_name)
-            if not question_file:
-                raise ValueError(f"unsupported scale: {scale_name}")
-            question_path = os.path.join(QUESTIONS_ROOT, question_file)
-            if not os.path.exists(question_path):
-                raise FileNotFoundError(f"question file not found: {question_path}")
+        worker_run = self._run_worker_process(
+            job_path=worker_paths["job"],
+            worker_log_path=worker_paths["log"],
+            worker_cfg=worker_cfg,
+        )
+        worker_result = self._load_worker_result(worker_paths["result"])
+        worker_success = self._worker_succeeded(worker_run, worker_result)
 
-            answered_rows: List[Dict[str, Any]] = []
-            trace_rows: List[Dict[str, Any]] = []
-            scale_external_memory_read = False
-            for index, item in enumerate(iter_jsonl(question_path), start=1):
-                question = resolve_question(item)
-                answer = session.answer_without_memory(question)
-                trace_payload = session.get_last_answer_trace()
-                row = dict(item) if isinstance(item, dict) else {"question": question}
-                row["answer"] = answer
-                answered_rows.append(row)
-                trace_rows.append(
-                    {
-                        "index": index,
-                        "question": question,
-                        "answer": answer,
-                        "trace": trace_payload,
-                    }
-                )
-                if self._trace_used_external_memory(trace_payload):
-                    scale_external_memory_read = True
-                    external_memory_read = True
-
-            answers_file = f"{self._safe_file_stem(scale_name)}_answered.jsonl"
-            trace_file = f"{self._safe_file_stem(scale_name)}_trace.json"
-            self._write_jsonl(os.path.join(trigger_dir, answers_file), answered_rows)
-            self._write_json(os.path.join(trigger_dir, trace_file), trace_rows)
-            scale_summaries[scale_name] = {
-                "question_file": question_file,
-                "question_count": len(answered_rows),
-                "answers_file": answers_file,
-                "trace_file": trace_file,
-                "external_memory_read": scale_external_memory_read,
-            }
-
-        metadata = {
-            "trigger_label": trigger_label,
-            "completed_session_count": int(completed_session_count),
-            "step_no": int(step_no),
-            "sim_time": str(sim_time or ""),
-            "snapshot_name": str(snapshot_name or ""),
-            "target_agent": target_agent,
-            "doctor_name": self._doctor_name(runtime_config),
-            "session_interval": self._safe_int(self._cfg().get("session_interval", 0), 0),
-            "max_completed_sessions": self._safe_int(self._cfg().get("max_completed_sessions", 0), 0),
-            "t4_enabled": bool(self._cfg().get("t4_enabled", False)),
-            "t4_after_steps": max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0)),
-            "readonly_eval": True,
-            "external_memory_read": external_memory_read,
-            "uses_answer_without_memory": True,
-            "writes_blocked_by_design": True,
-            "local_write_attempt_count": 0,
-            "external_write_attempt_count": 0,
-            "scales": scale_summaries,
-        }
-        if isinstance(extra_metadata, dict) and extra_metadata:
-            metadata.update(extra_metadata)
+        metadata = self._build_trigger_metadata(
+            trigger_label=trigger_label,
+            completed_session_count=completed_session_count,
+            runtime_config=runtime_config,
+            step_no=step_no,
+            sim_time=sim_time,
+            snapshot_name=snapshot_name,
+            trigger_dir=trigger_dir,
+            worker_paths=worker_paths,
+            worker_cfg=worker_cfg,
+            worker_run=worker_run,
+            worker_result=worker_result,
+            worker_success=worker_success,
+            extra_metadata=extra_metadata,
+        )
         self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
+
+        if not worker_success:
+            self._log(
+                "warning",
+                "[STAGED_EVAL] trigger={} worker_failed returncode={} timed_out={} error={}".format(
+                    trigger_label,
+                    worker_run.get("returncode"),
+                    bool(worker_run.get("timed_out", False)),
+                    metadata.get("worker_error", ""),
+                ),
+            )
+            raise RuntimeError(
+                "staged_eval worker failed for {}: {}".format(
+                    trigger_label,
+                    metadata.get("worker_error", "unknown error"),
+                )
+            )
+
         self._mark_trigger_done(metadata, trigger_dir)
         self._write_index()
         self._log(
             "info",
-            "[STAGED_EVAL] trigger={} target={} completed_sessions={} step={} sim_time={}".format(
+            "[STAGED_EVAL] trigger={} target={} completed_sessions={} step={} sim_time={} worker_duration_seconds={}".format(
                 trigger_label,
                 target_agent,
                 completed_session_count,
                 step_no,
                 sim_time,
+                metadata.get("worker_duration_seconds", 0.0),
             ),
         )
         return metadata
@@ -207,27 +195,7 @@ class StagedEvalManager:
     def _compute_completed_session_count(self, runtime_config: Dict[str, Any]) -> int:
         if not isinstance(runtime_config, dict):
             return 0
-        if self._use_resident_chat_completed_count():
-            return self._compute_resident_chat_completed_count(runtime_config)
-        return self._compute_session_prompt_completed_count(runtime_config)
-
-    def _compute_session_prompt_completed_count(self, runtime_config: Dict[str, Any]) -> int:
-        intervention_cfg = runtime_config.get("intervention", {}) or {}
-        pair_state = self._resolve_target_pair_state(runtime_config)
-        if not pair_state:
-            return 0
-
-        session_cfg = intervention_cfg.get("session_prompt_injection", {}) or {}
-        order = session_cfg.get("order", []) or []
-        current_index = self._safe_int(pair_state.get("current_index", 0), 0)
-        if current_index < 0:
-            current_index = 0
-
-        if bool(pair_state.get("completed", False)):
-            if isinstance(order, list) and order:
-                return len(order)
-            return current_index
-        return current_index
+        return self._compute_resident_chat_completed_count(runtime_config)
 
     def _compute_resident_chat_completed_count(self, runtime_config: Dict[str, Any]) -> int:
         if not isinstance(runtime_config, dict):
@@ -259,28 +227,28 @@ class StagedEvalManager:
         if interval <= 0:
             return None
 
-        completed_session_count = self._compute_completed_session_count(runtime_config)
-        if completed_session_count <= 0:
+        completed_conversation_count = self._compute_completed_session_count(runtime_config)
+        if completed_conversation_count <= 0:
             return None
 
         max_completed_sessions = self._safe_int(
             self._cfg().get("max_completed_sessions", 0),
             0,
         )
-        if max_completed_sessions > 0 and completed_session_count > max_completed_sessions:
+        if max_completed_sessions > 0 and completed_conversation_count > max_completed_sessions:
             return None
 
-        if completed_session_count % interval != 0:
+        if completed_conversation_count % interval != 0:
             return None
 
-        trigger_label = f"session_{completed_session_count}"
+        trigger_label = f"session_{completed_conversation_count}"
         if trigger_label in self.state.get("triggered_labels", []):
             return None
 
         try:
             return self._run_trigger(
                 trigger_label=trigger_label,
-                completed_session_count=completed_session_count,
+                completed_session_count=completed_conversation_count,
                 runtime_config=runtime_config,
                 conversation=conversation,
                 step_no=step_no,
@@ -365,11 +333,19 @@ class StagedEvalManager:
         cfg = self.config.get("staged_eval", {}) or {}
         return cfg if isinstance(cfg, dict) else {}
 
+    def _worker_cfg(self) -> Dict[str, Any]:
+        cfg = self._cfg()
+        return {
+            "worker_script": str(cfg.get("worker_script", DEFAULT_WORKER_SCRIPT) or DEFAULT_WORKER_SCRIPT).strip(),
+            "worker_timeout_seconds": max(
+                1,
+                self._safe_int(cfg.get("worker_timeout_seconds", 1800), 1800),
+            ),
+            "cleanup_tmp_storage": bool(cfg.get("cleanup_tmp_storage", True)),
+        }
+
     def _target_agent(self) -> str:
         return str(self._cfg().get("target_agent", "") or "").strip()
-
-    def _use_resident_chat_completed_count(self) -> bool:
-        return bool(self._cfg().get("use_resident_chat_completed_count", False))
 
     def _scales(self) -> List[str]:
         scales = self._cfg().get("scales", []) or []
@@ -381,13 +357,205 @@ class StagedEvalManager:
         intervention_cfg = runtime_config.get("intervention", {}) or {}
         return str(intervention_cfg.get("doctor", "") or "").strip()
 
-    def _trace_used_external_memory(self, trace_payload: Dict[str, Any]) -> bool:
-        if not isinstance(trace_payload, dict):
+    def _build_trigger_dir(self, trigger_label: str) -> str:
+        trigger_dir = os.path.join(self.output_dir, trigger_label)
+        os.makedirs(trigger_dir, exist_ok=True)
+        return trigger_dir
+
+    def _build_worker_paths(self, trigger_dir: str) -> Dict[str, str]:
+        return {
+            "job": os.path.join(trigger_dir, "job.json"),
+            "log": os.path.join(trigger_dir, "worker.log"),
+            "result": os.path.join(trigger_dir, "worker_result.json"),
+        }
+
+    def _resolve_scale_question_files(self) -> Dict[str, str]:
+        question_files: Dict[str, str] = {}
+        for scale_name in self._scales():
+            question_file = SCALE_QUESTION_FILES.get(scale_name)
+            if not question_file:
+                raise ValueError(f"unsupported scale: {scale_name}")
+            question_path = os.path.join(QUESTIONS_ROOT, question_file)
+            if not os.path.exists(question_path):
+                raise FileNotFoundError(f"question file not found: {question_path}")
+            question_files[scale_name] = question_file
+        return question_files
+
+    def _build_worker_job_payload(
+        self,
+        trigger_label: str,
+        completed_session_count: int,
+        runtime_config: Dict[str, Any],
+        conversation: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+        target_agent: str,
+        trigger_dir: str,
+        worker_result_path: str,
+        scale_question_files: Dict[str, str],
+        worker_cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "run_name": self.run_name,
+            "trigger_label": trigger_label,
+            "completed_session_count": int(completed_session_count),
+            "step_no": int(step_no),
+            "sim_time": str(sim_time or ""),
+            "snapshot_name": str(snapshot_name or ""),
+            "target_agent": target_agent,
+            "scales": list(self._scales()),
+            "scale_question_files": copy.deepcopy(scale_question_files),
+            "runtime_config": copy.deepcopy(runtime_config),
+            "conversation": copy.deepcopy(conversation or {}),
+            "trigger_dir": trigger_dir,
+            "worker_result_path": worker_result_path,
+            "storage_source_root": os.path.join(self.checkpoints_folder, "storage"),
+            "tmp_root_parent": os.path.join(self.output_dir, "_tmp"),
+            "cleanup_tmp_storage": bool(worker_cfg.get("cleanup_tmp_storage", True)),
+        }
+
+    def _resolve_worker_script_path(self, worker_script: str) -> str:
+        path = str(worker_script or "").strip()
+        if not path:
+            path = DEFAULT_WORKER_SCRIPT
+        if not os.path.isabs(path):
+            path = os.path.join(BASE_DIR, path)
+        return os.path.abspath(path)
+
+    def _run_worker_process(
+        self,
+        job_path: str,
+        worker_log_path: str,
+        worker_cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        worker_script_path = self._resolve_worker_script_path(worker_cfg.get("worker_script", DEFAULT_WORKER_SCRIPT))
+        if not os.path.isfile(worker_script_path):
+            raise FileNotFoundError("staged_eval worker script not found: {}".format(worker_script_path))
+
+        timeout_seconds = max(1, self._safe_int(worker_cfg.get("worker_timeout_seconds", 1800), 1800))
+        cmd = [sys.executable, worker_script_path, "--job", job_path]
+        started_at = time.time()
+        os.makedirs(os.path.dirname(worker_log_path), exist_ok=True)
+        with open(worker_log_path, "w", encoding="utf-8") as log_file:
+            log_file.write("[STAGED_EVAL_WORKER_CMD] {}\n".format(" ".join(cmd)))
+            log_file.flush()
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=BASE_DIR,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+                return {
+                    "returncode": completed.returncode,
+                    "timed_out": False,
+                    "duration_seconds": round(time.time() - started_at, 3),
+                    "error": "",
+                }
+            except subprocess.TimeoutExpired as exc:
+                log_file.write(
+                    "[STAGED_EVAL_WORKER_TIMEOUT] timeout_seconds={} error={}\n".format(
+                        timeout_seconds,
+                        exc,
+                    )
+                )
+                log_file.flush()
+                return {
+                    "returncode": None,
+                    "timed_out": True,
+                    "duration_seconds": round(time.time() - started_at, 3),
+                    "error": str(exc),
+                }
+            except Exception as exc:
+                log_file.write("[STAGED_EVAL_WORKER_SPAWN_ERROR] error={}\n".format(exc))
+                log_file.flush()
+                return {
+                    "returncode": None,
+                    "timed_out": False,
+                    "duration_seconds": round(time.time() - started_at, 3),
+                    "error": str(exc),
+                }
+
+    def _load_worker_result(self, result_path: str) -> Dict[str, Any]:
+        if not os.path.exists(result_path):
+            return {}
+        with open(result_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+
+    def _worker_succeeded(self, worker_run: Dict[str, Any], worker_result: Dict[str, Any]) -> bool:
+        if bool(worker_run.get("timed_out", False)):
             return False
-        retrieval = trace_payload.get("external_memory_retrieval", {}) or {}
-        if not isinstance(retrieval, dict):
+        if worker_run.get("returncode", None) != 0:
             return False
-        return bool(retrieval.get("ok", False)) or bool(str(retrieval.get("scoped_user_id", "") or "").strip())
+        if not isinstance(worker_result, dict):
+            return False
+        return str(worker_result.get("status", "") or "").strip().lower() == "ok"
+
+    def _build_trigger_metadata(
+        self,
+        trigger_label: str,
+        completed_session_count: int,
+        runtime_config: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+        trigger_dir: str,
+        worker_paths: Dict[str, str],
+        worker_cfg: Dict[str, Any],
+        worker_run: Dict[str, Any],
+        worker_result: Dict[str, Any],
+        worker_success: bool,
+        extra_metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        scales = worker_result.get("scale_summaries", {}) if isinstance(worker_result.get("scale_summaries", {}), dict) else {}
+        worker_error = str(worker_result.get("error", "") or worker_run.get("error", "") or "").strip()
+        metadata = {
+            "status": "ok" if worker_success else "worker_failed",
+            "trigger_label": trigger_label,
+            "completed_session_count": int(completed_session_count),
+            "step_no": int(step_no),
+            "sim_time": str(sim_time or ""),
+            "snapshot_name": str(snapshot_name or ""),
+            "target_agent": self._target_agent(),
+            "doctor_name": self._doctor_name(runtime_config),
+            "session_interval": self._safe_int(self._cfg().get("session_interval", 0), 0),
+            "max_completed_sessions": self._safe_int(self._cfg().get("max_completed_sessions", 0), 0),
+            "t4_enabled": bool(self._cfg().get("t4_enabled", False)),
+            "t4_after_steps": max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0)),
+            "readonly_eval": True,
+            "external_memory_read": bool(worker_result.get("external_memory_read", False)),
+            "uses_answer_without_memory": True,
+            "writes_blocked_by_design": False,
+            "writes_isolated_via_temp_storage": True,
+            "storage_isolation_enabled": True,
+            "local_write_attempt_count": 0,
+            "external_write_attempt_count": 0,
+            "worker_mode": "subprocess",
+            "worker_script": str(worker_cfg.get("worker_script", DEFAULT_WORKER_SCRIPT) or DEFAULT_WORKER_SCRIPT),
+            "worker_timeout_seconds": self._safe_int(worker_cfg.get("worker_timeout_seconds", 1800), 1800),
+            "cleanup_tmp_storage": bool(worker_cfg.get("cleanup_tmp_storage", True)),
+            "worker_log_file": os.path.relpath(worker_paths["log"], trigger_dir),
+            "worker_job_file": os.path.relpath(worker_paths["job"], trigger_dir),
+            "worker_result_file": os.path.relpath(worker_paths["result"], trigger_dir),
+            "worker_returncode": worker_run.get("returncode"),
+            "worker_timed_out": bool(worker_run.get("timed_out", False)),
+            "worker_duration_seconds": worker_run.get("duration_seconds", 0.0),
+            "worker_status": str(worker_result.get("status", "") or "").strip(),
+            "worker_error": worker_error,
+            "tmp_root": str(worker_result.get("tmp_root", "") or ""),
+            "tmp_storage_path": str(worker_result.get("tmp_storage_path", "") or ""),
+            "tmp_storage_deleted": bool(worker_result.get("tmp_storage_deleted", False)),
+            "cleanup_error": str(worker_result.get("cleanup_error", "") or ""),
+            "scales": scales,
+        }
+        if isinstance(extra_metadata, dict) and extra_metadata:
+            metadata.update(extra_metadata)
+        return metadata
 
     def _mark_trigger_done(self, metadata: Dict[str, Any], trigger_dir: str) -> None:
         label = str(metadata.get("trigger_label", "") or "").strip()
@@ -449,17 +617,9 @@ class StagedEvalManager:
         except Exception:
             return int(default)
 
-    def _safe_file_stem(self, value: str) -> str:
-        return str(value or "").replace("/", "_").replace("\\", "_").replace(" ", "_")
-
     def _write_json(self, path: str, payload: Any) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    def _write_jsonl(self, path: str, rows: List[Dict[str, Any]]) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _log(self, level: str, message: str) -> None:
         logger = self.logger
