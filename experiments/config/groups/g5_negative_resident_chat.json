@@ -29,6 +29,20 @@
     "session_prompt_injection": {
       "enabled": false
     },
+    "chat_controls": {
+      "enabled": true,
+      "defaults": {
+        "enabled": true,
+        "forced_only": true,
+        "forced_chat_iter": 18,
+        "repeat_break_threshold": 1,
+        "repeat_detection_enabled": false,
+        "forced_chat_min_turns": -1,
+        "forced_chat_max_turns": -1,
+        "terminate_detection_tail_window_enabled": true,
+        "terminate_detection_tail_window_turns": 9
+      }
+    },
     "dialog_judge": {
       "enabled": false
     },

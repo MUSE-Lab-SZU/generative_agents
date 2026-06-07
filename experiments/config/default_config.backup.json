@@ -1,4 +1,74 @@
 {
+  "agent": {
+    "percept": {
+      "mode": "box",
+      "vision_r": 8,
+      "att_bandwidth": 8
+    },
+    "schedule": {
+      "max_try": 5,
+      "diversity": 5
+    },
+    "think": {
+      "llm": {
+        "provider": "openai",
+        "model": "qwen3-8b-vllm",
+        "base_url": "http://127.0.0.1:18000/v1",
+        "api_key": "EMPTY",
+        "retry": 3,
+        "request_timeout_seconds": 120
+      },
+      "interval": 1000,
+      "poignancy_max": 30,
+      "reflect_focus_topk": 4,
+      "reflect_insights_topk": 1
+    },
+    "chat_iter": 4,
+    "associate": {
+      "embedding": {
+        "provider": "openai",
+        "model": "bge-m3-vllm",
+        "base_url": "http://127.0.0.1:18001/v1",
+        "api_key": "EMPTY"
+      },
+      "retention": 32,
+      "recent_dedup_limit": 0,
+      "recency_decay": 0.995,
+      "recency_weight": 0.5,
+      "relevance_weight": 5.0,
+      "importance_weight": 1.0,
+      "chat_retrieve": {
+        "mode": "semantic",
+        "similarity_top_k": 5
+      }
+    },
+    "chat_history": {
+      "summary_window_minutes": -1,
+      "max_read_items": -1,
+      "focus_retrieve_max": 15,
+      "recent_turn_focus_n": 15
+    },
+    "chat_memory": {
+      "write_mode": "hybrid"
+    },
+    "external_memory": {
+      "enabled": false,
+      "base_url": "http://localhost:8031",
+      "timeout": 10.0,
+      "read_mode": "chat_only",
+      "fallback_to_local": true,
+      "short_term_recent_n": 20,
+      "ingest_template_file": "data/prompts/external_memory_ingest.txt",
+      "updata_to_L2_apply_scenes": [
+        "all_session_chat"
+      ],
+      "updata_to_milestone_apply_scenes": [
+        "session2.3_completed",
+        "session3.3-A_completed",
+        "session4.2_completed"
+      ]
+    }
+  },
   "intervention": {
     "enabled": true,
     "doctor": "蜻蜓队长",
@@ -106,13 +176,13 @@
       "defaults": {
         "enabled": false,
         "forced_only": true,
-        "forced_chat_iter": -1,
+        "forced_chat_iter": 18,
         "repeat_break_threshold": 1,
         "repeat_detection_enabled": false,
         "forced_chat_min_turns": -1,
         "forced_chat_max_turns": -1,
         "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 6
+        "terminate_detection_tail_window_turns": 9
       },
       "agent_overrides": {
         "卡布达": {
@@ -281,5 +351,21 @@
       }
     }
   },
-  "staged_eval": {}
+  "staged_eval": {
+    "enabled": true,
+    "target_agent": "卡布达",
+    "include_t0": true,
+    "session_interval": 3,
+    "max_completed_sessions": 10,
+    "t4_enabled": true,
+    "t4_after_steps": 8,
+    "worker_script": "runshells/run_staged_eval_worker.py",
+    "worker_timeout_seconds": 1800,
+    "cleanup_tmp_storage": true,
+    "scales": [
+      "PHQ-9",
+      "BDI-II",
+      "SDS"
+    ]
+  }
 }
