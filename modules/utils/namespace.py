@@ -7,9 +7,10 @@ import copy
 class GenerativeAgentsMap:
     """Global Namespace map for Land"""
 
+    # 类变量，作为全局状态容器使用
     MAP = {}
 
-    @classmethod
+    @classmethod # 直接通过类调用，不用实例化对象
     def set(cls, key: str, value: Any):
         cls.MAP[key] = value
 

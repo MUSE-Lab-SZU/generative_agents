@@ -97,7 +97,6 @@ def test_generate_chat_template_keeps_persona_description_single_source():
     template = Template(Path("data/prompts/generate_chat.txt").read_text(encoding="utf-8"))
     common = {
         "agent": "卡布达",
-        "doctor_session_prompt_injection": "",
         "memory": "记忆",
         "address": "家，餐桌",
         "current_time": "09:00",

@@ -8,6 +8,8 @@ from modules.memory.event import Event
 
 
 class Tile:
+    """地图中的单个格子，保存坐标、地址、碰撞和事件信息"""
+
     def __init__(
         self,
         coord,
@@ -16,6 +18,7 @@ class Tile:
         address=None,
         collision=False,
     ):
+        """初始化地图格子的空间地址、碰撞状态和默认事件"""
         # in order: world, sector, arena, game_object
         self.coord = coord
         self.address = [world]
@@ -30,6 +33,7 @@ class Tile:
             self.add_event(Event(self.address[-1], address=self.address))
 
     def abstract(self):
+        """返回格子的简要可读信息"""
         address = ":".join(self.address)
         if self.collision:
             address += "(collision)"
@@ -39,17 +43,21 @@ class Tile:
         }
 
     def __str__(self):
+        """将格子信息转换为格式化字符串"""
         return utils.dump_dict(self.abstract())
 
     def __eq__(self, other):
+        """按坐标判断两个格子是否相同"""
         if isinstance(other, Tile):
             return hash(self.coord) == hash(other.coord)
         return False
 
     def get_events(self):
+        """获取当前格子上的所有事件对象"""
         return self.events.values()
 
     def add_event(self, event):
+        """向当前格子添加事件，已存在的相同事件不会重复添加"""
         if isinstance(event, (tuple, list)):
             event = Event.from_list(event)
         if all(e != event for e in self._events.values()):
@@ -58,6 +66,7 @@ class Tile:
         return event
 
     def remove_events(self, subject=None, event=None):
+        """按事件主体或事件对象移除当前格子上的事件"""
         r_events = {}
         for tag, eve in self._events.items():
             if subject and eve.subject == subject:
@@ -69,6 +78,7 @@ class Tile:
         return r_events
 
     def update_events(self, event, match="subject"):
+        """按匹配规则更新当前格子上的事件"""
         u_events = {}
         for tag, eve in self._events.items():
             if match == "subject" and eve.subject == event.subject:
@@ -77,9 +87,11 @@ class Tile:
         return u_events
 
     def has_address(self, key):
+        """判断当前格子是否包含指定层级的地址"""
         return key in self.address_map
 
     def get_address(self, level=None, as_list=True):
+        """获取当前格子到指定层级的地址"""
         level = level or self.address_keys[-1]
         assert level in self.address_keys, "Can not find {} from {}".format(
             level, self.address_keys
@@ -90,6 +102,7 @@ class Tile:
         return ":".join(self.address[:pos])
 
     def get_addresses(self):
+        """获取当前格子的所有可索引地址前缀"""
         addresses = []
         if len(self.address) > 1:
             addresses = [
@@ -99,15 +112,20 @@ class Tile:
 
     @property
     def events(self):
+        """获取当前格子的事件字典"""
         return self._events
 
     @property
     def is_empty(self):
+        """判断当前格子是否为空白格子"""
         return len(self.address) == 1 and not self._events
 
 
 class Maze:
+    """管理地图格子、地址索引、视野范围和路径搜索"""
+
     def __init__(self, config, logger):
+        """根据地图配置初始化所有格子和地址索引"""
         # define tiles
         self.maze_height, self.maze_width = config["size"]
         self.tile_size = config["tile_size"]
@@ -121,9 +139,10 @@ class Maze:
         ]
         for tile in config["tiles"]:
             x, y = tile.pop("coord")
-            self.tiles[y][x] = Tile((x, y), config["world"], address_keys, **tile)
+            self.tiles[y][x] = Tile((x, y), config["world"], address_keys, **tile) # 坐标表达和二维数组索引的顺序不一样
 
         # define address
+        # 地址：坐标点集合
         self.address_tiles = dict()
         for i in range(self.maze_height):
             for j in range(self.maze_width):
@@ -133,10 +152,12 @@ class Maze:
         self.logger = logger
 
     def _warn(self, message):
+        """通过 logger 输出地图相关警告"""
         if self.logger:
             self.logger.warning(message)
 
     def find_path(self, src_coord, dst_coord):
+        """BFS从起点坐标搜索到终点坐标的可行路径,返回路径坐标列表"""
         raw_src_coord, raw_dst_coord = src_coord, dst_coord
         src_coord, dst_coord = tuple(src_coord), tuple(dst_coord)
 
@@ -150,6 +171,7 @@ class Maze:
         map = [[0 for _ in range(self.maze_width)] for _ in range(self.maze_height)]
 
         def _in_bounds(coord):
+            """判断坐标是否在地图边界内"""
             return 0 <= coord[0] < self.maze_width and 0 <= coord[1] < self.maze_height
 
         if not _in_bounds(src_coord) or not _in_bounds(dst_coord):
@@ -196,9 +218,11 @@ class Maze:
         return path[::-1]
 
     def tile_at(self, coord):
+        """获取指定坐标上的格子"""
         return self.tiles[coord[1]][coord[0]]
 
     def update_obj(self, coord, obj_event):
+        """同步更新同一游戏对象地址上的对象事件"""
         tile = self.tile_at(coord)
         if not tile.has_address("game_object"):
             return
@@ -211,6 +235,7 @@ class Maze:
             self.tile_at(c).update_events(obj_event)
 
     def get_scope(self, coord, config):
+        """根据感知配置获取指定坐标周围的可见格子"""
         coords = []
         vision_r = config["vision_r"]
         if config["mode"] == "box":
@@ -222,23 +247,26 @@ class Maze:
                 max(coord[1] - vision_r, 0),
                 min(coord[1] + vision_r + 1, self.maze_height),
             ]
-            coords = list(product(list(range(*x_range)), list(range(*y_range))))
+            coords = list(product(list(range(*x_range)), list(range(*y_range)))) # *参数展开
         return [self.tile_at(c) for c in coords]
 
     def get_around(self, coord, no_collision=True):
+        """获取指定坐标上下左右相邻的格子坐标"""
         coords = [
             (coord[0] - 1, coord[1]),
             (coord[0] + 1, coord[1]),
             (coord[0], coord[1] - 1),
             (coord[0], coord[1] + 1),
         ]
+        # 只保留没有碰撞的格子
         if no_collision:
             coords = [c for c in coords if not self.tile_at(c).collision]
         return coords
 
     def get_address_tiles(self, address):
+        """获取指定地址对应的一组格子坐标"""
         addr = ":".join(address)
         if addr in self.address_tiles:
             return self.address_tiles[addr]
+        # TODO: 返回随机地址可能导致agent行为看起来奇怪
         return random.choice(list(self.address_tiles.values()))
-

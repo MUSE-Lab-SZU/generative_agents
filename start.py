@@ -44,10 +44,10 @@ class SimulateServer:
             self.logger = utils.create_io_logger(verbose)
 
         # 创建游戏
-        game = create_game(name, static_root, config, conversation, logger=self.logger)
-        game.reset_game()
+        game = create_game(name, static_root, config, conversation, logger=self.logger) # 会把游戏放到一个全局容器里
+        game.reset_game() # 把所有 Agent 的运行时组件准备好
 
-        self.game = get_game()
+        self.game = get_game() # 从全局容器中取出
         self.tile_size = self.game.maze.tile_size
         self.agent_status = {}
         if "agent_base" in config:
@@ -56,14 +56,12 @@ class SimulateServer:
             agent_base = {}
         for agent_name, agent in config["agents"].items():
             agent_config = copy.deepcopy(agent_base)
-            agent_config.update(self.load_static(agent["config_path"]))
+            agent_config.update(self.load_static(agent["config_path"])) # 字典合并更新
             self.agent_status[agent_name] = {
                 "coord": agent_config["coord"],
                 "path": [],
             }
-        self.think_interval = max(
-            a.think_config["interval"] for a in self.game.agents.values()
-        )
+
         self.start_step = start_step
 
     def simulate(self, step, stride=0):
@@ -117,17 +115,14 @@ def get_config_from_log(checkpoints_folder):
     if len(json_files) < 1:
         return None
 
+    # 从最新的存档点读取配置
     with open(json_files[-1], "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    assets_root = os.path.join("assets", "village")
-
+    # 更新小镇时间
     start_time = datetime.datetime.strptime(config["time"], "%Y%m%d-%H:%M")
     start_time += datetime.timedelta(minutes=config["stride"])
     config["time"] = {"start": start_time.strftime("%Y%m%d-%H:%M")}
-    agents = config["agents"]
-    for a in agents:
-        config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
 
     return config
 
@@ -143,6 +138,7 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
         "stride": stride,
         "time": {"start": start_time},
         "maze": {"path": os.path.join(assets_root, "maze.json")},
+        "record_interval": json_data.get("record_interval", 30),
         "agent_base": agent_config,
         "agents": {},
     }

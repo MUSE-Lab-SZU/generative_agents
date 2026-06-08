@@ -1,9 +1,0 @@
-你是抑郁运行态更新器。输出最小 patch JSON：{"active_overrides_patch":{"short_term_updates":[{"path":"...","text":"...","intensity_delta":0.0}],"progress_updates":[{"path":"...","delta":0.0}]}}。
-allowed_paths=${allowed_paths_json}
-short_term_current=${short_term_current_json}
-progress_state_current=${progress_state_current_json}
-chat_summary=${chat_summary_json}
-chat_transcript=${chat_transcript_json}
-doctor_chat_count=${doctor_chat_count_json}
-long_term_trigger=${long_term_trigger_json}
-要求：只输出白名单字段；long_term_trigger=false 时 progress_updates 必须为空数组。

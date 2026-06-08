@@ -12,12 +12,17 @@ from modules.model import parse_llm_output
 
 class Scratch:
     def __init__(self, name, currently, config):
+        """
+        初始化角色的 prompt 生成器，保存角色人设、当前状态和模板目录。
+        agent人手一个的
+        """
         self.name = name
         self.currently = currently
         self.config = config
         self.template_path = "data/prompts"
 
     def build_prompt(self, template, data):
+        """读取指定模板文件，并用 data 中的字段安全替换模板变量。"""
         file_content = ""
         try:
             with open(f"{self.template_path}/{template}.txt", "r", encoding="utf-8") as file:
@@ -37,6 +42,7 @@ class Scratch:
             return file_content
 
     def _base_desc(self):
+        """生成角色基础描述块，作为多数 prompt 的共同人设上下文。"""
         return self.build_prompt(
             "base_desc",
             {
@@ -52,6 +58,7 @@ class Scratch:
         )
 
     def prompt_poignancy_event(self, event):
+        """构造事件重要性评分 prompt，并把 LLM 输出解析为 1 到 10 的冲击值。"""
         prompt = self.build_prompt(
             "poignancy_event",
             {
@@ -75,6 +82,7 @@ class Scratch:
         }
 
     def prompt_poignancy_chat(self, event):
+        """构造对话重要性评分 prompt，用于判断聊天内容是否值得触发反思。"""
         prompt = self.build_prompt(
             "poignancy_chat",
             {
@@ -98,6 +106,7 @@ class Scratch:
         }
 
     def prompt_wake_up(self):
+        """根据角色生活习惯生成起床时间 prompt，并解析为小时数。"""
         prompt = self.build_prompt(
             "wake_up",
             {
@@ -114,13 +123,12 @@ class Scratch:
                 "\d{1,2}",
             ]
             wake_up_time = int(parse_llm_output(response, patterns))
-            if wake_up_time > 11:
-                wake_up_time = 11
             return wake_up_time
 
         return {"prompt": prompt, "callback": _callback, "failsafe": 6}
 
     def prompt_schedule_init(self, wake_up):
+        """生成当天粗粒度日程列表，通常作为小时级日程生成前的活动草案。"""
         prompt = self.build_prompt(
             "schedule_init",
             {
@@ -154,6 +162,8 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_schedule_daily(self, wake_up, daily_schedule):
+        """把粗粒度日程扩展成全天小时级安排，并解析为时间到活动的映射。"""
+        # TODO:只锁定了凌晨睡眠，不锁定晚上入睡时间。且规划是按24小时刷新的。对于熬夜或者不规律作息者，睡眠安排如何衔接？
         hourly_schedule = ""
         for i in range(wake_up):
             hourly_schedule += f"[{i}:00] 睡觉\n"
@@ -205,6 +215,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_schedule_decompose(self, plan, schedule):
+        """把当前日程块拆成更细的子任务，方便行动系统按分钟推进。"""
         def _plan_des(plan):
             start, end = schedule.plan_stamps(plan, time_format="%H:%M")
             return f'{start} 至 {end}，{self.name} 计划 {plan["describe"]}'
@@ -244,6 +255,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_schedule_revise(self, action, schedule):
+        """在插入新行动后重写当前日程块的剩余分解计划，保持时间线连续。"""
         plan, _ = schedule.current_plan()
         start, end = schedule.plan_stamps(plan, time_format="%H:%M")
         act_start_minutes = utils.daily_duration(action.start)
@@ -310,6 +322,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": plan["decompose"]}
 
     def prompt_determine_sector(self, describes, spatial, address, tile):
+        """根据计划内容、住处和当前位置，在候选区域中选择最合适的 sector。"""
         live_address = spatial.find_address("living_area", as_list=True)[:-1]
         curr_address = tile.get_address("sector", as_list=True)
 
@@ -356,6 +369,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_determine_arena(self, describes, spatial, address):
+        """在已确定的 sector 内选择具体 arena，作为行动目标地点的中间层。"""
         prompt = self.build_prompt(
             "determine_arena",
             {
@@ -384,6 +398,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_determine_object(self, describes, spatial, address):
+        """从目标地点的可交互物体中选出最匹配当前活动的对象。"""
         objects = spatial.get_leaves(address)
 
         prompt = self.build_prompt(
@@ -410,6 +425,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_describe_emoji(self, describe):
+        """为行动描述生成一个短 emoji 标记，用于前端和日志展示。"""
         prompt = self.build_prompt(
             "describe_emoji",
             {
@@ -441,6 +457,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": "💭", "retry": 1}
 
     def prompt_describe_event(self, subject, describe, address, emoji=None):
+        """把自然语言行动整理成 Event 三元组，并附带地址、原始描述和 emoji。"""
         prompt = self.build_prompt(
             "describe_event",
             {
@@ -476,6 +493,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_describe_object(self, obj, describe):
+        """根据角色行动描述生成目标物体的状态描述，例如被占用或空闲。"""
         prompt = self.build_prompt(
             "describe_object",
             {
@@ -495,6 +513,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": "空闲"}
 
     def prompt_decide_chat(self, agent, other, focus, chats):
+        """判断当前 agent 是否应该主动与另一个角色聊天。"""
         def _status_des(a):
             event = a.get_event()
             if a.path:
@@ -532,6 +551,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
     def prompt_decide_chat_terminate(self, agent, other, chats):
+        """根据当前对话内容判断是否应该结束本轮聊天。"""
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
             conversation or "[对话尚未开始]"
@@ -568,6 +588,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
     def prompt_decide_wait(self, agent, other, focus):
+        """判断当前 agent 是否应该等待另一个角色，以避免行动目标冲突。"""
         example1 = self.build_prompt(
             "decide_wait_example",
             {
@@ -643,6 +664,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
     def prompt_summarize_relation(self, agent, other_name):
+        """检索与指定角色相关的记忆，并总结两者当前关系。"""
         nodes = agent.associate.retrieve_focus([other_name], 50)
 
         prompt = self.build_prompt(
@@ -670,10 +692,10 @@ class Scratch:
         relation,
         chats,
         depression_chat_block="",
-        doctor_session_prompt_injection="",
         retrieval_profile=None,
         chat_history_target_name=None,
     ):
+        """生成 agent 对 other 的下一句回复，并注入关系、记忆、历史对话和可选动态模块上下文。"""
         focus = [relation, other.get_event().get_describe()]
         recent_turn_focus_n = 4
         if hasattr(agent, "get_chat_recent_turn_focus_n"):
@@ -756,7 +778,6 @@ class Scratch:
                 "agent": agent.name,
                 "base_desc_block": base_desc_block,
                 "depression_chat_block": depression_chat_block or "",
-                "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
                 "memory": memory,
                 "address": f"{address[-2]}，{address[-1]}",
                 "current_time": utils.get_timer().get_date("%H:%M"),
@@ -782,6 +803,7 @@ class Scratch:
         }
 
     def prompt_generate_chat_check_repeat(self, agent, chats, content):
+        """检查新生成的回复是否和当前对话上下文重复或过于相似。"""
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
                 conversation or "[对话尚未开始]"
@@ -804,6 +826,7 @@ class Scratch:
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
     def prompt_summarize_chats(self, chats):
+        """把一轮完整聊天压缩成摘要，写入长期联想记忆。"""
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
 
         prompt = self.build_prompt(
@@ -827,54 +850,8 @@ class Scratch:
             "failsafe": failsafe,
         }
 
-    def prompt_extract_doctor_order(self, doctor, patient, now, conversation):
-        prompt = self.build_prompt(
-            "extract_doctor_order",
-            {
-                "doctor": doctor,
-                "patient": patient,
-                "now": now,
-                "conversation": conversation,
-            }
-        )
-
-        def _callback(response):
-            text = response.strip()
-            if "{" in text and "}" in text:
-                text = "{" + text.split("{", 1)[1].rsplit("}", 1)[0] + "}"
-            data = utils.load_dict(text)
-            tasks = data.get("tasks", []) if isinstance(data, dict) else []
-            if not isinstance(tasks, list):
-                tasks = []
-            normalized = []
-            for task in tasks:
-                if not isinstance(task, dict):
-                    continue
-                date = str(task.get("date", "")).strip()
-                time = str(task.get("time", "")).strip()
-                describe = str(task.get("describe", "")).strip()
-                if not date or not time or not describe:
-                    continue
-                normalized.append(
-                    {
-                        "describe": describe,
-                        "date": date,
-                        "time": time,
-                        "duration": int(task.get("duration", 30) or 30),
-                        "address_hint": str(task.get("address_hint", "")).strip(),
-                        "must_do": bool(task.get("must_do", True)),
-                        "confidence": float(task.get("confidence", 0.0) or 0.0),
-                    }
-                )
-            return {"tasks": normalized}
-
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": {"tasks": []},
-        }
-
     def prompt_reflect_focus(self, nodes, topk):
+        """从近期记忆节点中生成若干反思问题，作为深层反思的检索焦点。"""
         prompt = self.build_prompt(
             "reflect_focus",
             {
@@ -898,6 +875,7 @@ class Scratch:
         }
 
     def prompt_reflect_insights(self, nodes, topk, depression_reflect_block=""):
+        """基于检索到的记忆节点生成洞察，并记录每条洞察对应的证据节点。"""
         prompt = self.build_prompt(
             "reflect_insights",
             {
@@ -939,6 +917,7 @@ class Scratch:
         }
 
     def prompt_reflect_chat_planing(self, chats):
+        """根据近期聊天内容提炼对后续计划有影响的反思结论。"""
         all_chats = "\n".join(["{}: {}".format(n, c) for n, c in chats])
 
         prompt = self.build_prompt(
@@ -959,6 +938,7 @@ class Scratch:
         }
 
     def prompt_reflect_chat_memory(self, chats):
+        """根据近期聊天内容提炼可保存为长期记忆的人际或事实信息。"""
         all_chats = "\n".join(["{}: {}".format(n, c) for n, c in chats])
 
         prompt = self.build_prompt(
@@ -980,6 +960,7 @@ class Scratch:
         }
 
     def prompt_retrieve_plan(self, nodes):
+        """从历史记忆节点中提取可能影响今天安排的计划性内容。"""
         statements = [
             n.create.strftime("%Y-%m-%d %H:%M") + ": " + n.describe for n in nodes
         ]
@@ -1009,6 +990,7 @@ class Scratch:
         }
 
     def prompt_retrieve_thought(self, nodes):
+        """从历史记忆节点中总结延续到今天的想法或原则。"""
         statements = [
             n.create.strftime("%Y-%m-%d %H:%M") + "：" + n.describe for n in nodes
         ]
@@ -1031,6 +1013,7 @@ class Scratch:
         }
 
     def prompt_retrieve_currently(self, plan_note, thought_note):
+        """综合昨日计划和想法，更新角色当前状态描述 currently。"""
         time_stamp = (
             utils.get_timer().get_date() - datetime.timedelta(days=1)
         ).strftime("%Y-%m-%d")

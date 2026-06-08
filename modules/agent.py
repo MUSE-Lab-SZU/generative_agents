@@ -55,11 +55,6 @@ class Agent:
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
-        self.depression_dynamic_global = ( # 来自data/config.json，动态抑郁模块整体配置（总开关总规则
-            copy.deepcopy(config.get("depression_dynamic_global", {}))
-            if isinstance(config.get("depression_dynamic_global", {}), dict)
-            else {}
-        )
         self.depression_dynamic = self._init_depression_dynamic(config) # 给当前角色创建 动态抑郁 实例
 
         # status 初始化角色状态
@@ -133,7 +128,7 @@ class Agent:
 
     def reset(self):
         """
-        按需初始化 Agent  在思考、对话等流程中使用的 LLM 实例。
+        按需初始化 Agent 在思考、对话等流程中使用的 LLM 实例。
         """
         if not self._llm:
             self._llm = create_llm_model(self.think_config["llm"])
@@ -357,6 +352,7 @@ class Agent:
         return self.schedule.current_plan()
 
     def revise_schedule(self, event, start, duration):
+        """用新的事件替换当前行动，并按需修订当前分解计划。"""
         self.action = memory.Action(event, start=start, duration=duration)
         plan, _ = self.schedule.current_plan()
         if len(plan["decompose"]) > 0:
@@ -405,6 +401,7 @@ class Agent:
         )
 
     def make_plan(self, agents):
+        """根据感知结果和当前行动状态，决定是否互动或生成下一步行动。"""
         if self._reaction(agents):
             return
         if self.path:
@@ -414,6 +411,7 @@ class Agent:
 
     # create action && object events
     def make_event(self, subject, describe, address):
+        """把自然语言行动描述整理成可写入地图和记忆的 Event 对象。"""
         # emoji = self.completion("describe_emoji", describe)
         # return self.completion(
         #     "describe_event", subject, subject + describe, address, emoji
@@ -507,6 +505,7 @@ class Agent:
         self.chats = []
 
     def find_path(self, agents):
+        """根据当前行动的目标地址，为 Agent 计算一条可移动路径。"""
         address = self.get_event().address
         if self.path:
             return self.path
@@ -540,6 +539,7 @@ class Agent:
         return pathes[target][1:]
 
     def _determine_action(self):
+        """根据当前日程和空间记忆，生成下一段具体行动及物体事件。"""
         self.logger.info("{} is determining action...".format(self.name))
         plan, de_plan = self.schedule.current_plan()
         describes = [plan["describe"], de_plan["describe"]]
@@ -580,6 +580,7 @@ class Agent:
         )
 
     def _reaction(self, agents=None, ignore_words=None):
+        """从当前感知概念中选择关注对象，并尝试聊天或等待对方。"""
         focus = None
         ignore_words = ignore_words or ["空闲"]
 
@@ -608,6 +609,7 @@ class Agent:
         return False
 
     def _skip_react(self, other):
+        """判断当前双方状态是否不适合触发社交反应。"""
         def _skip(event):
             if not event.address or "sleeping" in event.get_describe(False) or "睡觉" in event.get_describe(False):
                 return True
@@ -720,6 +722,7 @@ class Agent:
         return True
 
     def _wait_other(self, other, focus):
+        """在目标位置等待另一个 Agent 完成当前行动。"""
         if self._skip_react(other):
             return False
         if not self.path:
@@ -744,6 +747,7 @@ class Agent:
         self.revise_schedule(event, start, duration)
 
     def schedule_chat(self, chats, chats_summary, start, duration, other, address=None):
+        """把一次对话写入短期聊天缓存，并安排成当前行动。"""
         self.chats.extend(chats)
         event = memory.Event(
             self.name,
@@ -763,6 +767,7 @@ class Agent:
         expire=None,
         filling=None,
     ):
+        """计算事件重要性并把事件、想法或聊天写入联想记忆。"""
         if event.fit(None, "is", "idle"):
             poignancy = 1
         elif event.fit(None, "此时", "空闲"):
@@ -782,12 +787,15 @@ class Agent:
         )
 
     def get_tile(self):
+        """返回 Agent 当前所在坐标对应的地图 tile。"""
         return self.maze.tile_at(self.coord)
 
     def get_event(self, as_act=True):
+        """返回当前行动事件；`as_act=False` 时返回对应物体事件。"""
         return self.action.event if as_act else self.action.obj_event
 
     def is_awake(self):
+        """判断 Agent 当前是否处于清醒状态。"""
         if not self.action:
             return True
         if self.get_event().fit(self.name, "is", "sleeping"):
@@ -797,11 +805,13 @@ class Agent:
         return True
 
     def llm_available(self):
+        """判断当前 Agent 是否已经初始化并可调用 LLM。"""
         if not self._llm:
             return False
         return self._llm.is_available()
 
     def to_dict(self, with_action=True):
+        """把 Agent 当前状态序列化成可保存到 checkpoint 的字典。"""
         info = {
             "status": self.status,
             "schedule": self.schedule.to_dict(),
@@ -827,15 +837,6 @@ class Agent:
 
         这里不是“总是开启”的：它依赖 agent 目录下是否存在`depression_config.json`。
         """
-        global_cfg = (
-            self.depression_dynamic_global
-            if isinstance(self.depression_dynamic_global, dict)
-            else {}
-        )
-        # 没有global_cfg 或者 总配置开关是 False，就返回 None
-        if global_cfg and not bool(global_cfg.get("enabled", True)):
-            return None
-
         explicit_config_path = str(config.get("depression_config_path", "") or "").strip() # or的作用：如果为空/None/不存在，就变成空字符串
         agent_dir = str(config.get("agent_dir", "") or "").strip()
         candidate_paths = []
@@ -852,15 +853,14 @@ class Agent:
                 config_path = path
                 break
 
-        # 对于没有配置动态抑郁人设的 agent，系统的处理策略（默认会在日志中记录 info 信息
+        # 对于没有配置动态抑郁人设的 agent，禁用动态抑郁模块。
         if not config_path:
-            if global_cfg.get("on_missing_agent_config", "warn_and_disable") == "warn_and_disable":
-                if self.logger:
-                    self.logger.info(
-                        "[DEPRESSION_DYNAMIC] agent={} disabled: missing depression_config.json".format(
-                            self.name
-                        )
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} disabled: missing depression_config.json".format(
+                        self.name
                     )
+                )
             return None
 
         # 配置动态抑郁人设的 DepressionSimulationEngine 对象
@@ -896,6 +896,7 @@ class Agent:
             return None
 
     def _build_depression_base_prompt(self):
+        """构造动态抑郁模块使用的基础角色描述。"""
         try:
             return self.scratch._base_desc()
         except Exception:
@@ -1027,6 +1028,7 @@ class Agent:
         )
 
     def _build_depression_reflection_payload(self, focus, entries):
+        """把 reflect() 的焦点、结论和证据整理成动态模块事件负载。"""
         focus_items = self._normalize_depression_text_list(focus, limit=5)
         thoughts, evidence_ids, thought_node_ids = [], [], []
         for entry in entries or []:
@@ -1063,6 +1065,7 @@ class Agent:
         return "\n".join(rows), metadata
 
     def _normalize_depression_text_list(self, value, limit=20):
+        """把任意输入规整成去重、截断后的文本列表。"""
         if value is None:
             items = []
         elif isinstance(value, (list, tuple, set)):
@@ -1073,6 +1076,7 @@ class Agent:
 
     @staticmethod
     def _dedupe_depression_texts(values, limit=20):
+        """按原顺序去重文本，并限制数量和单条长度。"""
         results, seen = [], set()
         for item in values or []:
             text = str(item or "").strip()
@@ -1130,6 +1134,7 @@ class Agent:
         }
 
     def _dynamic_location(self):
+        """把当前地图地址压缩成动态抑郁模块使用的位置文本。"""
         try:
             address = self.get_tile().get_address()
             if isinstance(address, list) and len(address) >= 2:
@@ -1139,6 +1144,7 @@ class Agent:
             return ""
 
     def _dynamic_time_of_day(self):
+        """把当前模拟时间映射成 morning / afternoon / evening / night。"""
         hour = utils.get_timer().get_date().hour
         if 5 <= hour < 12:
             return "morning"
