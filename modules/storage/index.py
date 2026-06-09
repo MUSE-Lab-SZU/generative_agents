@@ -29,11 +29,18 @@ class LlamaIndex:
         elif embedding_config["provider"] == "openai":
             from llama_index.embeddings.openai import OpenAIEmbedding
 
-            embed_model = OpenAIEmbedding(
-                model_name=embedding_config["model"],
-                api_base=embedding_config["base_url"],
-                api_key=embedding_config["api_key"],
-            )
+            openai_kwargs = {
+                "model_name": embedding_config["model"],
+                "api_base": embedding_config["base_url"],
+                "api_key": embedding_config["api_key"],
+            }
+            if embedding_config.get("retry") is not None:
+                openai_kwargs["max_retries"] = int(embedding_config["retry"])
+            if embedding_config.get("request_timeout_seconds") is not None:
+                openai_kwargs["timeout"] = float(
+                    embedding_config["request_timeout_seconds"]
+                )
+            embed_model = OpenAIEmbedding(**openai_kwargs)
         else:
             raise NotImplementedError(
                 "embedding provider {} is not supported".format(embedding_config["provider"])

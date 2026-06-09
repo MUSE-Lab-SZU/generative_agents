@@ -12,7 +12,7 @@ ${optional_sections}推进原则：
 - 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。
 - 即使出现一点松动，也应表现为试探性的、会反复的变化。
 - 若当前对话没有真正触及这个节点，就不要跨越到下一个节点。
-${chain_window_section}
+${graph_window_section}
 
 @@ dynamic_stage_summary_section
 节点概述：${summary}
@@ -30,12 +30,12 @@ ${chain_window_section}
 - 语气底色：${tone}
 - 常见修正方式：${repair_pattern}
 
-@@ stage_chain_window_section
+@@ stage_graph_window_section
 
 当前窗口中的主诉走向：
-${chain_window_items}${next_limit_section}
+${graph_window_items}${next_limit_section}
 
-@@ dynamic_stage_chain_window_item
+@@ dynamic_stage_graph_window_item
 - [${marker}] ${label}：${summary}
 
 @@ dynamic_stage_next_limit_section

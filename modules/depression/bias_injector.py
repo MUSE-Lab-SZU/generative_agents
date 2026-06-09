@@ -206,8 +206,6 @@ class ComplaintBiasInjector:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "active_biases": [str(item) for item in self.active_biases],
-            "selection_policy": copy.deepcopy(self.selection_policy),
-            "bias_library": copy.deepcopy(self.bias_library),
         }
 
     @classmethod

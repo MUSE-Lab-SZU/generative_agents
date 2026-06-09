@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from string import Template
 
+from modules import utils
 from modules.depression import DepressionSimulationEngine
 
 try:
@@ -87,12 +88,6 @@ def _single_stage_empty_candidates_config():
     }
 
 
-def _legacy_complaint_chain_config():
-    config = _single_stage_empty_candidates_config()
-    config["complaint_chain"] = config.pop("complaint_graph")
-    return config
-
-
 def test_generate_chat_template_keeps_persona_description_single_source():
     template = Template(Path("data/prompts/generate_chat.txt").read_text(encoding="utf-8"))
     common = {
@@ -128,15 +123,6 @@ def test_generate_chat_template_keeps_persona_description_single_source():
     assert dynamic_prompt.count("=== 基础人格层 ===") == 1
 
 
-def test_legacy_complaint_chain_config_is_loaded_as_graph():
-    engine = DepressionSimulationEngine(_legacy_complaint_chain_config())
-    state = engine.get_current_state_info()
-
-    assert state["chain"]["mode"] == "complaint_graph"
-    assert state["current_stage"]["id"] == "stage_a"
-    assert state["chain"]["current_graph_window"][0]["id"] == "stage_a"
-
-
 def test_chat_event_keeps_existing_jump_behavior():
     engine = DepressionSimulationEngine(_engine_config())
 
@@ -154,11 +140,41 @@ def test_chat_event_keeps_existing_jump_behavior():
 
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_b"
-    assert state["chain"]["last_evaluation"]["action"] == "jump"
-    assert state["chain"]["last_evaluation"]["source"] == "chat"
-    assert state["chain"]["dialogue_history"][-1]["source"] == "chat"
-    assert state["chain"]["dialogue_history"][-1]["evidence_ids"] == ["chat-1"]
-    assert state["chain"]["stage_history"][-1]["source"] == "chat"
+    assert state["graph"]["last_evaluation"]["action"] == "jump"
+    assert state["graph"]["last_evaluation"]["source"] == "chat"
+    assert state["graph"]["dialogue_history"][-1]["source"] == "chat"
+    assert state["graph"]["dialogue_history"][-1]["evidence_ids"] == ["chat-1"]
+    assert state["graph"]["stage_history"][-1]["source"] == "chat"
+
+
+def test_depression_dynamic_uses_simulated_clock_for_runtime_timestamps():
+    utils.set_timer(start="20260609-16:10")
+    engine = DepressionSimulationEngine(_engine_config())
+
+    assert engine.to_dict()["last_update_time"].startswith("2026-06-09T16:10")
+
+    engine.commit_event(
+        source="chat",
+        location="家",
+        time_of_day="afternoon",
+        interaction_type="闲聊",
+        content="我因为失业觉得自己彻底失败。",
+        other_agent="朋友",
+        relationship="朋友",
+        metadata={"evidence_ids": ["chat-1"]},
+        llm_transition_signal=_jump_signal(),
+    )
+
+    saved = engine.to_dict()
+    graph = saved["complaint_graph_manager"]
+    assert saved["last_update_time"].startswith("2026-06-09T16:10")
+    assert graph["stage_start_time"].startswith("2026-06-09T16:10")
+    assert graph["dialogue_history"][-1]["timestamp"].startswith("2026-06-09T16:10")
+    assert graph["stage_history"][-1]["timestamp"].startswith("2026-06-09T16:10")
+
+    saved["last_update_time"] = "2026-06-09T15:10:53.809975"
+    restored = DepressionSimulationEngine.from_dict(saved)
+    assert restored.to_dict()["last_update_time"].startswith("2026-06-09T16:10")
 
 
 def test_reflection_event_downgrades_jump_to_hold():
@@ -177,17 +193,17 @@ def test_reflection_event_downgrades_jump_to_hold():
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_a"
     assert state["interaction_count"] == 1
-    assert state["chain"]["last_evaluation"]["action"] == "hold"
-    assert state["chain"]["last_evaluation"]["source"] == "reflection"
-    assert state["chain"]["dialogue_history"][-1]["source"] == "reflection"
-    assert state["chain"]["dialogue_history"][-1]["evidence_ids"] == ["thought-1", "event-2"]
-    assert state["chain"]["stage_history"][-1]["source"] == "reflection"
+    assert state["graph"]["last_evaluation"]["action"] == "hold"
+    assert state["graph"]["last_evaluation"]["source"] == "reflection"
+    assert state["graph"]["dialogue_history"][-1]["source"] == "reflection"
+    assert state["graph"]["dialogue_history"][-1]["evidence_ids"] == ["thought-1", "event-2"]
+    assert state["graph"]["stage_history"][-1]["source"] == "reflection"
 
 
 def test_empty_candidate_stage_without_llm_stage_holds_current_stage():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
     initial_state = engine.get_current_state_info()
-    assert initial_state["chain"]["planned_chain"] == ["stage_a"]
+    assert initial_state["graph"]["planned_graph"] == ["stage_a"]
 
     engine.commit_event(
         source="chat",
@@ -201,16 +217,16 @@ def test_empty_candidate_stage_without_llm_stage_holds_current_stage():
 
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_a"
-    assert state["chain"]["last_evaluation"]["action"] == "hold"
-    assert state["chain"]["stage_index"] == 0
+    assert state["graph"]["last_evaluation"]["action"] == "hold"
+    assert state["graph"]["stage_index"] == 0
 
     saved = engine.to_dict()
     assert len(engine.raw_config["complaint_graph"]["stages"]) == 1
-    assert len(saved["complaint_graph_manager"]["stages"]) == 1
-    assert saved["complaint_graph_manager"]["planned_chain"] == ["stage_a"]
+    assert saved["complaint_graph_manager"]["runtime_stages"] == []
+    assert saved["complaint_graph_manager"]["planned_graph"] == ["stage_a"]
 
 
-def test_llm_id_only_next_chain_does_not_materialize_unknown_stage():
+def test_llm_id_only_next_graph_does_not_materialize_unknown_stage():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
 
     engine.commit_event(
@@ -232,11 +248,11 @@ def test_llm_id_only_next_chain_does_not_materialize_unknown_stage():
 
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_a"
-    assert state["chain"]["last_evaluation"]["action"] == "hold"
-    assert state["chain"]["planned_chain"] == ["stage_a"]
+    assert state["graph"]["last_evaluation"]["action"] == "hold"
+    assert state["graph"]["planned_graph"] == ["stage_a"]
 
 
-def test_llm_full_stage_extends_empty_candidate_chain():
+def test_llm_full_stage_extends_empty_candidate_graph():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
 
     engine.commit_event(
@@ -267,11 +283,11 @@ def test_llm_full_stage_extends_empty_candidate_chain():
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_b"
     assert state["current_stage"]["source"] == "llm"
-    assert state["chain"]["planned_chain"] == ["stage_a", "stage_b"]
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert state["graph"]["planned_graph"] == ["stage_a", "stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
 
 
-def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
+def test_initialize_graph_window_uses_llm_full_stage_without_committing_turn():
     config = _single_stage_empty_candidates_config()
     config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
@@ -281,7 +297,7 @@ def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
             {
                 "matched_current_stage": True,
                 "match_confidence": 0.9,
-                "match_reason": "补足起始主诉链窗口",
+                "match_reason": "补足起始主诉图窗口",
                 "action": "replan",
                 "next_graph": [
                     "stage_a",
@@ -296,22 +312,22 @@ def test_initialize_chain_window_uses_llm_full_stage_without_committing_turn():
             ensure_ascii=False,
         )
 
-    state = engine.initialize_chain_window(
+    state = engine.initialize_graph_window(
         location="家",
         time_of_day="morning",
         roadmap_completion_func=completion,
     )
 
-    assert state["chain"]["planned_chain"] == ["stage_a", "stage_b"]
+    assert state["graph"]["planned_graph"] == ["stage_a", "stage_b"]
     assert state["interaction_count"] == 0
-    assert state["chain"]["stage_history"] == []
-    assert state["chain"]["stage_index"] == 0
+    assert state["graph"]["stage_history"] == []
+    assert state["graph"]["stage_index"] == 0
     assert state["current_stage"]["id"] == "stage_a"
-    assert engine.chain_manager.stage_catalog["stage_b"]["source"] == "llm"
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_b"]["source"] == "llm"
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
 
 
-def test_llm_chain_window_links_generated_stages_as_graph_edges():
+def test_llm_graph_window_links_generated_stages_as_graph_edges():
     config = _single_stage_empty_candidates_config()
     config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
@@ -340,14 +356,14 @@ def test_llm_chain_window_links_generated_stages_as_graph_edges():
             ensure_ascii=False,
         )
 
-    engine.initialize_chain_window(
+    engine.initialize_graph_window(
         location="家",
         time_of_day="morning",
         roadmap_completion_func=completion,
     )
 
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
-    assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
 
 
 def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
@@ -375,18 +391,18 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
             ensure_ascii=False,
         )
 
-    engine.initialize_chain_window(
+    engine.initialize_graph_window(
         location="家",
         time_of_day="morning",
         roadmap_completion_func=completion,
     )
 
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
-    assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == []
-    assert "stage_c" not in engine.chain_manager.stage_catalog
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == []
+    assert "stage_c" not in engine.graph_manager.stage_catalog
 
 
-def test_initialize_chain_window_retries_until_window_target_is_reached():
+def test_initialize_graph_window_retries_until_window_target_is_reached():
     config = _single_stage_empty_candidates_config()
     config["complaint_graph"]["planner"]["llm_enabled"] = True
     engine = DepressionSimulationEngine(config)
@@ -427,15 +443,15 @@ def test_initialize_chain_window_retries_until_window_target_is_reached():
         payload = responses.pop(0) if responses else last_response
         return json.dumps(payload, ensure_ascii=False)
 
-    state = engine.initialize_chain_window(
+    state = engine.initialize_graph_window(
         location="家",
         time_of_day="morning",
         roadmap_completion_func=completion,
     )
 
-    assert state["chain"]["planned_chain"] == ["stage_a", "stage_b", "stage_c"]
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
-    assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
+    assert state["graph"]["planned_graph"] == ["stage_a", "stage_b", "stage_c"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
 
 
 def test_initialize_graph_window_maintains_window_size_future_nodes():
@@ -461,19 +477,19 @@ def test_initialize_graph_window_maintains_window_size_future_nodes():
             ensure_ascii=False,
         )
 
-    state = engine.initialize_chain_window(
+    state = engine.initialize_graph_window(
         location="家",
         time_of_day="morning",
         roadmap_completion_func=completion,
     )
 
-    assert [stage["id"] for stage in state["chain"]["current_graph_window"]] == [
+    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == [
         "stage_a",
         "stage_b",
         "stage_c",
         "stage_d",
     ]
-    assert engine.chain_manager.stage_catalog["stage_c"]["next_candidates"] == ["stage_d"]
+    assert engine.graph_manager.stage_catalog["stage_c"]["next_candidates"] == ["stage_d"]
 
 
 def test_preview_interaction_prompt_does_not_materialize_llm_graph_updates():
@@ -510,8 +526,8 @@ def test_preview_interaction_prompt_does_not_materialize_llm_graph_updates():
         roadmap_completion_func=completion,
     )
 
-    assert list(engine.chain_manager.stage_catalog.keys()) == ["stage_a"]
-    assert engine.chain_manager.stage_catalog["stage_a"]["next_candidates"] == []
+    assert list(engine.graph_manager.stage_catalog.keys()) == ["stage_a"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == []
     assert engine.get_current_state_info()["current_stage"]["id"] == "stage_a"
 
 
@@ -544,8 +560,8 @@ def test_chat_replan_with_advance_evidence_moves_to_next_stage():
 
     state = engine.get_current_state_info()
     assert state["current_stage"]["id"] == "stage_b"
-    assert state["chain"]["stage_index"] == 1
-    assert state["chain"]["last_evaluation"]["action"] == "advance"
+    assert state["graph"]["stage_index"] == 1
+    assert state["graph"]["last_evaluation"]["action"] == "advance"
 
 
 def test_commit_advance_then_expands_new_current_stage_future_window():
@@ -593,40 +609,20 @@ def test_commit_advance_then_expands_new_current_stage_future_window():
     )
 
     assert state["current_stage"]["id"] == "stage_b"
-    assert [stage["id"] for stage in state["chain"]["current_graph_window"]] == [
+    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == [
         "stage_b",
         "stage_c",
         "stage_d",
         "stage_e",
     ]
-    assert engine.chain_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
-    assert state["chain"]["last_evaluation"]["action"] == "advance"
+    assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c"]
+    assert state["graph"]["last_evaluation"]["action"] == "advance"
 
 
-def test_legacy_runtime_next_placeholders_are_removed_on_restore():
+def test_restore_links_existing_planned_graph_edges():
     engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
     payload = engine.to_dict()
-    payload["complaint_graph_manager"]["stages"].append(
-        {
-            "id": "stage_a_runtime_next_1",
-            "label": "stage_a_runtime_next_1",
-            "summary": "stage_a_runtime_next_1",
-            "source": "runtime_bootstrap",
-        }
-    )
-    payload["complaint_graph_manager"]["planned_chain"] = ["stage_a", "stage_a_runtime_next_1"]
-
-    restored = DepressionSimulationEngine.from_dict(payload)
-    state = restored.get_current_state_info()
-
-    assert state["chain"]["planned_chain"] == ["stage_a"]
-    assert "stage_a_runtime_next_1" not in restored.chain_manager.stage_catalog
-
-
-def test_restore_links_existing_planned_chain_edges():
-    engine = DepressionSimulationEngine(_single_stage_empty_candidates_config())
-    payload = engine.to_dict()
-    payload["complaint_graph_manager"]["stages"].append(
+    payload["complaint_graph_manager"]["runtime_stages"].append(
         {
             "id": "stage_b",
             "label": "阶段 B",
@@ -635,11 +631,11 @@ def test_restore_links_existing_planned_chain_edges():
             "next_candidates": [],
         }
     )
-    payload["complaint_graph_manager"]["planned_chain"] = ["stage_a", "stage_b"]
+    payload["complaint_graph_manager"]["planned_graph"] = ["stage_a", "stage_b"]
 
     restored = DepressionSimulationEngine.from_dict(payload)
 
-    assert restored.chain_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert restored.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
 
 
 class _FakeDepressionDynamic:
@@ -655,7 +651,7 @@ class _FakeDepressionDynamic:
         self.calls.append(kwargs)
         return {"enabled": True}
 
-    def initialize_chain_window(self, **kwargs):
+    def initialize_graph_window(self, **kwargs):
         self.init_calls.append(kwargs)
         return {"enabled": True}
 
@@ -681,7 +677,7 @@ def _agent_with_fake_dynamic():
     return agent
 
 
-def test_agent_reset_initializes_depression_chain_window():
+def test_agent_reset_initializes_depression_graph_window():
     agent = _agent_with_fake_dynamic()
     agent.think_config = {"llm": {}}
 

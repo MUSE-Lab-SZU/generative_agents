@@ -20,7 +20,7 @@ class DynamicPromptBuilder:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config if isinstance(config, dict) else {}
-        self.include_chain_window = bool(self.config.get("include_chain_window", True))
+        self.include_graph_window = bool(self.config.get("include_graph_window", True))
         self.include_bias_layer = bool(self.config.get("include_bias_layer", True))
         self.include_emotion_layer = bool(self.config.get("include_emotion_layer", True))
 
@@ -28,7 +28,7 @@ class DynamicPromptBuilder:
         self,
         base_prompt: str,
         current_stage: Dict[str, Any],
-        chain_snapshot: Dict[str, Any],
+        graph_snapshot: Dict[str, Any],
         session_context: Dict[str, Any],
         cognitive_biases: List[Dict[str, Any]],
         activated_memories: List[Dict[str, Any]],
@@ -39,7 +39,7 @@ class DynamicPromptBuilder:
         # 它体现的是“稳定人设在前，当前轮波动在后”的约束方向。
         layers = [
             self._build_base_layer(base_prompt),
-            self._build_stage_layer(current_stage, chain_snapshot),
+            self._build_stage_layer(current_stage, graph_snapshot),
             self._build_context_layer(session_context),
         ]
         if self.include_bias_layer:
@@ -52,7 +52,7 @@ class DynamicPromptBuilder:
         self,
         base_prompt: str,
         current_stage: Dict[str, Any],
-        chain_snapshot: Optional[Dict[str, Any]] = None,
+        graph_snapshot: Optional[Dict[str, Any]] = None,
     ) -> str:
         # simple prompt 只保留最核心的“人格 + 当前主诉节点”，
         # 适合反思/摘要等不需要完整会话层的场景。
@@ -61,7 +61,7 @@ class DynamicPromptBuilder:
                 self._build_base_layer(base_prompt),
                 self._build_stage_layer(
                     current_stage=current_stage if isinstance(current_stage, dict) else {},
-                    chain_snapshot=chain_snapshot if isinstance(chain_snapshot, dict) else {},
+                    graph_snapshot=graph_snapshot if isinstance(graph_snapshot, dict) else {},
                 ),
             ]
         )
@@ -75,9 +75,9 @@ class DynamicPromptBuilder:
             ).strip()
         )
 
-    def _build_stage_layer(self, current_stage: Dict[str, Any], chain_snapshot: Dict[str, Any]) -> str:
+    def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        current_window = chain_snapshot.get("current_graph_window", chain_snapshot.get("current_chain_window", []))
+        current_window = graph_snapshot.get("current_graph_window", [])
         current_window = current_window if isinstance(current_window, list) else []
 
         # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
@@ -127,18 +127,18 @@ class DynamicPromptBuilder:
                 )
             )
 
-        chain_window_section = ""
-        if self.include_chain_window and current_window:
-            chain_window_items = []
+        graph_window_section = ""
+        if self.include_graph_window and current_window:
+            graph_window_items = []
             for idx, stage in enumerate(current_window):
                 if not isinstance(stage, dict):
                     continue
                 # idx=0 永远是当前节点；后面的节点只是“可能的后续方向”，
                 # 不是命令式要求角色立即跨过去。
                 marker = "当前" if idx == 0 else f"后续{idx}"
-                chain_window_items.append(
+                graph_window_items.append(
                     self._render_block(
-                        "dynamic_stage_chain_window_item",
+                        "dynamic_stage_graph_window_item",
                         {
                             "marker": marker,
                             "label": str(stage.get("label", "未知节点") or "未知节点"),
@@ -154,11 +154,11 @@ class DynamicPromptBuilder:
                         "dynamic_stage_next_limit_section",
                         {"next_label": next_label},
                     )
-            chain_window_section = render_prompt_section(
+            graph_window_section = render_prompt_section(
                 "depression/dynamic_prompt_layers",
-                "stage_chain_window_section",
+                "stage_graph_window_section",
                 {
-                    "chain_window_items": "".join(chain_window_items),
+                    "graph_window_items": "".join(graph_window_items),
                     "next_limit_section": next_limit_section,
                 },
             )
@@ -170,7 +170,7 @@ class DynamicPromptBuilder:
                 {
                     "label": label,
                     "optional_sections": "".join(optional_sections),
-                    "chain_window_section": chain_window_section,
+                    "graph_window_section": graph_window_section,
                 },
             ).strip()
         )

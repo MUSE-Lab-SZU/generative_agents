@@ -1,18 +1,7 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "profile": {
-    "name": "卡布达",
-    "role": "中度抑郁来访者",
-    "depression_severity": "中度",
-    "case_summary": "被辞退后明显把事件和自我价值绑定，低落、羞耻、回避和疲惫反复出现；面对关心时既想说又担心麻烦别人。",
-    "baseline_style": {
-      "masking": true,
-      "help_seeking_ambivalence": true,
-      "self_blame": true,
-      "functional_impairment": "moderate"
-    }
-  },
+  "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "moderate_job_loss_equals_self_failure",
     "planner": {
@@ -98,7 +87,7 @@
     "enabled": false
   },
   "prompt": {
-    "include_chain_window": true,
+    "include_graph_window": true,
     "include_bias_layer": true,
     "include_emotion_layer": true
   }

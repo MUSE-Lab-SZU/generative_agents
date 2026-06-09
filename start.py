@@ -1,3 +1,5 @@
+"""命令行模拟入口：创建或恢复小镇仿真，并按步推进 Agent 行为。"""
+
 import os
 import copy
 import json
@@ -20,7 +22,10 @@ personas = [
 
 
 class SimulateServer:
+    """负责连接命令行配置、游戏实例、Agent 状态和检查点存档的模拟服务。"""
+
     def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file=""):
+        """初始化模拟服务，加载存档对话、创建游戏实例，并整理每个 Agent 的初始状态。"""
         self.name = name
         self.static_root = static_root
         self.checkpoints_folder = checkpoints_folder
@@ -65,6 +70,7 @@ class SimulateServer:
         self.start_step = start_step
 
     def simulate(self, step, stride=0):
+        """从当前步数开始推进指定轮数，并在每轮后保存配置快照和对话记录。"""
         timer = utils.get_timer()
         for i in range(self.start_step, self.start_step + step):
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
@@ -100,11 +106,13 @@ class SimulateServer:
                 timer.forward(stride)
 
     def load_static(self, path):
+        """从静态资源目录读取指定 Agent 或场景配置字典。"""
         return utils.load_dict(os.path.join(self.static_root, path))
 
 
 # 从存档数据中载入配置，用于断点恢复
 def get_config_from_log(checkpoints_folder):
+    """读取最新检查点配置，并把小镇起始时间推进到下一步用于断点恢复。"""
     files = sorted(os.listdir(checkpoints_folder))
 
     json_files = list()
@@ -129,6 +137,7 @@ def get_config_from_log(checkpoints_folder):
 
 # 为新游戏创建配置
 def get_config(start_time="20240213-09:30", stride=15, agents=None):
+    """基于默认数据文件和 Agent 列表生成一次新模拟所需的初始配置。"""
     with open("data/config.json", "r", encoding="utf-8") as f:
         json_data = json.load(f)
         agent_config = json_data["agent"]

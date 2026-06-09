@@ -1,18 +1,7 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "profile": {
-    "name": "卡布达",
-    "role": "重度抑郁来访者",
-    "depression_severity": "重度",
-    "case_summary": "被辞退后将事件体验为彻底坍塌，自责、羞耻、无望和退缩显著；日常功能明显受损，表达变少、变慢，面对支持也很难相信自己能被接住。",
-    "baseline_style": {
-      "masking": true,
-      "help_seeking_ambivalence": true,
-      "self_blame": true,
-      "functional_impairment": "severe"
-    }
-  },
+  "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "severe_job_loss_total_collapse",
     "planner": {
@@ -101,7 +90,7 @@
     "enabled": false
   },
   "prompt": {
-    "include_chain_window": true,
+    "include_graph_window": true,
     "include_bias_layer": true,
     "include_emotion_layer": true
   }

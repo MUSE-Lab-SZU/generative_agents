@@ -1,16 +1,7 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "profile": {
-    "name": "卡布达",
-    "role": "抑郁来访者",
-    "case_summary": "被辞退后把事件升级成对自我价值的全盘否定，面对关心时容易轻描淡写、迟疑和退缩。",
-    "baseline_style": {
-      "masking": true,
-      "help_seeking_ambivalence": true,
-      "self_blame": true
-    }
-  },
+  "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "job_loss_equals_self_failure",
     "planner": {
@@ -96,7 +87,7 @@
     "enabled": false
   },
   "prompt": {
-    "include_chain_window": true,
+    "include_graph_window": true,
     "include_bias_layer": true,
     "include_emotion_layer": true
   }

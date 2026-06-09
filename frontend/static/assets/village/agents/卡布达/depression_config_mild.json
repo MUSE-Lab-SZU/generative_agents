@@ -1,18 +1,7 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "profile": {
-    "name": "卡布达",
-    "role": "轻度抑郁来访者",
-    "depression_severity": "轻度",
-    "case_summary": "被辞退后出现持续低落、自我怀疑和回避近况询问，但仍能勉强维持基本日常；面对关心时会轻描淡写，也能在安全关系中慢慢多说一点。",
-    "baseline_style": {
-      "masking": true,
-      "help_seeking_ambivalence": true,
-      "self_blame": true,
-      "functional_impairment": "mild"
-    }
-  },
+  "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "mild_job_loss_self_doubt",
     "planner": {
@@ -99,7 +88,7 @@
     "enabled": false
   },
   "prompt": {
-    "include_chain_window": true,
+    "include_graph_window": true,
     "include_bias_layer": true,
     "include_emotion_layer": true
   }

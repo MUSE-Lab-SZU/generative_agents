@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 
 class SessionContextBuilder:
-    """将当前一轮互动整理成主诉链可消费的会话上下文。"""
+    """将当前一轮互动整理成主诉图可消费的会话上下文。"""
 
     TOPIC_RULES = {
         "工作挫败": ["工作", "辞职", "辞退", "公司", "绩效", "老板", "上班", "失业", "开除"],

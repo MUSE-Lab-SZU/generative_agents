@@ -132,7 +132,7 @@ class Agent:
         """
         if not self._llm:
             self._llm = create_llm_model(self.think_config["llm"])
-        self._initialize_depression_chain_window()
+        self._initialize_depression_graph_window()
 
     def completion(self, func_hint, *args, **kwargs):
         """统一的 prompt -> LLM -> 结果回收入口。
@@ -870,7 +870,8 @@ class Agent:
                     "config_path": config_path,
                     "agent_dir": os.path.dirname(config_path),
                     "agent_name": self.name,
-                }
+                },
+                clock_provider=utils.get_timer().get_date,
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
 
@@ -902,13 +903,13 @@ class Agent:
         except Exception:
             return str(self.scratch.currently or "")
 
-    def _initialize_depression_chain_window(self):
-        """启动/恢复时让 LLM 补足运行态主诉链窗口。"""
+    def _initialize_depression_graph_window(self):
+        """启动/恢复时让 LLM 补足运行态主诉图窗口。"""
         if not self.depression_dynamic or not self.llm_available():
             return None
         try:
             self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
-            return self.depression_dynamic.initialize_chain_window(
+            return self.depression_dynamic.initialize_graph_window(
                 location=self._dynamic_location(),
                 time_of_day=self._dynamic_time_of_day(),
                 roadmap_completion_func=self._depression_llm_completion,
@@ -916,7 +917,7 @@ class Agent:
         except Exception as exc:
             if self.logger:
                 self.logger.info(
-                    "[DEPRESSION_DYNAMIC] agent={} chain window init failed: {}".format(
+                    "[DEPRESSION_DYNAMIC] agent={} graph window init failed: {}".format(
                         self.name, exc
                     )
                 )
@@ -978,7 +979,7 @@ class Agent:
         relationship="",
         metadata=None,
     ):
-        """统一提交会影响主诉链的事件，仅允许对话和反思。"""
+        """统一提交会影响主诉图的事件，仅允许对话和反思。"""
         if not self.depression_dynamic:
             return None
         event_source = str(source or "").strip()
@@ -1158,17 +1159,7 @@ class Agent:
         """把原项目中的关系信息映射到动态抑郁模块的有限关系标签。"""
         if not self.depression_dynamic:
             return ""
-        raw_config = getattr(self.depression_dynamic, "raw_config", {})
-        mapping = {}
-        if isinstance(raw_config.get("relationship_overrides", {}), dict):
-            mapping.update(raw_config.get("relationship_overrides", {}))
-        profile = raw_config.get("profile", {}) if isinstance(raw_config.get("profile", {}), dict) else {}
-        if isinstance(profile.get("relationship_overrides", {}), dict):
-            mapping.update(profile.get("relationship_overrides", {}))
         other_name = str(getattr(other, "name", "") or "").strip()
-        if other_name in mapping:
-            return str(mapping[other_name] or "").strip()
-
         summary = str(relation_summary or "")
         text = "{} {}".format(other_name, summary)
         heuristics = [

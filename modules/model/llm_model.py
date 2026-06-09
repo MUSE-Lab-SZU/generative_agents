@@ -13,6 +13,10 @@ class LLMModel:
         self._api_key = config["api_key"]
         self._base_url = config["base_url"]
         self._model = config["model"]
+        self._default_retry = self._positive_int(config.get("retry"), 10)
+        self._request_timeout_seconds = self._positive_float(
+            config.get("request_timeout_seconds")
+        )
         self._meta_responses = [] # 最近一次 completion 中，每次重试拿到的模型原始文本。
         self._summary = {"total": [0, 0, 0]} # 调用统计：[请求次数, 成功次数, 失败次数]。
 
@@ -28,7 +32,7 @@ class LLMModel:
     def completion(
         self,
         prompt,
-        retry=10,
+        retry=None,
         callback=None,
         failsafe=None,
         caller="llm_normal",
@@ -37,6 +41,7 @@ class LLMModel:
         """执行一次带重试的模型调用，并用 callback 把原始文本解析成业务结果。"""
         response, self._meta_responses = None, []
         self._summary.setdefault(caller, [0, 0, 0])
+        retry = self._positive_int(retry, self._default_retry)
         for _ in range(retry):
             try:
                 meta_response = self._completion(prompt, **kwargs).strip()
@@ -85,24 +90,66 @@ class LLMModel:
         """返回最近一次 completion 重试过程中收集到的原始模型输出。"""
         return self._meta_responses
 
+    @staticmethod
+    def _positive_int(value, default):
+        """把配置值转换成正整数，转换失败时使用给定默认值。"""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = default
+        return max(1, value)
+
+    @staticmethod
+    def _positive_float(value):
+        """把配置值转换成正浮点数，缺失或非法时返回 None。"""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _is_qwen3(self):
+        """判断当前模型名是否指向 Qwen3，用于统一处理思考标签。"""
+        return "qwen3" in self._model.lower()
+
+    def _prepare_prompt(self, prompt):
+        """按模型特性补充控制指令，例如让 Qwen3 关闭 think 输出。"""
+        if self._is_qwen3() and "\n/no_think" not in prompt:
+            return prompt + "\n/no_think"
+        return prompt
+
+    def _clean_response(self, text):
+        """清理模型原始输出中会干扰正则解析的控制片段。"""
+        if self._is_qwen3():
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return text
+
 
 class OpenAILLMModel(LLMModel):
     """使用 OpenAI 兼容 Chat Completions API 的模型实现。"""
 
     def setup(self, config):
-        """创建 OpenAI SDK client，支持传入兼容服务的 base_url。"""
+        """创建 OpenAI SDK client，支持兼容服务的 base_url、超时和 SDK 重试。"""
         from openai import OpenAI
 
-        return OpenAI(api_key=self._api_key, base_url=self._base_url)
+        client_kwargs = {"api_key": self._api_key or "EMPTY"}
+        if self._base_url:
+            client_kwargs["base_url"] = self._base_url
+        if self._request_timeout_seconds is not None:
+            client_kwargs["timeout"] = self._request_timeout_seconds
+        if "retry" in config:
+            client_kwargs["max_retries"] = self._default_retry
+        return OpenAI(**client_kwargs)
 
     def _completion(self, prompt, temperature=0.5):
         """向 OpenAI 兼容接口发送单轮用户消息，并返回第一条候选回复。"""
+        prompt = self._prepare_prompt(prompt)
         messages = [{"role": "user", "content": prompt}]
         response = self._handle.chat.completions.create(
             model=self._model, messages=messages, temperature=temperature
         )
         if len(response.choices) > 0:
-            return response.choices[0].message.content
+            return self._clean_response(response.choices[0].message.content or "")
         return ""
 
 
@@ -135,15 +182,12 @@ class OllamaLLMModel(LLMModel):
 
     def _completion(self, prompt, temperature=0.5):
         """发送 Ollama 聊天请求，并清理可能影响解析的 Qwen think 内容。"""
-        if "qwen3" in self._model and "\n/no_think" not in prompt:
-            # 针对Qwen3模型禁用think，提高推理速度
-            prompt += "\n/no_think"
+        prompt = self._prepare_prompt(prompt)
         messages = [{"role": "user", "content": prompt}]
         response = self.ollama_chat(messages=messages, temperature=temperature)
         if response and len(response["choices"]) > 0:
             ret = response["choices"][0]["message"]["content"]
-            # 从输出结果中过滤掉<think>标签内的文字，以免影响后续逻辑
-            return re.sub(r"<think>.*</think>", "", ret, flags=re.DOTALL)
+            return self._clean_response(ret)
         return ""
 
 
