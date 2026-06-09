@@ -20,6 +20,64 @@ personas = [
     # "蟑螂恶霸" # 小混混
 ]
 
+TRACE_STATE_SIDECAR_DIR = "trace_state_sidecars"
+TRACE_STATE_SNAPSHOT_KEYS = (
+    "forced_prompt_trace_state",
+    "dialog_judge_trace_state",
+)
+
+
+def _build_trace_state_sidecar_path(checkpoints_folder, state_key, snapshot_name):
+    safe_key = str(state_key or "").strip() or "trace_state"
+    safe_snapshot = str(snapshot_name or "").strip() or "snapshot"
+    return os.path.join(
+        checkpoints_folder,
+        TRACE_STATE_SIDECAR_DIR,
+        safe_key,
+        "{}.json".format(safe_snapshot),
+    )
+
+
+def _write_json_file(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _load_json_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _strip_snapshot_trace_state(config):
+    snapshot_config = copy.deepcopy(config)
+    intervention_state = snapshot_config.get("intervention_state", {})
+    if not isinstance(intervention_state, dict):
+        return snapshot_config
+    for key in TRACE_STATE_SNAPSHOT_KEYS:
+        intervention_state.pop(key, None)
+    return snapshot_config
+
+
+def _restore_trace_state_sidecars(config, checkpoints_folder, snapshot_name):
+    if not isinstance(config, dict):
+        return config
+    intervention_state = config.setdefault("intervention_state", {})
+    if not isinstance(intervention_state, dict):
+        intervention_state = {}
+        config["intervention_state"] = intervention_state
+
+    for state_key in TRACE_STATE_SNAPSHOT_KEYS:
+        if intervention_state.get(state_key):
+            continue
+        sidecar_path = _build_trace_state_sidecar_path(checkpoints_folder, state_key, snapshot_name)
+        payload = _load_json_file(sidecar_path)
+        if isinstance(payload, dict):
+            intervention_state[state_key] = payload
+    return config
+
 
 class SimulateServer:
     def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file=""):
@@ -121,12 +179,7 @@ class SimulateServer:
                 }
             )
             snapshot_name = f"simulate-{sim_time.replace(':', '')}.json"
-            # 保存Agent活动数据
-            with open(f"{self.checkpoints_folder}/{snapshot_name}", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.config, indent=2, ensure_ascii=False))
-            # 保存对话数据
-            with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
+            snapshot_stem = os.path.splitext(snapshot_name)[0]
             judge_trace_dir = os.path.join(self.checkpoints_folder, "judge_traces")
             os.makedirs(judge_trace_dir, exist_ok=True)
             judge_trace_payload = {"sessions": []}
@@ -137,8 +190,18 @@ class SimulateServer:
                         judge_trace_payload = payload
                 except Exception:
                     judge_trace_payload = {"sessions": []}
-            with open(os.path.join(judge_trace_dir, "judge_conversation.json"), "w", encoding="utf-8") as f:
-                f.write(json.dumps(judge_trace_payload, indent=2, ensure_ascii=False))
+            _write_json_file(
+                os.path.join(judge_trace_dir, "judge_conversation.json"),
+                judge_trace_payload,
+            )
+            _write_json_file(
+                _build_trace_state_sidecar_path(
+                    self.checkpoints_folder,
+                    "dialog_judge_trace_state",
+                    snapshot_stem,
+                ),
+                judge_trace_payload,
+            )
             if self.logger:
                 sessions = judge_trace_payload.get("sessions", []) if isinstance(judge_trace_payload, dict) else []
                 session_count = len(sessions) if isinstance(sessions, list) else 0
@@ -193,6 +256,25 @@ class SimulateServer:
                         written_count,
                     )
                 )
+            _write_json_file(
+                _build_trace_state_sidecar_path(
+                    self.checkpoints_folder,
+                    "forced_prompt_trace_state",
+                    snapshot_stem,
+                ),
+                forced_prompt_payload,
+            )
+            # 保存Agent活动数据；trace state 已转移到 sidecar，避免快照持续膨胀。
+            snapshot_config = _strip_snapshot_trace_state(self.config)
+            _write_json_file(
+                f"{self.checkpoints_folder}/{snapshot_name}",
+                snapshot_config,
+            )
+            # 保存对话数据
+            _write_json_file(
+                f"{self.checkpoints_folder}/conversation.json",
+                self.game.conversation,
+            )
 
             self.staged_eval.maybe_run_post_step_eval(
                 runtime_config=copy.deepcopy(self.config),
@@ -221,8 +303,11 @@ def get_config_from_log(checkpoints_folder):
     if len(json_files) < 1:
         return None
 
-    with open(json_files[-1], "r", encoding="utf-8") as f:
+    snapshot_path = json_files[-1]
+    snapshot_name = os.path.splitext(os.path.basename(snapshot_path))[0]
+    with open(snapshot_path, "r", encoding="utf-8") as f:
         config = json.load(f)
+    config = _restore_trace_state_sidecars(config, checkpoints_folder, snapshot_name)
 
     assets_root = os.path.join("assets", "village")
 

@@ -11,10 +11,10 @@
     },
     "think": {
       "llm": {
-        "provider": "ollama",
-        "model": "qwen3:8b-q4_K_M",
-        "base_url": "http://127.0.0.1:11434/v1",
-        "api_key": "",
+        "provider": "openai",
+        "model": "qwen3-8b-vllm",
+        "base_url": "http://127.0.0.1:18000/v1",
+        "api_key": "EMPTY",
         "retry": 3,
         "request_timeout_seconds": 120
       },
@@ -26,10 +26,10 @@
     "chat_iter": 4,
     "associate": {
       "embedding": {
-        "provider": "ollama",
-        "model": "bge-m3:latest",
-        "base_url": "http://127.0.0.1:11434",
-        "api_key": ""
+        "provider": "openai",
+        "model": "bge-m3-vllm",
+        "base_url": "http://127.0.0.1:18001/v1",
+        "api_key": "EMPTY"
       },
       "retention": 32,
       "recent_dedup_limit": 0,
@@ -355,11 +355,13 @@
     "enabled": true,
     "target_agent": "卡布达",
     "include_t0": true,
-    "use_resident_chat_completed_count": false,
-    "session_interval": 2,
+    "session_interval": 3,
     "max_completed_sessions": 10,
     "t4_enabled": true,
     "t4_after_steps": 8,
+    "worker_script": "runshells/run_staged_eval_worker.py",
+    "worker_timeout_seconds": 1800,
+    "cleanup_tmp_storage": true,
     "scales": [
       "PHQ-9",
       "BDI-II",

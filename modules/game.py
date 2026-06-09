@@ -25,7 +25,11 @@ class Game:
             agent_base = config["agent_base"]
         else:
             agent_base = {}
-        storage_root = os.path.join(f"results/checkpoints/{name}", "storage")
+        storage_root_override = str(config.get("storage_root_override", "") or "").strip()
+        if storage_root_override:
+            storage_root = os.path.abspath(storage_root_override)
+        else:
+            storage_root = os.path.join(f"results/checkpoints/{name}", "storage")
         if not os.path.isdir(storage_root):
             os.makedirs(storage_root)
         global_dynamic_cfg = copy.deepcopy(

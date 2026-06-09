@@ -9,6 +9,7 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import Settings
 
 from modules import utils
+from modules.model.llm_model import resolve_ollama_timeout_seconds
 
 
 STORAGE_RETRY_MAX = 3
@@ -29,6 +30,9 @@ class LlamaIndex:
                 model_name=embedding_config["model"],
                 base_url=embedding_config["base_url"],
                 ollama_additional_kwargs={"mirostat": 0},
+                client_kwargs={
+                    "timeout": resolve_ollama_timeout_seconds(embedding_config),
+                },
             )
         elif embedding_config["provider"] == "openai":
             from llama_index.embeddings.openai import OpenAIEmbedding

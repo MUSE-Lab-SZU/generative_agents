@@ -56,10 +56,10 @@ from run_one_experiment import (
 RUN_NAME = ""
 
 # 仿真起始时间（对应 start.py 的 --start）
-START_TIME = "20260529-09:30"
+START_TIME = "20260607-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 48
+STEP = 60
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 360
@@ -94,8 +94,10 @@ SUMMARY_ONLY = False
 # 是否只打印命令，不实际执行
 DRY_RUN = False
 
-SIMULATION_LOG_POLL_SECONDS = 300
-SIMULATION_LOG_STALE_SECONDS = 10 * 60
+SIMULATION_LOG_POLL_SECONDS = 60
+# 首步可能长时间停留在密集 LLM 调用里，此时日志未必持续刷新；
+# 10 分钟会把“仍在工作但很慢”的运行误判成卡死并重启。
+SIMULATION_LOG_STALE_SECONDS = 15 * 60
 SIMULATION_MAX_RESTARTS = 3
 
 # ============================================================
@@ -108,7 +110,9 @@ GLOBAL_CONFIG = BASE_DIR / "data" / "config.json"
 GROUP_OVERLAY_DIR = BASE_DIR / "experiments" / "config" / "groups"
 EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
 REPORTS_DIR = EXPERIMENT_DATA_ROOT / "reports"
-BACKUP_DIR = Path(tempfile.gettempdir()) / "generative_agents_batch_config_backup_zxou"
+BACKUP_DIR = Path(tempfile.gettempdir()) / "generative_agents_batch_config_backup"
+PERSISTENT_GLOBAL_CONFIG_BACKUP = BASE_DIR / "experiments" / "config" / "default_config.backup.json"
+PERSISTENT_GLOBAL_CONFIG_STATE = BASE_DIR / "experiments" / "config" / "default_config.backup_state.json"
 
 SEVERITY_CONFIG_FILES = {
     "mild": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_mild.json",
@@ -357,6 +361,24 @@ def simulation_log_path(run_name: str, cfg: RuntimeConfig) -> Path:
     return checkpoint_dir_for_run(run_name) / cfg.log_file
 
 
+def latest_checkpoint_activity_mtime(run_name: str) -> float | None:
+    checkpoint_dir = checkpoint_dir_for_run(run_name)
+    if not checkpoint_dir.is_dir():
+        return None
+
+    latest_mtime = None
+    for path in checkpoint_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            current_mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if latest_mtime is None or current_mtime > latest_mtime:
+            latest_mtime = current_mtime
+    return latest_mtime
+
+
 def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool) -> list[str]:
     cmd = [
         sys.executable,
@@ -404,6 +426,7 @@ def run_simulation_with_recovery(run_name: str, cfg: RuntimeConfig) -> None:
         proc = subprocess.Popen(cmd, cwd=BASE_DIR)
         log_path = simulation_log_path(run_name, cfg)
         last_log_mtime = None
+        last_checkpoint_mtime = latest_checkpoint_activity_mtime(run_name)
         stale_since = time.time()
 
         while True:
@@ -417,6 +440,14 @@ def run_simulation_with_recovery(run_name: str, cfg: RuntimeConfig) -> None:
                 if last_log_mtime is None or current_mtime > last_log_mtime:
                     last_log_mtime = current_mtime
                     stale_since = time.time()
+
+            current_checkpoint_mtime = latest_checkpoint_activity_mtime(run_name)
+            if (
+                current_checkpoint_mtime is not None
+                and (last_checkpoint_mtime is None or current_checkpoint_mtime > last_checkpoint_mtime)
+            ):
+                last_checkpoint_mtime = current_checkpoint_mtime
+                stale_since = time.time()
 
             if time.time() - stale_since >= SIMULATION_LOG_STALE_SECONDS:
                 terminate_process(proc)
@@ -448,6 +479,18 @@ def summary_output_stem(cfg: RuntimeConfig) -> str:
 def load_json_file(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_optional_json_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        payload = load_json_file(path)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def write_json_file(path: Path, payload: Any) -> None:
@@ -522,6 +565,26 @@ def trigger_sort_key(label: str, completed_session_count: int) -> tuple[int, int
     return (completed, 4, normalized)
 
 
+def prompt_yes_no(question: str, *, default: bool) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    try:
+        answer = input(question + suffix)
+    except EOFError:
+        print(f"[WARN] 未读取到输入，按默认值 {'是' if default else '否'} 处理。")
+        return default
+
+    normalized = answer.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"y", "yes", "1", "true", "是"}:
+        return True
+    if normalized in {"n", "no", "0", "false", "否"}:
+        return False
+
+    print(f"[WARN] 无法识别输入 {answer!r}，按默认值 {'是' if default else '否'} 处理。")
+    return default
+
+
 def backup_configs(*, dry_run: bool) -> None:
     if dry_run:
         print(f"[DRY-RUN] backup dir: {BACKUP_DIR}")
@@ -550,6 +613,84 @@ def restore_configs(*, dry_run: bool) -> None:
         if backup_path.exists():
             shutil.copy2(backup_path, path)
             print(f"[RESTORE] {label} -> {path}")
+
+
+def record_persistent_global_config_backup(*, dry_run: bool) -> None:
+    print(f"[CONFIG-BACKUP] default config -> {PERSISTENT_GLOBAL_CONFIG_BACKUP}")
+    if dry_run:
+        print(f"[DRY-RUN] state file -> {PERSISTENT_GLOBAL_CONFIG_STATE}")
+        return
+
+    PERSISTENT_GLOBAL_CONFIG_BACKUP.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(GLOBAL_CONFIG, PERSISTENT_GLOBAL_CONFIG_BACKUP)
+    write_json_file(
+        PERSISTENT_GLOBAL_CONFIG_STATE,
+        {
+            "active": True,
+            "source_path": str(GLOBAL_CONFIG),
+            "backup_path": str(PERSISTENT_GLOBAL_CONFIG_BACKUP),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "script": "runshells/run_batch_experiment.py",
+        },
+    )
+    print(f"[STATE] active config backup -> {PERSISTENT_GLOBAL_CONFIG_STATE}")
+
+
+def restore_persistent_global_config_backup(*, dry_run: bool) -> None:
+    if not PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
+        print(f"[WARN] 缺少默认 config 备份文件: {PERSISTENT_GLOBAL_CONFIG_BACKUP}")
+        return
+
+    print(f"[RESTORE] persistent config backup -> {GLOBAL_CONFIG}")
+    if dry_run:
+        return
+    shutil.copy2(PERSISTENT_GLOBAL_CONFIG_BACKUP, GLOBAL_CONFIG)
+
+
+def clear_persistent_global_config_state(*, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[DRY-RUN] clear state file: {PERSISTENT_GLOBAL_CONFIG_STATE}")
+        return
+    if PERSISTENT_GLOBAL_CONFIG_STATE.exists():
+        PERSISTENT_GLOBAL_CONFIG_STATE.unlink()
+        print(f"[STATE] cleared config backup state: {PERSISTENT_GLOBAL_CONFIG_STATE}")
+
+
+def maybe_restore_interrupted_global_config(*, dry_run: bool) -> None:
+    state = load_optional_json_file(PERSISTENT_GLOBAL_CONFIG_STATE)
+    if not state or not state.get("active"):
+        return
+
+    if not PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
+        print(
+            "[WARN] 检测到上次批量实验留下未清理的配置状态，但找不到默认 config 备份；将跳过恢复。"
+        )
+        clear_persistent_global_config_state(dry_run=dry_run)
+        return
+
+    created_at = str(state.get("created_at", "") or "unknown")
+    if dry_run:
+        print(
+            "[DRY-RUN] detected pending config restore state "
+            f"(created_at={created_at}), would prompt for restoration."
+        )
+        clear_persistent_global_config_state(dry_run=dry_run)
+        return
+
+    should_restore = prompt_yes_no(
+        (
+            "检测到上次批量实验留下未清理的默认 config 备份"
+            f"（创建时间: {created_at}）。如果上次提前中断，建议先恢复 `data/config.json`。"
+            "是否现在先恢复备份？"
+        ),
+        default=True,
+    )
+    if should_restore:
+        restore_persistent_global_config_backup(dry_run=False)
+    else:
+        print("[INFO] 已跳过恢复默认 config 备份，将以当前 data/config.json 继续。")
+
+    clear_persistent_global_config_state(dry_run=False)
 
 
 def apply_severity_config(severity: str, *, dry_run: bool) -> None:
@@ -1055,7 +1196,9 @@ def main() -> None:
         export_batch_summary(cfg)
         return
 
+    maybe_restore_interrupted_global_config(dry_run=cfg.dry_run)
     backup_configs(dry_run=cfg.dry_run)
+    record_persistent_global_config_backup(dry_run=cfg.dry_run)
 
     completed: list[str] = []
     failed: list[str] = []
@@ -1071,6 +1214,7 @@ def main() -> None:
                 restore_configs(dry_run=cfg.dry_run)
     finally:
         restore_configs(dry_run=cfg.dry_run)
+        clear_persistent_global_config_state(dry_run=cfg.dry_run)
 
     print("\n==========================================")
     print(f"批量实验完成: {len(completed)} 成功 / {len(failed)} 失败")

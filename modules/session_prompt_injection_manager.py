@@ -239,6 +239,7 @@ class SessionPromptInjectionManager:
 
         if meeting_id and str(state.get("last_advance_meeting_id", "")) == str(meeting_id):
             state["last_detected_end"] = True
+            state["last_meeting_id"] = str(meeting_id or state.get("last_meeting_id", ""))
             state["updated_at"] = now_str or self._now_str()
             return {
                 "action": "skip_duplicate_meeting",

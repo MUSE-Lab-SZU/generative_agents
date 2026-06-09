@@ -9,6 +9,37 @@ DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
 DEFAULT_LLM_RETRY = 10
 
 
+def resolve_ollama_timeout_seconds(config, default=DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS):
+    """Resolve a positive timeout from config for Ollama requests."""
+    if not isinstance(config, dict):
+        return default
+
+    raw_value = config.get("request_timeout_seconds", config.get("timeout", default))
+    try:
+        timeout_value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+    if timeout_value <= 0:
+        return default
+    return timeout_value
+
+
+def prepare_prompt_for_model(prompt, model_name):
+    if not isinstance(prompt, str):
+        return prompt
+    if "qwen3" in str(model_name).lower() and "\n/nothink" not in prompt:
+        # Keep Qwen3 in non-thinking mode to reduce latency and avoid leaking reasoning text.
+        return prompt + "\n/nothink"
+    return prompt
+
+
+def strip_qwen_think_tags(text):
+    if not isinstance(text, str):
+        return text
+    return re.sub(r"<think>.*</think>", "", text, flags=re.DOTALL).strip()
+
+
 class LLMModel:
     def __init__(self, config):
         self._api_key = config["api_key"]
@@ -17,9 +48,7 @@ class LLMModel:
         self._meta_responses = []
         self._summary = {"total": [0, 0, 0]}
         self._default_retry = config.get("retry", DEFAULT_LLM_RETRY)
-        self._request_timeout_seconds = config.get(
-            "request_timeout_seconds", DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS
-        )
+        self._request_timeout_seconds = resolve_ollama_timeout_seconds(config)
 
         self._handle = self.setup(config)
         self._enabled = True
@@ -89,15 +118,20 @@ class OpenAILLMModel(LLMModel):
     def setup(self, config):
         from openai import OpenAI
 
-        return OpenAI(api_key=self._api_key, base_url=self._base_url)
+        return OpenAI(
+            api_key=self._api_key,
+            base_url=self._base_url,
+            timeout=self._request_timeout_seconds,
+        )
 
     def _completion(self, prompt, temperature=0.5):
+        prompt = prepare_prompt_for_model(prompt, self._model)
         messages = [{"role": "user", "content": prompt}]
         response = self._handle.chat.completions.create(
             model=self._model, messages=messages, temperature=temperature
         )
         if len(response.choices) > 0:
-            return response.choices[0].message.content
+            return strip_qwen_think_tags(response.choices[0].message.content)
         return ""
 
 
@@ -138,15 +172,12 @@ class OllamaLLMModel(LLMModel):
         return response.json()
 
     def _completion(self, prompt, temperature=0.5):
-        if "qwen3" in self._model and "\n/nothink" not in prompt:
-            # 针对Qwen3模型禁用think，提高推理速度
-            prompt += "\n/nothink"
+        prompt = prepare_prompt_for_model(prompt, self._model)
         messages = [{"role": "user", "content": prompt}]
         response = self.ollama_chat(messages=messages, temperature=temperature)
         if response and len(response["choices"]) > 0:
             ret = response["choices"][0]["message"]["content"]
-            # 从输出结果中过滤掉<think>标签内的文字，以免影响后续逻辑
-            return re.sub(r"<think>.*</think>", "", ret, flags=re.DOTALL)
+            return strip_qwen_think_tags(ret)
         return ""
 
 
