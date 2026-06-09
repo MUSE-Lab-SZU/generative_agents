@@ -187,11 +187,13 @@ class ComplaintGraphManager:
         return str(self.get_current_stage().get("id", ""))
 
     def get_current_graph_window(self, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        """返回当前节点及其直接候选分支。"""
         if not self.planned_graph:
             return []
         width = self._bounded_int(count, self.window_size + 1, 1, 20)
-        start = min(max(0, int(self.stage_index)), len(self.planned_graph) - 1)
-        ids = self.planned_graph[start : start + width]
+        current_stage = self.get_current_stage()
+        current_id = str(current_stage.get("id", "") or "").strip()
+        ids = [current_id] + self._candidate_ids_for_stage(current_stage, width - 1)
         return [copy.deepcopy(self.stage_catalog.get(stage_id, {})) for stage_id in ids]
 
     def get_graph_snapshot(self) -> Dict[str, Any]:
@@ -256,7 +258,7 @@ class ComplaintGraphManager:
         - 当前节点是否被触及；
         - 置信度如何；
         - 动作是 hold / advance / replan / jump；
-        - 如果要前进，下一段图路径长什么样。
+        - 如果要前进，当前节点的候选分支是什么。
         真正改状态要等 `commit_turn()`。
         """
         session_context = session_context if isinstance(session_context, dict) else {}
@@ -264,81 +266,47 @@ class ComplaintGraphManager:
         current_stage = self.get_current_stage()
 
         normalized_signal = self._normalize_llm_signal(llm_signal)
-        if callable(completion_func) and self.llm_enabled:
-            # 若提供 LLM 规划器，就让它先给出结构化建议；
-            # 但后面依然会经过 normalize / allow_xxx 等约束过滤。
-            inferred_signal = self._infer_graph_signal(
-                completion_func=completion_func,
+        if not normalized_signal and callable(completion_func) and self.llm_enabled:
+            # 分支规划器只补候选，不参与本轮动作裁决。
+            self.ensure_graph_window(
                 session_context=session_context,
                 conversation_content=conversation,
+                completion_func=completion_func,
                 llm_cfg=llm_cfg,
+                record_evaluation=False,
             )
-            if inferred_signal:
-                normalized_signal = inferred_signal
+            current_stage = self.get_current_stage()
 
-        # 无论是否启用 LLM，启发式匹配都是一个重要“兜底”。
-        heur_matched, heur_confidence, heur_reason = self._heuristic_match(
+        fallback_signal = self._fallback_transition_signal(
             current_stage=current_stage,
             session_context=session_context,
             conversation_content=conversation,
         )
-
-        matched = heur_matched
-        match_confidence = heur_confidence
-        match_reason = heur_reason
-        # 默认策略是“先不推进”，只有后续证据足够才会改成 advance / jump。
-        action = "hold"
-        # 先拿当前窗口当作未来图路径的缺省值。
-        next_graph_ids: List[str] = self._preview_future_graph(current_stage)
-        stage_updates: List[Dict[str, Any]] = []
-
-        if normalized_signal:
-            # 一旦有 LLM/外部信号，就用它覆盖启发式默认值；
-            # 但覆盖之后仍然会接受 action 白名单、allow_replan 等约束。
-            matched = bool(normalized_signal.get("matched", matched))
-            match_confidence = self._bounded_float(
-                normalized_signal.get("match_confidence", match_confidence),
-                match_confidence,
-                0.0,
-                1.0,
+        transition_signal = normalized_signal
+        if not transition_signal and callable(completion_func) and self.llm_enabled:
+            transition_signal = self._infer_transition_signal(
+                completion_func=completion_func,
+                current_stage=current_stage,
+                session_context=session_context,
+                conversation_content=conversation,
+                llm_cfg=llm_cfg,
+                fallback_signal=fallback_signal,
             )
-            match_reason = str(normalized_signal.get("match_reason", match_reason) or match_reason)
-            action = str(normalized_signal.get("action", action) or action).strip().lower() or "hold"
-            stage_updates = self._normalize_stage_updates(normalized_signal.get("stage_updates", []))
-            candidate_graph = normalized_signal.get("next_graph", [])
-            if isinstance(candidate_graph, list) and candidate_graph:
-                next_graph_ids = self._normalize_next_graph(
-                    candidate_graph,
-                    current_stage["id"],
-                    stage_updates,
-                )
+        if not transition_signal:
+            transition_signal = fallback_signal
 
+        matched = bool(transition_signal.get("matched", False))
+        match_confidence = self._bounded_float(transition_signal.get("match_confidence"), 0.0, 0.0, 1.0)
+        match_reason = str(transition_signal.get("match_reason", "") or "")
+        action = str(transition_signal.get("action", "hold") or "hold").strip().lower()
+        stage_updates = self._normalize_stage_updates(transition_signal.get("stage_updates", []))
+        next_graph_ids = self._normalize_next_graph(
+            transition_signal.get("next_graph", self._preview_future_graph(current_stage)),
+            current_stage["id"],
+            stage_updates,
+        )
         if action not in {"hold", "advance", "replan", "jump"}:
             action = "hold"
-
-        if not normalized_signal:
-            # 只有在完全没有结构化 LLM 信号时，才纯靠规则决定动作。
-            action = self._decide_action(
-                current_stage=current_stage,
-                matched=matched,
-                match_confidence=match_confidence,
-                session_context=session_context,
-                conversation_content=conversation,
-            )
-        elif action == "replan" and not self._is_graph_window_init_context(session_context):
-            heuristic_action = self._decide_action(
-                current_stage=current_stage,
-                matched=matched,
-                match_confidence=match_confidence,
-                session_context=session_context,
-                conversation_content=conversation,
-            )
-            if heuristic_action == "advance" and len(next_graph_ids) > 1:
-                action = "advance"
-                match_reason = self._clip_text(
-                    "{}；规则判定本轮已满足推进信号，replan 升级为 advance".format(match_reason),
-                    limit=180,
-                )
 
         if action == "replan" and not self.allow_replan:
             action = "hold"
@@ -347,7 +315,7 @@ class ComplaintGraphManager:
 
         next_stage: Optional[Dict[str, Any]] = None
         if action in {"advance", "jump"}:
-            # advance / jump 的共同前提：必须能推出一个“后继节点”。
+            # advance / jump 的共同前提：必须能推出一个候选节点。
             # 如果 next_graph 不够长，就退回当前 stage 的 next_candidates。
             if len(next_graph_ids) > 1:
                 next_stage = self._lookup_stage(next_graph_ids[1], stage_updates)
@@ -357,7 +325,7 @@ class ComplaintGraphManager:
                     next_graph_ids = [current_stage["id"], candidate_id]
                     next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
             if not next_stage:
-                # 没有 LLM 生成的完整后续节点，也没有配置内已存在的候选时，
+                # 没有完整候选节点，也没有配置内已存在的候选时，
                 # 不凭规则臆造主诉节点。
                 action = "hold"
 
@@ -381,9 +349,9 @@ class ComplaintGraphManager:
         """把 evaluation 真正写入状态机。
 
         这里最值得审查的点是：
-        - `hold/replan` 只替换未来窗口，不切换当前节点；
-        - `advance` 将 `stage_index` 向前推进一格；
-        - `jump` 会直接重建整条 planned_graph。
+        - `hold/replan` 只更新当前节点候选分支；
+        - `advance` 选择一个候选分支成为新的当前节点；
+        - `jump` 会把目标节点作为新的当前路径起点。
         """
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         current_before = self.get_current_stage()
@@ -409,13 +377,17 @@ class ComplaintGraphManager:
         duration_minutes = self.get_state_duration()
 
         if action in {"hold", "replan"}:
-            # hold/replan 的共同点：当前节点不动，只更新后面的路线图。
+            # hold/replan 只改当前节点的候选分支，不移动指针。
             self._replace_future_graph(next_graph)
         elif action == "advance":
-            self._replace_future_graph(next_graph)
-            if self.stage_index < len(self.planned_graph) - 1:
-                # 只有先把未来图路径写好，再 +1，才能保证“下一格”是刚更新过的。
-                self.stage_index += 1
+            target_stage_id = str(next_graph[1] if len(next_graph) > 1 else "").strip()
+            if target_stage_id and target_stage_id in self.stage_catalog:
+                # advance 表示从候选分支中选中一个节点，兄弟分支仍留在父节点上。
+                self._ensure_branch_candidates(current_before.get("id", ""), [target_stage_id])
+                self.planned_graph = self.planned_graph[: self.stage_index + 1]
+                if not self.planned_graph or self.planned_graph[-1] != target_stage_id:
+                    self.planned_graph.append(target_stage_id)
+                self.stage_index = len(self.planned_graph) - 1
                 self.stage_start_time = self._now()
         elif action == "jump":
             target_stage = evaluation.get("next_stage") if isinstance(evaluation.get("next_stage"), dict) else None
@@ -429,13 +401,8 @@ class ComplaintGraphManager:
                     # jump 允许把一个运行时临时生成的 stage 写入 catalog，
                     # 这样后续 snapshot / 恢复状态时不会丢失它。
                     self.stage_catalog[target_stage_id] = self._sanitize_stage(target_stage or {"id": target_stage_id, "label": target_stage_id}, source="jump")
-                # jump 的语义不是“在原图上跳格子”，而是“把目标节点改成新的当前起点”。
-                # 如果 LLM 同时给了目标之后的窗口，保留这段运行态图路径。
-                jump_graph = [item for item in next_graph[1:] if item in self.stage_catalog]
-                if not jump_graph or jump_graph[0] != target_stage_id:
-                    jump_graph = [target_stage_id] + [item for item in jump_graph if item != target_stage_id]
-                self._link_graph_edges(jump_graph)
-                self.planned_graph = jump_graph + self._build_future_graph_from_stage(target_stage_id, self.window_size)
+                # jump 表示直接把目标节点设为当前路径起点。
+                self.planned_graph = [target_stage_id]
                 self.stage_index = 0
                 self.stage_start_time = self._now()
 
@@ -503,7 +470,7 @@ class ComplaintGraphManager:
         completion_func: Optional[Callable[[str], str]] = None,
         llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """用 LLM 补足运行态主诉图窗口，但不推进当前节点。"""
+        """用 LLM 为当前节点补候选分支，但不推进当前节点。"""
         return self.ensure_graph_window(
             session_context=session_context,
             conversation_content=conversation_content,
@@ -522,58 +489,34 @@ class ComplaintGraphManager:
         source: str = "graph_window_expansion",
         record_evaluation: bool = False,
     ) -> Dict[str, Any]:
-        """按需补足“当前节点 + window_size 个未来节点”的运行态图窗口。"""
+        """当当前节点没有 next_candidates 时，按 window_size 规划候选分支。"""
         if not callable(completion_func) or not self.llm_enabled:
             return self.get_graph_snapshot()
-        if len(self.get_current_graph_window(self.window_size + 1)) >= self.window_size + 1:
+        current_stage = self.get_current_stage()
+        if not self._stage_needs_branch_plan(current_stage):
             return self.get_graph_snapshot()
-        if self._coerce_bool(self.get_current_stage().get("is_terminal_stage", False)):
+        if self._coerce_bool(current_stage.get("is_terminal_stage", False)):
             return self.get_graph_snapshot()
 
-        target_width = self.window_size + 1
-        max_attempts = max(1, int(self.window_size))
-        for _ in range(max_attempts):
-            before_width = len(self.get_current_graph_window(target_width))
-            before_catalog_size = len(self.stage_catalog)
-            if before_width >= target_width:
-                break
-
-            evaluation = self.evaluate_turn(
-                session_context=self._graph_expansion_context(session_context),
-                conversation_content=str(conversation_content or ""),
-                completion_func=completion_func,
-                llm_cfg=llm_cfg,
-            )
-            stage_updates = self._normalize_stage_updates(evaluation.get("stage_updates", []))
-            next_graph = self._normalize_next_graph(
-                evaluation.get("next_graph", []),
-                self.get_current_stage_id(),
-                stage_updates,
-            )
-            if len(next_graph) > 1:
-                self._materialize_stage_updates(stage_updates)
-                next_graph = self._normalize_graph_path(next_graph, self.get_current_stage_id())
-                self._replace_future_graph(next_graph)
-                self._ensure_future_window()
-                if record_evaluation:
-                    self.last_session_context = copy.deepcopy(
-                        evaluation.get("session_context", {})
-                        if isinstance(evaluation.get("session_context", {}), dict)
-                        else {}
-                    )
-                    self.last_evaluation = {
-                        "action": "replan",
-                        "matched": bool(evaluation.get("matched", False)),
-                        "match_confidence": self._bounded_float(
-                            evaluation.get("match_confidence"), 0.0, 0.0, 1.0
-                        ),
-                        "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
-                        "source": str(source or "graph_window_expansion")[:32],
-                    }
-
-            after_width = len(self.get_current_graph_window(target_width))
-            if after_width <= before_width and len(self.stage_catalog) <= before_catalog_size:
-                break
+        planning_context = self._graph_expansion_context(session_context)
+        child_stages = self._infer_branch_plan(
+            completion_func=completion_func,
+            parent_stage=current_stage,
+            session_context=planning_context,
+            conversation_content=str(conversation_content or ""),
+            llm_cfg=llm_cfg,
+        )
+        if child_stages:
+            child_ids = self._materialize_branch_plan(current_stage["id"], child_stages)
+            if record_evaluation:
+                self.last_session_context = copy.deepcopy(planning_context)
+                self.last_evaluation = {
+                    "action": "plan_branches",
+                    "matched": False,
+                    "match_confidence": 0.0,
+                    "match_reason": "planned {} candidate branches".format(len(child_ids)),
+                    "source": str(source or "graph_window_expansion")[:32],
+                }
         return self.get_graph_snapshot()
 
     def force_stage(self, stage_id: str, reason: str = "manual") -> None:
@@ -587,7 +530,7 @@ class ComplaintGraphManager:
             )
         previous_stage = self.get_current_stage()
         duration_minutes = self.get_state_duration()
-        self.planned_graph = [stage_key] + self._build_future_graph_from_stage(stage_key, self.window_size)
+        self.planned_graph = [stage_key]
         self.stage_index = 0
         self.stage_start_time = self._now()
         current_stage = self.get_current_stage()
@@ -621,10 +564,16 @@ class ComplaintGraphManager:
                 item["timestamp"] = ts.isoformat()
             history_rows.append(item)
         static_stage_ids = self._configured_stage_ids()
+        reachable_stage_ids = self._reachable_stage_ids()
         runtime_stages = [
             copy.deepcopy(stage)
             for stage_id, stage in self.stage_catalog.items()
-            if stage_id not in static_stage_ids or str(stage.get("source", "") or "") != "config"
+            if stage_id in reachable_stage_ids
+            and (
+                stage_id not in static_stage_ids
+                or str(stage.get("source", "") or "") != "config"
+                or self._runtime_candidates_changed(stage_id, stage)
+            )
         ]
         return {
             "mode": "complaint_graph",
@@ -701,6 +650,7 @@ class ComplaintGraphManager:
         return manager
 
     def _configured_stage_ids(self) -> set:
+        """返回静态配置里声明过的节点 ID。"""
         raw_stages = self._raw_graph_config.get("stages", self._raw_graph_config.get("stage_catalog", []))
         if isinstance(raw_stages, dict):
             raw_stages = list(raw_stages.values())
@@ -714,78 +664,127 @@ class ComplaintGraphManager:
                     stage_ids.add(stage_id)
         return stage_ids
 
+    def _runtime_candidates_changed(self, stage_id: str, stage: Dict[str, Any]) -> bool:
+        """判断静态节点的候选分支是否被运行态规划改写。"""
+        configured = self._configured_next_candidates(stage_id)
+        current = [
+            str(item or "").strip()
+            for item in self._to_list(stage.get("next_candidates", []) if isinstance(stage, dict) else [])
+            if str(item or "").strip()
+        ]
+        return current != configured
+
+    def _configured_next_candidates(self, stage_id: str) -> List[str]:
+        """读取静态配置中某个节点原始的 next_candidates。"""
+        target = str(stage_id or "").strip()
+        raw_stages = self._raw_graph_config.get("stages", self._raw_graph_config.get("stage_catalog", []))
+        if isinstance(raw_stages, dict):
+            raw_stages = list(raw_stages.values())
+        for item in raw_stages if isinstance(raw_stages, list) else []:
+            if not isinstance(item, dict) or str(item.get("id", "") or "").strip() != target:
+                continue
+            return [
+                str(candidate or "").strip()
+                for candidate in self._to_list(item.get("next_candidates", []))
+                if str(candidate or "").strip()
+            ]
+        return []
+
     def _preview_future_graph(self, current_stage: Dict[str, Any]) -> List[str]:
-        """返回“当前节点 + 未来若干节点”的窗口。"""
+        """返回“当前节点 + 直接候选分支”的窗口。"""
         current_id = str(current_stage.get("id", "") or "").strip()
         if not current_id:
             return []
-        future_ids = [current_id]
-        if self.stage_index < len(self.planned_graph) - 1:
-            # 优先复用现有 planned_graph 中“当前位置之后”的部分。
-            future_ids.extend([str(item) for item in self.planned_graph[self.stage_index + 1 : self.stage_index + self.window_size + 1]])
-        if len(future_ids) <= 1:
-            # 如果当前图太短，再按 next_candidates 临时补一段未来窗口。
-            future_ids.extend(self._build_future_graph_from_stage(current_id, self.window_size))
-        return self._normalize_graph_path(future_ids, current_id)
+        return self._normalize_graph_path(
+            [current_id] + self._candidate_ids_for_stage(current_stage, self.window_size),
+            current_id,
+        )
 
     def _replace_future_graph(self, next_graph: List[str]) -> None:
-        # 保留历史前缀，只更新“从当前节点往后”的规划窗口。
-        current_prefix = self.planned_graph[: self.stage_index]
+        """用传入窗口替换当前节点的直接候选分支。"""
         normalized = self._normalize_graph_path(next_graph, self.get_current_stage_id())
-        self._link_graph_edges(normalized)
-        self.planned_graph = current_prefix + normalized
-        self.stage_index = min(self.stage_index, max(0, len(self.planned_graph) - 1))
+        if normalized:
+            self._apply_branch_candidates(normalized[0], normalized[1:])
 
     def _ensure_future_window(self) -> None:
-        # 运行中始终尽量保证“当前节点之后还有若干可预览节点”，
-        # 这样 prompt_builder 才能展示出一个短窗口，而不是只剩当前点。
+        """规整当前路径指针，不再自动臆造未来节点。"""
         if not self.planned_graph:
             self.planned_graph = self._build_default_graph(self.initial_stage_id)
             self.stage_index = 0
             return
-        remaining = len(self.planned_graph) - self.stage_index - 1
-        if remaining >= self.window_size:
-            return
-        current_id = self.get_current_stage_id()
-        needed = self.window_size - remaining
-        self.planned_graph.extend(self._build_future_graph_from_stage(current_id, needed))
         self.planned_graph = self._normalize_graph_ids(self.planned_graph)
+        self.stage_index = min(max(0, int(self.stage_index)), max(0, len(self.planned_graph) - 1))
 
     def _build_default_graph(self, initial_stage_id: str) -> List[str]:
+        """构造只包含起始节点的已访问路径。"""
         start_id = str(initial_stage_id or "").strip()
         if not start_id or start_id not in self.stage_catalog:
             start_id = next(iter(self.stage_catalog.keys()))
-        graph_path = [start_id]
-        # 默认图不是完整剧情，只是“当前点 + 一个有限长度的前瞻窗口”。
-        graph_path.extend(self._build_future_graph_from_stage(start_id, self.window_size))
-        return self._normalize_graph_ids(graph_path)
+        return self._normalize_graph_ids([start_id])
 
-    def _build_future_graph_from_stage(self, stage_id: str, count: int) -> List[str]:
+    def _candidate_ids_for_stage(self, stage: Dict[str, Any], count: int) -> List[str]:
+        """清洗并截断单个节点的 next_candidates。"""
+        if not isinstance(stage, dict):
+            return []
+        stage_id = str(stage.get("id", "") or "").strip()
+        limit = max(0, int(count))
         results: List[str] = []
-        current_id = str(stage_id or "").strip()
-        seen = {current_id}
-        for _ in range(max(0, int(count))):
-            stage = self.stage_catalog.get(current_id, {})
-            next_candidates = stage.get("next_candidates", []) if isinstance(stage, dict) else []
-            if not isinstance(next_candidates, list) or not next_candidates:
+        seen = {stage_id}
+        for candidate in self._to_list(stage.get("next_candidates", [])):
+            candidate_id = str(candidate or "").strip()
+            if (
+                not candidate_id
+                or candidate_id in seen
+                or candidate_id not in self.stage_catalog
+            ):
+                continue
+            seen.add(candidate_id)
+            results.append(candidate_id)
+            if len(results) >= limit:
                 break
-            next_id = ""
-            for candidate in next_candidates:
-                candidate_id = str(candidate or "").strip()
-                if candidate_id and candidate_id in self.stage_catalog:
-                    # 当前实现选择第一个合法候选，说明 future graph 是“弱分支”的：
-                    # 支持多个候选配置，但默认只走第一条可行路径。
-                    next_id = candidate_id
-                    break
-            if not next_id:
-                break
-            if next_id in seen:
-                # 防止 A -> B -> A 这种配置错误导致死循环。
-                break
-            seen.add(next_id)
-            results.append(next_id)
-            current_id = next_id
         return results
+
+    def _apply_branch_candidates(self, parent_id: str, child_ids: List[str]) -> None:
+        """把若干子分支写回父节点的 next_candidates。"""
+        parent_key = str(parent_id or "").strip()
+        if parent_key not in self.stage_catalog:
+            return
+        normalized: List[str] = []
+        seen = {parent_key}
+        for child_id in child_ids:
+            key = str(child_id or "").strip()
+            if not key or key in seen or key not in self.stage_catalog:
+                continue
+            seen.add(key)
+            normalized.append(key[:80])
+            if len(normalized) >= self.window_size:
+                break
+        self.stage_catalog[parent_key]["next_candidates"] = normalized
+
+    def _ensure_branch_candidates(self, parent_id: str, child_ids: List[str]) -> None:
+        """把目标分支补进父节点候选中，保留原有兄弟分支。"""
+        parent_key = str(parent_id or "").strip()
+        if parent_key not in self.stage_catalog:
+            return
+        existing = self._candidate_ids_for_stage(self.stage_catalog[parent_key], self.window_size)
+        merged = existing + [str(item or "").strip() for item in child_ids]
+        self._apply_branch_candidates(parent_key, merged)
+
+    def _reachable_stage_ids(self) -> set:
+        """返回已访问路径和候选分支能到达的节点 ID。"""
+        roots = self._normalize_graph_ids(self.planned_graph or [self.initial_stage_id])
+        reachable = set()
+        stack = list(roots)
+        while stack:
+            stage_id = str(stack.pop() or "").strip()
+            if not stage_id or stage_id in reachable or stage_id not in self.stage_catalog:
+                continue
+            reachable.add(stage_id)
+            stage = self.stage_catalog.get(stage_id, {})
+            for candidate_id in self._candidate_ids_for_stage(stage, 8):
+                if candidate_id not in reachable:
+                    stack.append(candidate_id)
+        return reachable
 
     def _link_graph_edges(self, graph_ids: List[str]) -> None:
         ids = self._normalize_graph_ids(graph_ids)
@@ -964,41 +963,289 @@ class ComplaintGraphManager:
                 count += 1
         return count
 
-    def _infer_graph_signal(
+    def _fallback_transition_signal(
+        self,
+        current_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+    ) -> Dict[str, Any]:
+        """在没有 LLM 判定时，用轻量规则给出保守转移信号。"""
+        matched, confidence, reason = self._heuristic_match(
+            current_stage=current_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+        )
+        action = self._decide_action(
+            current_stage=current_stage,
+            matched=matched,
+            match_confidence=confidence,
+            session_context=session_context,
+            conversation_content=conversation_content,
+        )
+        return {
+            "matched": bool(matched),
+            "match_confidence": round(float(confidence), 4),
+            "match_reason": str(reason or "")[:180],
+            "action": action,
+            "next_graph": self._preview_future_graph(current_stage),
+            "stage_updates": [],
+        }
+
+    def _infer_transition_signal(
         self,
         completion_func: Callable[[str], str],
+        current_stage: Dict[str, Any],
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
+        fallback_signal: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        prompt = self._build_graph_prompt(session_context, conversation_content, llm_cfg)
-        raw = ""
+        """调用 LLM 判定本轮是否推进主诉节点。"""
+        prompt = self._build_transition_prompt(
+            current_stage=current_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_cfg=llm_cfg,
+            fallback_signal=fallback_signal,
+        )
         try:
             raw = str(completion_func(prompt) or "")
         except Exception:
             raw = ""
         parsed = self._parse_json_object(raw)
-        return self._normalize_llm_signal(parsed)
+        return self._normalize_transition_signal(parsed, current_stage)
 
-    def _build_graph_prompt(
+    def _build_transition_prompt(
         self,
+        current_stage: Dict[str, Any],
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
+        fallback_signal: Dict[str, Any],
     ) -> str:
-        # 给 LLM 的任务不是“诊断病情”，而是“判断当前主诉节点是否被触及”。
+        """构造主诉图推进判定 prompt。"""
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        current_graph_window = self.get_current_graph_window(self.window_size + 1)
+        candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
         payload = {
-            "current_stage": self.get_current_stage(),
-            "current_graph_window": current_graph_window,
-            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
-            "window_size": int(self.window_size),
-            "needs_graph_expansion": len(current_graph_window) < self.window_size + 1,
+            "task": "transition_decision",
+            "current_stage": copy.deepcopy(current_stage),
+            "candidate_stages": [copy.deepcopy(self.stage_catalog[item]) for item in candidate_ids],
+            "candidate_ids": candidate_ids,
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-            "allowed_actions": ["hold", "advance", "replan", "jump"],
+            "fallback_signal": copy.deepcopy(fallback_signal if isinstance(fallback_signal, dict) else {}),
+            "state_duration_minutes": round(float(self.get_state_duration()), 4),
+            "recent_dialogue_history": copy.deepcopy(self.dialogue_history[-3:]),
+        }
+        return render_prompt(
+            "depression/graph_transition",
+            {"payload_json": json.dumps(payload, ensure_ascii=False)},
+        )
+
+    def _normalize_transition_signal(
+        self,
+        payload: Any,
+        current_stage: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """清洗 LLM 的推进判定结果。"""
+        if not isinstance(payload, dict):
+            return None
+        current_id = str(current_stage.get("id", "") or "").strip()
+        candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
+        action = str(payload.get("action", "hold") or "hold").strip().lower()
+        if action not in {"hold", "advance", "jump"}:
+            action = "hold"
+        target_id = str(
+            payload.get("target_stage_id", payload.get("next_stage_id", "")) or ""
+        ).strip()
+        if not target_id and action in {"advance", "jump"} and candidate_ids:
+            target_id = candidate_ids[0]
+        if action == "advance" and target_id not in candidate_ids:
+            action = "hold"
+            target_id = ""
+        if action == "jump" and target_id not in self.stage_catalog:
+            action = "hold"
+            target_id = ""
+        confidence = self._bounded_float(
+            payload.get("confidence", payload.get("match_confidence", 0.0)),
+            0.0,
+            0.0,
+            1.0,
+        )
+        if action in {"advance", "jump"} and confidence < self.min_match_confidence:
+            action = "hold"
+            target_id = ""
+        next_graph = [current_id]
+        if target_id:
+            next_graph.append(target_id)
+        return {
+            "matched": self._coerce_bool(payload.get("matched_current_stage", action != "hold")),
+            "match_confidence": round(float(confidence), 4),
+            "match_reason": str(payload.get("reason", payload.get("match_reason", "")) or "")[:180],
+            "action": action,
+            "next_graph": next_graph,
+            "stage_updates": [],
+        }
+
+    def _stage_needs_branch_plan(self, stage: Dict[str, Any]) -> bool:
+        """判断当前节点是否需要调用规划器补直接子分支。"""
+        if not isinstance(stage, dict):
+            return False
+        if self._coerce_bool(stage.get("is_terminal_stage", False)):
+            return False
+        return not self._candidate_ids_for_stage(stage, self.window_size)
+
+    def _infer_branch_plan(
+        self,
+        completion_func: Callable[[str], str],
+        parent_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """两阶段生成当前节点的候选子分支。"""
+        seed_payload = self._call_graph_planner(
+            completion_func=completion_func,
+            mode="branch_seed",
+            parent_stage=parent_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_cfg=llm_cfg,
+        )
+        seeds = self._normalize_branch_seeds(seed_payload)
+        stages: List[Dict[str, Any]] = []
+        for seed in seeds[: self.window_size]:
+            detail_payload = self._call_graph_planner(
+                completion_func=completion_func,
+                mode="branch_detail",
+                parent_stage=parent_stage,
+                session_context=session_context,
+                conversation_content=conversation_content,
+                llm_cfg=llm_cfg,
+                candidate_seed=seed,
+            )
+            stages.append(self._normalize_branch_detail(detail_payload, seed))
+        return stages
+
+    def _call_graph_planner(
+        self,
+        completion_func: Callable[[str], str],
+        mode: str,
+        parent_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        candidate_seed: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """调用主诉图规划 prompt 并解析 JSON 对象。"""
+        prompt = self._build_graph_prompt(
+            mode=mode,
+            parent_stage=parent_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_cfg=llm_cfg,
+            candidate_seed=candidate_seed,
+        )
+        try:
+            raw = str(completion_func(prompt) or "")
+        except Exception:
+            raw = ""
+        parsed = self._parse_json_object(raw)
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _normalize_branch_seeds(self, payload: Any) -> List[Dict[str, Any]]:
+        """清洗第一阶段返回的简略子节点。"""
+        if not isinstance(payload, dict):
+            return []
+        raw_items = (
+            payload.get("children")
+            or payload.get("branches")
+            or payload.get("next_candidates")
+            or payload.get("stage_updates")
+            or payload.get("next_graph")
+            or []
+        )
+        seeds: List[Dict[str, Any]] = []
+        seen = {self.get_current_stage_id()}
+        for item in self._to_list(raw_items):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", item.get("name", "")) or "").strip()
+            summary = str(item.get("summary", item.get("description", label)) or label).strip()
+            stage_id = str(item.get("id", "") or "").strip() or self._make_stage_id(label or summary)
+            if not stage_id or stage_id in seen:
+                continue
+            seen.add(stage_id)
+            seeds.append(
+                {
+                    "id": stage_id[:80],
+                    "label": (label or stage_id)[:80],
+                    "summary": self._clip_text(summary or label or stage_id, limit=220),
+                }
+            )
+            if len(seeds) >= self.window_size:
+                break
+        return seeds
+
+    def _normalize_branch_detail(self, payload: Any, seed: Dict[str, Any]) -> Dict[str, Any]:
+        """清洗第二阶段返回的完整子节点，失败时用 seed 补默认字段。"""
+        detail: Dict[str, Any] = {}
+        if isinstance(payload, dict):
+            if isinstance(payload.get("stage"), dict):
+                detail = copy.deepcopy(payload.get("stage", {}))
+            elif isinstance(payload.get("stage_update"), dict):
+                detail = copy.deepcopy(payload.get("stage_update", {}))
+            elif any(key in payload for key in ["id", "label", "summary", "core_belief"]):
+                detail = copy.deepcopy(payload)
+            else:
+                updates = self._to_list(payload.get("stage_updates", []))
+                for item in updates:
+                    if isinstance(item, dict):
+                        detail = copy.deepcopy(item)
+                        break
+        merged = copy.deepcopy(seed if isinstance(seed, dict) else {})
+        merged.update(detail)
+        return self._sanitize_stage(merged, source="llm")
+
+    def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
+        """写入子节点并更新父节点 next_candidates。"""
+        child_ids: List[str] = []
+        for stage in child_stages:
+            normalized = self._sanitize_stage(stage, source=str(stage.get("source", "llm") or "llm"))
+            stage_id = str(normalized.get("id", "") or "").strip()
+            if not stage_id or stage_id == parent_id or stage_id in child_ids:
+                continue
+            normalized["next_candidates"] = []
+            self.stage_catalog[stage_id] = normalized
+            child_ids.append(stage_id)
+            if len(child_ids) >= self.window_size:
+                break
+        self._apply_branch_candidates(parent_id, child_ids)
+        self._prune_unknown_next_candidates(child_ids + [str(parent_id or "").strip()])
+        return child_ids
+
+    def _build_graph_prompt(
+        self,
+        mode: str,
+        parent_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        candidate_seed: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """构造分支规划器 prompt。"""
+        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
+        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        payload = {
+            "mode": str(mode or "branch_seed"),
+            "current_stage": copy.deepcopy(parent_stage),
+            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
+            "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
+            "window_size": int(self.window_size),
+            "candidate_seed": copy.deepcopy(candidate_seed if isinstance(candidate_seed, dict) else {}),
+            "session_context": session_context,
+            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
         }
         payload_json = json.dumps(payload, ensure_ascii=False)
         return render_prompt(
@@ -1007,8 +1254,8 @@ class ComplaintGraphManager:
         )
 
     def _normalize_llm_signal(self, payload: Any) -> Optional[Dict[str, Any]]:
-        # 把 LLM 的自由输出压缩成状态机能消费的受限结构，
-        # 同时对低置信结果做降级，避免 LLM 过度推进节点。
+        # 把外部显式转移信号压缩成状态机能消费的受限结构。
+        # graph_planner 本身不再走这个入口。
         if not isinstance(payload, dict):
             return None
 
@@ -1267,19 +1514,6 @@ class ComplaintGraphManager:
             "evidence_ids": [],
         }
         return payload
-
-    def _is_graph_window_init_context(self, session_context: Dict[str, Any]) -> bool:
-        scene = (
-            session_context.get("scene", {})
-            if isinstance(session_context.get("scene", {}), dict)
-            else {}
-        )
-        interaction_type = str(scene.get("interaction_type", "") or "").strip()
-        runtime_source = str(self._runtime_event_from_context(session_context).get("source", "") or "").strip()
-        return interaction_type in {"主诉图初始化", "主诉图补足"} or runtime_source in {
-            "graph_window_init",
-            "graph_window_expansion",
-        }
 
     def _track_dialogue(
         self,

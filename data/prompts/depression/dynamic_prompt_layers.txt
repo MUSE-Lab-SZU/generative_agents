@@ -32,14 +32,14 @@ ${graph_window_section}
 
 @@ stage_graph_window_section
 
-当前窗口中的主诉走向：
+当前节点的候选主诉分支：
 ${graph_window_items}${next_limit_section}
 
 @@ dynamic_stage_graph_window_item
 - [${marker}] ${label}：${summary}
 
 @@ dynamic_stage_next_limit_section
-- 若本轮确实出现推进，最多只自然靠近「${next_label}」，不要跨越式跳转。
+- 若本轮确实出现推进，只能自然靠近候选分支之一：${candidate_labels}；不要跨越式跳转。
 
 @@ context_layer
 === 会话上下文层 ===

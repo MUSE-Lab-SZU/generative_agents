@@ -129,9 +129,8 @@ class DynamicPromptBuilder:
             for idx, stage in enumerate(current_window):
                 if not isinstance(stage, dict):
                     continue
-                # idx=0 永远是当前节点；后面的节点只是“可能的后续方向”，
-                # 不是命令式要求角色立即跨过去。
-                marker = "当前" if idx == 0 else f"后续{idx}"
+                # idx=0 永远是当前节点；后面的节点是并列候选分支。
+                marker = "当前" if idx == 0 else f"分支{idx}"
                 graph_window_items.append(
                     self._render_block(
                         "dynamic_stage_graph_window_item",
@@ -144,11 +143,15 @@ class DynamicPromptBuilder:
                 )
             next_limit_section = ""
             if len(current_window) > 1:
-                next_label = str(current_window[1].get("label", "") or "").strip() if isinstance(current_window[1], dict) else ""
-                if next_label:
+                candidate_labels = [
+                    str(stage.get("label", "") or "").strip()
+                    for stage in current_window[1:]
+                    if isinstance(stage, dict) and str(stage.get("label", "") or "").strip()
+                ]
+                if candidate_labels:
                     next_limit_section = self._render_block(
                         "dynamic_stage_next_limit_section",
-                        {"next_label": next_label},
+                        {"candidate_labels": "、".join(candidate_labels[:6])},
                     )
             graph_window_section = render_prompt_section(
                 "depression/dynamic_prompt_layers",

@@ -904,7 +904,7 @@ class Agent:
             return str(self.scratch.currently or "")
 
     def _initialize_depression_graph_window(self):
-        """启动/恢复时让 LLM 补足运行态主诉图窗口。"""
+        """启动/恢复时让 LLM 为当前主诉节点补候选分支。"""
         if not self.depression_dynamic or not self.llm_available():
             return None
         try:

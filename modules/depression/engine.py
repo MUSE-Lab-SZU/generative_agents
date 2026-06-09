@@ -144,19 +144,27 @@ class DepressionSimulationEngine:
             interaction_type=interaction_type,
             conversation_content=conversation_content,
         )
-        # 第 2 步：先在当前状态上做“如果这轮发生，会怎样”的评估。
-        evaluation = self.graph_manager.evaluate_turn(
+        # 第 2 步：克隆一个 manager 做 preview evaluate/commit，避免污染真实状态。
+        preview_manager = ComplaintGraphManager.from_dict(
+            self.graph_manager.to_dict(), now_provider=self._clock_provider
+        )
+        evaluation = preview_manager.evaluate_turn(
             session_context=session_context,
             conversation_content=conversation_content,
             completion_func=roadmap_completion_func,
             llm_cfg=roadmap_llm_cfg,
             llm_signal=llm_transition_signal,
         )
-        # 第 3 步：克隆一个 manager 做 preview commit，避免污染真实状态。
-        preview_manager = ComplaintGraphManager.from_dict(
-            self.graph_manager.to_dict(), now_provider=self._clock_provider
-        )
+        # 第 3 步：在克隆状态上提交预览评估。
         preview_graph = preview_manager.commit_turn(copy.deepcopy(evaluation))
+        if callable(roadmap_completion_func):
+            preview_graph = preview_manager.ensure_graph_window(
+                session_context=session_context,
+                conversation_content=conversation_content,
+                completion_func=roadmap_completion_func,
+                llm_cfg=roadmap_llm_cfg,
+                record_evaluation=False,
+            )
         current_stage = preview_manager.get_current_stage()
         # 第 4 步：在 preview 后的节点上推断记忆和瞬时情绪。
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
@@ -362,7 +370,7 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """启动或恢复时用 LLM 补足运行态主诉图窗口，不改变当前 stage。"""
+        """启动或恢复时用 LLM 补足当前主诉节点的候选分支，不改变当前 stage。"""
         if not self.enabled:
             return self._disabled_runtime()
         if not callable(roadmap_completion_func):
@@ -373,7 +381,7 @@ class DepressionSimulationEngine:
             other_agent="",
             relationship="",
             interaction_type=interaction_type,
-            conversation_content="初始化主诉图窗口：请基于当前主诉节点，规划自然、保守、可推进的后续主诉图节点。",
+            conversation_content="初始化主诉图分支：请基于当前主诉节点，规划自然、保守、可推进的候选子节点。",
         )
         graph_snapshot = self.graph_manager.initialize_graph_window(
             session_context=session_context,
@@ -505,7 +513,7 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """强制切换到指定主诉节点，并可选择让 LLM 重新补足后续图窗口。"""
+        """强制切换到指定主诉节点，并可选择让 LLM 重新补足候选分支。"""
         self.graph_manager.force_stage(stage_id, reason=reason)
         if callable(roadmap_completion_func):
             session_context = self.context_builder.build_context(
