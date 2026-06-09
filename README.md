@@ -28,6 +28,7 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-08：修复`staged_eval`在G1组触发失败的bug，触发原因是0603的判断条件修改
 - 2026-06-07：优化`experiments/config/groups`配置、修复`runshells/run_batch_experiment.py`中断时可能导致`config.json`文件错乱问题
 - 2026-06-07：新增vllm部署相关脚本，使用`bash runshells/vllm_services.sh start`命令启动vllm，使用`bash runshells/stop_vllm_services.sh`命令关闭vllm，同时修改了`config.json`和相关llm调用函数，新增`test/live_vllm_preflight.py`运行前vllm健康检查脚本
 - 2026-06-05：新增运行前ollama健康检查脚本`test/live_ollama_preflight.py`。新增embedding请求超时机制，之前只设置了chat-llm请求超时。
