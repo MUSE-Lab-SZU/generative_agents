@@ -18,7 +18,7 @@ class ExternalMemoryBridge:
 
     MAP_FILENAME = "external_memory_node_map.json"
     RECENT_RAW_SECTION_TITLE = "【近期原文（本服务入库）】"
-    LEVEL_ACTION_RETRY_DELAYS_S = (1.0, 2.0, 3.0, 5.0, 8.0, 11.0, 11.0)
+    LEVEL_ACTION_RETRY_DELAYS_S = (1.0, 2.0, 3.0, 5.0, 8.0, 11.0, 15.0, 15.0, 15.0, 15.0)
 
     def __init__(
         self,

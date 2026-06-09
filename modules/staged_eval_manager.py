@@ -195,7 +195,22 @@ class StagedEvalManager:
     def _compute_completed_session_count(self, runtime_config: Dict[str, Any]) -> int:
         if not isinstance(runtime_config, dict):
             return 0
-        return self._compute_resident_chat_completed_count(runtime_config)
+        count, _ = self._resolve_completed_session_count(runtime_config)
+        return count
+
+    def _resolve_completed_session_count(self, runtime_config: Dict[str, Any]) -> tuple[int, str]:
+        if not isinstance(runtime_config, dict):
+            return 0, "none"
+
+        resident_count = self._compute_resident_chat_completed_count(runtime_config)
+        if resident_count > 0:
+            return resident_count, "resident_chat"
+
+        doctor_count = self._compute_doctor_completed_meeting_count(runtime_config)
+        if doctor_count > 0:
+            return doctor_count, "doctor_completed_meeting"
+
+        return 0, "none"
 
     def _compute_resident_chat_completed_count(self, runtime_config: Dict[str, Any]) -> int:
         if not isinstance(runtime_config, dict):
@@ -214,6 +229,49 @@ class StagedEvalManager:
             return 0
         count = self._safe_int(completed_counts.get(target_agent, 0), 0)
         return max(0, count)
+
+    def _compute_doctor_completed_meeting_count(self, runtime_config: Dict[str, Any]) -> int:
+        if not isinstance(runtime_config, dict):
+            return 0
+
+        state = runtime_config.get("intervention_state", {}) or {}
+        if not isinstance(state, dict):
+            return 0
+
+        session_eval_state = state.get("session_eval_state", {}) or {}
+        if not isinstance(session_eval_state, dict):
+            return 0
+
+        history_by_pair = session_eval_state.get("history_by_pair", {}) or {}
+        if not isinstance(history_by_pair, dict):
+            return 0
+
+        doctor_name = self._doctor_name(runtime_config)
+        target_agent = self._target_agent()
+        if not doctor_name or not target_agent:
+            return 0
+
+        pair_key = f"{doctor_name}::{target_agent}"
+        history = history_by_pair.get(pair_key, [])
+        if not isinstance(history, list) or not history:
+            return 0
+
+        completed_meeting_ids = []
+        seen_meeting_ids = set()
+        fallback_history_count = 0
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            fallback_history_count += 1
+            meeting_id = str(item.get("meeting_id", "") or "").strip()
+            if (not meeting_id) or (meeting_id in seen_meeting_ids):
+                continue
+            seen_meeting_ids.add(meeting_id)
+            completed_meeting_ids.append(meeting_id)
+
+        if completed_meeting_ids:
+            return len(completed_meeting_ids)
+        return fallback_history_count
 
     def _maybe_run_session_interval_trigger(
         self,
@@ -514,10 +572,12 @@ class StagedEvalManager:
     ) -> Dict[str, Any]:
         scales = worker_result.get("scale_summaries", {}) if isinstance(worker_result.get("scale_summaries", {}), dict) else {}
         worker_error = str(worker_result.get("error", "") or worker_run.get("error", "") or "").strip()
+        _, completed_session_count_source = self._resolve_completed_session_count(runtime_config)
         metadata = {
             "status": "ok" if worker_success else "worker_failed",
             "trigger_label": trigger_label,
             "completed_session_count": int(completed_session_count),
+            "completed_session_count_source": completed_session_count_source,
             "step_no": int(step_no),
             "sim_time": str(sim_time or ""),
             "snapshot_name": str(snapshot_name or ""),

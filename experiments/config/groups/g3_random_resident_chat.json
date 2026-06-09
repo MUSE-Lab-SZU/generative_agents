@@ -58,6 +58,9 @@
     "order_extract": {
       "enabled": false
     },
+    "memory_policy": {
+      "enabled": false
+    },
     "forced_llm": {
       "enabled": true
     }

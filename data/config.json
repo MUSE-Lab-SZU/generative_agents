@@ -52,7 +52,7 @@
       "write_mode": "hybrid"
     },
     "external_memory": {
-      "enabled": false,
+      "enabled": true,
       "base_url": "http://localhost:8031",
       "timeout": 10.0,
       "read_mode": "chat_only",
