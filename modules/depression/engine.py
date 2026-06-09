@@ -8,7 +8,6 @@ import os
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .bias_injector import ComplaintBiasInjector
 from .context_analyzer import SessionContextBuilder
 from .emotion_inferencer import EmotionInferencer
 from .memory_system import TraumaMemorySystem
@@ -32,7 +31,6 @@ class DepressionSimulationEngine:
     可以把本类理解成一个“编排器”：
     - `SessionContextBuilder`：先把对话场景整理成结构化上下文；
     - `ComplaintGraphManager`：判断当前是否仍处在同一主诉节点，是否推进；
-    - `ComplaintBiasInjector`：决定本轮要显性呈现哪些认知偏差；
     - `EmotionInferencer`：给出本轮瞬时情绪；
     - `DynamicPromptBuilder`：把以上内容拼回 prompt。
 
@@ -46,7 +44,7 @@ class DepressionSimulationEngine:
         config: Optional[Union[Dict[str, Any], str]] = None,
         clock_provider: Optional[Callable[[], datetime]] = None,
     ):
-        """解析配置并初始化主诉图、上下文、偏差、记忆、情绪和 prompt 子系统。"""
+        """解析配置并初始化主诉图、上下文、记忆、情绪和 prompt 子系统。"""
         resolved = self._resolve_config(config)
         self.raw_config = copy.deepcopy(resolved)
         self.config_path = str(resolved.get("_config_path", "") or "")
@@ -67,10 +65,6 @@ class DepressionSimulationEngine:
         self.graph_manager = ComplaintGraphManager(resolved, now_provider=self._clock_provider)
         self.context_builder = SessionContextBuilder(self_name=agent_name)
         self.context_analyzer = self.context_builder  # 兼容旧字段名
-        self.bias_injector = ComplaintBiasInjector(
-            library_override=((resolved.get("bias", {}) or {}).get("library_override", {}) if isinstance(resolved.get("bias", {}), dict) else {}),
-            selection_policy=((resolved.get("bias", {}) or {}).get("selection_policy", {}) if isinstance(resolved.get("bias", {}), dict) else {}),
-        )
         self.memory_system = TraumaMemorySystem(resolved.get("memory", {}))
         self.emotion_inferencer = EmotionInferencer(resolved.get("emotion", {}))
         self.prompt_builder = DynamicPromptBuilder(resolved.get("prompt", {}))
@@ -120,7 +114,6 @@ class DepressionSimulationEngine:
             current_stage=runtime.get("current_stage", {}),
             graph_snapshot=runtime.get("graph", {}),
             session_context=runtime.get("session_context", {}),
-            cognitive_biases=runtime.get("biases", []),
             activated_memories=runtime.get("memory_context", []),
             emotion=runtime.get("emotion", {}),
         )
@@ -165,8 +158,7 @@ class DepressionSimulationEngine:
         )
         preview_graph = preview_manager.commit_turn(copy.deepcopy(evaluation))
         current_stage = preview_manager.get_current_stage()
-        # 第 4 步：在 preview 后的节点上推断偏差、记忆和瞬时情绪。
-        biases = self.bias_injector.inject_bias(current_stage, session_context, conversation_content)
+        # 第 4 步：在 preview 后的节点上推断记忆和瞬时情绪。
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
         emotion = self._infer_emotion(
             current_stage=current_stage,
@@ -180,7 +172,6 @@ class DepressionSimulationEngine:
             current_stage=current_stage,
             graph_snapshot=preview_graph,
             session_context=session_context,
-            cognitive_biases=biases,
             activated_memories=memory_context,
             emotion=emotion,
         )
@@ -282,7 +273,7 @@ class DepressionSimulationEngine:
         emotion_completion_func: Optional[Callable[[str], str]] = None,
         disallow_jump: bool = False,
     ) -> Dict[str, Any]:
-        """执行提交流水线：评估主诉图、落盘状态、推断偏差记忆和情绪。"""
+        """执行提交流水线：评估主诉图、落盘状态、推断记忆和情绪。"""
         if not self.enabled:
             return self._disabled_runtime()
 
@@ -315,7 +306,6 @@ class DepressionSimulationEngine:
             )
         current_stage = self.graph_manager.get_current_stage()
 
-        biases = self.bias_injector.inject_bias(current_stage, session_context, conversation_content)
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
         emotion = self._infer_emotion(
             current_stage=current_stage,
@@ -338,8 +328,6 @@ class DepressionSimulationEngine:
             "evaluation": copy.deepcopy(evaluation),
             "session_context": session_context,
             "emotion": emotion,
-            "biases": biases,
-            "active_biases": [item.get("type") for item in biases if isinstance(item, dict)],
             "memory_context": memory_context,
             "interaction_count": self.interaction_count,
             "last_update": self.last_update_time.isoformat(),
@@ -504,7 +492,6 @@ class DepressionSimulationEngine:
             "current_stage": self.graph_manager.get_current_stage(),
             "graph": self.graph_manager.get_graph_snapshot(),
             "state_duration_minutes": self.graph_manager.get_state_duration(),
-            "active_biases": list(self.bias_injector.active_biases),
             "memory_context": copy.deepcopy(self.memory_system.memory_context),
             "emotion": copy.deepcopy(self.last_emotion),
             "interaction_count": self.interaction_count,
@@ -562,13 +549,12 @@ class DepressionSimulationEngine:
         return None
 
     def reset(self) -> None:
-        """重置交互计数、缓存情绪、上下文、主诉图、偏差和记忆运行态。"""
+        """重置交互计数、缓存情绪、上下文、主诉图和记忆运行态。"""
         self.interaction_count = 0
         self.last_emotion = {}
         self.last_session_context = {}
         self.last_update_time = self._now()
         self.graph_manager.reset()
-        self.bias_injector.active_biases.clear()
         self.memory_system.memory_context = []
 
     @classmethod
@@ -594,7 +580,6 @@ class DepressionSimulationEngine:
             "last_emotion": copy.deepcopy(self.last_emotion),
             "last_session_context": copy.deepcopy(self.last_session_context),
             "complaint_graph_manager": self.graph_manager.to_dict(),
-            "bias_injector": self.bias_injector.to_dict(),
         }
         if not (config_reference.get("config_path") or config_reference.get("agent_dir")) and isinstance(self.raw_config, dict) and self.raw_config:
             payload["inline_config"] = copy.deepcopy(self.raw_config)
@@ -608,7 +593,7 @@ class DepressionSimulationEngine:
 
         阅读时可重点留意：
         1. 配置会被重新解析；
-        2. graph/context/bias/memory 都会分别恢复；
+        2. graph/context/memory 都会分别恢复；
         3. emotion/prompt_builder 会按最新配置重新实例化。
         """
         payload = payload if isinstance(payload, dict) else {}
@@ -652,16 +637,6 @@ class DepressionSimulationEngine:
             self.context_builder.context_history = [copy.deepcopy(self.last_session_context)]
         self.context_builder.set_self_name(self._infer_agent_name(refreshed))
         self.context_analyzer = self.context_builder
-
-        bias_payload = payload.get("bias_injector", {}) if isinstance(payload.get("bias_injector", {}), dict) else {}
-        bias_config = refreshed.get("bias", {}) if isinstance(refreshed.get("bias", {}), dict) else {}
-        self.bias_injector = ComplaintBiasInjector(
-            library_override=bias_config.get("library_override", {}) if isinstance(bias_config.get("library_override", {}), dict) else {},
-            selection_policy=bias_config.get("selection_policy", {}) if isinstance(bias_config.get("selection_policy", {}), dict) else {},
-        )
-        active_biases = bias_payload.get("active_biases", [])
-        if isinstance(active_biases, list):
-            self.bias_injector.active_biases = [str(item) for item in active_biases if str(item).strip()]
 
         memory_payload = payload.get("memory_system", {}) if isinstance(payload.get("memory_system", {}), dict) else {}
         self.memory_system = TraumaMemorySystem(refreshed.get("memory", {}))

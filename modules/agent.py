@@ -153,7 +153,7 @@ class Agent:
         depression_chat_ctx = None
         if func_hint == "generate_chat":
             # 对话生成是动态抑郁模块最重要的挂载点：
-            # 先 preview 当前轮应该呈现什么“主诉节点/情绪/偏差”，
+            # 先 preview 当前轮应该呈现什么“主诉节点/情绪”，
             # 再把生成好的提示块注入原始聊天 prompt。
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
                 args=args,

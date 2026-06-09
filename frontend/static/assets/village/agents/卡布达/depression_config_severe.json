@@ -33,22 +33,6 @@
           "hopelessness": 0.82,
           "trust": 0.16
         },
-        "bias_profile": {
-          "dominant": ["all_or_nothing", "catastrophizing", "personalization"],
-          "secondary": ["mental_filter", "fortune_telling"],
-          "max_active": 3,
-          "thought_templates": {
-            "all_or_nothing": [
-              "这不是一次工作上的失败，而像是证明我整个人都不行。"
-            ],
-            "catastrophizing": [
-              "这件事往后只会越拖越糟，我很难想象还能回到正常。"
-            ],
-            "personalization": [
-              "不管别人怎么解释，我还是会觉得最后都是我自己的问题。"
-            ]
-          }
-        },
         "advance_signals": [
           "能说出日常功能明显受影响",
           "承认自己很难一个人扛",
@@ -76,12 +60,6 @@
       }
     ]
   },
-  "bias": {
-    "library_override": {},
-    "selection_policy": {
-      "default_max_active": 3
-    }
-  },
   "emotion": {
     "llm_enabled": true,
     "volatility_limit": 0.08
@@ -91,7 +69,6 @@
   },
   "prompt": {
     "include_graph_window": true,
-    "include_bias_layer": true,
     "include_emotion_layer": true
   }
 }

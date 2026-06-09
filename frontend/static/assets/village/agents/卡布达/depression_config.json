@@ -33,19 +33,6 @@
           "hopelessness": 0.68,
           "trust": 0.22
         },
-        "bias_profile": {
-          "dominant": ["all_or_nothing", "personalization"],
-          "secondary": ["catastrophizing"],
-          "max_active": 2,
-          "thought_templates": {
-            "all_or_nothing": [
-              "既然连最基本的工作都保不住，那我整体就是失败的。"
-            ],
-            "personalization": [
-              "表面上像是公司问题，但我还是会觉得根子是在我这个人身上。"
-            ]
-          }
-        },
         "advance_signals": [
           "开始描述失业后具体卡住的地方",
           "承认自己很累",
@@ -73,12 +60,6 @@
       }
     ]
   },
-  "bias": {
-    "library_override": {},
-    "selection_policy": {
-      "default_max_active": 2
-    }
-  },
   "emotion": {
     "llm_enabled": true,
     "volatility_limit": 0.12
@@ -88,7 +69,6 @@
   },
   "prompt": {
     "include_graph_window": true,
-    "include_bias_layer": true,
     "include_emotion_layer": true
   }
 }

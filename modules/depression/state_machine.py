@@ -34,7 +34,6 @@ class ComplaintStage:
     narrative_focus: List[str] = field(default_factory=list)
     speaking_style: Dict[str, Any] = field(default_factory=dict)
     emotion_vector: Dict[str, float] = field(default_factory=dict)
-    bias_profile: Dict[str, Any] = field(default_factory=dict)
     advance_signals: List[str] = field(default_factory=list)
     hold_signals: List[str] = field(default_factory=list)
     relation_modifiers: Dict[str, Any] = field(default_factory=dict)
@@ -82,11 +81,6 @@ class ComplaintGraphManager:
             "shame": 0.40,
             "hopelessness": 0.35,
             "trust": 0.20,
-        },
-        "bias_profile": {
-            "dominant": ["mental_filter"],
-            "secondary": ["emotional_reasoning"],
-            "max_active": 1,
         },
         "advance_signals": [],
         "hold_signals": ["沉默", "不知道说什么"],
@@ -1184,7 +1178,6 @@ class ComplaintGraphManager:
         core_belief = str(payload.get("core_belief", "") or "").strip()
         speaking_style = payload.get("speaking_style", {}) if isinstance(payload.get("speaking_style", {}), dict) else {}
         emotion_vector = payload.get("emotion_vector", {}) if isinstance(payload.get("emotion_vector", {}), dict) else {}
-        bias_profile = payload.get("bias_profile", {}) if isinstance(payload.get("bias_profile", {}), dict) else {}
         relation_modifiers = payload.get("relation_modifiers", {}) if isinstance(payload.get("relation_modifiers", {}), dict) else {}
 
         # 这里就是 JSON 配置落地为运行时 stage 的关键位置。
@@ -1192,7 +1185,6 @@ class ComplaintGraphManager:
         # - narrative_focus
         # - speaking_style
         # - emotion_vector
-        # - bias_profile
         # 最终都会被规整成下面这个 ComplaintStage 结构。
         normalized = ComplaintStage(
             id=stage_id[:80],
@@ -1214,7 +1206,6 @@ class ComplaintGraphManager:
                 "hopelessness": round(self._bounded_float(emotion_vector.get("hopelessness"), 0.35, 0.0, 1.0), 4),
                 "trust": round(self._bounded_float(emotion_vector.get("trust"), 0.20, 0.0, 1.0), 4),
             },
-            bias_profile=copy.deepcopy(bias_profile),
             advance_signals=[str(item)[:80] for item in self._to_list(payload.get("advance_signals", [])) if str(item).strip()][:12],
             hold_signals=[str(item)[:80] for item in self._to_list(payload.get("hold_signals", [])) if str(item).strip()][:12],
             relation_modifiers=copy.deepcopy(relation_modifiers),

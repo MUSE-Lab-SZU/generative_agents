@@ -80,7 +80,6 @@ class SnapshotRow:
     dynamic_env_trigger_potential: Optional[float]
     dynamic_trigger_count: int
     dynamic_trigger_names: str
-    dynamic_active_biases_count: int
     dynamic_activated_memory_count: int
     dynamic_accumulated_triggers: Dict[str, float]
     dynamic_last_update_time: str
@@ -361,7 +360,6 @@ def _extract_row(
     context_analyzer = _to_dict(runtime.get("context_analyzer", {}))
     current_context = _to_dict(context_analyzer.get("current_context", {}))
     env = _to_dict(current_context.get("environment", {}))
-    bias_injector = _to_dict(runtime.get("bias_injector", {}))
     memory_system = _to_dict(runtime.get("memory_system", {}))
     accumulated_raw = _to_dict(state_machine.get("accumulated_triggers", {}))
     accumulated_triggers: Dict[str, float] = {}
@@ -406,7 +404,6 @@ def _extract_row(
         dynamic_env_trigger_potential=_to_float(env.get("trigger_potential")),
         dynamic_trigger_count=len(_to_list(current_context.get("triggers", []))),
         dynamic_trigger_names="|".join(trigger_names),
-        dynamic_active_biases_count=len(_to_list(bias_injector.get("active_biases", []))),
         dynamic_activated_memory_count=len(_to_list(memory_system.get("activated_memory_ids", []))),
         dynamic_accumulated_triggers=accumulated_triggers,
         dynamic_last_update_time=str(runtime.get("last_update_time", "") or ""),
@@ -530,7 +527,6 @@ def _rows_to_dicts(rows: List[SnapshotRow], trigger_keys: List[str]) -> List[Dic
             "dynamic_env_trigger_potential": r.dynamic_env_trigger_potential,
             "dynamic_trigger_count": r.dynamic_trigger_count,
             "dynamic_trigger_names": r.dynamic_trigger_names,
-            "dynamic_active_biases_count": r.dynamic_active_biases_count,
             "dynamic_activated_memory_count": r.dynamic_activated_memory_count,
             "dynamic_last_update_time": r.dynamic_last_update_time,
             "intervention_lock_enabled": r.intervention_lock_enabled,

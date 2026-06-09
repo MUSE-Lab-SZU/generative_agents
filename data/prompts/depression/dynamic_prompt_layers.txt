@@ -65,18 +65,6 @@ ${optional_sections}
 @@ dynamic_context_flags_section
 场景附加判断：${flags}
 
-@@ bias_empty_layer
-=== 认知偏差层 ===
-当前没有特别突出的自动化偏差被显性调用。
-
-@@ bias_layer
-=== 认知偏差层 ===
-以下自动化偏差会影响你如何解释现实：
-${bias_items}这些偏差会让你更容易用绝对化、自责化或悲观化的方式理解正在发生的事。
-
-@@ dynamic_bias_item
-- ${name}：「${thought}」
-
 @@ emotion_layer
 === 瞬时情绪与表达指导层 ===
 当前瞬时情绪标签：${label}
@@ -120,4 +108,3 @@ ${instruction_sections}
 
 @@ dynamic_emotion_memory_section
 - 记忆层当前虽非主驱动，但如有相关旧叙事浮现，也只能作为轻微背景，不要压过主诉节点。
-

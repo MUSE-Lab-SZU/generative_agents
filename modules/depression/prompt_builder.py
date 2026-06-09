@@ -8,7 +8,7 @@ from .prompt_templates import load_prompt_json, render_prompt_section
 
 
 class DynamicPromptBuilder:
-    """构建主诉节点、会话、偏差与瞬时情绪组成的多层 Prompt。"""
+    """构建主诉节点、会话与瞬时情绪组成的多层 Prompt。"""
 
     PROMPT_CONFIG: Dict[str, Any] = load_prompt_json("depression/depression_prompt_config", {})
     CONTEXT_FLAG_TEXTS: Dict[str, str] = (
@@ -21,7 +21,6 @@ class DynamicPromptBuilder:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config if isinstance(config, dict) else {}
         self.include_graph_window = bool(self.config.get("include_graph_window", True))
-        self.include_bias_layer = bool(self.config.get("include_bias_layer", True))
         self.include_emotion_layer = bool(self.config.get("include_emotion_layer", True))
 
     def build_prompt(
@@ -30,20 +29,17 @@ class DynamicPromptBuilder:
         current_stage: Dict[str, Any],
         graph_snapshot: Dict[str, Any],
         session_context: Dict[str, Any],
-        cognitive_biases: List[Dict[str, Any]],
         activated_memories: List[Dict[str, Any]],
         emotion: Optional[Dict[str, Any]] = None,
     ) -> str:
         # 层次顺序很重要：
-        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 偏差 -> 瞬时情绪。
+        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 瞬时情绪。
         # 它体现的是“稳定人设在前，当前轮波动在后”的约束方向。
         layers = [
             self._build_base_layer(base_prompt),
             self._build_stage_layer(current_stage, graph_snapshot),
             self._build_context_layer(session_context),
         ]
-        if self.include_bias_layer:
-            layers.append(self._build_bias_layer(cognitive_biases))
         if self.include_emotion_layer:
             layers.append(self._build_emotion_layer(current_stage, emotion or {}, activated_memories))
         return self._combine_layers(layers)
@@ -258,35 +254,6 @@ class DynamicPromptBuilder:
                     "time_of_day": scene.get("time_of_day", "未知"),
                     "optional_sections": "".join(optional_sections).rstrip(),
                 },
-            ).strip()
-        )
-
-    def _build_bias_layer(self, biases: List[Dict[str, Any]]) -> str:
-        if not biases:
-            return self._with_trailing_newline(
-                render_prompt_section(
-                    "depression/dynamic_prompt_layers",
-                    "bias_empty_layer",
-                    {},
-                ).strip()
-            )
-        bias_items = []
-        for item in biases:
-            # bias 层给的是“内心自动化想法”的示例，而不是要求逐字照搬。
-            bias_items.append(
-                self._render_block(
-                    "dynamic_bias_item",
-                    {
-                        "name": item.get("name", item.get("type", "未知偏差")),
-                        "thought": item.get("thought", ""),
-                    },
-                )
-            )
-        return self._with_trailing_newline(
-            render_prompt_section(
-                "depression/dynamic_prompt_layers",
-                "bias_layer",
-                {"bias_items": "".join(bias_items)},
             ).strip()
         )
 
