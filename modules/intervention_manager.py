@@ -142,6 +142,7 @@ class InterventionManager:
                 step_no, self._fmt_dt(now), self.enabled, len(self.meeting_rules)
             )
         )
+        self._reset_step_flags()
         game_agents = getattr(game, "agents", {}) if isinstance(getattr(game, "agents", {}), dict) else {}
         if self.memory_injection:
             try:
@@ -368,6 +369,8 @@ class InterventionManager:
         skip_consult_artifacts = closed_meeting_kind == "resident_chat"
         if skip_consult_artifacts and closed_meeting_id:
             self._mark_resident_chat_completed(closed_patient_name)
+        elif closed_meeting_id:
+            self.mark_step_flag("forced_consult_happened", True)
         if skip_consult_artifacts:
             self._log_highlight(
                 "RESIDENT_CHAT_AFTER_CHAT_SKIP_CONSULT meeting_id={} speaker={} other={}".format(
@@ -529,6 +532,8 @@ class InterventionManager:
                             self._log_highlight(
                                 "MEMORY_INJECTION_SESSION_APPLY_ERROR detail={}".format(str(exc))
                             )
+                    if bool(audit.get("completed", False)):
+                        self.mark_step_flag("treatment_completed_this_step", True)
                     if self.stop_rule_scheduling_on_session_completed and bool(audit.get("completed", False)):
                         purged = self._purge_patient_meetings(
                             patient_name=patient_for_session.name,
@@ -3032,6 +3037,7 @@ class InterventionManager:
             self.state["doctor_current_meeting"] = {}
         if not isinstance(self.state.get("meeting_dedup"), dict):
             self.state["meeting_dedup"] = {}
+        self._ensure_step_flags_state_schema()
         resident_chat_state = self.state.get("resident_chat_state", {})
         if not isinstance(resident_chat_state, dict):
             resident_chat_state = {}
@@ -3052,6 +3058,37 @@ class InterventionManager:
         self._ensure_dialog_judge_trace_state_schema()
         self._ensure_session_eval_state_schema()
         self._ensure_forced_prompt_trace_state_schema()
+
+    def _ensure_step_flags_state_schema(self) -> None:
+        state = self.state.setdefault("step_flags", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.state["step_flags"] = state
+        for key in (
+            "forced_consult_happened",
+            "treatment_completed_this_step",
+            "staged_eval_triggered_this_step",
+        ):
+            state[key] = bool(state.get(key, False))
+
+    def _reset_step_flags(self) -> None:
+        self._ensure_state_schema()
+        flags = self.state.setdefault("step_flags", {})
+        flags["forced_consult_happened"] = False
+        flags["treatment_completed_this_step"] = False
+        flags["staged_eval_triggered_this_step"] = False
+
+    def mark_step_flag(self, flag_name: str, value: bool = True) -> None:
+        self._ensure_state_schema()
+        flags = self.state.setdefault("step_flags", {})
+        flags[str(flag_name or "").strip()] = bool(value)
+
+    def get_step_flags(self) -> Dict[str, Any]:
+        self._ensure_state_schema()
+        flags = self.state.get("step_flags", {})
+        if not isinstance(flags, dict):
+            return {}
+        return copy.deepcopy(flags)
 
     def _mark_resident_chat_completed(self, patient_name: str) -> None:
         patient = str(patient_name or "").strip()

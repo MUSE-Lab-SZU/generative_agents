@@ -28,6 +28,12 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-13：修复event记忆重复产生的问题
+- 2026-06-12：昨天做实验发现16h只跑了7个session对话，太长了。优化`modules/prompt/scratch.py`，使其可以根据`stride`调整计划decompose间隔。调整step=280、stride=720、每14步session对话1次（模拟现实的一周一次）
+- 2026-06-11：拉大step值（60->560）、把每4step/定期对话改成每28step/定期对话，模拟现实频率。治疗结束前只保留某些json快照，避免太多了不好审查。
+- 2026-06-10：把staged_eval从串行改成并发、把`run_batch_experiment.py`的所有条件实验从串行改成并发
+- 2026-06-09：合并学长更新的动态抑郁人设
+- 2026-06-09：新增实验脚本`runshells/run_batch_experiment.py`功能：显示运行时间和防磁盘空间不足。修改`config.json`的"max_completed_sessions"配置值，避免staged_eval只有3个的情况。
 - 2026-06-08：修复`staged_eval`在G1组触发失败的bug，触发原因是0603的判断条件修改
 - 2026-06-07：优化`experiments/config/groups`配置、修复`runshells/run_batch_experiment.py`中断时可能导致`config.json`文件错乱问题
 - 2026-06-07：新增vllm部署相关脚本，使用`bash runshells/vllm_services.sh start`命令启动vllm，使用`bash runshells/stop_vllm_services.sh`命令关闭vllm，同时修改了`config.json`和相关llm调用函数，新增`test/live_vllm_preflight.py`运行前vllm健康检查脚本
@@ -301,8 +307,8 @@ python -u customization/depression_scale_agent/app.py
 
 这个脚本面向“按实验组批量跑仿真并自动汇总评估结果”的场景，主流程是：
 
-1. 根据 `group × severity` 组合替换配置。
-2. 逐条件调用 `start.py` 跑仿真。
+1. 为每个 `group × severity` 条件生成独立的 runtime config，不再覆盖共享 `data/config.json`。
+2. 按 condition 调度 `start.py` 跑仿真；可通过 `--max-parallel` 并行运行多个条件。
 3. 收集 `judge_conversation.json`、`forced_prompt_traces/`、`conversation.json`、`staged_eval/` 等核心产物。
 4. 对 `scales/staged/` 下的阶段评估结果自动补齐评分文件。
 5. 汇总到 `results/experiment_data/reports/*_summary.json` 和 `*_summary.md`。
@@ -321,12 +327,29 @@ python3 runshells/run_batch_experiment.py --condition Counsel-G1-ALL
 python3 runshells/run_batch_experiment.py --condition Counsel-ALL-MOD
 ```
 
+常用控制参数：
+
+```bash
+python3 runshells/run_batch_experiment.py --max-parallel 2
+python3 runshells/run_batch_experiment.py --name my-batch --resume-batch
+python3 runshells/run_batch_experiment.py --name my-batch --resume-condition Counsel-G1-MILD
+```
+
+批量状态会写到：
+
+- `results/experiment_data/batch_state/<batch_name>/`
+- 每个 condition 一份状态文件，记录 `run_name`、`status`、`resume_allowed`、`last_completed_phase`
+- `runtime_configs/`：每个 condition 的运行时配置
+- `timings/`：每个 condition 的分片 timing 记录，批次结束后会合并成 `reports/<batch>_timings.jsonl`
+
 脚本顶部常量可以直接改当前批次的 `RUN_NAME`、`STEP`、`STRIDE`、`SCALE_AGENT`，以及是否执行 `merge`、`post_scale`、`compress`、记忆可视化、外置记忆审计。
 
 ### `staged_eval` 是怎么触发的
 
 - `start.py` 在首个 step 内先调用 `StagedEvalManager.maybe_run_t0(...)`，用于生成初始基线评估（`T0`）。
 - 每个 step 写完快照与对话后，再调用 `maybe_run_post_step_eval(...)` 检查是否触发阶段评估。
+- 触发后会先把评估任务排队，再由后台 worker 异步执行；仿真主循环不会同步等待 worker 完成。
+- 单个 run 当前默认同一时刻最多只有 1 个后台 `staged_eval` worker；仿真结束前会自动 drain，避免收集结果时漏 trigger。
 - 当完成对话次数命中 `session_interval` 倍数时，会生成 `session_2`、`session_4` 这类阶段点。
 - `session_N` 仍然沿用历史目录命名，但这里的 `N` 现在表示“第 N 次完成对话”。
 - 当目标医患 session 全部完成后，若开启 `t4_enabled`，会在 `t4_after_steps` 个仿真步之后再补一个 `T4` 观察点。
@@ -377,6 +400,10 @@ start.py 直接输出的仿真数据：
   - `analysis_report.md`：综合分析报告
   - `analysis_report_appendix.md`：报告附录（量表问答原始记录）
 - `results/experiment_data/logs/`：实验运行日志
+- `results/experiment_data/batch_state/<batch_name>/`：批量脚本状态
+  - `<condition>.json`：condition 生命周期状态与续跑信息
+  - `runtime_configs/`：每个 condition 的 runtime config
+  - `timings/`：每个 condition 的 timing 分片
 
 ### results/compressed/
 

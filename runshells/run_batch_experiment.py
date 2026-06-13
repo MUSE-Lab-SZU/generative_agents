@@ -19,11 +19,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,13 +57,13 @@ from run_one_experiment import (
 RUN_NAME = ""
 
 # 仿真起始时间（对应 start.py 的 --start）
-START_TIME = "20260607-09:30"
+START_TIME = "20260612-11:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 60
+STEP = 280
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
-STRIDE = 360
+STRIDE = 720
 
 # 日志详细程度（对应 start.py 的 --verbose）
 VERBOSE = "info"
@@ -94,11 +95,19 @@ SUMMARY_ONLY = False
 # 是否只打印命令，不实际执行
 DRY_RUN = False
 
+MAX_PARALLEL = 2
+
 SIMULATION_LOG_POLL_SECONDS = 60
 # 首步可能长时间停留在密集 LLM 调用里，此时日志未必持续刷新；
 # 10 分钟会把“仍在工作但很慢”的运行误判成卡死并重启。
 SIMULATION_LOG_STALE_SECONDS = 15 * 60
 SIMULATION_MAX_RESTARTS = 3
+
+# 为了尽量避免写 checkpoint / 汇总时直接撞上磁盘写满，
+# 在启动新阶段前要求至少保留 3 GiB 可用空间；
+# 仿真运行中如果跌到 1 GiB 以下，则提前停掉子进程并给出明确报错。
+MIN_FREE_DISK_BYTES_TO_START = 0.5 * 1024 ** 3
+MIN_FREE_DISK_BYTES_TO_CONTINUE = 0.5 * 1024 ** 3
 
 # ============================================================
 # ↑↑↑ 可调参数：直接修改这里即可（中文注释）↑↑↑
@@ -110,9 +119,17 @@ GLOBAL_CONFIG = BASE_DIR / "data" / "config.json"
 GROUP_OVERLAY_DIR = BASE_DIR / "experiments" / "config" / "groups"
 EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
 REPORTS_DIR = EXPERIMENT_DATA_ROOT / "reports"
-BACKUP_DIR = Path(tempfile.gettempdir()) / "generative_agents_batch_config_backup"
+BATCH_STATE_ROOT = EXPERIMENT_DATA_ROOT / "batch_state"
 PERSISTENT_GLOBAL_CONFIG_BACKUP = BASE_DIR / "experiments" / "config" / "default_config.backup.json"
-PERSISTENT_GLOBAL_CONFIG_STATE = BASE_DIR / "experiments" / "config" / "default_config.backup_state.json"
+
+PERSONAS = [
+    "卡布达",
+    "金龟次郎",
+    "田德莉娜",
+    "呱呱蛙",
+    "蜻蜓队长",
+    "蟑螂恶霸",
+]
 
 SEVERITY_CONFIG_FILES = {
     "mild": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_mild.json",
@@ -143,12 +160,6 @@ SEVERITY_SELECTOR_ALIASES = {
     "SEV": "severe",
     "SEVERE": "severe",
 }
-
-BACKUP_FILES = {
-    "depression_config.json": DEPRESSION_CONFIG,
-    "config.json": GLOBAL_CONFIG,
-}
-
 
 @dataclass(frozen=True)
 class BatchCondition:
@@ -184,7 +195,18 @@ class RuntimeConfig:
     run_compress: bool
     run_agent_memory_vis: bool
     run_external_memory_audit: bool
+    max_parallel: int
+    resume_batch: bool
+    resume_condition: str | None
+    skip_completed: bool
     conditions: list[BatchCondition]
+
+
+@dataclass
+class SimulationRunStats:
+    attempt_count: int = 0
+    restart_count: int = 0
+    resumed_attempt_count: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,6 +224,11 @@ def parse_args() -> argparse.Namespace:
         help="只跑指定条件；支持 Counsel-G1-MILD、Counsel-G1-ALL、Counsel-ALL-MOD",
     )
     parser.add_argument("--dry-run", action="store_true", help="覆盖脚本前面的 DRY_RUN=True")
+    parser.add_argument("--max-parallel", type=int, default=None, help="并行运行的 condition 数，默认 2")
+    parser.add_argument("--resume-batch", action="store_true", help="只续跑当前 batch 中可续的失败项")
+    parser.add_argument("--resume-condition", default=None, help="只续跑指定条件；支持和 --condition 相同的选择器")
+    parser.add_argument("--skip-completed", dest="skip_completed", action="store_true", default=True, help="默认跳过已完成 condition")
+    parser.add_argument("--no-skip-completed", dest="skip_completed", action="store_false", help="即使已完成也重新调度")
     parser.add_argument("--skip-merge", action="store_true", help="跳过 merge 阶段")
     parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II/SDS 评估")
     parser.add_argument("--skip-compress", action="store_true", help="跳过 compress.py")
@@ -281,6 +308,10 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         run_compress=bool(RUN_COMPRESS and not args.skip_compress),
         run_agent_memory_vis=bool((RUN_AGENT_MEMORY_VIS or args.run_agent_memory_vis) and not args.skip_agent_memory_vis),
         run_external_memory_audit=bool((RUN_EXTERNAL_MEMORY_AUDIT or args.run_external_memory_audit) and not args.skip_external_memory_audit),
+        max_parallel=max(1, int(args.max_parallel if args.max_parallel is not None else MAX_PARALLEL)),
+        resume_batch=bool(args.resume_batch),
+        resume_condition=str(args.resume_condition or "").strip() or None,
+        skip_completed=bool(args.skip_completed),
         conditions=resolve_conditions(args.condition),
     )
 
@@ -303,7 +334,13 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  跑 compress:  {cfg.run_compress}")
     print(f"  跑记忆可视化: {cfg.run_agent_memory_vis}")
     print(f"  跑外置审计:   {cfg.run_external_memory_audit}")
+    print(f"  并行度:       {cfg.max_parallel}")
+    print(f"  续跑批次:     {cfg.resume_batch}")
+    print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
+    print(f"  跳过已完成:   {cfg.skip_completed}")
     print(f"  dry-run:      {cfg.dry_run}")
+    print(f"  启动剩余空间: >= {format_bytes(MIN_FREE_DISK_BYTES_TO_START)}")
+    print(f"  运行保底空间: >= {format_bytes(MIN_FREE_DISK_BYTES_TO_CONTINUE)}")
     print("  条件列表:     " + ", ".join(condition.name for condition in cfg.conditions))
     print("==========================================")
 
@@ -314,6 +351,108 @@ def build_trial_run_prefix(batch_name: str, condition_name: str) -> str:
 
 def build_trial_run_name(batch_name: str, condition_name: str) -> str:
     return f"{build_trial_run_prefix(batch_name, condition_name)}-{datetime.now().strftime('%m%d-%H%M')}"
+
+
+def slugify_condition_name(value: str) -> str:
+    text = str(value or "").strip()
+    safe = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_"}:
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe) or "condition"
+
+
+def batch_state_dir(cfg: RuntimeConfig) -> Path:
+    return BATCH_STATE_ROOT / cfg.name
+
+
+def batch_runtime_config_dir(cfg: RuntimeConfig) -> Path:
+    return batch_state_dir(cfg) / "runtime_configs"
+
+
+def batch_condition_state_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return batch_state_dir(cfg) / f"{slugify_condition_name(condition.name)}.json"
+
+
+def batch_condition_timing_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return batch_state_dir(cfg) / "timings" / f"{slugify_condition_name(condition.name)}.jsonl"
+
+
+def batch_condition_runtime_config_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return batch_runtime_config_dir(cfg) / f"{slugify_condition_name(condition.name)}.json"
+
+
+def format_bytes(num_bytes: int) -> str:
+    size = float(max(0, num_bytes))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TiB"
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def current_free_disk_bytes() -> int:
+    return shutil.disk_usage(BASE_DIR).free
+
+
+def ensure_free_disk_space(*, min_free_bytes: int, context: str, dry_run: bool) -> int:
+    free_bytes = current_free_disk_bytes()
+    if free_bytes < min_free_bytes:
+        message = (
+            f"{context} 前磁盘剩余空间不足：当前 {format_bytes(free_bytes)}，"
+            f"低于安全阈值 {format_bytes(min_free_bytes)}。"
+            "建议先清理 `results/checkpoints`、`results/experiment_data` "
+            "或迁移旧日志/回放文件后再继续。"
+        )
+        if dry_run:
+            print(f"[DRY-RUN] {message}")
+        else:
+            raise RuntimeError(message)
+    return free_bytes
+
+
+def batch_timing_report_path(cfg: RuntimeConfig) -> Path:
+    return REPORTS_DIR / f"{cfg.name}_timings.jsonl"
+
+
+def append_condition_timing_record(cfg: RuntimeConfig, condition: BatchCondition, payload: dict[str, Any]) -> Path:
+    path = batch_condition_timing_path(cfg, condition)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False))
+        f.write("\n")
+    print(f"[TIMING] {path}")
+    return path
+
+
+def merge_batch_timing_records(cfg: RuntimeConfig) -> Path:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = batch_timing_report_path(cfg)
+    lines: list[str] = []
+    for condition in cfg.conditions:
+        timing_path = batch_condition_timing_path(cfg, condition)
+        if not timing_path.exists():
+            continue
+        lines.extend(
+            line for line in timing_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    if cfg.dry_run:
+        print(f"[DRY-RUN] merge timing records -> {path}")
+        return path
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    print(f"[TIMING] merged -> {path}")
+    return path
 
 
 def matches_trial_run_name(run_name: str, batch_name: str, condition_name: str) -> bool:
@@ -382,7 +521,7 @@ def latest_checkpoint_activity_mtime(run_name: str) -> float | None:
     return latest_mtime
 
 
-def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool) -> list[str]:
+def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool, runtime_config_path: Path | None = None) -> list[str]:
     cmd = [
         sys.executable,
         str(START_SCRIPT),
@@ -399,6 +538,8 @@ def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool) -> 
     ]
     if resume:
         cmd.append("--resume")
+    elif runtime_config_path is not None:
+        cmd.extend(["--runtime-config", str(runtime_config_path)])
     if cfg.log_file:
         cmd.extend(["--log", cfg.log_file])
     return cmd
@@ -415,17 +556,33 @@ def terminate_process(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
-def run_simulation_with_recovery(run_name: str, cfg: RuntimeConfig) -> None:
-    ensure_checkpoint_state(run_name, resume=False, dry_run=cfg.dry_run)
+def run_simulation_with_recovery(
+    run_name: str,
+    cfg: RuntimeConfig,
+    *,
+    runtime_config_path: Path | None = None,
+    resume: bool = False,
+    stats: SimulationRunStats | None = None,
+) -> None:
+    ensure_checkpoint_state(run_name, resume=resume, dry_run=cfg.dry_run)
     if cfg.dry_run:
         print(f"[DRY-RUN] monitored simulation for {run_name}")
         return
 
+    stats = stats or SimulationRunStats()
     restart_count = 0
-    resume = False
+    resume_next = bool(resume)
     while True:
-        cmd = build_simulation_cmd(run_name, cfg, resume=resume)
+        ensure_free_disk_space(
+            min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+            context=f"启动仿真子进程 {run_name}",
+            dry_run=cfg.dry_run,
+        )
+        cmd = build_simulation_cmd(run_name, cfg, resume=resume_next, runtime_config_path=runtime_config_path)
         print(f"[RUN] {' '.join(cmd)}")
+        stats.attempt_count += 1
+        if resume_next:
+            stats.resumed_attempt_count += 1
         proc = subprocess.Popen(cmd, cwd=BASE_DIR)
         log_path = simulation_log_path(run_name, cfg)
         last_log_mtime = None
@@ -452,20 +609,30 @@ def run_simulation_with_recovery(run_name: str, cfg: RuntimeConfig) -> None:
                 last_checkpoint_mtime = current_checkpoint_mtime
                 stale_since = time.time()
 
+            free_bytes = current_free_disk_bytes()
+            if free_bytes < MIN_FREE_DISK_BYTES_TO_CONTINUE:
+                terminate_process(proc)
+                raise RuntimeError(
+                    f"仿真运行中磁盘剩余空间过低：当前 {format_bytes(free_bytes)}，"
+                    f"已低于保底阈值 {format_bytes(MIN_FREE_DISK_BYTES_TO_CONTINUE)}，"
+                    f"已提前停止子进程以保护 checkpoint：{run_name}"
+                )
+
             if time.time() - stale_since >= SIMULATION_LOG_STALE_SECONDS:
                 terminate_process(proc)
                 restart_count += 1
+                stats.restart_count = restart_count
                 if restart_count > SIMULATION_MAX_RESTARTS:
                     raise TimeoutError(
                         f"simulation log stayed stale for {SIMULATION_LOG_STALE_SECONDS}s after {SIMULATION_MAX_RESTARTS} restarts: {run_name}"
                     )
                 if has_snapshot(run_name):
                     print(f"[RESTART] resume simulation after stale log: {run_name}")
-                    resume = True
+                    resume_next = True
                 else:
                     archive_blocked_checkpoint_dir(run_name)
                     print(f"[RESTART] restart simulation from scratch after stale log: {run_name}")
-                    resume = False
+                    resume_next = False
                 break
 
             time.sleep(SIMULATION_LOG_POLL_SECONDS)
@@ -497,6 +664,7 @@ def load_optional_json_file(path: Path) -> dict | None:
 
 
 def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -509,6 +677,125 @@ def deep_merge_dict(base: dict, overlay: dict) -> dict:
         else:
             merged[key] = value
     return merged
+
+
+def latest_snapshot_name_for_run(run_name: str) -> str:
+    checkpoint_dir = checkpoint_dir_for_run(run_name)
+    if not checkpoint_dir.is_dir():
+        return ""
+    snapshots = sorted(
+        path.name for path in checkpoint_dir.iterdir()
+        if path.is_file() and path.name.startswith("simulate-") and path.name.endswith(".json")
+    )
+    if not snapshots:
+        return ""
+    return snapshots[-1]
+
+
+def condition_checkpoint_exists(run_name: str) -> bool:
+    return checkpoint_dir_for_run(run_name).is_dir()
+
+
+def condition_experiment_dir_exists(run_name: str) -> bool:
+    return (EXPERIMENT_DATA_ROOT / run_name).is_dir()
+
+
+def runtime_config_template_path() -> Path:
+    if PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
+        return PERSISTENT_GLOBAL_CONFIG_BACKUP
+    return GLOBAL_CONFIG
+
+
+def build_condition_runtime_config_payload(condition: BatchCondition, cfg: RuntimeConfig) -> dict[str, Any]:
+    template = load_json_file(runtime_config_template_path())
+    overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
+    merged = deep_merge_dict(template, overlay)
+    assets_root = "assets/village"
+    payload: dict[str, Any] = {
+        "stride": cfg.stride,
+        "time": {"start": cfg.start},
+        "maze": {"path": f"{assets_root}/maze.json"},
+        "agent_base": copy.deepcopy(merged.get("agent", {})),
+        "agents": {},
+    }
+    intervention_config = copy.deepcopy(merged.get("intervention", {}))
+    staged_eval_config = copy.deepcopy(merged.get("staged_eval", {}))
+    checkpointing_config = copy.deepcopy(merged.get("checkpointing", {}))
+    if intervention_config:
+        payload["intervention"] = intervention_config
+    if staged_eval_config:
+        payload["staged_eval"] = staged_eval_config
+    if checkpointing_config:
+        payload["checkpointing"] = checkpointing_config
+    for agent_name in PERSONAS:
+        payload["agents"][agent_name] = {
+            "config_path": f"{assets_root}/agents/{agent_name.replace(' ', '_')}/agent.json",
+        }
+    payload["agents"].setdefault("卡布达", {})
+    payload["agents"]["卡布达"]["depression_config_path"] = str(SEVERITY_CONFIG_FILES[condition.severity])
+    return payload
+
+
+def ensure_condition_runtime_config(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    path = batch_condition_runtime_config_path(cfg, condition)
+    payload = build_condition_runtime_config_payload(condition, cfg)
+    if cfg.dry_run:
+        print(f"[DRY-RUN] write runtime config: {path}")
+        return path
+    write_json_file(path, payload)
+    return path
+
+
+def default_condition_state(cfg: RuntimeConfig, condition: BatchCondition) -> dict[str, Any]:
+    return {
+        "batch_name": cfg.name,
+        "condition_name": condition.name,
+        "group": condition.group,
+        "severity": condition.severity,
+        "run_name": "",
+        "status": "queued",
+        "resume_allowed": False,
+        "last_completed_phase": "",
+        "checkpoint_exists": False,
+        "experiment_dir_exists": False,
+        "latest_snapshot_name": "",
+        "error": "",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def read_condition_state(cfg: RuntimeConfig, condition: BatchCondition) -> dict[str, Any]:
+    path = batch_condition_state_path(cfg, condition)
+    if not path.exists():
+        return default_condition_state(cfg, condition)
+    payload = load_optional_json_file(path) or {}
+    state = default_condition_state(cfg, condition)
+    state.update(payload)
+    return state
+
+
+def write_condition_state(cfg: RuntimeConfig, condition: BatchCondition, state: dict[str, Any]) -> Path:
+    path = batch_condition_state_path(cfg, condition)
+    payload = default_condition_state(cfg, condition)
+    payload.update(state or {})
+    run_name = str(payload.get("run_name", "") or "").strip()
+    if run_name:
+        payload["checkpoint_exists"] = condition_checkpoint_exists(run_name)
+        payload["experiment_dir_exists"] = condition_experiment_dir_exists(run_name)
+        payload["latest_snapshot_name"] = latest_snapshot_name_for_run(run_name)
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    if cfg.dry_run:
+        print(f"[DRY-RUN] write condition state: {path}")
+        return path
+    write_json_file(path, payload)
+    return path
+
+
+def update_condition_state(cfg: RuntimeConfig, condition: BatchCondition, **updates: Any) -> dict[str, Any]:
+    state = read_condition_state(cfg, condition)
+    state.update(updates)
+    write_condition_state(cfg, condition, state)
+    return state
 
 
 def mean(values: list[float]) -> float | None:
@@ -568,155 +855,6 @@ def trigger_sort_key(label: str, completed_session_count: int) -> tuple[int, int
     return (completed, 4, normalized)
 
 
-def prompt_yes_no(question: str, *, default: bool) -> bool:
-    suffix = " [Y/n]: " if default else " [y/N]: "
-    try:
-        answer = input(question + suffix)
-    except EOFError:
-        print(f"[WARN] 未读取到输入，按默认值 {'是' if default else '否'} 处理。")
-        return default
-
-    normalized = answer.strip().lower()
-    if not normalized:
-        return default
-    if normalized in {"y", "yes", "1", "true", "是"}:
-        return True
-    if normalized in {"n", "no", "0", "false", "否"}:
-        return False
-
-    print(f"[WARN] 无法识别输入 {answer!r}，按默认值 {'是' if default else '否'} 处理。")
-    return default
-
-
-def backup_configs(*, dry_run: bool) -> None:
-    if dry_run:
-        print(f"[DRY-RUN] backup dir: {BACKUP_DIR}")
-        for label, path in BACKUP_FILES.items():
-            print(f"[DRY-RUN] backup {label}: {path}")
-        return
-
-    if BACKUP_DIR.exists():
-        shutil.rmtree(BACKUP_DIR)
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-
-    for label, path in BACKUP_FILES.items():
-        shutil.copy2(path, BACKUP_DIR / label)
-        print(f"[BACKUP] {label} -> {BACKUP_DIR / label}")
-
-
-def restore_configs(*, dry_run: bool) -> None:
-    if dry_run:
-        print(f"[DRY-RUN] restore dir: {BACKUP_DIR}")
-        for label, path in BACKUP_FILES.items():
-            print(f"[DRY-RUN] restore {label}: {path}")
-        return
-
-    for label, path in BACKUP_FILES.items():
-        backup_path = BACKUP_DIR / label
-        if backup_path.exists():
-            shutil.copy2(backup_path, path)
-            print(f"[RESTORE] {label} -> {path}")
-
-
-def record_persistent_global_config_backup(*, dry_run: bool) -> None:
-    print(f"[CONFIG-BACKUP] default config -> {PERSISTENT_GLOBAL_CONFIG_BACKUP}")
-    if dry_run:
-        print(f"[DRY-RUN] state file -> {PERSISTENT_GLOBAL_CONFIG_STATE}")
-        return
-
-    PERSISTENT_GLOBAL_CONFIG_BACKUP.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(GLOBAL_CONFIG, PERSISTENT_GLOBAL_CONFIG_BACKUP)
-    write_json_file(
-        PERSISTENT_GLOBAL_CONFIG_STATE,
-        {
-            "active": True,
-            "source_path": str(GLOBAL_CONFIG),
-            "backup_path": str(PERSISTENT_GLOBAL_CONFIG_BACKUP),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "script": "runshells/run_batch_experiment.py",
-        },
-    )
-    print(f"[STATE] active config backup -> {PERSISTENT_GLOBAL_CONFIG_STATE}")
-
-
-def restore_persistent_global_config_backup(*, dry_run: bool) -> None:
-    if not PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
-        print(f"[WARN] 缺少默认 config 备份文件: {PERSISTENT_GLOBAL_CONFIG_BACKUP}")
-        return
-
-    print(f"[RESTORE] persistent config backup -> {GLOBAL_CONFIG}")
-    if dry_run:
-        return
-    shutil.copy2(PERSISTENT_GLOBAL_CONFIG_BACKUP, GLOBAL_CONFIG)
-
-
-def clear_persistent_global_config_state(*, dry_run: bool) -> None:
-    if dry_run:
-        print(f"[DRY-RUN] clear state file: {PERSISTENT_GLOBAL_CONFIG_STATE}")
-        return
-    if PERSISTENT_GLOBAL_CONFIG_STATE.exists():
-        PERSISTENT_GLOBAL_CONFIG_STATE.unlink()
-        print(f"[STATE] cleared config backup state: {PERSISTENT_GLOBAL_CONFIG_STATE}")
-
-
-def maybe_restore_interrupted_global_config(*, dry_run: bool) -> None:
-    state = load_optional_json_file(PERSISTENT_GLOBAL_CONFIG_STATE)
-    if not state or not state.get("active"):
-        return
-
-    if not PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
-        print(
-            "[WARN] 检测到上次批量实验留下未清理的配置状态，但找不到默认 config 备份；将跳过恢复。"
-        )
-        clear_persistent_global_config_state(dry_run=dry_run)
-        return
-
-    created_at = str(state.get("created_at", "") or "unknown")
-    if dry_run:
-        print(
-            "[DRY-RUN] detected pending config restore state "
-            f"(created_at={created_at}), would prompt for restoration."
-        )
-        clear_persistent_global_config_state(dry_run=dry_run)
-        return
-
-    should_restore = prompt_yes_no(
-        (
-            "检测到上次批量实验留下未清理的默认 config 备份"
-            f"（创建时间: {created_at}）。如果上次提前中断，建议先恢复 `data/config.json`。"
-            "是否现在先恢复备份？"
-        ),
-        default=True,
-    )
-    if should_restore:
-        restore_persistent_global_config_backup(dry_run=False)
-    else:
-        print("[INFO] 已跳过恢复默认 config 备份，将以当前 data/config.json 继续。")
-
-    clear_persistent_global_config_state(dry_run=False)
-
-
-def apply_severity_config(severity: str, *, dry_run: bool) -> None:
-    source_path = SEVERITY_CONFIG_FILES[severity]
-    print(f"[CONFIG] severity={severity} -> {source_path.name}")
-    if dry_run:
-        return
-    shutil.copy2(source_path, DEPRESSION_CONFIG)
-
-
-def apply_group_overlay(group: str, *, dry_run: bool) -> Path:
-    overlay_path = GROUP_OVERLAY_FILES[group]
-    print(f"[CONFIG] group={group} -> {overlay_path.name}")
-    if dry_run:
-        return overlay_path
-
-    config = load_json_file(GLOBAL_CONFIG)
-    overlay = load_json_file(overlay_path)
-    merged = deep_merge_dict(config, overlay)
-    write_json_file(GLOBAL_CONFIG, merged)
-    return overlay_path
-
-
 def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeConfig) -> None:
     output_dir = EXPERIMENT_DATA_ROOT / run_name
     meta_path = output_dir / "trial_meta.json"
@@ -753,8 +891,21 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
     print(f"[WRITE] {meta_path}")
 
 
-def run_simulation(run_name: str, cfg: RuntimeConfig) -> None:
-    run_simulation_with_recovery(run_name, cfg)
+def run_simulation(
+    run_name: str,
+    cfg: RuntimeConfig,
+    *,
+    runtime_config_path: Path | None = None,
+    resume: bool = False,
+    stats: SimulationRunStats | None = None,
+) -> None:
+    run_simulation_with_recovery(
+        run_name,
+        cfg,
+        runtime_config_path=runtime_config_path,
+        resume=resume,
+        stats=stats,
+    )
 
 
 def run_merge(run_name: str, cfg: RuntimeConfig) -> None:
@@ -769,8 +920,64 @@ def run_compress(run_name: str, cfg: RuntimeConfig) -> None:
     run_cmd([sys.executable, str(COMPRESS_SCRIPT), "--name", run_name], dry_run=cfg.dry_run, timeout=1800)
 
 
+RESUMEABLE_CONDITION_STATUSES = {
+    "simulation_interrupted_disk",
+    "failed_after_checkpoint",
+    "postprocessing_interrupted",
+    "simulation_done",
+    "postprocessing",
+}
+
+
+def is_disk_protection_error(exc: Exception) -> bool:
+    message = str(exc or "")
+    return "磁盘剩余空间过低" in message or "磁盘剩余空间不足" in message
+
+
+def resolve_condition_run_name(cfg: RuntimeConfig, condition: BatchCondition, state: dict[str, Any]) -> str:
+    run_name = str(state.get("run_name", "") or "").strip()
+    if run_name:
+        return run_name
+    return build_trial_run_name(cfg.name, condition.name)
+
+
+def should_resume_condition(cfg: RuntimeConfig, condition: BatchCondition, state: dict[str, Any]) -> bool:
+    if cfg.resume_batch:
+        return str(state.get("status", "") or "") in RESUMEABLE_CONDITION_STATUSES
+    if cfg.resume_condition:
+        resume_targets = {item.name for item in resolve_conditions(cfg.resume_condition)}
+        return condition.name in resume_targets
+    return False
+
+
+def ensure_condition_state_initialized(cfg: RuntimeConfig, condition: BatchCondition) -> dict[str, Any]:
+    state = read_condition_state(cfg, condition)
+    if str(state.get("run_name", "") or "").strip():
+        return state
+    state["run_name"] = resolve_condition_run_name(cfg, condition, state)
+    write_condition_state(cfg, condition, state)
+    return state
+
+
 def run_condition(condition: BatchCondition, cfg: RuntimeConfig) -> str:
-    run_name = build_trial_run_name(cfg.name, condition.name)
+    state = ensure_condition_state_initialized(cfg, condition)
+    run_name = resolve_condition_run_name(cfg, condition, state)
+    simulation_stats = SimulationRunStats()
+    runtime_config_path = ensure_condition_runtime_config(cfg, condition)
+    checkpoint_exists = condition_checkpoint_exists(run_name)
+    resume_requested = should_resume_condition(cfg, condition, state)
+
+    if state.get("status") == "completed" and not resume_requested and not cfg.skip_completed:
+        run_name = build_trial_run_name(cfg.name, condition.name)
+        state = default_condition_state(cfg, condition)
+        state["run_name"] = run_name
+        write_condition_state(cfg, condition, state)
+        checkpoint_exists = False
+
+    if checkpoint_exists and not resume_requested and str(state.get("status", "") or "") not in {"completed", "simulation_done"}:
+        raise RuntimeError(
+            f"{condition.name} 已存在未完成 checkpoint（run_name={run_name}），请使用 --resume-batch 或 --resume-condition 续跑。"
+        )
 
     print("==========================================")
     print(f" 条件: {condition.name}")
@@ -778,29 +985,202 @@ def run_condition(condition: BatchCondition, cfg: RuntimeConfig) -> str:
     print(f"  实际运行名:   {run_name}")
     print(f"  group:        {condition.group}")
     print(f"  severity:     {condition.severity}")
+    print(f"  resume:       {resume_requested}")
     print("==========================================")
 
-    try:
-        apply_severity_config(condition.severity, dry_run=cfg.dry_run)
-        apply_group_overlay(condition.group, dry_run=cfg.dry_run)
+    update_condition_state(
+        cfg,
+        condition,
+        run_name=run_name,
+        status="queued",
+        resume_allowed=bool(checkpoint_exists),
+        error="",
+    )
 
-        run_simulation(run_name, cfg)
+    should_run_simulation = True
+    current_status = str(state.get("status", "") or "")
+    if checkpoint_exists and current_status in {"simulation_done", "postprocessing_interrupted", "postprocessing", "completed"}:
+        should_run_simulation = False
+
+    if should_run_simulation:
+        simulation_started_at = datetime.now()
+        simulation_started_perf = time.monotonic()
+        simulation_status = "success"
+        simulation_error = ""
+        update_condition_state(
+            cfg,
+            condition,
+            run_name=run_name,
+            status="running_simulation",
+            resume_allowed=False,
+            error="",
+        )
+        try:
+            ensure_free_disk_space(
+                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                context=f"开始条件 {condition.name}",
+                dry_run=cfg.dry_run,
+            )
+            run_simulation(
+                run_name,
+                cfg,
+                runtime_config_path=runtime_config_path,
+                resume=resume_requested and checkpoint_exists,
+                stats=simulation_stats,
+            )
+            update_condition_state(
+                cfg,
+                condition,
+                run_name=run_name,
+                status="simulation_done",
+                resume_allowed=True,
+                last_completed_phase="simulation",
+                error="",
+            )
+        except Exception as exc:
+            simulation_status = "failed"
+            simulation_error = str(exc)
+            checkpoint_exists = condition_checkpoint_exists(run_name)
+            if is_disk_protection_error(exc):
+                update_condition_state(
+                    cfg,
+                    condition,
+                    run_name=run_name,
+                    status="simulation_interrupted_disk",
+                    resume_allowed=True,
+                    error=simulation_error,
+                )
+            elif checkpoint_exists:
+                update_condition_state(
+                    cfg,
+                    condition,
+                    run_name=run_name,
+                    status="failed_after_checkpoint",
+                    resume_allowed=True,
+                    error=simulation_error,
+                )
+            else:
+                update_condition_state(
+                    cfg,
+                    condition,
+                    run_name=run_name,
+                    status="failed",
+                    resume_allowed=False,
+                    error=simulation_error,
+                )
+            raise
+        finally:
+            simulation_finished_at = datetime.now()
+            simulation_duration_seconds = time.monotonic() - simulation_started_perf
+            free_bytes_after_sim = current_free_disk_bytes()
+            timing_payload = {
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                "batch_name": cfg.name,
+                "condition_name": condition.name,
+                "run_name": run_name,
+                "phase": "simulation",
+                "status": simulation_status,
+                "started_at": simulation_started_at.isoformat(timespec="seconds"),
+                "ended_at": simulation_finished_at.isoformat(timespec="seconds"),
+                "duration_seconds": round(simulation_duration_seconds, 3),
+                "duration_human": format_duration(simulation_duration_seconds),
+                "attempt_count": simulation_stats.attempt_count,
+                "restart_count": simulation_stats.restart_count,
+                "resumed_attempt_count": simulation_stats.resumed_attempt_count,
+                "free_disk_bytes_after": free_bytes_after_sim,
+                "free_disk_after": format_bytes(free_bytes_after_sim),
+                "log_file": cfg.log_file,
+                "error": simulation_error,
+            }
+            if cfg.dry_run:
+                print(f"[DRY-RUN] timing record: {json.dumps(timing_payload, ensure_ascii=False)}")
+            else:
+                append_condition_timing_record(cfg, condition, timing_payload)
+            print(
+                f"[TIMING] {condition.name} simulation {simulation_status}: "
+                f"{format_duration(simulation_duration_seconds)} "
+                f"(attempts={simulation_stats.attempt_count}, restarts={simulation_stats.restart_count})"
+            )
+
+    update_condition_state(
+        cfg,
+        condition,
+        run_name=run_name,
+        status="postprocessing",
+        resume_allowed=True,
+        error="",
+    )
+    try:
+        ensure_free_disk_space(
+            min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+            context=f"merge 阶段 {run_name}",
+            dry_run=cfg.dry_run,
+        )
         run_merge(run_name, cfg)
+        update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="merge")
+        ensure_free_disk_space(
+            min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+            context=f"收集结果 {run_name}",
+            dry_run=cfg.dry_run,
+        )
         collect_core_outputs(run_name, dry_run=cfg.dry_run)
+        update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="collect")
 
         if not cfg.dry_run:
             write_batch_metadata(run_name, condition, cfg)
 
         if cfg.run_post_scale:
+            ensure_free_disk_space(
+                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                context=f"量表评估 {run_name}",
+                dry_run=cfg.dry_run,
+            )
             run_post_scales(run_name, cfg.agent, dry_run=cfg.dry_run)
+            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="post_scale")
         if cfg.run_compress:
+            ensure_free_disk_space(
+                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                context=f"compress 阶段 {run_name}",
+                dry_run=cfg.dry_run,
+            )
             run_compress(run_name, cfg)
+            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="compress")
         if cfg.run_agent_memory_vis:
+            ensure_free_disk_space(
+                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                context=f"角色记忆可视化 {run_name}",
+                dry_run=cfg.dry_run,
+            )
             run_agent_memory_visualization(run_name, cfg.agent, dry_run=cfg.dry_run)
+            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="agent_memory_vis")
         if cfg.run_external_memory_audit:
+            ensure_free_disk_space(
+                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                context=f"外置记忆审计 {run_name}",
+                dry_run=cfg.dry_run,
+            )
             run_external_memory_audit(run_name, cfg.agent, dry_run=cfg.dry_run)
-    finally:
-        restore_configs(dry_run=cfg.dry_run)
+            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="external_memory_audit")
+    except Exception as exc:
+        update_condition_state(
+            cfg,
+            condition,
+            run_name=run_name,
+            status="postprocessing_interrupted",
+            resume_allowed=True,
+            error=str(exc),
+        )
+        raise
+
+    update_condition_state(
+        cfg,
+        condition,
+        run_name=run_name,
+        status="completed",
+        resume_allowed=False,
+        last_completed_phase="completed",
+        error="",
+    )
 
     return run_name
 
@@ -955,9 +1335,18 @@ def collect_batch_results(cfg: RuntimeConfig) -> tuple[list[dict], list[str]]:
     results = []
     warnings = []
     for condition in cfg.conditions:
-        run_dir = find_latest_trial_run_dir(cfg.name, condition.name)
+        state = read_condition_state(cfg, condition)
+        run_name = str(state.get("run_name", "") or "").strip()
+        status = str(state.get("status", "") or "").strip()
+        if run_name and status and status != "completed":
+            warnings.append(f"跳过未完成条件: {condition.name} (status={status})")
+            continue
+        run_dir = EXPERIMENT_DATA_ROOT / run_name if run_name else find_latest_trial_run_dir(cfg.name, condition.name)
         if run_dir is None:
             warnings.append(f"缺少结果目录: {build_trial_run_prefix(cfg.name, condition.name)}[-时间后缀]")
+            continue
+        if not run_dir.is_dir():
+            warnings.append(f"缺少结果目录: {run_dir.name}")
             continue
         if not cfg.dry_run:
             ensure_staged_eval_scores(run_dir, dry_run=False)
@@ -1190,6 +1579,43 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
     return json_path, md_path
 
 
+def prepare_conditions_for_execution(cfg: RuntimeConfig) -> tuple[list[BatchCondition], list[str]]:
+    selected: list[BatchCondition] = []
+    notes: list[str] = []
+    resume_targets = set()
+    if cfg.resume_condition:
+        resume_targets = {item.name for item in resolve_conditions(cfg.resume_condition)}
+
+    for condition in cfg.conditions:
+        state = read_condition_state(cfg, condition)
+        status = str(state.get("status", "") or "").strip()
+        run_name = str(state.get("run_name", "") or "").strip()
+        if cfg.resume_condition and condition.name not in resume_targets:
+            notes.append(f"[SKIP] 非指定续跑条件: {condition.name}")
+            continue
+        if cfg.resume_condition and status == "completed":
+            notes.append(f"[SKIP] 指定续跑条件已完成: {condition.name}")
+            continue
+        if cfg.resume_batch and status not in RESUMEABLE_CONDITION_STATUSES:
+            notes.append(f"[SKIP] 不在可续跑状态: {condition.name} (status={status or 'queued'})")
+            continue
+        if (
+            (not cfg.resume_batch)
+            and (not cfg.resume_condition)
+            and run_name
+            and condition_checkpoint_exists(run_name)
+            and status
+            and status not in {"completed"}
+        ):
+            notes.append(f"[BLOCKED] {condition.name} 存在未完成 checkpoint，请改用 --resume-batch 或 --resume-condition")
+            continue
+        if cfg.skip_completed and (not cfg.resume_batch) and (not cfg.resume_condition) and status == "completed":
+            notes.append(f"[SKIP] 已完成: {condition.name}")
+            continue
+        selected.append(condition)
+    return selected, notes
+
+
 def main() -> None:
     args = parse_args()
     cfg = resolve_runtime_config(args)
@@ -1199,28 +1625,36 @@ def main() -> None:
         export_batch_summary(cfg)
         return
 
-    maybe_restore_interrupted_global_config(dry_run=cfg.dry_run)
-    backup_configs(dry_run=cfg.dry_run)
-    record_persistent_global_config_backup(dry_run=cfg.dry_run)
+    if not cfg.dry_run:
+        batch_state_dir(cfg).mkdir(parents=True, exist_ok=True)
+    conditions_to_run, notes = prepare_conditions_for_execution(cfg)
+    for note in notes:
+        print(note)
 
     completed: list[str] = []
     failed: list[str] = []
-    try:
-        for index, condition in enumerate(cfg.conditions, start=1):
-            print(f"\n##### [{index}/{len(cfg.conditions)}] {condition.name} #####")
-            try:
-                run_name = run_condition(condition, cfg)
-                completed.append(run_name)
-            except Exception as exc:
-                print(f"[ERROR] {condition.name}: {exc}")
-                failed.append(condition.name)
-                restore_configs(dry_run=cfg.dry_run)
-    finally:
-        restore_configs(dry_run=cfg.dry_run)
-        clear_persistent_global_config_state(dry_run=cfg.dry_run)
+    if conditions_to_run:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.max_parallel) as executor:
+            future_map = {}
+            for index, condition in enumerate(conditions_to_run, start=1):
+                print(f"\n##### [{index}/{len(conditions_to_run)}] {condition.name} #####")
+                future = executor.submit(run_condition, condition, cfg)
+                future_map[future] = condition
+            for future in concurrent.futures.as_completed(future_map):
+                condition = future_map[future]
+                try:
+                    run_name = future.result()
+                    completed.append(run_name)
+                except Exception as exc:
+                    print(f"[ERROR] {condition.name}: {exc}")
+                    failed.append(condition.name)
+    else:
+        print("[INFO] 当前没有需要执行的 condition。")
+
+    merge_batch_timing_records(cfg)
 
     print("\n==========================================")
-    print(f"批量实验完成: {len(completed)} 成功 / {len(failed)} 失败")
+    print(f"批量实验完成: {len(completed)} 成功 / {len(failed)} 失败 / {len(notes)} 跳过")
     if completed:
         print("成功运行名:")
         for run_name in completed:
@@ -1231,7 +1665,7 @@ def main() -> None:
             print(f"- {condition_name}")
     print("==========================================")
 
-    if completed and not cfg.dry_run:
+    if (completed or cfg.summary_only or notes) and not cfg.dry_run:
         export_batch_summary(cfg)
 
 

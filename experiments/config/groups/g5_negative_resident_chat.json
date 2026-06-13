@@ -12,7 +12,7 @@
         {
           "rule_id": "g5_random_negative_chat",
           "type": "interval_steps",
-          "interval_steps": 4,
+          "interval_steps": 14,
           "step_phase": 2,
           "target_patient": "卡布达",
           "resident_candidates": [
@@ -32,15 +32,7 @@
     "chat_controls": {
       "enabled": true,
       "defaults": {
-        "enabled": true,
-        "forced_only": true,
-        "forced_chat_iter": 18,
-        "repeat_break_threshold": 1,
-        "repeat_detection_enabled": false,
-        "forced_chat_min_turns": -1,
-        "forced_chat_max_turns": -1,
-        "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 9
+        "enabled": true
       }
     },
     "dialog_judge": {
@@ -64,6 +56,5 @@
     "forced_llm": {
       "enabled": true
     }
-  },
-  "staged_eval": {}
+  }
 }

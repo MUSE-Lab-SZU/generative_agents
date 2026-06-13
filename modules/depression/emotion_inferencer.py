@@ -1,4 +1,4 @@
-"""基于主诉链的瞬时说话情绪推断器。"""
+"""基于主诉图的瞬时说话情绪推断器。"""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ class EmotionInferencer:
 
     def build_prompt(self, payload: Dict[str, Any]) -> str:
         current_stage = json.dumps(payload.get("current_stage", {}) or {}, ensure_ascii=False)
-        chain_snapshot = json.dumps(payload.get("chain_snapshot", {}) or {}, ensure_ascii=False)
+        graph_snapshot = json.dumps(payload.get("graph_snapshot", {}) or {}, ensure_ascii=False)
         session_context = json.dumps(payload.get("session_context", {}) or {}, ensure_ascii=False)
         previous_emotion = json.dumps(payload.get("previous_emotion", {}) or {}, ensure_ascii=False)
         conversation_content = self._clip_text(payload.get("conversation_content", ""), limit=1200)
@@ -53,7 +53,7 @@ class EmotionInferencer:
             "depression/emotion_inferencer",
             {
                 "current_stage": current_stage,
-                "chain_snapshot": chain_snapshot,
+                "graph_snapshot": graph_snapshot,
                 "session_context": session_context,
                 "previous_emotion": previous_emotion,
                 "conversation_content": conversation_content or "（暂无明确话语内容）",

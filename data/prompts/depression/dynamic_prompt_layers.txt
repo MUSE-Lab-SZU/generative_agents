@@ -8,12 +8,11 @@ ${base_prompt}
 @@ stage_layer
 === 当前主诉节点层 ===
 当前节点：${label}
-${optional_sections}回复原则：
+${optional_sections}推进原则：
 - 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。
 - 即使出现一点松动，也应表现为试探性的、会反复的变化。
-- 当医生追问“最近最压着你的是什么”“为什么这件事这么难受”这类问题时，若当前节点已指向较明确的核心压力源，应优先自然回应到这个压力源。
-- 如果你先提到的是整理、发呆、拖延、身体沉重等表层入口，下一句应尽量补出背后更压着自己的事。
-- 不要生硬复述“节点名”或像在背设定；要用患者自己的口吻，把更核心的压力自然说出来。
+- 若当前对话没有真正触及这个节点，就不要跨越到下一个节点。
+${graph_window_section}
 
 @@ dynamic_stage_summary_section
 节点概述：${summary}
@@ -31,14 +30,16 @@ ${optional_sections}回复原则：
 - 语气底色：${tone}
 - 常见修正方式：${repair_pattern}
 
-@@ stage_chain_window_section
+@@ stage_graph_window_section
 
+当前节点的候选主诉分支：
+${graph_window_items}${next_limit_section}
 
-@@ dynamic_stage_chain_window_item
+@@ dynamic_stage_graph_window_item
 - [${marker}] ${label}：${summary}
 
 @@ dynamic_stage_next_limit_section
-- 若本轮确实出现推进，最多只自然靠近「${next_label}」，不要跨越式跳转。
+- 若本轮确实出现推进，只能自然靠近候选分支之一：${candidate_labels}；不要跨越式跳转。
 
 @@ context_layer
 === 会话上下文层 ===
@@ -63,18 +64,6 @@ ${optional_sections}
 
 @@ dynamic_context_flags_section
 场景附加判断：${flags}
-
-@@ bias_empty_layer
-=== 认知偏差层 ===
-当前没有特别突出的自动化偏差被显性调用。
-
-@@ bias_layer
-=== 认知偏差层 ===
-以下自动化偏差会影响你如何解释现实：
-${bias_items}这些偏差会让你更容易用绝对化、自责化或悲观化的方式理解正在发生的事。
-
-@@ dynamic_bias_item
-- ${name}：「${thought}」
 
 @@ emotion_layer
 === 瞬时情绪与表达指导层 ===
@@ -119,4 +108,3 @@ ${instruction_sections}
 
 @@ dynamic_emotion_memory_section
 - 记忆层当前虽非主驱动，但如有相关旧叙事浮现，也只能作为轻微背景，不要压过主诉节点。
-

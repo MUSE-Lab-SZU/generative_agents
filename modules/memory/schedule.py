@@ -48,6 +48,11 @@ class Schedule:
         )
         return self.daily_schedule[-1]
 
+    def reset_daily(self, create=None):
+        self.daily_schedule = []
+        if create is not None:
+            self.create = create
+
     def current_plan(self):
         total_minute = utils.get_timer().daily_duration()
         for plan in self.daily_schedule:

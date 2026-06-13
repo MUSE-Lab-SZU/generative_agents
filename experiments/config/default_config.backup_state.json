@@ -1,7 +1,0 @@
-{
-  "active": true,
-  "source_path": "/home/zyli/generative_agents-2/data/config.json",
-  "backup_path": "/home/zyli/generative_agents-2/experiments/config/default_config.backup.json",
-  "created_at": "2026-06-07T20:58:56",
-  "script": "runshells/run_batch_experiment.py"
-}

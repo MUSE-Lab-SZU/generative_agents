@@ -1,4 +1,4 @@
-"""主诉链驱动的动态 Prompt 构建器。"""
+"""主诉图驱动的动态 Prompt 构建器。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from .prompt_templates import load_prompt_json, render_prompt_section
 
 
 class DynamicPromptBuilder:
-    """构建主诉节点、会话、偏差与瞬时情绪组成的多层 Prompt。"""
+    """构建主诉节点、会话与瞬时情绪组成的多层 Prompt。"""
 
     PROMPT_CONFIG: Dict[str, Any] = load_prompt_json("depression/depression_prompt_config", {})
     CONTEXT_FLAG_TEXTS: Dict[str, str] = (
@@ -20,30 +20,26 @@ class DynamicPromptBuilder:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config if isinstance(config, dict) else {}
-        self.include_chain_window = bool(self.config.get("include_chain_window", True))
-        self.include_bias_layer = bool(self.config.get("include_bias_layer", True))
+        self.include_graph_window = bool(self.config.get("include_graph_window", True))
         self.include_emotion_layer = bool(self.config.get("include_emotion_layer", True))
 
     def build_prompt(
         self,
         base_prompt: str,
         current_stage: Dict[str, Any],
-        chain_snapshot: Dict[str, Any],
+        graph_snapshot: Dict[str, Any],
         session_context: Dict[str, Any],
-        cognitive_biases: List[Dict[str, Any]],
         activated_memories: List[Dict[str, Any]],
         emotion: Optional[Dict[str, Any]] = None,
     ) -> str:
         # 层次顺序很重要：
-        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 偏差 -> 瞬时情绪。
+        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 瞬时情绪。
         # 它体现的是“稳定人设在前，当前轮波动在后”的约束方向。
         layers = [
             self._build_base_layer(base_prompt),
-            self._build_stage_layer(current_stage, chain_snapshot),
+            self._build_stage_layer(current_stage, graph_snapshot),
             self._build_context_layer(session_context),
         ]
-        if self.include_bias_layer:
-            layers.append(self._build_bias_layer(cognitive_biases))
         if self.include_emotion_layer:
             layers.append(self._build_emotion_layer(current_stage, emotion or {}, activated_memories))
         return self._combine_layers(layers)
@@ -52,7 +48,7 @@ class DynamicPromptBuilder:
         self,
         base_prompt: str,
         current_stage: Dict[str, Any],
-        chain_snapshot: Optional[Dict[str, Any]] = None,
+        graph_snapshot: Optional[Dict[str, Any]] = None,
     ) -> str:
         # simple prompt 只保留最核心的“人格 + 当前主诉节点”，
         # 适合反思/摘要等不需要完整会话层的场景。
@@ -61,7 +57,7 @@ class DynamicPromptBuilder:
                 self._build_base_layer(base_prompt),
                 self._build_stage_layer(
                     current_stage=current_stage if isinstance(current_stage, dict) else {},
-                    chain_snapshot=chain_snapshot if isinstance(chain_snapshot, dict) else {},
+                    graph_snapshot=graph_snapshot if isinstance(graph_snapshot, dict) else {},
                 ),
             ]
         )
@@ -75,11 +71,12 @@ class DynamicPromptBuilder:
             ).strip()
         )
 
-    def _build_stage_layer(self, current_stage: Dict[str, Any], chain_snapshot: Dict[str, Any]) -> str:
+    def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        current_window = chain_snapshot.get("current_chain_window", []) if isinstance(chain_snapshot.get("current_chain_window", []), list) else []
+        current_window = graph_snapshot.get("current_graph_window", [])
+        current_window = current_window if isinstance(current_window, list) else []
 
-        # 这些字段都直接来自 complaint_chain 配置中的单个 stage。
+        # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
         summary = str(current_stage.get("summary", "") or "").strip()
         core_belief = str(current_stage.get("core_belief", "") or "").strip()
@@ -126,18 +123,17 @@ class DynamicPromptBuilder:
                 )
             )
 
-        chain_window_section = ""
-        if self.include_chain_window and current_window:
-            chain_window_items = []
+        graph_window_section = ""
+        if self.include_graph_window and current_window:
+            graph_window_items = []
             for idx, stage in enumerate(current_window):
                 if not isinstance(stage, dict):
                     continue
-                # idx=0 永远是当前节点；后面的节点只是“可能的后续方向”，
-                # 不是命令式要求角色立即跨过去。
-                marker = "当前" if idx == 0 else f"后续{idx}"
-                chain_window_items.append(
+                # idx=0 永远是当前节点；后面的节点是并列候选分支。
+                marker = "当前" if idx == 0 else f"分支{idx}"
+                graph_window_items.append(
                     self._render_block(
-                        "dynamic_stage_chain_window_item",
+                        "dynamic_stage_graph_window_item",
                         {
                             "marker": marker,
                             "label": str(stage.get("label", "未知节点") or "未知节点"),
@@ -147,17 +143,21 @@ class DynamicPromptBuilder:
                 )
             next_limit_section = ""
             if len(current_window) > 1:
-                next_label = str(current_window[1].get("label", "") or "").strip() if isinstance(current_window[1], dict) else ""
-                if next_label:
+                candidate_labels = [
+                    str(stage.get("label", "") or "").strip()
+                    for stage in current_window[1:]
+                    if isinstance(stage, dict) and str(stage.get("label", "") or "").strip()
+                ]
+                if candidate_labels:
                     next_limit_section = self._render_block(
                         "dynamic_stage_next_limit_section",
-                        {"next_label": next_label},
+                        {"candidate_labels": "、".join(candidate_labels[:6])},
                     )
-            chain_window_section = render_prompt_section(
+            graph_window_section = render_prompt_section(
                 "depression/dynamic_prompt_layers",
-                "stage_chain_window_section",
+                "stage_graph_window_section",
                 {
-                    "chain_window_items": "".join(chain_window_items),
+                    "graph_window_items": "".join(graph_window_items),
                     "next_limit_section": next_limit_section,
                 },
             )
@@ -169,7 +169,7 @@ class DynamicPromptBuilder:
                 {
                     "label": label,
                     "optional_sections": "".join(optional_sections),
-                    "chain_window_section": chain_window_section,
+                    "graph_window_section": graph_window_section,
                 },
             ).strip()
         )
@@ -257,35 +257,6 @@ class DynamicPromptBuilder:
                     "time_of_day": scene.get("time_of_day", "未知"),
                     "optional_sections": "".join(optional_sections).rstrip(),
                 },
-            ).strip()
-        )
-
-    def _build_bias_layer(self, biases: List[Dict[str, Any]]) -> str:
-        if not biases:
-            return self._with_trailing_newline(
-                render_prompt_section(
-                    "depression/dynamic_prompt_layers",
-                    "bias_empty_layer",
-                    {},
-                ).strip()
-            )
-        bias_items = []
-        for item in biases:
-            # bias 层给的是“内心自动化想法”的示例，而不是要求逐字照搬。
-            bias_items.append(
-                self._render_block(
-                    "dynamic_bias_item",
-                    {
-                        "name": item.get("name", item.get("type", "未知偏差")),
-                        "thought": item.get("thought", ""),
-                    },
-                )
-            )
-        return self._with_trailing_newline(
-            render_prompt_section(
-                "depression/dynamic_prompt_layers",
-                "bias_layer",
-                {"bias_items": "".join(bias_items)},
             ).strip()
         )
 

@@ -1,19 +1,8 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "profile": {
-    "name": "卡布达",
-    "role": "轻度抑郁来访者",
-    "depression_severity": "轻度",
-    "case_summary": "被辞退后出现持续低落、自我怀疑和回避近况询问，但仍能勉强维持基本日常；面对关心时会轻描淡写，也能在安全关系中慢慢多说一点。",
-    "baseline_style": {
-      "masking": true,
-      "help_seeking_ambivalence": true,
-      "self_blame": true,
-      "functional_impairment": "mild"
-    }
-  },
-  "complaint_chain": {
+  "name": "卡布达",
+  "complaint_graph": {
     "initial_stage_id": "mild_job_loss_self_doubt",
     "planner": {
       "window_size": 3,
@@ -44,19 +33,6 @@
           "hopelessness": 0.28,
           "trust": 0.44
         },
-        "bias_profile": {
-          "dominant": ["mental_filter"],
-          "secondary": ["personalization", "should_statements"],
-          "max_active": 1,
-          "thought_templates": {
-            "mental_filter": [
-              "明明也有别的原因，但我脑子里总是先留下自己被辞退这件事。"
-            ],
-            "personalization": [
-              "我知道不一定全是我的问题，可还是会忍不住往自己身上想。"
-            ]
-          }
-        },
         "advance_signals": [
           "能具体描述被辞退后的日常影响",
           "承认自己有点难受",
@@ -85,12 +61,6 @@
       }
     ]
   },
-  "bias": {
-    "library_override": {},
-    "selection_policy": {
-      "default_max_active": 1
-    }
-  },
   "emotion": {
     "llm_enabled": true,
     "volatility_limit": 0.1
@@ -99,8 +69,7 @@
     "enabled": false
   },
   "prompt": {
-    "include_chain_window": true,
-    "include_bias_layer": true,
+    "include_graph_window": true,
     "include_emotion_layer": true
   }
 }

@@ -16,7 +16,7 @@
 }
 字段约束：intensity / disclosure_level / defensiveness 必须在 0 到 1 之间。
 当前主诉节点：${current_stage}
-当前链窗口：${chain_snapshot}
+当前图窗口：${graph_snapshot}
 会话上下文：${session_context}
 上一轮情绪：${previous_emotion}
 本轮会话内容：${conversation_content}
