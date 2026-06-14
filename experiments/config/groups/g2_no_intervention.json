@@ -4,14 +4,10 @@
     "meeting_queue": {
       "enabled": false
     },
-    "meeting_rules": [],
     "order_extract": {
       "enabled": false
     },
     "session_prompt_injection": {
-      "enabled": false
-    },
-    "chat_controls": {
       "enabled": false
     },
     "forced_llm": {

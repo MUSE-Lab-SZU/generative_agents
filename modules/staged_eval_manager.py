@@ -33,7 +33,15 @@ class StagedEvalManager:
         self.logger = logger
         self.output_dir = os.path.join(self.checkpoints_folder, "staged_eval")
         self.state = self.config.setdefault("staged_eval_state", {})
+        self._running_proc: subprocess.Popen | None = None
+        self._running_log_handle = None
+        self._step_trigger_enqueued = False
         self._ensure_state_schema()
+        self._load_state_file()
+        self._recover_inflight_state()
+
+    def begin_step(self) -> None:
+        self._step_trigger_enqueued = False
 
     def maybe_run_t0(
         self,
@@ -42,6 +50,7 @@ class StagedEvalManager:
         step_no: int,
         sim_time: str,
     ) -> Dict[str, Any] | None:
+        self.poll()
         if not self._enabled():
             return None
         if not bool(self._cfg().get("include_t0", False)):
@@ -49,7 +58,7 @@ class StagedEvalManager:
         if bool(self.state.get("t0_done", False)):
             return None
         try:
-            return self._run_trigger(
+            return self._enqueue_trigger(
                 trigger_label="T0",
                 completed_session_count=0,
                 runtime_config=runtime_config,
@@ -70,6 +79,7 @@ class StagedEvalManager:
         sim_time: str,
         snapshot_name: str,
     ) -> Dict[str, Any] | None:
+        self.poll()
         if not self._enabled():
             return None
 
@@ -96,7 +106,45 @@ class StagedEvalManager:
 
         return last_result
 
-    def _run_trigger(
+    def poll(self) -> Dict[str, Any] | None:
+        result = self._poll_worker()
+        self._maybe_start_next_job()
+        return result
+
+    def drain(self) -> List[Dict[str, Any]]:
+        completed: List[Dict[str, Any]] = []
+        while True:
+            result = self.poll()
+            if result is not None:
+                completed.append(result)
+            if self._running_proc is None and not self.state.get("pending_jobs"):
+                break
+            time.sleep(1)
+        return completed
+
+    def was_trigger_enqueued_this_step(self) -> bool:
+        return bool(self._step_trigger_enqueued)
+
+    def is_t4_done(self) -> bool:
+        return bool(self.state.get("t4_done", False))
+
+    def should_auto_stop_after_t4_done(self) -> bool:
+        return bool(
+            self._enabled()
+            and self._cfg().get("auto_stop_after_t4_done", False)
+            and self.is_t4_done()
+        )
+
+    def abort_pending_work(self, reason: str = "") -> None:
+        self._log("warning", "[STAGED_EVAL] abort_pending_work reason={}".format(str(reason or "")))
+        self._terminate_running_worker()
+        running_job = self.state.get("running_job")
+        if isinstance(running_job, dict) and running_job:
+            self._requeue_running_job(running_job)
+        self.state["running_job"] = None
+        self._persist_state()
+
+    def _enqueue_trigger(
         self,
         trigger_label: str,
         completed_session_count: int,
@@ -112,6 +160,8 @@ class StagedEvalManager:
             raise ValueError("staged_eval.target_agent is required")
         if target_agent not in (runtime_config.get("agents", {}) or {}):
             raise ValueError(f"target agent not found in runtime config: {target_agent}")
+        if self._is_label_finished_or_pending(trigger_label):
+            return self._load_existing_metadata(trigger_label)
 
         os.makedirs(self.output_dir, exist_ok=True)
         trigger_dir = self._build_trigger_dir(trigger_label)
@@ -134,60 +184,35 @@ class StagedEvalManager:
             worker_cfg=worker_cfg,
         )
         self._write_json(worker_paths["job"], job_payload)
-
-        worker_run = self._run_worker_process(
-            job_path=worker_paths["job"],
-            worker_log_path=worker_paths["log"],
-            worker_cfg=worker_cfg,
-        )
-        worker_result = self._load_worker_result(worker_paths["result"])
-        worker_success = self._worker_succeeded(worker_run, worker_result)
-
-        metadata = self._build_trigger_metadata(
+        metadata = self._build_trigger_queue_metadata(
             trigger_label=trigger_label,
             completed_session_count=completed_session_count,
             runtime_config=runtime_config,
             step_no=step_no,
             sim_time=sim_time,
             snapshot_name=snapshot_name,
-            trigger_dir=trigger_dir,
             worker_paths=worker_paths,
             worker_cfg=worker_cfg,
-            worker_run=worker_run,
-            worker_result=worker_result,
-            worker_success=worker_success,
             extra_metadata=extra_metadata,
         )
         self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
-
-        if not worker_success:
-            self._log(
-                "warning",
-                "[STAGED_EVAL] trigger={} worker_failed returncode={} timed_out={} error={}".format(
-                    trigger_label,
-                    worker_run.get("returncode"),
-                    bool(worker_run.get("timed_out", False)),
-                    metadata.get("worker_error", ""),
-                ),
-            )
-            raise RuntimeError(
-                "staged_eval worker failed for {}: {}".format(
-                    trigger_label,
-                    metadata.get("worker_error", "unknown error"),
-                )
-            )
-
-        self._mark_trigger_done(metadata, trigger_dir)
-        self._write_index()
+        self._enqueue_job_record(
+            trigger_label=trigger_label,
+            trigger_dir=trigger_dir,
+            worker_paths=worker_paths,
+            worker_cfg=worker_cfg,
+        )
+        self._step_trigger_enqueued = True
+        self._persist_state()
+        self._maybe_start_next_job()
         self._log(
             "info",
-            "[STAGED_EVAL] trigger={} target={} completed_sessions={} step={} sim_time={} worker_duration_seconds={}".format(
+            "[STAGED_EVAL] trigger={} queued target={} completed_sessions={} step={} sim_time={}".format(
                 trigger_label,
                 target_agent,
                 completed_session_count,
                 step_no,
                 sim_time,
-                metadata.get("worker_duration_seconds", 0.0),
             ),
         )
         return metadata
@@ -300,11 +325,11 @@ class StagedEvalManager:
             return None
 
         trigger_label = f"session_{completed_conversation_count}"
-        if trigger_label in self.state.get("triggered_labels", []):
+        if self._is_label_finished_or_pending(trigger_label):
             return None
 
         try:
-            return self._run_trigger(
+            return self._enqueue_trigger(
                 trigger_label=trigger_label,
                 completed_session_count=completed_conversation_count,
                 runtime_config=runtime_config,
@@ -327,8 +352,9 @@ class StagedEvalManager:
     ) -> Dict[str, Any] | None:
         if not bool(self._cfg().get("t4_enabled", False)):
             return None
-        if bool(self.state.get("t4_done", False)) or ("T4" in self.state.get("triggered_labels", [])):
+        if bool(self.state.get("t4_done", False)) or self._is_label_finished_or_pending("T4"):
             self.state["t4_done"] = True
+            self._persist_state()
             return None
         if not self._is_target_pair_completed(runtime_config):
             return None
@@ -338,6 +364,7 @@ class StagedEvalManager:
             completion_step_no = int(step_no)
             self.state["t4_completion_step_no"] = completion_step_no
             self.state["t4_completion_snapshot_name"] = str(snapshot_name or "")
+            self._persist_state()
 
         after_steps = max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0))
         if int(step_no) - int(completion_step_no) < after_steps:
@@ -345,7 +372,7 @@ class StagedEvalManager:
 
         completed_session_count = self._compute_completed_session_count(runtime_config)
         try:
-            return self._run_trigger(
+            return self._enqueue_trigger(
                 trigger_label="T4",
                 completed_session_count=completed_session_count,
                 runtime_config=runtime_config,
@@ -481,62 +508,339 @@ class StagedEvalManager:
             path = os.path.join(BASE_DIR, path)
         return os.path.abspath(path)
 
-    def _run_worker_process(
+    def _state_file_path(self) -> str:
+        return os.path.join(self.output_dir, "state.json")
+
+    def _persist_state(self) -> None:
+        self.config["staged_eval_state"] = self.state
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._write_json(self._state_file_path(), self.state)
+        self._write_index()
+
+    def _load_state_file(self) -> None:
+        path = self._state_file_path()
+        if not os.path.exists(path):
+            return
+        try:
+            payload = self._load_worker_result(path)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        self.state.update(copy.deepcopy(payload))
+        self.config["staged_eval_state"] = self.state
+        self._ensure_state_schema()
+
+    def _recover_inflight_state(self) -> None:
+        running_job = self.state.get("running_job")
+        if isinstance(running_job, dict) and running_job:
+            self._requeue_running_job(running_job)
+        self.state["running_job"] = None
+        self._persist_state()
+
+    def _build_trigger_queue_metadata(
         self,
-        job_path: str,
-        worker_log_path: str,
+        trigger_label: str,
+        completed_session_count: int,
+        runtime_config: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+        worker_paths: Dict[str, str],
         worker_cfg: Dict[str, Any],
+        extra_metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        _, completed_session_count_source = self._resolve_completed_session_count(runtime_config)
+        trigger_dir = os.path.dirname(worker_paths["job"])
+        metadata = {
+            "status": "queued",
+            "trigger_label": trigger_label,
+            "completed_session_count": int(completed_session_count),
+            "completed_session_count_source": completed_session_count_source,
+            "step_no": int(step_no),
+            "sim_time": str(sim_time or ""),
+            "snapshot_name": str(snapshot_name or ""),
+            "target_agent": self._target_agent(),
+            "doctor_name": self._doctor_name(runtime_config),
+            "session_interval": self._safe_int(self._cfg().get("session_interval", 0), 0),
+            "max_completed_sessions": self._safe_int(self._cfg().get("max_completed_sessions", 0), 0),
+            "t4_enabled": bool(self._cfg().get("t4_enabled", False)),
+            "t4_after_steps": max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0)),
+            "readonly_eval": True,
+            "external_memory_read": False,
+            "uses_answer_without_memory": True,
+            "writes_blocked_by_design": False,
+            "writes_isolated_via_temp_storage": True,
+            "storage_isolation_enabled": True,
+            "local_write_attempt_count": 0,
+            "external_write_attempt_count": 0,
+            "worker_mode": "subprocess_async",
+            "worker_script": str(worker_cfg.get("worker_script", DEFAULT_WORKER_SCRIPT) or DEFAULT_WORKER_SCRIPT),
+            "worker_timeout_seconds": self._safe_int(worker_cfg.get("worker_timeout_seconds", 1800), 1800),
+            "cleanup_tmp_storage": bool(worker_cfg.get("cleanup_tmp_storage", True)),
+            "worker_log_file": os.path.relpath(worker_paths["log"], trigger_dir),
+            "worker_job_file": os.path.relpath(worker_paths["job"], trigger_dir),
+            "worker_result_file": os.path.relpath(worker_paths["result"], trigger_dir),
+            "worker_returncode": None,
+            "worker_timed_out": False,
+            "worker_duration_seconds": 0.0,
+            "worker_status": "",
+            "worker_error": "",
+            "tmp_root": "",
+            "tmp_storage_path": "",
+            "tmp_storage_deleted": False,
+            "cleanup_error": "",
+            "scales": {},
+        }
+        if isinstance(extra_metadata, dict) and extra_metadata:
+            metadata.update(extra_metadata)
+        return metadata
+
+    def _enqueue_job_record(
+        self,
+        trigger_label: str,
+        trigger_dir: str,
+        worker_paths: Dict[str, str],
+        worker_cfg: Dict[str, Any],
+    ) -> None:
+        pending_jobs = self.state.setdefault("pending_jobs", [])
+        if not isinstance(pending_jobs, list):
+            pending_jobs = []
+            self.state["pending_jobs"] = pending_jobs
+        if self._find_pending_job(trigger_label) is not None:
+            return
+        pending_jobs.append(
+            {
+                "trigger_label": trigger_label,
+                "trigger_dir": trigger_dir,
+                "job_path": worker_paths["job"],
+                "log_path": worker_paths["log"],
+                "result_path": worker_paths["result"],
+                "worker_cfg": copy.deepcopy(worker_cfg),
+                "queued_at": round(time.time(), 3),
+            }
+        )
+        queued_labels = self.state.setdefault("queued_labels", [])
+        if trigger_label not in queued_labels:
+            queued_labels.append(trigger_label)
+
+    def _find_pending_job(self, trigger_label: str) -> Dict[str, Any] | None:
+        pending_jobs = self.state.get("pending_jobs", [])
+        if not isinstance(pending_jobs, list):
+            return None
+        for item in pending_jobs:
+            if str((item or {}).get("trigger_label", "") or "") == trigger_label:
+                return item if isinstance(item, dict) else None
+        return None
+
+    def _requeue_running_job(self, job_info: Dict[str, Any]) -> None:
+        if not isinstance(job_info, dict) or not job_info:
+            return
+        label = str(job_info.get("trigger_label", "") or "").strip()
+        if not label:
+            return
+        if self._find_pending_job(label) is None:
+            pending_jobs = self.state.setdefault("pending_jobs", [])
+            pending_jobs.insert(0, copy.deepcopy(job_info))
+        queued_labels = self.state.setdefault("queued_labels", [])
+        if label not in queued_labels:
+            queued_labels.append(label)
+
+    def _remove_pending_job(self, trigger_label: str) -> None:
+        pending_jobs = self.state.get("pending_jobs", [])
+        if isinstance(pending_jobs, list):
+            self.state["pending_jobs"] = [
+                item for item in pending_jobs
+                if str((item or {}).get("trigger_label", "") or "") != trigger_label
+            ]
+        queued_labels = self.state.get("queued_labels", [])
+        if isinstance(queued_labels, list):
+            self.state["queued_labels"] = [label for label in queued_labels if str(label or "") != trigger_label]
+
+    def _start_worker_process(
+        self,
+        job_info: Dict[str, Any],
+    ) -> subprocess.Popen:
+        worker_cfg = job_info.get("worker_cfg", {}) or {}
         worker_script_path = self._resolve_worker_script_path(worker_cfg.get("worker_script", DEFAULT_WORKER_SCRIPT))
         if not os.path.isfile(worker_script_path):
             raise FileNotFoundError("staged_eval worker script not found: {}".format(worker_script_path))
 
-        timeout_seconds = max(1, self._safe_int(worker_cfg.get("worker_timeout_seconds", 1800), 1800))
-        cmd = [sys.executable, worker_script_path, "--job", job_path]
-        started_at = time.time()
+        cmd = [sys.executable, worker_script_path, "--job", str(job_info.get("job_path", "") or "")]
+        worker_log_path = str(job_info.get("log_path", "") or "")
         os.makedirs(os.path.dirname(worker_log_path), exist_ok=True)
-        with open(worker_log_path, "w", encoding="utf-8") as log_file:
-            log_file.write("[STAGED_EVAL_WORKER_CMD] {}\n".format(" ".join(cmd)))
-            log_file.flush()
+        log_file = open(worker_log_path, "w", encoding="utf-8")
+        log_file.write("[STAGED_EVAL_WORKER_CMD] {}\n".format(" ".join(cmd)))
+        log_file.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=BASE_DIR,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self._running_log_handle = log_file
+        return proc
+
+    def _maybe_start_next_job(self) -> None:
+        if self._running_proc is not None:
+            return
+        pending_jobs = self.state.get("pending_jobs", [])
+        if not isinstance(pending_jobs, list) or not pending_jobs:
+            return
+
+        job_info = copy.deepcopy(pending_jobs[0])
+        try:
+            proc = self._start_worker_process(job_info)
+        except Exception as exc:
+            label = str(job_info.get("trigger_label", "") or "").strip()
+            self._remove_pending_job(label)
+            failed_labels = self.state.setdefault("failed_labels", [])
+            if label and label not in failed_labels:
+                failed_labels.append(label)
+            self.state["running_job"] = None
+            self._persist_state()
+            self._log("warning", "[STAGED_EVAL] failed_to_start trigger={} error={}".format(label, exc))
+            return
+
+        started_at = time.time()
+        timeout_seconds = max(
+            1,
+            self._safe_int((job_info.get("worker_cfg", {}) or {}).get("worker_timeout_seconds", 1800), 1800),
+        )
+        job_info["started_at"] = round(started_at, 3)
+        job_info["worker_timeout_seconds"] = timeout_seconds
+        job_info["pid"] = int(proc.pid)
+        self.state["running_job"] = job_info
+        self._running_proc = proc
+        self._persist_state()
+
+    def _terminate_running_worker(self) -> None:
+        proc = self._running_proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
             try:
-                completed = subprocess.run(
-                    cmd,
-                    cwd=BASE_DIR,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=timeout_seconds,
-                    check=False,
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if self._running_log_handle is not None:
+            self._running_log_handle.flush()
+            self._running_log_handle.close()
+            self._running_log_handle = None
+        self._running_proc = None
+
+    def _poll_worker(self) -> Dict[str, Any] | None:
+        proc = self._running_proc
+        running_job = self.state.get("running_job")
+        if proc is None or not isinstance(running_job, dict) or not running_job:
+            return None
+
+        started_at = float(running_job.get("started_at", time.time()) or time.time())
+        timeout_seconds = max(1, self._safe_int(running_job.get("worker_timeout_seconds", 1800), 1800))
+        returncode = proc.poll()
+        if returncode is None and (time.time() - started_at) < timeout_seconds:
+            return None
+
+        timed_out = False
+        error = ""
+        if returncode is None:
+            timed_out = True
+            error = "worker timed out after {}s".format(timeout_seconds)
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            returncode = None
+
+        if self._running_log_handle is not None:
+            if timed_out:
+                self._running_log_handle.write(
+                    "[STAGED_EVAL_WORKER_TIMEOUT] timeout_seconds={} error={}\n".format(timeout_seconds, error)
                 )
-                return {
-                    "returncode": completed.returncode,
-                    "timed_out": False,
-                    "duration_seconds": round(time.time() - started_at, 3),
-                    "error": "",
-                }
-            except subprocess.TimeoutExpired as exc:
-                log_file.write(
-                    "[STAGED_EVAL_WORKER_TIMEOUT] timeout_seconds={} error={}\n".format(
-                        timeout_seconds,
-                        exc,
-                    )
-                )
-                log_file.flush()
-                return {
-                    "returncode": None,
-                    "timed_out": True,
-                    "duration_seconds": round(time.time() - started_at, 3),
-                    "error": str(exc),
-                }
-            except Exception as exc:
-                log_file.write("[STAGED_EVAL_WORKER_SPAWN_ERROR] error={}\n".format(exc))
-                log_file.flush()
-                return {
-                    "returncode": None,
-                    "timed_out": False,
-                    "duration_seconds": round(time.time() - started_at, 3),
-                    "error": str(exc),
-                }
+            self._running_log_handle.flush()
+            self._running_log_handle.close()
+            self._running_log_handle = None
+
+        self._running_proc = None
+        worker_run = {
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "duration_seconds": round(time.time() - started_at, 3),
+            "error": error,
+        }
+        metadata = self._finalize_running_job(running_job, worker_run)
+        self.state["running_job"] = None
+        self._persist_state()
+        return metadata
+
+    def _finalize_running_job(self, running_job: Dict[str, Any], worker_run: Dict[str, Any]) -> Dict[str, Any]:
+        job_path = str(running_job.get("job_path", "") or "")
+        trigger_dir = str(running_job.get("trigger_dir", "") or "")
+        queued_metadata = self._load_existing_metadata(str(running_job.get("trigger_label", "") or ""))
+        worker_paths = {
+            "job": job_path,
+            "log": str(running_job.get("log_path", "") or ""),
+            "result": str(running_job.get("result_path", "") or ""),
+        }
+        worker_cfg = running_job.get("worker_cfg", {}) or {}
+        worker_result = self._load_worker_result(worker_paths["result"])
+        worker_success = self._worker_succeeded(worker_run, worker_result)
+        job_payload = self._load_worker_result(job_path)
+        runtime_config = job_payload.get("runtime_config", {}) if isinstance(job_payload.get("runtime_config", {}), dict) else {}
+        metadata = self._build_trigger_metadata(
+            trigger_label=str(job_payload.get("trigger_label", "") or ""),
+            completed_session_count=self._safe_int(job_payload.get("completed_session_count", 0), 0),
+            runtime_config=runtime_config,
+            step_no=self._safe_int(job_payload.get("step_no", 0), 0),
+            sim_time=str(job_payload.get("sim_time", "") or ""),
+            snapshot_name=str(job_payload.get("snapshot_name", "") or ""),
+            trigger_dir=trigger_dir,
+            worker_paths=worker_paths,
+            worker_cfg=worker_cfg,
+            worker_run=worker_run,
+            worker_result=worker_result,
+            worker_success=worker_success,
+        )
+        if isinstance(queued_metadata, dict):
+            for key, value in queued_metadata.items():
+                if key not in metadata:
+                    metadata[key] = value
+        self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
+        label = str(metadata.get("trigger_label", "") or "").strip()
+        self._remove_pending_job(label)
+
+        if worker_success:
+            self._mark_trigger_done(metadata, trigger_dir)
+            self._log(
+                "info",
+                "[STAGED_EVAL] trigger={} target={} completed_sessions={} step={} sim_time={} worker_duration_seconds={}".format(
+                    label,
+                    metadata.get("target_agent", ""),
+                    metadata.get("completed_session_count", 0),
+                    metadata.get("step_no", 0),
+                    metadata.get("sim_time", ""),
+                    metadata.get("worker_duration_seconds", 0.0),
+                ),
+            )
+        else:
+            failed_labels = self.state.setdefault("failed_labels", [])
+            if label and label not in failed_labels:
+                failed_labels.append(label)
+            self._log(
+                "warning",
+                "[STAGED_EVAL] trigger={} worker_failed returncode={} timed_out={} error={}".format(
+                    label,
+                    worker_run.get("returncode"),
+                    bool(worker_run.get("timed_out", False)),
+                    metadata.get("worker_error", ""),
+                ),
+            )
+        return metadata
 
     def _load_worker_result(self, result_path: str) -> Dict[str, Any]:
         if not os.path.exists(result_path):
@@ -622,6 +926,10 @@ class StagedEvalManager:
         labels = self.state.setdefault("triggered_labels", [])
         if label and label not in labels:
             labels.append(label)
+        self._remove_pending_job(label)
+        failed_labels = self.state.setdefault("failed_labels", [])
+        if label in failed_labels:
+            failed_labels[:] = [item for item in failed_labels if str(item or "") != label]
         if label == "T0":
             self.state["t0_done"] = True
         if label == "T4":
@@ -644,6 +952,10 @@ class StagedEvalManager:
         payload = {
             "run_name": self.run_name,
             "triggered_labels": list(self.state.get("triggered_labels", []) or []),
+            "queued_labels": list(self.state.get("queued_labels", []) or []),
+            "failed_labels": list(self.state.get("failed_labels", []) or []),
+            "pending_jobs": list(self.state.get("pending_jobs", []) or []),
+            "running_job": copy.deepcopy(self.state.get("running_job", None)),
             "records": list(self.state.get("records", []) or []),
         }
         self._write_json(os.path.join(self.output_dir, "index.json"), payload)
@@ -658,6 +970,14 @@ class StagedEvalManager:
             self.state["triggered_completed_session_counts"] = []
         if not isinstance(self.state.get("records"), list):
             self.state["records"] = []
+        if not isinstance(self.state.get("queued_labels"), list):
+            self.state["queued_labels"] = []
+        if not isinstance(self.state.get("failed_labels"), list):
+            self.state["failed_labels"] = []
+        if not isinstance(self.state.get("pending_jobs"), list):
+            self.state["pending_jobs"] = []
+        if not isinstance(self.state.get("running_job"), dict):
+            self.state["running_job"] = None
         self.state["t0_done"] = bool(self.state.get("t0_done", False))
         self.state["t4_done"] = bool(self.state.get("t4_done", False))
         completion_step_no = self.state.get("t4_completion_step_no")
@@ -671,6 +991,32 @@ class StagedEvalManager:
             self.state["t4_completion_step_no"] = None
         self.state["t4_completion_snapshot_name"] = str(self.state.get("t4_completion_snapshot_name", "") or "")
 
+    def _is_label_finished_or_pending(self, trigger_label: str) -> bool:
+        label = str(trigger_label or "").strip()
+        if not label:
+            return False
+        if label in self.state.get("triggered_labels", []):
+            return True
+        if label in self.state.get("queued_labels", []):
+            return True
+        if label in self.state.get("failed_labels", []):
+            return True
+        running_job = self.state.get("running_job")
+        if isinstance(running_job, dict) and str(running_job.get("trigger_label", "") or "") == label:
+            return True
+        return self._find_pending_job(label) is not None
+
+    def _load_existing_metadata(self, trigger_label: str) -> Dict[str, Any] | None:
+        trigger_dir = os.path.join(self.output_dir, str(trigger_label or "").strip())
+        metadata_path = os.path.join(trigger_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
+            return None
+        try:
+            payload = self._load_worker_result(metadata_path)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _safe_int(self, value: Any, default: int) -> int:
         try:
             return int(value)
@@ -678,6 +1024,7 @@ class StagedEvalManager:
             return int(default)
 
     def _write_json(self, path: str, payload: Any) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 

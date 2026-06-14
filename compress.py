@@ -1,7 +1,7 @@
 import os
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from modules.maze import Maze
 from start import personas
@@ -141,7 +141,7 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
     files = sorted(os.listdir(checkpoints_folder))
     json_files = list()
     for file_name in files:
-        if file_name.endswith(".json") and file_name != conversation_file:
+        if file_name.startswith("simulate-") and file_name.endswith(".json"):
             json_files.append(os.path.join(checkpoints_folder, file_name))
 
     persona_init_pos = dict()
@@ -178,12 +178,14 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
             # 保存回放的起始时间
             if len(result["start_datetime"]) < 1:
                 t = datetime.strptime(json_data["time"], "%Y%m%d-%H:%M")
-                result["start_datetime"] = t.isoformat()
+                result["start_datetime"] = (
+                    t - timedelta(minutes=max(0, step - 1) * stride)
+                ).isoformat()
 
             # 遍历单个存档文件中的所有Agent
             for agent_name, agent_data in agents.items():
                 # 插入第0帧
-                if step == 1:
+                if agent_name not in persona_init_pos:
                     insert_frame0(persona_init_pos, all_movement, agent_name)
 
                 source_coord = last_location.get(agent_name, all_movement["0"][agent_name])["movement"]
@@ -352,7 +354,7 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file):
     all_markdown_content = extract_description()
     files = sorted(os.listdir(checkpoints_folder))
     for file_name in files:
-        if (not file_name.endswith(".json")) or (file_name == conversation_file):
+        if (not file_name.startswith("simulate-")) or (not file_name.endswith(".json")):
             continue
 
         file_path = os.path.join(checkpoints_folder, file_name)

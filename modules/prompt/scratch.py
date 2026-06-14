@@ -240,6 +240,8 @@ class Scratch:
 
         start, end = schedule.plan_stamps(plan, time_format="%H:%M")
         increment = max(int(plan["duration"] / 100) * 5, 5)
+        stride = max(1, int(self.config.get("stride", 5) or 5))
+        effective_increment = min(int(plan["duration"]), max(increment, stride))
 
         prompt = self.build_prompt(
             "schedule_decompose",
@@ -247,7 +249,7 @@ class Scratch:
                 "base_desc": self._base_desc(),
                 "agent": self.name,
                 "plan": "；".join([_plan_des(schedule.daily_schedule[i]) for i in indices]),
-                "increment": increment,
+                "increment": effective_increment,
                 "start": start,
                 "end": end,
                 "total_duration": plan["duration"],
@@ -265,7 +267,12 @@ class Scratch:
                 schedules.append((plan["describe"], left))
             return schedules
 
-        failsafe = [(plan["describe"], 10) for _ in range(int(plan["duration"] / 10))]
+        failsafe = []
+        remaining = int(plan["duration"])
+        while remaining > 0:
+            chunk = min(effective_increment, remaining)
+            failsafe.append((plan["describe"], chunk))
+            remaining -= chunk
         return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
 
     def prompt_schedule_revise(self, action, schedule):

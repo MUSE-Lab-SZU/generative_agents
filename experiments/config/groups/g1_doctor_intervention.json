@@ -6,280 +6,38 @@
       "卡布达",
       "金龟次郎"
     ],
-    "meeting_queue": {
-      "enabled": true,
-      "max_queue_per_doctor": 128
-    },
-    "meeting_rules": [
-      {
-        "rule_id": "weekly_followup",
-        "type": "weekly",
-        "weekday": 1,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "every_7_days_followup",
-        "type": "interval_days",
-        "interval_days": 7,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "fast_every_6h",
-        "type": "interval_minutes",
-        "interval_minutes": 360,
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      },
-      {
-        "rule_id": "fast_every_4step",
-        "type": "interval_steps",
-        "interval_steps": 4,
-        "step_phase": 2,
-        "duration": 1440,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": true
-      },
-      {
-        "rule_id": "fast_every_2step_jgcl",
-        "type": "interval_steps",
-        "interval_steps": 2,
-        "step_phase": 0,
-        "duration": 1440,
-        "doctor": "蜻蜓队长",
-        "patient": "金龟次郎",
-        "enabled": false
-      },
-      {
-        "rule_id": "prod_weekly_monday_1400",
-        "type": "weekly",
-        "weekday": 1,
-        "time": "14:00",
-        "duration": 30,
-        "doctor": "蜻蜓队长",
-        "patient": "卡布达",
-        "enabled": false
-      }
-    ],
     "resident_chat_scheduler": {
-      "enabled": false,
-      "rules": []
+      "enabled": false
     },
     "order_extract": {
-      "enabled": true,
-      "min_confidence": 0.3,
-      "max_tasks_per_chat": 3
+      "enabled": true
     },
     "session_prompt_injection": {
-      "enabled": true,
-      "prompt_file": "data/prompts/intervention_prompts.json",
-      "namespace": "CBT",
-      "placeholder": "{doctor_session_prompt_injection}",
-      "advance_marker": "[SESSION_END]",
-      "order": [
-        "session1",
-        "session2.1",
-        "session2.2",
-        "session2.3",
-        "session3.1",
-        "session3.2",
-        "session3.3-A",
-        "session4.1",
-        "session4.2",
-        "session4.4"
-      ],
-      "scope": "forced_chat_only",
-      "stop_rule_scheduling_on_session_completed": true
-    },
-    "chat_controls": {
-      "enabled": true,
-      "defaults": {
-        "enabled": false,
-        "forced_only": true,
-        "forced_chat_iter": -1,
-        "repeat_break_threshold": 1,
-        "repeat_detection_enabled": false,
-        "forced_chat_min_turns": -1,
-        "forced_chat_max_turns": -1,
-        "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 6
-      },
-      "agent_overrides": {
-        "卡布达": {
-          "enabled": true,
-          "forced_only": true,
-          "forced_chat_iter": 18,
-          "repeat_break_threshold": 100,
-          "forced_chat_min_turns": 2,
-          "forced_chat_max_turns": -1
-        },
-        "金龟次郎": {
-          "enabled": true,
-          "forced_only": true,
-          "forced_chat_iter": 18,
-          "repeat_break_threshold": 100,
-          "forced_chat_min_turns": 2,
-          "forced_chat_max_turns": -1
-        },
-        "蜻蜓队长": {
-          "enabled": true,
-          "forced_only": true,
-          "forced_chat_iter": 18,
-          "repeat_break_threshold": 100,
-          "forced_chat_min_turns": 2,
-          "forced_chat_max_turns": -1
-        }
-      }
+      "enabled": true
     },
     "forced_llm": {
-      "enabled": true,
-      "provider": "openai",
-      "model": "deepseek-v4-flash",
-      "base_url": "https://api.deepseek.com",
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "retry": 5,
-      "temperature": 0.5,
-      "depr_short_term_retry": 5,
-      "depr_short_term_force_forced_llm": true,
-      "depr_current_event_retry": 5,
-      "depr_current_event_force_forced_llm": true,
-      "decide_chat_terminate_retry": 5,
-      "decide_chat_terminate_force_forced_llm": true
+      "enabled": true
     },
     "dialog_judge": {
-      "enabled": true,
-      "prompt_file": "data/prompts/intervention/dialog_judge.txt",
-      "retry": 3,
-      "force_forced_llm": true,
-      "patient_state_prompt_file": "data/prompts/intervention/dialog_judge_patient_state_summary.txt",
-      "patient_state_summary_retry": 2
+      "enabled": true
     },
     "session_eval": {
-      "enabled": true,
-      "route": "forced_llm",
-      "prompt_file": "data/prompts/intervention/session_eval.txt",
-      "retry": 3,
-      "history_recent_n": 3
+      "enabled": true
     },
     "consult_record": {
-      "enabled": false,
-      "prompt_generate_file": "data/prompts/intervention/consult_record_generate.txt",
-      "prompt_injection_file": "data/prompts/intervention/doctor_consult_record_injection.txt",
-      "llm_retry": 3,
-      "validation": {
-        "soap_text_max_len": 300
-      },
-      "audit": {
-        "max_entries": 2000
-      }
+      "enabled": false
     },
     "consult_history": {
-      "enabled": true,
-      "retrieve_top_k": 3,
-      "gate_prompt_file": "data/prompts/intervention/consult_history_gate.txt",
-      "gate_retry": 2,
-      "summary_route": "forced_llm",
-      "summary_prompt_file": "data/prompts/intervention/consult_history_summary.txt",
-      "summary_retry": 2
+      "enabled": true
     },
     "depression_dynamic": {
-      "enabled": true,
-      "normal_chain_enabled": true,
-      "forced_chain_enabled": true,
-      "prompt_injection_enabled": true,
-      "event_commit_enabled": true,
-      "target_hints": [
-        "generate_chat",
-        "decide_chat",
-        "decide_chat_terminate",
-        "summarize_relation",
-        "summarize_chats",
-        "determine_sector",
-        "determine_arena",
-        "determine_object",
-        "describe_object"
-      ],
-      "on_missing_agent_config": "warn_and_disable",
-      "log_enabled": true
+      "enabled": true
     },
     "memory_injection": {
-      "enabled": true,
-      "content_file": "data/intervention/memory_injections.json",
-      "rules": {
-        "init_kabuda_depression_stress": {
-          "enabled": true,
-          "target_agent": "卡布达",
-          "source": "初始化规则注入_卡布达抑郁压力事件",
-          "update_to_L2": false,
-          "update_to_milestone": true,
-          "options": {
-            "allow_partial_success": true,
-            "dedup_mode": "global"
-          }
-        },
-        "session_completed_memory_rule_kbd": {
-          "enabled": true,
-          "target_agent": "卡布达",
-          "source": "会诊完成注入_多Session记忆_卡布达",
-          "trigger": {
-            "sessions": [
-              "session1",
-              "session2.1",
-              "session4.4"
-            ]
-          },
-          "update_to_L2": true,
-          "update_to_milestone": false,
-          "options": {
-            "allow_partial_success": true,
-            "dedup_mode": "global",
-            "max_items_per_session": 3
-          }
-        }
-      },
-      "defaults": {
-        "poignancy": 5,
-        "expire_days": 30,
-        "address_mode": "current_tile",
-        "allow_partial_success": true,
-        "dedup_mode": "global"
-      },
-      "limits": {
-        "max_items_per_request": 20,
-        "max_describe_chars": 1000,
-        "max_audit_entries": 2000,
-        "max_fingerprints": 20000
-      }
+      "enabled": true
     },
     "memory_policy": {
-      "enabled": true,
-      "scope": "forced_chat_only",
-      "forced_chat_expire_days": 30,
-      "retrieve_profile": {
-        "recency_weight_multiplier": 1.0,
-        "relevance_weight_multiplier": 1.0,
-        "importance_weight_multiplier": 1.0,
-        "role_bonus": {
-          "enabled": true,
-          "doctor": "蜻蜓队长",
-          "patients": [
-            "卡布达",
-            "金龟次郎"
-          ],
-          "bonus": 0.4
-        }
-      }
+      "enabled": true
     }
-  },
-  "staged_eval": {}
+  }
 }

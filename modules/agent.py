@@ -5,6 +5,7 @@ import math
 import random
 import datetime
 import copy
+import hashlib
 
 from modules import memory, prompt, utils
 from modules.depression import DepressionSimulationEngine
@@ -196,6 +197,7 @@ class Agent:
     def reset(self):
         if not self._llm:
             self._llm = create_llm_model(self.think_config["llm"])
+        self._initialize_depression_graph_window()
 
     def completion(self, func_hint, *args, **kwargs):
         assert hasattr(
@@ -502,7 +504,9 @@ class Agent:
                         "retrieve_currently", plan, thought
                     )
             # make init schedule
-            self.schedule.create = utils.get_timer().get_date()
+            schedule_create = utils.get_timer().get_date()
+            old_schedule_len = len(self.schedule.daily_schedule)
+            self.schedule.reset_daily(create=schedule_create)
             wake_up = self.completion("wake_up")
             init_schedule = self.completion("schedule_init", wake_up)
             # make daily schedule
@@ -527,6 +531,16 @@ class Agent:
             for idx, start in enumerate(starts):
                 end = starts[idx + 1] if idx + 1 < len(starts) else 24 * 60
                 self.schedule.add_plan(schedule[start], end - start)
+            self.logger.info(
+                "[SCHEDULE_REBUILD] agent={} old_items={} new_items={} create={}".format(
+                    self.name,
+                    old_schedule_len,
+                    len(self.schedule.daily_schedule),
+                    self.schedule.create.strftime("%Y%m%d-%H:%M:%S")
+                    if self.schedule.create
+                    else "",
+                )
+            )
             schedule_time = utils.get_timer().time_format_cn(self.schedule.create)
             thought = "这是 {} 在 {} 的计划：{}".format(
                 self.name, schedule_time, "；".join(init_schedule)
@@ -578,6 +592,7 @@ class Agent:
     def percept(self):
         scope = self.maze.get_scope(self.coord, self.percept_config)
         chat_dedup_marker = self._get_chat_dedup_marker()
+        self_event_dedup_marker = self._get_self_percept_dedup_marker()
         # add spatial memory
         for tile in scope:
             if tile.has_address("game_object"):
@@ -641,7 +656,27 @@ class Agent:
                         chat_dedup_marker = None
                         continue
                     node_type = "chat" if event.fit(self.name, "对话") else "event"
+                    if (
+                        self_event_dedup_marker
+                        and event.subject == self.name
+                        and self._self_percept_dedup_marker_matches_event(
+                            self_event_dedup_marker, event
+                        )
+                    ):
+                        self.logger.info(
+                            "[SELF_EVENT_DEDUP] agent={} node_type={} event_subject={} event_object={} create={}".format(
+                                self.name,
+                                node_type,
+                                event.subject,
+                                event.object,
+                                self_event_dedup_marker.get("create", ""),
+                            )
+                        )
+                        continue
                     node = self._add_concept(node_type, event)
+                    if event.subject == self.name:
+                        self._set_self_percept_dedup_marker(event, node_type=node_type)
+                        self_event_dedup_marker = self._get_self_percept_dedup_marker()
                     self.status["poignancy"] += node.poignancy
                 self.concepts.append(node)
         if chat_dedup_marker:
@@ -725,6 +760,7 @@ class Agent:
             : self.associate.max_importance
         ]
         # summary thought
+        reflection_entries = []
         focus = self.completion("reflect_focus", nodes, self.reflect_focus_topk)
         retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
         for r_nodes in retrieved.values():
@@ -757,7 +793,14 @@ class Agent:
                 )
             )
             for thought, evidence in thoughts:
-                _add_thought(thought, evidence)
+                node = _add_thought(thought, evidence)
+                reflection_entries.append(
+                    {
+                        "thought": thought,
+                        "evidence": evidence,
+                        "node_id": getattr(node, "node_id", ""),
+                    }
+                )
         # summary chats
         if self.chats:
             recorded, evidence = set(), []
@@ -769,9 +812,26 @@ class Agent:
                     node = res[-1]
                     evidence.append(node.node_id)
             thought = self.completion("reflect_chat_planing", self.chats)
-            _add_thought(f"对于 {self.name} 的计划：{thought}", evidence)
+            plan_thought = f"对于 {self.name} 的计划：{thought}"
+            node = _add_thought(plan_thought, evidence)
+            reflection_entries.append(
+                {
+                    "thought": plan_thought,
+                    "evidence": evidence,
+                    "node_id": getattr(node, "node_id", ""),
+                }
+            )
             thought = self.completion("reflect_chat_memory", self.chats)
-            _add_thought(f"{self.name} {thought}", evidence)
+            memory_thought = f"{self.name} {thought}"
+            node = _add_thought(memory_thought, evidence)
+            reflection_entries.append(
+                {
+                    "thought": memory_thought,
+                    "evidence": evidence,
+                    "node_id": getattr(node, "node_id", ""),
+                }
+            )
+        self._commit_depression_reflection(focus, reflection_entries)
         self.status["poignancy"] = 0
         self.chats = []
 
@@ -2324,12 +2384,47 @@ class Agent:
         ]
         return "||".join(parts)
 
+    def _build_self_percept_dedup_fingerprint(self, event):
+        if event is None:
+            return ""
+        parts = [
+            str(getattr(event, "subject", "") or ""),
+            str(getattr(event, "predicate", "") or ""),
+            str(getattr(event, "object", "") or ""),
+            self._normalize_dedup_text(
+                event.get_describe() if hasattr(event, "get_describe") else ""
+            ),
+            ":".join(str(p) for p in getattr(event, "address", []) or []),
+        ]
+        return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
+
     def _chat_dedup_marker_window_minutes(self):
         return 720
+
+    def _build_self_percept_action_key(self):
+        action = getattr(self, "action", None)
+        if not action or not getattr(action, "event", None):
+            return ""
+        action_event = getattr(action, "event", None)
+        action_start = getattr(action, "start", None)
+        parts = [
+            self._build_self_percept_dedup_fingerprint(action_event),
+            (
+                action_start.strftime("%Y%m%d-%H:%M:%S")
+                if isinstance(action_start, datetime.datetime)
+                else ""
+            ),
+            str(getattr(action, "duration", "") or ""),
+        ]
+        return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
 
     def _clear_chat_dedup_marker(self):
         if isinstance(getattr(self, "status", None), dict):
             self.status.pop("_chat_dedup_marker", None)
+
+    def _clear_self_percept_dedup_marker(self):
+        if isinstance(getattr(self, "status", None), dict):
+            self.status.pop("_self_percept_dedup_marker", None)
 
     def _get_chat_dedup_marker(self):
         if not isinstance(getattr(self, "status", None), dict):
@@ -2351,6 +2446,27 @@ class Agent:
                 return None
         return marker
 
+    def _get_self_percept_dedup_marker(self):
+        if not isinstance(getattr(self, "status", None), dict):
+            return None
+        marker = self.status.get("_self_percept_dedup_marker")
+        if not isinstance(marker, dict):
+            self._clear_self_percept_dedup_marker()
+            return None
+        if str(marker.get("kind", "") or "") != "self_percept":
+            self._clear_self_percept_dedup_marker()
+            return None
+        marker_fingerprint = str(marker.get("fingerprint", "") or "").strip()
+        marker_action_key = str(marker.get("action_key", "") or "").strip()
+        current_action_key = self._build_self_percept_action_key()
+        if not marker_fingerprint or not marker_action_key or not current_action_key:
+            self._clear_self_percept_dedup_marker()
+            return None
+        if marker_action_key != current_action_key:
+            self._clear_self_percept_dedup_marker()
+            return None
+        return marker
+
     def _set_chat_dedup_marker(self, node_id, event, create, source, write_mode):
         if write_mode not in {"immediate", "hybrid"} or event is None:
             return
@@ -2361,6 +2477,25 @@ class Agent:
             "fingerprint": self._build_chat_dedup_fingerprint(event),
             "write_mode": str(write_mode or ""),
             "source": str(source or ""),
+            "create": create_dt.strftime("%Y%m%d-%H:%M:%S"),
+        }
+
+    def _set_self_percept_dedup_marker(self, event, create=None, node_type="event"):
+        if event is None or event.subject != self.name:
+            return
+        action_key = self._build_self_percept_action_key()
+        if not action_key:
+            return
+        create_dt = (
+            create
+            if isinstance(create, datetime.datetime)
+            else utils.get_timer().get_date()
+        )
+        self.status["_self_percept_dedup_marker"] = {
+            "kind": "self_percept",
+            "node_type": str(node_type or "event"),
+            "fingerprint": self._build_self_percept_dedup_fingerprint(event),
+            "action_key": action_key,
             "create": create_dt.strftime("%Y%m%d-%H:%M:%S"),
         }
 
@@ -2375,6 +2510,16 @@ class Agent:
         if not marker_fingerprint:
             return False
         return marker_fingerprint == self._build_chat_dedup_fingerprint(event)
+
+    def _self_percept_dedup_marker_matches_event(self, marker, event):
+        if not isinstance(marker, dict) or event is None:
+            return False
+        if str(marker.get("kind", "") or "") != "self_percept":
+            return False
+        marker_fingerprint = str(marker.get("fingerprint", "") or "")
+        if not marker_fingerprint:
+            return False
+        return marker_fingerprint == self._build_self_percept_dedup_fingerprint(event)
 
     def _add_concept(
         self,
@@ -2645,7 +2790,8 @@ class Agent:
                     "config_path": config_path,
                     "agent_dir": os.path.dirname(config_path),
                     "agent_name": self.name,
-                }
+                },
+                clock_provider=utils.get_timer().get_date,
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
             state_payload = config.get("depression_dynamic_state", {})
@@ -2673,6 +2819,25 @@ class Agent:
             return self.scratch._base_desc()
         except Exception:
             return str(self.scratch.currently or "")
+
+    def _initialize_depression_graph_window(self):
+        if not self.depression_dynamic or not self.llm_available():
+            return None
+        try:
+            self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+            return self.depression_dynamic.initialize_graph_window(
+                location=self._dynamic_location(),
+                time_of_day=self._dynamic_time_of_day(),
+                roadmap_completion_func=self._depression_llm_completion,
+            )
+        except Exception as exc:
+            if self.logger:
+                self.logger.info(
+                    "[DEPRESSION_DYNAMIC] agent={} graph window init failed: {}".format(
+                        self.name, exc
+                    )
+                )
+        return None
 
     def _prepare_depression_generate_chat(self, args, kwargs):
         if not self.depression_dynamic:
@@ -2713,31 +2878,142 @@ class Agent:
         next_kwargs["depression_reflect_block"] = self.depression_dynamic.get_simple_prompt()
         return next_kwargs
 
-    def _commit_depression_generate_chat(self, context, output):
+    def _commit_depression_event(
+        self,
+        source,
+        location,
+        time_of_day,
+        interaction_type,
+        content,
+        other_agent="",
+        relationship="",
+        metadata=None,
+    ):
         if not self.depression_dynamic:
-            return
-        utterance = str(output or "").strip()
-        if not utterance:
-            return
+            return None
+        event_source = str(source or "").strip()
+        if event_source not in {"chat", "reflection"}:
+            return None
+        event_content = str(content or "").strip()
+        if not event_content:
+            return None
+
         self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
         try:
-            self.depression_dynamic.commit_interaction(
-                location=context["location"],
-                time_of_day=context["time_of_day"],
-                other_agent=context["other_agent"],
-                relationship=context["relationship"],
-                interaction_type=context["interaction_type"],
-                conversation_content=utterance,
+            return self.depression_dynamic.commit_event(
+                source=event_source,
+                location=location,
+                time_of_day=time_of_day,
+                other_agent=other_agent,
+                relationship=relationship,
+                interaction_type=interaction_type,
+                content=event_content,
+                metadata=metadata if isinstance(metadata, dict) else {},
                 roadmap_completion_func=self._depression_llm_completion,
                 emotion_completion_func=self._depression_llm_completion,
             )
         except Exception as exc:
             if self.logger:
                 self.logger.info(
-                    "[DEPRESSION_DYNAMIC] agent={} commit failed: {}".format(
-                        self.name, exc
+                    "[DEPRESSION_DYNAMIC] agent={} {} commit failed: {}".format(
+                        self.name, event_source, exc
                     )
                 )
+        return None
+
+    def _commit_depression_reflection(self, focus, entries):
+        if not entries:
+            return None
+        content, metadata = self._build_depression_reflection_payload(focus, entries)
+        return self._commit_depression_event(
+            source="reflection",
+            location=self._dynamic_location(),
+            time_of_day=self._dynamic_time_of_day(),
+            interaction_type="内在反思",
+            content=content,
+            other_agent="",
+            relationship="",
+            metadata=metadata,
+        )
+
+    def _build_depression_reflection_payload(self, focus, entries):
+        focus_items = self._normalize_depression_text_list(focus, limit=5)
+        thoughts, evidence_ids, thought_node_ids = [], [], []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            thought = str(entry.get("thought", "") or "").strip()
+            if thought:
+                thoughts.append(thought)
+            thought_node_id = str(entry.get("node_id", "") or "").strip()
+            if thought_node_id:
+                thought_node_ids.append(thought_node_id)
+            evidence_ids.extend(
+                self._normalize_depression_text_list(entry.get("evidence", []), limit=20)
+            )
+
+        thoughts = self._dedupe_depression_texts(thoughts, limit=8)
+        evidence_ids = self._dedupe_depression_texts(evidence_ids, limit=20)
+        thought_node_ids = self._dedupe_depression_texts(thought_node_ids, limit=20)
+
+        rows = []
+        if focus_items:
+            rows.append("反思焦点：" + "；".join(focus_items[:3]))
+        if thoughts:
+            rows.append("反思结论：" + "；".join(thoughts[:5]))
+        rows.append("证据数量：{}".format(len(evidence_ids)))
+        if evidence_ids:
+            rows.append("证据线索：" + "，".join(evidence_ids[:8]))
+
+        metadata = {
+            "focus": focus_items,
+            "thought_count": len(thoughts),
+            "thoughts": thoughts,
+            "evidence_ids": evidence_ids,
+            "thought_node_ids": thought_node_ids,
+        }
+        return "\n".join(rows), metadata
+
+    def _normalize_depression_text_list(self, value, limit=20):
+        if value is None:
+            items = []
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+        return self._dedupe_depression_texts(
+            [str(item or "").strip() for item in items], limit=limit
+        )
+
+    @staticmethod
+    def _dedupe_depression_texts(values, limit=20):
+        results, seen = [], set()
+        for item in values or []:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            results.append(text[:160])
+            if len(results) >= int(limit):
+                break
+        return results
+
+    def _commit_depression_generate_chat(self, context, output):
+        if not self.depression_dynamic:
+            return
+        utterance = str(output or "").strip()
+        if not utterance:
+            return
+        self._commit_depression_event(
+            source="chat",
+            location=context["location"],
+            time_of_day=context["time_of_day"],
+            other_agent=context["other_agent"],
+            relationship=context["relationship"],
+            interaction_type=context["interaction_type"],
+            content=utterance,
+            metadata={"origin": "generate_chat", "evidence_ids": []},
+        )
 
     def _build_depression_chat_context(self, other, relation_summary, chats):
         location = self._dynamic_location()
@@ -2781,17 +3057,7 @@ class Agent:
     def _infer_dynamic_relationship(self, other, relation_summary=""):
         if not self.depression_dynamic:
             return ""
-        raw_config = getattr(self.depression_dynamic, "raw_config", {})
-        mapping = {}
-        if isinstance(raw_config.get("relationship_overrides", {}), dict):
-            mapping.update(raw_config.get("relationship_overrides", {}))
-        profile = raw_config.get("profile", {}) if isinstance(raw_config.get("profile", {}), dict) else {}
-        if isinstance(profile.get("relationship_overrides", {}), dict):
-            mapping.update(profile.get("relationship_overrides", {}))
         other_name = str(getattr(other, "name", "") or "").strip()
-        if other_name in mapping:
-            return str(mapping[other_name] or "").strip()
-
         summary = str(relation_summary or "")
         text = "{} {}".format(other_name, summary)
         heuristics = [

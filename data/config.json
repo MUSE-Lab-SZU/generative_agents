@@ -113,7 +113,7 @@
       {
         "rule_id": "fast_every_4step",
         "type": "interval_steps",
-        "interval_steps": 4,
+        "interval_steps": 14,
         "step_phase": 2,
         "duration": 1440,
         "doctor": "蜻蜓队长",
@@ -176,13 +176,13 @@
       "defaults": {
         "enabled": false,
         "forced_only": true,
-        "forced_chat_iter": -1,
+        "forced_chat_iter": 18,
         "repeat_break_threshold": 1,
         "repeat_detection_enabled": false,
         "forced_chat_min_turns": -1,
         "forced_chat_max_turns": -1,
         "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 6
+        "terminate_detection_tail_window_turns": 9
       },
       "agent_overrides": {
         "卡布达": {
@@ -351,16 +351,24 @@
       }
     }
   },
+  "checkpointing": {
+    "enabled": true,
+    "mode": "consult_sparse",
+    "periodic_every_steps": 56,
+    "write_final_snapshot": true,
+    "write_on_staged_eval_trigger": true
+  },
   "staged_eval": {
     "enabled": true,
     "target_agent": "卡布达",
     "include_t0": true,
-    "session_interval": 3,
-    "max_completed_sessions": 10,
+    "session_interval": 4,
+    "max_completed_sessions": 1000,
     "t4_enabled": true,
     "t4_after_steps": 8,
+    "auto_stop_after_t4_done": true,
     "worker_script": "runshells/run_staged_eval_worker.py",
-    "worker_timeout_seconds": 1800,
+    "worker_timeout_seconds": 3600,
     "cleanup_tmp_storage": true,
     "scales": [
       "PHQ-9",

@@ -68,8 +68,6 @@ class TraumaMemorySystem:
         # 即使现在是空实现，也先把序列化接口留好，
         # 这样以后补功能时不用改上层 checkpoint 结构。
         return {
-            "config": copy.deepcopy(self.config),
-            "enabled": bool(self.enabled),
             "memory_context": copy.deepcopy(self.memory_context),
         }
 

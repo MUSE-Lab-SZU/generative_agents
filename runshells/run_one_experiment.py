@@ -39,7 +39,7 @@ RESUME_RUN = False
 START_TIME = "20260529-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 48
+STEP = 560
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 360
