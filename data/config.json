@@ -46,7 +46,8 @@
       "summary_window_minutes": -1,
       "max_read_items": -1,
       "focus_retrieve_max": 15,
-      "recent_turn_focus_n": 15
+      "recent_turn_focus_n": 15,
+      "normal_chat_min_interval_minutes": 720
     },
     "chat_memory": {
       "write_mode": "hybrid"
@@ -114,7 +115,7 @@
         "rule_id": "fast_every_4step",
         "type": "interval_steps",
         "interval_steps": 14,
-        "step_phase": 2,
+        "step_phase": 1,
         "duration": 1440,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
@@ -368,12 +369,11 @@
     "t4_after_steps": 8,
     "auto_stop_after_t4_done": true,
     "worker_script": "runshells/run_staged_eval_worker.py",
-    "worker_timeout_seconds": 3600,
+    "worker_timeout_seconds": 7200,
     "cleanup_tmp_storage": true,
     "scales": [
       "PHQ-9",
-      "BDI-II",
-      "SDS"
+      "BDI-II"
     ]
   }
 }

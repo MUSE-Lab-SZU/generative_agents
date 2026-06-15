@@ -35,6 +35,7 @@ from run_one_experiment import (
     BASE_DIR,
     COMPRESS_SCRIPT,
     MERGE_SCRIPT,
+    POST_EVAL_TIMEOUT_SECONDS,
     SCALE_SCORING_DIR,
     SCORE_WORKER_SCRIPT,
     SCALES,
@@ -57,7 +58,7 @@ from run_one_experiment import (
 RUN_NAME = ""
 
 # 仿真起始时间（对应 start.py 的 --start）
-START_TIME = "20260612-11:30"
+START_TIME = "20260614-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
 STEP = 280
@@ -77,7 +78,7 @@ SCALE_AGENT = "卡布达"
 # 是否执行“merge 对话与咨询记录”阶段
 RUN_MERGE = True
 
-# 是否执行治疗后量表评估（PHQ-9 / BDI-II / SDS）
+# 是否执行治疗后量表评估（PHQ-9 / BDI-II）
 RUN_POST_SCALE = True
 
 # 是否执行 compress.py 生成回放资源
@@ -103,11 +104,10 @@ SIMULATION_LOG_POLL_SECONDS = 60
 SIMULATION_LOG_STALE_SECONDS = 15 * 60
 SIMULATION_MAX_RESTARTS = 3
 
-# 为了尽量避免写 checkpoint / 汇总时直接撞上磁盘写满，
-# 在启动新阶段前要求至少保留 3 GiB 可用空间；
-# 仿真运行中如果跌到 1 GiB 以下，则提前停掉子进程并给出明确报错。
-MIN_FREE_DISK_BYTES_TO_START = 0.5 * 1024 ** 3
-MIN_FREE_DISK_BYTES_TO_CONTINUE = 0.5 * 1024 ** 3
+# 当前 results 已迁移到数据盘软链接，这里把磁盘保护阈值调低到 50 MiB，
+# 作为临时折中，避免仓库根目录所在分区的剩余空间误触发中断。
+MIN_FREE_DISK_BYTES_TO_START = 50 * 1024 ** 2
+MIN_FREE_DISK_BYTES_TO_CONTINUE = 50 * 1024 ** 2
 
 # ============================================================
 # ↑↑↑ 可调参数：直接修改这里即可（中文注释）↑↑↑
@@ -230,7 +230,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-completed", dest="skip_completed", action="store_true", default=True, help="默认跳过已完成 condition")
     parser.add_argument("--no-skip-completed", dest="skip_completed", action="store_false", help="即使已完成也重新调度")
     parser.add_argument("--skip-merge", action="store_true", help="跳过 merge 阶段")
-    parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II/SDS 评估")
+    parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II 评估")
     parser.add_argument("--skip-compress", action="store_true", help="跳过 compress.py")
     parser.add_argument("--run-agent-memory-vis", action="store_true", help="显式开启角色记忆可视化")
     parser.add_argument("--skip-agent-memory-vis", action="store_true", help="跳过角色记忆可视化")
@@ -1209,7 +1209,7 @@ def ensure_staged_eval_scores(run_dir: Path, *, dry_run: bool) -> None:
                     str(scored_path),
                 ],
                 dry_run=dry_run,
-                timeout=300,
+                timeout=POST_EVAL_TIMEOUT_SECONDS,
             )
 
 
@@ -1539,7 +1539,7 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
     lines = []
     lines.append(f"# 批量实验结果汇总：{cfg.name}\n")
     lines.append(f"生成时间：{payload['generated_at']}\n")
-    lines.append("> 本汇总只统计 PHQ-9 / BDI-II / SDS；当前不包含 30Q。\n")
+    lines.append("> 本汇总只统计 PHQ-9 / BDI-II；当前不包含 30Q。\n")
     lines.append("## 汇总范围\n")
     lines.append(f"- 条件数：{len(results)}")
     lines.append(f"- 评估点：{', '.join(payload['trigger_labels']) if payload['trigger_labels'] else '—'}")

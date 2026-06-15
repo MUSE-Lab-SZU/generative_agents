@@ -66,6 +66,9 @@ class Agent:
         self.chat_recent_turn_focus_n = self._resolve_chat_recent_turn_focus_n(
             self.chat_history_config.get("recent_turn_focus_n", 4)
         )
+        self.normal_chat_min_interval_minutes = self._resolve_normal_chat_min_interval_minutes(
+            self.chat_history_config.get("normal_chat_min_interval_minutes", 60)
+        )
         self.chat_memory_write_mode = self._resolve_chat_memory_write_mode(
             self.chat_memory_config.get("write_mode", "hybrid")
         )
@@ -77,11 +80,12 @@ class Agent:
             )
         )
         self.logger.info(
-            "[CHAT_HISTORY_READ_CFG] agent={} max_read_items={} focus_retrieve_max={} recent_turn_focus_n={}".format(
+            "[CHAT_HISTORY_READ_CFG] agent={} max_read_items={} focus_retrieve_max={} recent_turn_focus_n={} normal_chat_min_interval_minutes={}".format(
                 self.name,
                 self.chat_history_max_read_items,
                 self.chat_focus_retrieve_max,
                 self.chat_recent_turn_focus_n,
+                self.normal_chat_min_interval_minutes,
             )
         )
         self.logger.info(
@@ -412,8 +416,19 @@ class Agent:
         self._normalize_stale_forced_chat_action()
         events = self.move(status["coord"], status.get("path"))
         plan, _ = self.make_schedule()
+        lock = self.status.get("intervention", {}).get("lock", {}) if isinstance(self.status, dict) else {}
+        forced_lock_active = bool(
+            isinstance(lock, dict)
+            and lock.get("enabled", False)
+            and str(lock.get("meeting_id", "") or "").strip()
+            and str(lock.get("target_agent", "") or "").strip()
+        )
 
-        if (plan["describe"] == "sleeping" or "睡" in plan["describe"]) and self.is_awake():
+        if (
+            (plan["describe"] == "sleeping" or "睡" in plan["describe"])
+            and self.is_awake()
+            and not forced_lock_active
+        ):
             self.logger.info("{} is going to sleep...".format(self.name))
             address = self.spatial.find_address("睡觉", as_list=True)
             tiles = self.maze.get_address_tiles(address)
@@ -1326,14 +1341,15 @@ class Agent:
                     self.name, other.name, delta, chats[0]
                 )
             )
-            if not forced and delta < 60:
+            if not forced and delta < self.normal_chat_min_interval_minutes:
                 self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
                 self.logger.info(
-                    "========== [{}][CHAT_BLOCKED] reason=delta_lt_60 self={} other={} delta={} ==========".format(
+                    "========== [{}][CHAT_BLOCKED] reason=delta_lt_min_interval self={} other={} delta={} min_interval={} ==========".format(
                         trace_scope,
                         self.name,
                         other.name,
                         delta,
+                        self.normal_chat_min_interval_minutes,
                     )
                 )
                 return False
@@ -2687,6 +2703,18 @@ class Agent:
         if recent_turn < 0:
             return default_recent_turn
         return recent_turn
+
+    def _resolve_normal_chat_min_interval_minutes(self, value):
+        default_interval = 60
+        if isinstance(value, bool):
+            return default_interval
+        try:
+            interval = int(value)
+        except Exception:
+            return default_interval
+        if interval <= 0:
+            return default_interval
+        return interval
 
     def _resolve_chat_memory_write_mode(self, value):
         mode = str(value or "hybrid").strip().lower()

@@ -21,7 +21,6 @@ DEFAULT_WORKER_SCRIPT = "runshells/run_staged_eval_worker.py"
 SCALE_QUESTION_FILES = {
     "PHQ-9": "PHQ-9-v2.jsonl",
     "BDI-II": "BDI-II-v2.jsonl",
-    "SDS": "SDS-v2.jsonl",
 }
 
 
