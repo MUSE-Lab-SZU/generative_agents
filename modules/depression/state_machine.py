@@ -108,7 +108,6 @@ class ComplaintGraphManager:
             self.planner.get("min_match_confidence"), 0.60, 0.0, 1.0
         )
         self.allow_replan = self._coerce_bool(self.planner.get("allow_replan", True))
-        self.allow_jump = self._coerce_bool(self.planner.get("allow_jump", True))
         self.llm_enabled = self._coerce_bool(self.planner.get("llm_enabled", True))
         self.max_dialog_history = self._bounded_int(
             self.planner.get("max_dialog_history"), 12, 4, 50
@@ -257,7 +256,7 @@ class ComplaintGraphManager:
         输出的是一个 evaluation dict，类似“事务草稿”：
         - 当前节点是否被触及；
         - 置信度如何；
-        - 动作是 hold / advance / replan / jump；
+        - 动作是 hold / advance / replan；
         - 如果要前进，当前节点的候选分支是什么。
         真正改状态要等 `commit_turn()`。
         """
@@ -305,17 +304,15 @@ class ComplaintGraphManager:
             current_stage["id"],
             stage_updates,
         )
-        if action not in {"hold", "advance", "replan", "jump"}:
+        if action not in {"hold", "advance", "replan"}:
             action = "hold"
 
         if action == "replan" and not self.allow_replan:
             action = "hold"
-        if action == "jump" and not self.allow_jump:
-            action = "hold"
 
         next_stage: Optional[Dict[str, Any]] = None
-        if action in {"advance", "jump"}:
-            # advance / jump 的共同前提：必须能推出一个候选节点。
+        if action == "advance":
+            # advance 的前提：必须能推出一个候选节点。
             # 如果 next_graph 不够长，就退回当前 stage 的 next_candidates。
             if len(next_graph_ids) > 1:
                 next_stage = self._lookup_stage(next_graph_ids[1], stage_updates)
@@ -350,12 +347,13 @@ class ComplaintGraphManager:
 
         这里最值得审查的点是：
         - `hold/replan` 只更新当前节点候选分支；
-        - `advance` 选择一个候选分支成为新的当前节点；
-        - `jump` 会把目标节点作为新的当前路径起点。
+        - `advance` 选择一个候选分支成为新的当前节点。
         """
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         current_before = self.get_current_stage()
         action = str(evaluation.get("action", "hold") or "hold").strip().lower()
+        if action not in {"hold", "advance", "replan"}:
+            action = "hold"
         matched = bool(evaluation.get("matched", False))
         match_confidence = self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(evaluation.get("match_reason", "") or "")[:180]
@@ -389,23 +387,6 @@ class ComplaintGraphManager:
                     self.planned_graph.append(target_stage_id)
                 self.stage_index = len(self.planned_graph) - 1
                 self.stage_start_time = self._now()
-        elif action == "jump":
-            target_stage = evaluation.get("next_stage") if isinstance(evaluation.get("next_stage"), dict) else None
-            target_stage_id = ""
-            if isinstance(target_stage, dict):
-                target_stage_id = str(target_stage.get("id", "") or "").strip()
-            if not target_stage_id and len(next_graph) > 1:
-                target_stage_id = str(next_graph[1] or "").strip()
-            if target_stage_id:
-                if target_stage_id not in self.stage_catalog:
-                    # jump 允许把一个运行时临时生成的 stage 写入 catalog，
-                    # 这样后续 snapshot / 恢复状态时不会丢失它。
-                    self.stage_catalog[target_stage_id] = self._sanitize_stage(target_stage or {"id": target_stage_id, "label": target_stage_id}, source="jump")
-                # jump 表示直接把目标节点设为当前路径起点。
-                self.planned_graph = [target_stage_id]
-                self.stage_index = 0
-                self.stage_start_time = self._now()
-
         self._ensure_future_window()
         current_after = self.get_current_stage()
 
@@ -461,7 +442,7 @@ class ComplaintGraphManager:
             llm_signal=llm_transition_signal,
         )
         self.commit_turn(evaluation)
-        return str(evaluation.get("action", "hold")) in {"advance", "jump"}
+        return str(evaluation.get("action", "hold")) == "advance"
 
     def initialize_graph_window(
         self,
@@ -1054,17 +1035,14 @@ class ComplaintGraphManager:
         current_id = str(current_stage.get("id", "") or "").strip()
         candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
         action = str(payload.get("action", "hold") or "hold").strip().lower()
-        if action not in {"hold", "advance", "jump"}:
+        if action not in {"hold", "advance"}:
             action = "hold"
         target_id = str(
             payload.get("target_stage_id", payload.get("next_stage_id", "")) or ""
         ).strip()
-        if not target_id and action in {"advance", "jump"} and candidate_ids:
+        if not target_id and action == "advance" and candidate_ids:
             target_id = candidate_ids[0]
         if action == "advance" and target_id not in candidate_ids:
-            action = "hold"
-            target_id = ""
-        if action == "jump" and target_id not in self.stage_catalog:
             action = "hold"
             target_id = ""
         confidence = self._bounded_float(
@@ -1073,8 +1051,10 @@ class ComplaintGraphManager:
             0.0,
             1.0,
         )
-        if action in {"advance", "jump"} and confidence < self.min_match_confidence:
+        if action == "advance" and confidence < self.min_match_confidence:
             action = "hold"
+            target_id = ""
+        if action != "advance":
             target_id = ""
         next_graph = [current_id]
         if target_id:
@@ -1272,7 +1252,7 @@ class ComplaintGraphManager:
             payload.get("match_reason", payload.get("match_evidence", "")) or ""
         ).strip()[:180]
         action = str(payload.get("action", "hold") or "hold").strip().lower()
-        if action not in {"hold", "advance", "replan", "jump"}:
+        if action not in {"hold", "advance", "replan"}:
             action = "hold"
 
         raw_next = payload.get("next_graph", [])

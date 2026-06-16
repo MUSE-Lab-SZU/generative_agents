@@ -268,7 +268,6 @@ class DepressionSimulationEngine:
             roadmap_completion_func=roadmap_completion_func,
             roadmap_llm_cfg=roadmap_llm_cfg,
             emotion_completion_func=emotion_completion_func,
-            disallow_jump=(event_source == "reflection"),
         )
 
     def _commit_context(
@@ -279,7 +278,6 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
-        disallow_jump: bool = False,
     ) -> Dict[str, Any]:
         """执行提交流水线：评估主诉图、落盘状态、推断记忆和情绪。"""
         if not self.enabled:
@@ -287,11 +285,6 @@ class DepressionSimulationEngine:
 
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation_content = str(conversation_content or "")
-        stage_catalog_before = (
-            copy.deepcopy(self.graph_manager.stage_catalog)
-            if disallow_jump
-            else None
-        )
         evaluation = self.graph_manager.evaluate_turn(
             session_context=session_context,
             conversation_content=conversation_content,
@@ -299,10 +292,6 @@ class DepressionSimulationEngine:
             llm_cfg=roadmap_llm_cfg,
             llm_signal=llm_transition_signal,
         )
-        if disallow_jump and str(evaluation.get("action", "") or "").strip().lower() == "jump":
-            if isinstance(stage_catalog_before, dict):
-                self.graph_manager.stage_catalog = stage_catalog_before
-            evaluation = self._downgrade_jump_evaluation(evaluation)
         graph_snapshot = self.graph_manager.commit_turn(evaluation)
         if callable(roadmap_completion_func):
             graph_snapshot = self.graph_manager.ensure_graph_window(
@@ -439,28 +428,6 @@ class DepressionSimulationEngine:
             "metadata": meta,
             "evidence_ids": normalized_evidence,
         }
-
-    def _downgrade_jump_evaluation(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
-        """把不允许跳转场景中的 jump 评估降级为 hold，并保留当前窗口。"""
-        payload = copy.deepcopy(evaluation if isinstance(evaluation, dict) else {})
-        if str(payload.get("action", "") or "").strip().lower() != "jump":
-            return payload
-        current_graph = self.graph_manager.get_current_graph_window(
-            getattr(self.graph_manager, "window_size", 3) + 1
-        )
-        payload["action"] = "hold"
-        payload["next_stage"] = None
-        payload["stage_updates"] = []
-        payload["next_graph"] = [
-            str(stage.get("id", "") or "")
-            for stage in current_graph
-            if isinstance(stage, dict) and str(stage.get("id", "") or "").strip()
-        ]
-        payload["next_graph"] = copy.deepcopy(payload["next_graph"])
-        reason = str(payload.get("match_reason", "") or "").strip()
-        suffix = "reflection_disallows_jump"
-        payload["match_reason"] = "{}; {}".format(reason, suffix) if reason else suffix
-        return payload
 
     def _infer_emotion(
         self,
