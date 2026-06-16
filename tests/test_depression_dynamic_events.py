@@ -127,7 +127,7 @@ def test_generate_chat_template_keeps_persona_description_single_source():
     assert dynamic_prompt.count("=== 基础人格层 ===") == 1
 
 
-def test_chat_event_keeps_existing_jump_behavior():
+def test_chat_event_downgrades_legacy_jump_to_hold():
     engine = DepressionSimulationEngine(_engine_config())
 
     engine.commit_event(
@@ -143,8 +143,8 @@ def test_chat_event_keeps_existing_jump_behavior():
     )
 
     state = engine.get_current_state_info()
-    assert state["current_stage"]["id"] == "stage_b"
-    assert state["graph"]["last_evaluation"]["action"] == "jump"
+    assert state["current_stage"]["id"] == "stage_a"
+    assert state["graph"]["last_evaluation"]["action"] == "hold"
     assert state["graph"]["last_evaluation"]["source"] == "chat"
     assert state["graph"]["dialogue_history"][-1]["source"] == "chat"
     assert state["graph"]["dialogue_history"][-1]["evidence_ids"] == ["chat-1"]

@@ -9,7 +9,6 @@
       "llm_enabled": true,
       "min_match_confidence": 0.64,
       "allow_replan": true,
-      "allow_jump": true,
       "max_dialog_history": 16
     },
     "stages": [
