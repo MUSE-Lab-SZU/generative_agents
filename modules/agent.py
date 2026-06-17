@@ -1333,7 +1333,7 @@ class Agent:
 
         prev_self_ctx, prev_other_ctx = self._set_chat_route_ctx(other, forced=forced)
 
-        chats = self.associate.retrieve_chats(other.name)
+        chats = self.associate.retrieve_chats(other.name, force_direct=True)
         if chats:
             delta = utils.get_timer().get_delta(chats[0].create)
             self.logger.info(
@@ -2019,6 +2019,8 @@ class Agent:
                     forced_meeting_id = str(meeting_ctx.get("meeting_id", "") or "")
             except Exception:
                 forced_meeting_id = ""
+        if forced_meeting_id:
+            chat_meta_common["meeting_id"] = forced_meeting_id
 
         self.schedule_chat(
             chats,
@@ -2295,9 +2297,12 @@ class Agent:
             address=address or self.get_tile().get_address(),
             emoji=f"💬",
         )
+        pending_meta = copy.deepcopy(chat_meta or {})
+        if meeting_id and not pending_meta.get("meeting_id"):
+            pending_meta["meeting_id"] = meeting_id
         self._pending_chat_memory_meta = {
             "expire": chat_expire,
-            "meta": copy.deepcopy(chat_meta or {}),
+            "meta": pending_meta,
             "start": start,
             "duration": duration,
             "other": getattr(other, "name", ""),
@@ -2349,6 +2354,7 @@ class Agent:
                 event,
                 create=start,
                 expire=expire,
+                filling=chat_meta or {},
             )
             self._set_chat_dedup_marker(
                 node_id=getattr(node, "node_id", ""),
@@ -2562,6 +2568,12 @@ class Agent:
                 if isinstance(pending_expire, datetime.datetime):
                     expire = pending_expire
                 meta = pending.get("meta", {}) if isinstance(pending.get("meta"), dict) else {}
+                if filling is None:
+                    filling = copy.deepcopy(meta)
+                elif isinstance(filling, dict):
+                    merged_filling = copy.deepcopy(meta)
+                    merged_filling.update(filling)
+                    filling = merged_filling
                 override_address = self._normalize_address_list(
                     meta.get("memory_address_override", [])
                 )

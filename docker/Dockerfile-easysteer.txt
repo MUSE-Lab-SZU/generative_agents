@@ -1,0 +1,204 @@
+# syntax=docker/dockerfile:1.7
+
+# 基础镜像：
+# 当前仓库里的 vllm-steer 已经要求 torch 2.10.0，并默认围绕 CUDA 12.9 构建。
+# 因此这里改成 CUDA 12.9.1，避免出现“仓库要求的 torch 版本存在，但 cu121 源里没有”的问题。
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+
+LABEL maintainer="ZJU-REAL"
+LABEL description="EasySteer runtime image for academic GPU platforms"
+
+# 这一组环境变量主要解决三类问题：
+# 1. 避免 apt 在无交互环境里卡住；
+# 2. 统一容器时区和字符集；
+# 3. 让 Python / pip 在日志和缓存行为上更适合服务器环境。
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# 某些集群会在宿主机层面注入代理配置，apt 继承后反而可能失败。
+# 这里显式关闭 apt 代理，和你之前成功部署的镜像保持一致。
+RUN printf 'Acquire::http::Proxy "false";\nAcquire::https::Proxy "false";\n' \
+    > /etc/apt/apt.conf.d/00proxy
+
+# 更换 Ubuntu 软件源到清华镜像，减少校园网/国内网络环境下的下载失败概率。
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
+# 设置系统时区，避免日志时间和实际使用时区不一致。
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    echo ${TZ} > /etc/timezone
+
+# 安装构建和运行 EasySteer 所需的基础工具：
+# - build-essential / cmake / ninja-build：给可能的本地编译兜底
+# - git / curl / wget：拉依赖、排查问题时常用
+# - zlib1g-dev / libffi-dev / pkg-config：Python 科学计算依赖常见底层库
+# - openssh-server / vim：保留你之前镜像里常用的远程调试工具
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    libffi-dev \
+    ninja-build \
+    openssh-server \
+    pkg-config \
+    vim \
+    wget \
+    zlib1g-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装 Miniconda：
+# 这样可以把 Python 运行时和系统 Python 隔离开，更适合智算平台长期维护。
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-py310_23.5.2-0-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm -f /tmp/miniconda.sh
+
+# 先把 conda 自身加入 PATH，后面创建环境时会直接用到。
+ENV PATH="/opt/conda/bin:${PATH}"
+
+# 配置 conda 基本行为：
+# - 显示下载源，便于后续排障
+# - 增加 conda-forge，补充更多科学计算依赖
+# - 使用 strict priority，减少不同 channel 混装造成的冲突
+RUN conda config --system --set show_channel_urls yes && \
+    conda config --system --add channels conda-forge && \
+    conda config --system --set channel_priority strict
+
+# 创建独立的 EasySteer Python 3.10 环境。
+# 官方 README 也是以 Python 3.10 为主线说明的，因此这里保持一致。
+RUN conda create -n easysteer python=3.10 -y
+
+# 后续所有 Python / pip 命令都默认走 easysteer 环境，
+# 这样无需每一层都显式 conda activate。
+ENV PATH="/opt/conda/envs/easysteer/bin:/opt/conda/bin:${PATH}" \
+    CONDA_DEFAULT_ENV=easysteer \
+    CONDA_PREFIX=/opt/conda/envs/easysteer
+
+# 把 pip 默认源切到清华镜像，提升国内网络环境下的可用性。
+# 如果你们智算平台有自己的内网 PyPI，也可以在这里替换掉。
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+    pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+
+# 统一项目工作目录。
+# 不再使用 /app 作为真实代码目录，避免被平台运行工作区覆盖。
+WORKDIR /workspace/easysteer
+
+# 复制整个 EasySteer 仓库。
+# 这里必须把 vllm-steer 子目录也一起带进去，因为 EasySteer 依赖本地改造版 vLLM。
+COPY . /workspace/easysteer/
+
+# 先安装与 CUDA 12.9 对应的 PyTorch 栈。
+# 单独提前安装有两个好处：
+# 1. 更直观地锁定 CUDA 轮子来源；
+# 2. 后续安装 vllm-steer 时可以复用现成 torch，减少环境歧义。
+RUN pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu129 \
+    "torch==2.10.0" \
+    "torchaudio==2.10.0" \
+    "torchvision==0.25.0" && \
+    python -c "import torch, torchaudio, torchvision; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('torchaudio', torchaudio.__version__); print('torchvision', torchvision.__version__); assert torch.__version__.startswith('2.10.0'); assert torch.version.cuda == '12.9'"
+
+# 下面这组环境变量是安装 vllm-steer 的关键：
+# - VLLM_USE_PRECOMPILED=1：优先使用官方预编译 wheel，避免在集群上长时间本地编译
+# - VLLM_PRECOMPILED_WHEEL_COMMIT：固定到 EasySteer README 推荐的兼容提交
+# - VLLM_MAIN_CUDA_VERSION / VLLM_PRECOMPILED_WHEEL_VARIANT：
+#   显式告诉 vllm 当前要拿 CUDA 12.9 / cu129 这一套预编译产物
+# - SETUPTOOLS_SCM_PRETEND_VERSION：因为根目录 .dockerignore 排除了 .git，
+#   不补这个变量的话，vllm-steer 在镜像里读取不到版本信息，构建容易失败
+# - VLLM_DOCKER_BUILD_CONTEXT=1：告诉 vllm 当前处于 Docker 构建上下文
+ENV VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=95c0f928cdeeaa21c4906e73cee6a156e1b3b995 \
+    VLLM_MAIN_CUDA_VERSION=12.9 \
+    VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1+easysteer \
+    VLLM_DOCKER_BUILD_CONTEXT=1
+
+# 安装本地改造过的 vllm-steer。
+# 这里额外做三件事来提高集群环境下的稳定性：
+# 1. 用 use_existing_torch.py 去掉 requirements 里的 torch 相关显式依赖；
+# 2. 用 constraints 文件强制所有后续安装都复用已装好的 cu129 torch 栈；
+# 3. 先装 runtime deps，再用 --no-deps 安装 editable 包，避免 pip 在解析 transitive deps 时把 torch 升到 2.12/cu130。
+RUN cd /workspace/easysteer/vllm-steer && \
+    python use_existing_torch.py --prefix && \
+    printf '%s\n' \
+        'torch==2.10.0+cu129' \
+        'torchaudio==2.10.0+cu129' \
+        'torchvision==0.25.0+cu129' \
+        > /tmp/torch-cu129-constraints.txt && \
+    pip install --no-cache-dir -r requirements/build.txt && \
+    pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
+        -c /tmp/torch-cu129-constraints.txt \
+        -r requirements/cuda.txt && \
+    pip install --no-cache-dir -e . --no-build-isolation --no-deps && \
+    python -c "import torch, torchaudio, torchvision, vllm; print('post-vllm torch', torch.__version__, 'cuda', torch.version.cuda); print('post-vllm torchaudio', torchaudio.__version__); print('post-vllm torchvision', torchvision.__version__); assert torch.__version__.startswith('2.10.0'); assert torch.version.cuda == '12.9'"
+
+# 安装 EasySteer 本体。
+# 使用 editable 模式后，你在挂载源码目录调试时会更方便。
+RUN cd /workspace/easysteer && \
+    pip install --no-cache-dir -e .
+
+# 安装前端控制面板的额外依赖。
+# 这样镜像既能跑 docker_test.py，也能直接运行 frontend/app.py 或 start.sh。
+RUN pip install --no-cache-dir -r /workspace/easysteer/frontend/requirements.txt
+
+# 安装 Jupyter。
+RUN pip install --no-cache-dir jupyter jupyterlab ipykernel && \
+    python -m ipykernel install --sys-prefix --name easysteer --display-name "Python (easysteer)"
+
+# 做一个轻量级自检：
+# 如果这里 import 失败，说明镜像在构建阶段就已经有问题，可以尽早暴露出来。
+RUN python -c "import easysteer, flask, vllm, torch; print('EasySteer image is ready with torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# 预创建常用目录：
+# - /workspace：默认工作区，和官方 compose 保持一致
+# - /workspace/models：建议挂载模型目录到这里
+# - /model：为直接挂载单个模型目录提供稳定路径
+# - /workspace/hf-cache：集中管理 Hugging Face 缓存，避免散落到不同位置
+RUN mkdir -p /workspace/workspace /workspace/models /workspace/hf-cache /root/.cache/huggingface/hub /model
+
+# 统一 Hugging Face 相关缓存目录，减少重复下载与排障成本。
+ENV HF_HOME=/workspace/hf-cache \
+    HUGGINGFACE_HUB_CACHE=/workspace/hf-cache/hub \
+    EASYSTEER_MODEL_PATH=/model/Qwen2.5-1.5B-Instruct \
+    EASYSTEER_VECTOR_PATH=/workspace/easysteer/vectors/happy_diffmean.gguf
+
+# 如果 build.sh 传入了 MODEL_CONTEXT，这里会把模型目录直接写入镜像；
+# 如果未传入，则 build.sh 会提供一个空目录作为占位上下文，使构建仍然可继续。
+COPY --from=model / /model/Qwen2.5-1.5B-Instruct
+
+# 为旧脚本保留 /app 兼容路径。
+# 这些链接在构建期创建一次。
+RUN mkdir -p /app && \
+    ln -sfn /workspace/easysteer /app/easysteer && \
+    ln -sfn /model /app/models && \
+    ln -sfn /workspace/hf-cache /app/hf-cache
+
+# 如果平台直接开 bash，进入 shell 时也重新创建软链接并激活 conda。
+RUN echo 'mkdir -p /app' >> /root/.bashrc && \
+    echo 'ln -sfn /workspace/easysteer /app/easysteer' >> /root/.bashrc && \
+    echo 'ln -sfn /model /app/models' >> /root/.bashrc && \
+    echo 'ln -sfn /workspace/hf-cache /app/hf-cache' >> /root/.bashrc && \
+    echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo 'conda activate easysteer' >> /root/.bashrc
+
+# 暴露常见端口：
+# - 5000：EasySteer Flask 后端
+# - 8017：vLLM 服务
+# - 8111：静态前端页面
+# - 8888：Jupyter
+EXPOSE 5000 8017 8111 8888
+
+# 默认进入工作目录。
+WORKDIR /workspace/workspace
+
+# 启动时再创建一次 /app 兼容软链接，防止平台运行时覆盖 /app。
+CMD ["/bin/bash", "-lc", "mkdir -p /app && ln -sfn /workspace/easysteer /app/easysteer && ln -sfn /model /app/models && ln -sfn /workspace/hf-cache /app/hf-cache && source /opt/conda/bin/activate easysteer && exec bash"]

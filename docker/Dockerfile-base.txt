@@ -1,0 +1,155 @@
+# syntax=docker/dockerfile:1.7
+
+# Base image for remote GPU platforms.
+#
+# This file intentionally contains only the reusable runtime layer:
+# CUDA, system build tools, Conda/Python, PyTorch, official vLLM,
+# notebook utilities, and shared cache/model directories.
+#
+# Project-specific layers should stay in a later Dockerfile:
+# - COPY this repository
+# - pip install requirements_linux.txt
+# - configure data/config.json or runtime env vars
+# - copy or mount experiment data and model weights
+
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+
+LABEL maintainer="ZJU-REAL"
+LABEL description="Reusable CUDA/vLLM base image for GenerativeAgentsCN experiments"
+
+ARG PYTHON_VERSION=3.10
+ARG CONDA_ENV=llm-depression
+ARG MINICONDA_VERSION=py310_23.5.2-0
+ARG PYTORCH_VERSION=2.10.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCH_CUDA_VARIANT=cu129
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG VLLM_PIP_SPEC=vllm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Some GPU platforms inject host proxy settings into containers.  Keeping apt
+# proxy disabled matches the previously successful EasySteer image.
+RUN printf 'Acquire::http::Proxy "false";\nAcquire::https::Proxy "false";\n' \
+    > /etc/apt/apt.conf.d/00proxy
+
+# Use a China-friendly Ubuntu mirror for remote academic GPU platforms.
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    echo ${TZ} > /etc/timezone
+
+# Reusable OS layer:
+# - build-essential/cmake/ninja/pkg-config for packages with native extensions
+# - git/curl/wget/ca-certificates for model and package retrieval
+# - libffi/zlib for common Python scientific packages
+# - openssh-server/vim/tmux/less/procps for remote debugging on platforms
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        less \
+        libffi-dev \
+        ninja-build \
+        openssh-server \
+        pkg-config \
+        procps \
+        rsync \
+        tmux \
+        vim \
+        wget \
+        zlib1g-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm -f /tmp/miniconda.sh
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+RUN conda config --system --set show_channel_urls yes && \
+    conda config --system --add channels conda-forge && \
+    conda config --system --set channel_priority strict && \
+    conda create -n ${CONDA_ENV} python=${PYTHON_VERSION} -y && \
+    conda clean -afy
+
+ENV PATH="/opt/conda/envs/${CONDA_ENV}/bin:/opt/conda/bin:${PATH}" \
+    CONDA_DEFAULT_ENV=${CONDA_ENV} \
+    CONDA_PREFIX=/opt/conda/envs/${CONDA_ENV}
+
+RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    pip config set global.trusted-host ${PIP_TRUSTED_HOST} && \
+    python -m pip install --upgrade pip setuptools wheel
+
+# Match the successful EasySteer image: install the CUDA 12.9 PyTorch stack
+# before vLLM so later dependency resolution reuses this GPU build.
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
+        "torch==${PYTORCH_VERSION}" \
+        "torchaudio==${TORCHAUDIO_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}" && \
+    python -c "import torch, torchaudio, torchvision; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('torchaudio', torchaudio.__version__); print('torchvision', torchvision.__version__)"
+
+# Official vLLM runtime for the current project.  Keep the spec as a build arg
+# so the project image can pin or override it without editing this base file:
+#   --build-arg VLLM_PIP_SPEC='vllm==<version>'
+#
+# The constraint file preserves the CUDA 12.9 PyTorch stack installed above.
+RUN printf '%s\n' \
+        "torch==${PYTORCH_VERSION}+${TORCH_CUDA_VARIANT}" \
+        "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_VARIANT}" \
+        "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_VARIANT}" \
+        > /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt && \
+    pip install --no-cache-dir -U \
+        --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
+        -c /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt \
+        "${VLLM_PIP_SPEC}" \
+        modelscope && \
+    python -m pip show vllm && \
+    python -c "import torch, vllm; print('vllm', getattr(vllm, '__version__', 'unknown')); print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# Notebook and quick diagnostics used on remote platforms.
+RUN pip install --no-cache-dir jupyter jupyterlab ipykernel requests openai && \
+    python -m ipykernel install --sys-prefix --name ${CONDA_ENV} --display-name "Python (${CONDA_ENV})"
+
+# Shared runtime directories.  Models are expected to be mounted or copied by
+# the project image, not baked into this base layer.
+RUN mkdir -p \
+        /workspace \
+        /workspace/project \
+        /workspace/models \
+        /workspace/hf-cache \
+        /workspace/modelscope-cache \
+        /root/.cache/huggingface/hub \
+        /model
+
+ENV HF_HOME=/workspace/hf-cache \
+    HUGGINGFACE_HUB_CACHE=/workspace/hf-cache/hub \
+    MODELSCOPE_CACHE=/workspace/modelscope-cache
+
+RUN echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo "conda activate ${CONDA_ENV}" >> /root/.bashrc && \
+    echo 'cd /workspace/project 2>/dev/null || cd /workspace' >> /root/.bashrc
+
+# 18000/18001 match runshells/vllm_services.sh.  8888 is for Jupyter.
+EXPOSE 18000 18001 8888
+
+WORKDIR /workspace/project
+
+# For interactive docker sessions this lets ~/.bashrc activate Conda, so the
+# prompt shows "(llm-depression)" instead of hiding it behind a wrapper shell.
+CMD ["/bin/bash"]

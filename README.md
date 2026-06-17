@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-07
+> 更新时间：2026-06-17
 
 ## 关键测试结果速查
 
@@ -28,6 +28,10 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-17：新增`runshells/recover_staged_eval_scores.py`脚本，作用是给中断实验的staged_eval补上score评分以及report，避免之前的实验浪费。
+- 2026-06-17：调整vllm启动参数和config.json相关参数，避免超出上下文限制
+- 2026-06-16：新建Dockerfile相关文件，vllm启动脚本新增多卡模式
+- 2026-06-15：改造本地医患对话记忆检索：聊天时用对方最近发言作为`retrieve_focus`和历史对话检索query，无对方发言时回退到`other.name + relation`；`retrieve_chats`新增`query`、`prefer_forced`、`force_direct`参数，间隔判断保持对象过滤+近期排序，prompt历史注入先限定对话对象再语义检索并优先召回forced chat；本地chat metadata新增`forced`、`meeting_id`、`expire_days`、`retrieval_scope`，并将`forced_chat_expire_days`设为`-1`以保留完整实验周期的医患咨询记忆。
 - 2026-06-14：调整对话触发时间，避免落到夜间睡眠时间。去掉SDS评估。
 - 2026-06-13：修复event记忆重复产生的问题
 - 2026-06-12：昨天做实验发现16h只跑了7个session对话，太长了。优化`modules/prompt/scratch.py`，使其可以根据`stride`调整计划decompose间隔。调整step=280、stride=720、每14步session对话1次（模拟现实的一周一次）

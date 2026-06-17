@@ -43,17 +43,17 @@
       }
     },
     "chat_history": {
-      "summary_window_minutes": -1,
-      "max_read_items": -1,
-      "focus_retrieve_max": 15,
+      "summary_window_minutes": 60480,
+      "max_read_items": 8,
+      "focus_retrieve_max": 20,
       "recent_turn_focus_n": 15,
-      "normal_chat_min_interval_minutes": 720
+      "normal_chat_min_interval_minutes": 1440
     },
     "chat_memory": {
       "write_mode": "hybrid"
     },
     "external_memory": {
-      "enabled": true,
+      "enabled": false,
       "base_url": "http://localhost:8031",
       "timeout": 10.0,
       "read_mode": "chat_only",
@@ -335,7 +335,7 @@
     "memory_policy": {
       "enabled": true,
       "scope": "forced_chat_only",
-      "forced_chat_expire_days": 30,
+      "forced_chat_expire_days": -1,
       "retrieve_profile": {
         "recency_weight_multiplier": 1.0,
         "relevance_weight_multiplier": 1.0,
