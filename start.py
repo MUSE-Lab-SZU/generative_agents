@@ -406,7 +406,8 @@ def get_config_from_log(checkpoints_folder):
     config["time"] = {"start": start_time.strftime("%Y%m%d-%H:%M")}
     agents = config["agents"]
     for a in agents:
-        config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
+        if not str(config["agents"][a].get("config_path", "") or "").strip():
+            config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
 
     return config
 

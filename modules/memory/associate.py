@@ -702,10 +702,20 @@ class Associate:
 
         retrieved = {}
         node_ids = self.memory["event"] + self.memory["thought"]
+        if not node_ids:
+            return [] if reduce_all else {text: [] for text in focus}
+        try:
+            candidate_top_k = int(retrieve_max)
+        except Exception:
+            candidate_top_k = 30
+        if candidate_top_k == -1:
+            candidate_top_k = len(node_ids)
+        else:
+            candidate_top_k = min(len(node_ids), max(1, candidate_top_k * 4))
         for text in focus:
             nodes = self._index.retrieve(
                 text,
-                similarity_top_k=len(node_ids),
+                similarity_top_k=candidate_top_k,
                 node_ids=node_ids,
                 retriever_creator=_create_retriever,
             )

@@ -10,10 +10,12 @@ MODEL_ROOT="${MODEL_ROOT:-/share/home/tm866039793920000/a874457430/MODEL}"
 QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-$MODEL_ROOT/Qwen3-8B}"
 EMBED_MODEL_DIR="${EMBED_MODEL_DIR:-$MODEL_ROOT/bge-m3}"
 
-QWEN_GPUS="${QWEN_GPUS:-${QWEN_GPU:-0,1,2,3}}"
-EMBED_GPUS="${EMBED_GPUS:-${EMBED_GPU:-3}}"
+QWEN_GPUS="${QWEN_GPUS:-${QWEN_GPU:-0,1}}"
+EMBED_GPUS="${EMBED_GPUS:-${EMBED_GPU:-2}}"
+EMBED2_GPUS="${EMBED2_GPUS:-${EMBED_SECONDARY_GPU:-3}}"
 QWEN_PORT="${QWEN_PORT:-18000}"
 EMBED_PORT="${EMBED_PORT:-18001}"
+EMBED2_PORT="${EMBED2_PORT:-18002}"
 
 QWEN_NAME="${QWEN_NAME:-qwen3-8b-vllm}"
 EMBED_NAME="${EMBED_NAME:-bge-m3-vllm}"
@@ -24,23 +26,27 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 QWEN_DTYPE="${QWEN_DTYPE:-half}"
 EMBED_DTYPE="${EMBED_DTYPE:-half}"
 
-# This staged script is tuned for the 4-GPU experiment host. Qwen still leaves
-# room on the shared embedding GPU, but uses a wider context than the 1-GPU run.
-QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.76}"
-EMBED_GPU_MEMORY_UTILIZATION="${EMBED_GPU_MEMORY_UTILIZATION:-0.18}"
+# Keep generation and embedding on separate physical GPUs. Qwen3-8B uses
+# tensor parallelism across GPUs 0-1, while BGE owns GPU 2 without contention.
+QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.90}"
+EMBED_GPU_MEMORY_UTILIZATION="${EMBED_GPU_MEMORY_UTILIZATION:-0.90}"
 
 QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-32768}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-}"
 EMBED_TENSOR_PARALLEL_SIZE="${EMBED_TENSOR_PARALLEL_SIZE:-}"
+EMBED2_TENSOR_PARALLEL_SIZE="${EMBED2_TENSOR_PARALLEL_SIZE:-$EMBED_TENSOR_PARALLEL_SIZE}"
+ENABLE_SECOND_EMBED="${ENABLE_SECOND_EMBED:-1}"
 
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-900}"
 WAIT_INTERVAL_SECONDS="${WAIT_INTERVAL_SECONDS:-5}"
 
 QWEN_PID_FILE="$STATE_DIR/qwen3.pid"
 EMBED_PID_FILE="$STATE_DIR/bge_m3.pid"
+EMBED2_PID_FILE="$STATE_DIR/bge_m3_2.pid"
 QWEN_LOG_FILE="$LOG_DIR/qwen3.log"
 EMBED_LOG_FILE="$LOG_DIR/bge_m3.log"
+EMBED2_LOG_FILE="$LOG_DIR/bge_m3_2.log"
 
 ACTION="${1:-start}"
 
@@ -255,34 +261,46 @@ start_qwen() {
 start_embed() {
     local embed_tp
     embed_tp="$(resolve_tensor_parallel_size "$EMBED_TENSOR_PARALLEL_SIZE" "$EMBED_GPUS")"
-    start_service "BGE-M3" "$EMBED_MODEL_DIR" "$EMBED_GPUS" "$EMBED_PORT" "$EMBED_NAME" \
+    start_service "BGE-M3 #1" "$EMBED_MODEL_DIR" "$EMBED_GPUS" "$EMBED_PORT" "$EMBED_NAME" \
         "$EMBED_DTYPE" "$EMBED_GPU_MEMORY_UTILIZATION" "$EMBED_MAX_MODEL_LEN" "$embed_tp" "--runner pooling --convert embed" \
         "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
+
+    if [ "$ENABLE_SECOND_EMBED" = "1" ]; then
+        local embed2_tp
+        embed2_tp="$(resolve_tensor_parallel_size "$EMBED2_TENSOR_PARALLEL_SIZE" "$EMBED2_GPUS")"
+        start_service "BGE-M3 #2" "$EMBED_MODEL_DIR" "$EMBED2_GPUS" "$EMBED2_PORT" "$EMBED_NAME" \
+            "$EMBED_DTYPE" "$EMBED_GPU_MEMORY_UTILIZATION" "$EMBED_MAX_MODEL_LEN" "$embed2_tp" "--runner pooling --convert embed" \
+            "$EMBED2_PID_FILE" "$EMBED2_LOG_FILE"
+    fi
 }
 
 print_status() {
     echo "vLLM 分阶段服务状态"
     echo "  Qwen3 service : $(if is_pid_running "$QWEN_PID_FILE"; then echo "RUNNING pid=$(cat "$QWEN_PID_FILE")"; else echo "STOPPED"; fi)"
-    echo "  BGE-M3 service: $(if is_pid_running "$EMBED_PID_FILE"; then echo "RUNNING pid=$(cat "$EMBED_PID_FILE")"; else echo "STOPPED"; fi)"
+    echo "  BGE-M3 #1     : $(if is_pid_running "$EMBED_PID_FILE"; then echo "RUNNING pid=$(cat "$EMBED_PID_FILE")"; else echo "STOPPED"; fi)"
+    echo "  BGE-M3 #2     : $(if is_pid_running "$EMBED2_PID_FILE"; then echo "RUNNING pid=$(cat "$EMBED2_PID_FILE")"; else echo "STOPPED"; fi)"
     echo "  Qwen GPUs     : $QWEN_GPUS (mem=$QWEN_GPU_MEMORY_UTILIZATION)"
-    echo "  Embed GPUs    : $EMBED_GPUS (mem=$EMBED_GPU_MEMORY_UTILIZATION)"
+    echo "  Embed #1 GPUs : $EMBED_GPUS (mem=$EMBED_GPU_MEMORY_UTILIZATION)"
+    echo "  Embed #2 GPUs : $EMBED2_GPUS (enabled=$ENABLE_SECOND_EMBED)"
     echo "  Qwen URL      : http://127.0.0.1:$QWEN_PORT/v1/chat/completions"
-    echo "  Embed URL     : http://127.0.0.1:$EMBED_PORT/v1/embeddings"
+    echo "  Embed #1 URL  : http://127.0.0.1:$EMBED_PORT/v1/embeddings"
+    echo "  Embed #2 URL  : http://127.0.0.1:$EMBED2_PORT/v1/embeddings"
     echo "  Qwen Log      : $QWEN_LOG_FILE"
-    echo "  Embed Log     : $EMBED_LOG_FILE"
+    echo "  Embed #1 Log  : $EMBED_LOG_FILE"
+    echo "  Embed #2 Log  : $EMBED2_LOG_FILE"
 }
 
 print_usage() {
     cat <<EOF
 用法: $0 [start|start-qwen|start-embed|stop|restart|status|help]
 
-start 会先启动 Qwen，确认 Qwen 服务就绪后，再启动 BGE-M3 embedding。
+start 会先启动 Qwen，确认 Qwen 服务就绪后，再启动两个 BGE-M3 embedding endpoint。
 
-共享 GPU 示例：
-  QWEN_GPUS=0,1,2,3 EMBED_GPUS=3 bash runshells/vllm_services_staged.sh start
+4 GPU 隔离部署示例：
+  QWEN_GPUS=0,1 EMBED_GPUS=2 EMBED2_GPUS=3 bash runshells/vllm_services_staged.sh start
 
-如果 embedding 仍然 OOM，可以继续降低：
-  QWEN_GPU_MEMORY_UTILIZATION=0.60 EMBED_GPU_MEMORY_UTILIZATION=0.15
+如果只想启动一个 embedding endpoint：
+  ENABLE_SECOND_EMBED=0 bash runshells/vllm_services_staged.sh start
 EOF
 }
 
@@ -292,7 +310,10 @@ case "$ACTION" in
         start_qwen
         wait_for_model "Qwen3" "http://127.0.0.1:$QWEN_PORT" "$QWEN_NAME" "$QWEN_PID_FILE" "$QWEN_LOG_FILE"
         start_embed
-        wait_for_model "BGE-M3" "http://127.0.0.1:$EMBED_PORT" "$EMBED_NAME" "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
+        wait_for_model "BGE-M3 #1" "http://127.0.0.1:$EMBED_PORT" "$EMBED_NAME" "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
+        if [ "$ENABLE_SECOND_EMBED" = "1" ]; then
+            wait_for_model "BGE-M3 #2" "http://127.0.0.1:$EMBED2_PORT" "$EMBED_NAME" "$EMBED2_PID_FILE" "$EMBED2_LOG_FILE"
+        fi
         print_status
         ;;
     start-qwen)
@@ -304,11 +325,15 @@ case "$ACTION" in
     start-embed)
         resolve_vllm_cmd
         start_embed
-        wait_for_model "BGE-M3" "http://127.0.0.1:$EMBED_PORT" "$EMBED_NAME" "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
+        wait_for_model "BGE-M3 #1" "http://127.0.0.1:$EMBED_PORT" "$EMBED_NAME" "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
+        if [ "$ENABLE_SECOND_EMBED" = "1" ]; then
+            wait_for_model "BGE-M3 #2" "http://127.0.0.1:$EMBED2_PORT" "$EMBED_NAME" "$EMBED2_PID_FILE" "$EMBED2_LOG_FILE"
+        fi
         print_status
         ;;
     stop)
-        stop_service "BGE-M3" "$EMBED_PID_FILE"
+        stop_service "BGE-M3 #2" "$EMBED2_PID_FILE"
+        stop_service "BGE-M3 #1" "$EMBED_PID_FILE"
         stop_service "Qwen3" "$QWEN_PID_FILE"
         ;;
     restart)

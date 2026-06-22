@@ -822,6 +822,7 @@ class Agent:
             for name, _ in self.chats:
                 if name == self.name or name in recorded:
                     continue
+                recorded.add(name)
                 res = self.associate.retrieve_chats(name)
                 if res and len(res) > 0:
                     node = res[-1]
@@ -1043,11 +1044,14 @@ class Agent:
     def _resolve_controlled_turn_limits(self, policy):
         budget = self.chat_iter
         min_turns = 1
-        max_turns = budget
 
         forced_chat_iter = int(policy.get("forced_chat_iter", -1) or -1)
         if forced_chat_iter != -1:
             budget = forced_chat_iter
+        if budget < 1:
+            budget = 1
+
+        max_turns = budget
 
         forced_chat_min_turns = int(policy.get("forced_chat_min_turns", -1) or -1)
         if forced_chat_min_turns != -1:
@@ -1059,8 +1063,6 @@ class Agent:
 
         if max_turns < min_turns:
             max_turns = min_turns
-        if budget < 1:
-            budget = 1
 
         return budget, min_turns, max_turns
 

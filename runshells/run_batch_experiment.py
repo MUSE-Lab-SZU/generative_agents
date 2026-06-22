@@ -11,9 +11,10 @@
     python3 runshells/run_batch_experiment.py
 
 也支持按条件筛选，例如：
+    python3 runshells/run_batch_experiment.py --condition Counsel-KBD2-G1-MILD
+    python3 runshells/run_batch_experiment.py --condition Counsel-KBD3-ALL-MOD
     python3 runshells/run_batch_experiment.py --condition Counsel-G1-MILD
-    python3 runshells/run_batch_experiment.py --condition Counsel-G1-ALL
-    python3 runshells/run_batch_experiment.py --condition Counsel-ALL-MOD
+    python3 runshells/run_batch_experiment.py --condition Counsel-KBD2-G3-MOD --condition Counsel-KBD3-G5-MOD --max-parallel 2
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import argparse
 import concurrent.futures
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -48,6 +50,12 @@ from run_one_experiment import (
     run_external_memory_audit,
     run_post_scales,
 )
+from kabuda_variant_runtime import (
+    VARIANT_SELECTOR_ALIASES as KABUDA_VARIANT_SELECTOR_ALIASES,
+    VARIANT_SHORT_NAMES,
+    VARIANTS,
+    prepare_kabuda_variant_runtime,
+)
 
 
 # ============================================================
@@ -61,7 +69,7 @@ RUN_NAME = ""
 START_TIME = "20260614-09:30"
 
 # 仿真步数（对应 start.py 的 --step）
-STEP = 280
+STEP = 120
 
 # 每步推进的分钟数（对应 start.py 的 --stride）
 STRIDE = 720
@@ -98,6 +106,14 @@ DRY_RUN = False
 
 MAX_PARALLEL = 2
 
+# 并行运行多个 condition 时，按顺序把 embedding 请求分散到多个 BGE endpoint。
+# 可用环境变量覆盖，例如：
+#   BATCH_EMBEDDING_BASE_URLS=http://127.0.0.1:18001/v1,http://127.0.0.1:18002/v1
+EMBEDDING_BASE_URLS = [
+    "http://127.0.0.1:18001/v1",
+    "http://127.0.0.1:18002/v1",
+]
+
 SIMULATION_LOG_POLL_SECONDS = 60
 # 首步可能长时间停留在密集 LLM 调用里，此时日志未必持续刷新；
 # 10 分钟会把“仍在工作但很慢”的运行误判成卡死并重启。
@@ -114,7 +130,6 @@ MIN_FREE_DISK_BYTES_TO_CONTINUE = 50 * 1024 ** 2
 # ============================================================
 
 
-DEPRESSION_CONFIG = BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config.json"
 GLOBAL_CONFIG = BASE_DIR / "data" / "config.json"
 GROUP_OVERLAY_DIR = BASE_DIR / "experiments" / "config" / "groups"
 EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
@@ -131,12 +146,6 @@ PERSONAS = [
     "蟑螂恶霸",
 ]
 
-SEVERITY_CONFIG_FILES = {
-    "mild": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_mild.json",
-    "moderate": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_moderate.json",
-    "severe": BASE_DIR / "frontend" / "static" / "assets" / "village" / "agents" / "卡布达" / "depression_config_severe.json",
-}
-
 GROUP_OVERLAY_FILES = {
     "g1": GROUP_OVERLAY_DIR / "g1_doctor_intervention.json",
     "g2": GROUP_OVERLAY_DIR / "g2_no_intervention.json",
@@ -152,6 +161,7 @@ SEVERITY_SHORT_NAMES = {
 SEVERITIES = ["mild", "moderate", "severe"]
 GROUPS = ["g1", "g2", "g3", "g5"]
 WILDCARD_TOKENS = {"*", "ALL"}
+VARIANT_SELECTOR_ALIASES = dict(KABUDA_VARIANT_SELECTOR_ALIASES)
 GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
 SEVERITY_SELECTOR_ALIASES = {
     "MILD": "mild",
@@ -164,16 +174,19 @@ SEVERITY_SELECTOR_ALIASES = {
 @dataclass(frozen=True)
 class BatchCondition:
     name: str
+    variant: str
     group: str
     severity: str
 
 
 ALL_CONDITIONS = [
     BatchCondition(
-        name=f"Counsel-{group.upper()}-{SEVERITY_SHORT_NAMES[severity]}",
+        name=f"Counsel-{VARIANT_SHORT_NAMES[variant]}-{group.upper()}-{SEVERITY_SHORT_NAMES[severity]}",
+        variant=variant,
         group=group,
         severity=severity,
     )
+    for variant in VARIANTS
     for group in GROUPS
     for severity in SEVERITIES
 ]
@@ -196,6 +209,7 @@ class RuntimeConfig:
     run_agent_memory_vis: bool
     run_external_memory_audit: bool
     max_parallel: int
+    embedding_base_urls: list[str]
     resume_batch: bool
     resume_condition: str | None
     skip_completed: bool
@@ -220,8 +234,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent", default=None, help="覆盖脚本前面的 SCALE_AGENT")
     parser.add_argument(
         "--condition",
+        action="append",
         default=None,
-        help="只跑指定条件；支持 Counsel-G1-MILD、Counsel-G1-ALL、Counsel-ALL-MOD",
+        help="只跑指定条件；可重复传入；支持 Counsel-KBD2-G1-MILD、Counsel-KBD3-ALL-MOD；旧格式 Counsel-G1-MILD 等价于 KBD1",
     )
     parser.add_argument("--dry-run", action="store_true", help="覆盖脚本前面的 DRY_RUN=True")
     parser.add_argument("--max-parallel", type=int, default=None, help="并行运行的 condition 数，默认 2")
@@ -245,14 +260,14 @@ def generate_batch_name() -> str:
 
 def _available_condition_selector_examples() -> str:
     return ", ".join([
+        "Counsel-KBD2-G1-MILD",
+        "Counsel-KBD3-ALL-MOD",
+        "Counsel-ALL-G1-MILD",
         "Counsel-G1-MILD",
-        "Counsel-G1-ALL",
-        "Counsel-ALL-MOD",
     ])
 
 
-
-def resolve_conditions(condition_name: str | None) -> list[BatchCondition]:
+def resolve_condition_selector(condition_name: str | None) -> list[BatchCondition]:
     if not condition_name:
         return list(ALL_CONDITIONS)
 
@@ -272,7 +287,24 @@ def resolve_conditions(condition_name: str | None) -> list[BatchCondition]:
             return [
                 condition
                 for condition in ALL_CONDITIONS
-                if (target_group is None or condition.group == target_group)
+                if condition.variant == "kbd1"
+                and (target_group is None or condition.group == target_group)
+                and (target_severity is None or condition.severity == target_severity)
+            ]
+    if len(tokens) == 4 and tokens[0] == "COUNSEL":
+        variant_token, group_token, severity_token = tokens[1], tokens[2], tokens[3]
+        valid_variant_token = variant_token in WILDCARD_TOKENS or variant_token in VARIANT_SELECTOR_ALIASES
+        valid_group_token = group_token in WILDCARD_TOKENS or group_token in GROUP_SELECTOR_ALIASES
+        valid_severity_token = severity_token in WILDCARD_TOKENS or severity_token in SEVERITY_SELECTOR_ALIASES
+        if valid_variant_token and valid_group_token and valid_severity_token:
+            target_variant = None if variant_token in WILDCARD_TOKENS else VARIANT_SELECTOR_ALIASES[variant_token]
+            target_group = None if group_token in WILDCARD_TOKENS else GROUP_SELECTOR_ALIASES[group_token]
+            target_severity = None if severity_token in WILDCARD_TOKENS else SEVERITY_SELECTOR_ALIASES[severity_token]
+            return [
+                condition
+                for condition in ALL_CONDITIONS
+                if (target_variant is None or condition.variant == target_variant)
+                and (target_group is None or condition.group == target_group)
                 and (target_severity is None or condition.severity == target_severity)
             ]
 
@@ -283,6 +315,22 @@ def resolve_conditions(condition_name: str | None) -> list[BatchCondition]:
         f"可用精确条件: {available}\n"
         f"也支持选择器: {examples}"
     )
+
+
+def resolve_conditions(condition_names: str | list[str] | None) -> list[BatchCondition]:
+    if not condition_names:
+        return list(ALL_CONDITIONS)
+
+    selectors = [condition_names] if isinstance(condition_names, str) else condition_names
+    conditions: list[BatchCondition] = []
+    seen_names: set[str] = set()
+    for selector in selectors:
+        for condition in resolve_condition_selector(selector):
+            if condition.name in seen_names:
+                continue
+            conditions.append(condition)
+            seen_names.add(condition.name)
+    return conditions
 
 
 def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
@@ -309,11 +357,28 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         run_agent_memory_vis=bool((RUN_AGENT_MEMORY_VIS or args.run_agent_memory_vis) and not args.skip_agent_memory_vis),
         run_external_memory_audit=bool((RUN_EXTERNAL_MEMORY_AUDIT or args.run_external_memory_audit) and not args.skip_external_memory_audit),
         max_parallel=max(1, int(args.max_parallel if args.max_parallel is not None else MAX_PARALLEL)),
+        embedding_base_urls=resolve_embedding_base_urls(),
         resume_batch=bool(args.resume_batch),
         resume_condition=str(args.resume_condition or "").strip() or None,
         skip_completed=bool(args.skip_completed),
         conditions=resolve_conditions(args.condition),
     )
+
+
+def resolve_embedding_base_urls() -> list[str]:
+    raw = str(os.environ.get("BATCH_EMBEDDING_BASE_URLS", "") or "").strip()
+    if raw:
+        urls = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    else:
+        urls = [item.strip().rstrip("/") for item in EMBEDDING_BASE_URLS if item.strip()]
+    return urls or ["http://127.0.0.1:18001/v1"]
+
+
+def embedding_base_url_for_slot(cfg: RuntimeConfig, slot_index: int) -> str | None:
+    if cfg.max_parallel < 2 or len(cfg.embedding_base_urls) <= 1:
+        return cfg.embedding_base_urls[0] if cfg.embedding_base_urls else None
+    usable_urls = cfg.embedding_base_urls[: max(1, min(cfg.max_parallel, len(cfg.embedding_base_urls)))]
+    return usable_urls[slot_index % len(usable_urls)]
 
 
 def print_effective_config(cfg: RuntimeConfig) -> None:
@@ -335,6 +400,7 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  跑记忆可视化: {cfg.run_agent_memory_vis}")
     print(f"  跑外置审计:   {cfg.run_external_memory_audit}")
     print(f"  并行度:       {cfg.max_parallel}")
+    print("  Embedding URLs: " + ", ".join(cfg.embedding_base_urls))
     print(f"  续跑批次:     {cfg.resume_batch}")
     print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
     print(f"  跳过已完成:   {cfg.skip_completed}")
@@ -370,6 +436,10 @@ def batch_state_dir(cfg: RuntimeConfig) -> Path:
 
 def batch_runtime_config_dir(cfg: RuntimeConfig) -> Path:
     return batch_state_dir(cfg) / "runtime_configs"
+
+
+def batch_runtime_persona_dir(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return batch_state_dir(cfg) / "runtime_personas" / slugify_condition_name(condition.name)
 
 
 def batch_condition_state_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
@@ -706,10 +776,22 @@ def runtime_config_template_path() -> Path:
     return GLOBAL_CONFIG
 
 
-def build_condition_runtime_config_payload(condition: BatchCondition, cfg: RuntimeConfig) -> dict[str, Any]:
+def build_condition_runtime_config_payload(
+    condition: BatchCondition,
+    cfg: RuntimeConfig,
+    *,
+    embedding_base_url: str | None = None,
+) -> dict[str, Any]:
     template = load_json_file(runtime_config_template_path())
     overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
     merged = deep_merge_dict(template, overlay)
+    variant_runtime = prepare_kabuda_variant_runtime(
+        base_dir=BASE_DIR,
+        variant=condition.variant,
+        severity=condition.severity,
+        output_dir=batch_runtime_persona_dir(cfg, condition),
+        dry_run=cfg.dry_run,
+    )
     assets_root = "assets/village"
     payload: dict[str, Any] = {
         "stride": cfg.stride,
@@ -718,11 +800,23 @@ def build_condition_runtime_config_payload(condition: BatchCondition, cfg: Runti
         "agent_base": copy.deepcopy(merged.get("agent", {})),
         "agents": {},
     }
+    if embedding_base_url:
+        embedding_config = (
+            payload
+            .setdefault("agent_base", {})
+            .setdefault("associate", {})
+            .setdefault("embedding", {})
+        )
+        if isinstance(embedding_config, dict):
+            embedding_config["base_url"] = embedding_base_url
     intervention_config = copy.deepcopy(merged.get("intervention", {}))
     staged_eval_config = copy.deepcopy(merged.get("staged_eval", {}))
     checkpointing_config = copy.deepcopy(merged.get("checkpointing", {}))
     if intervention_config:
         payload["intervention"] = intervention_config
+        memory_injection_config = payload["intervention"].setdefault("memory_injection", {})
+        if isinstance(memory_injection_config, dict):
+            memory_injection_config["content_file"] = variant_runtime.memory_injection_config_path
     if staged_eval_config:
         payload["staged_eval"] = staged_eval_config
     if checkpointing_config:
@@ -732,15 +826,25 @@ def build_condition_runtime_config_payload(condition: BatchCondition, cfg: Runti
             "config_path": f"{assets_root}/agents/{agent_name.replace(' ', '_')}/agent.json",
         }
     payload["agents"].setdefault("卡布达", {})
-    payload["agents"]["卡布达"]["depression_config_path"] = str(SEVERITY_CONFIG_FILES[condition.severity])
+    payload["agents"]["卡布达"]["config_path"] = str(variant_runtime.agent_config_path)
+    payload["agents"]["卡布达"]["depression_config_path"] = str(variant_runtime.depression_config_path)
     return payload
 
 
-def ensure_condition_runtime_config(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+def ensure_condition_runtime_config(
+    cfg: RuntimeConfig,
+    condition: BatchCondition,
+    *,
+    embedding_base_url: str | None = None,
+) -> Path:
     path = batch_condition_runtime_config_path(cfg, condition)
-    payload = build_condition_runtime_config_payload(condition, cfg)
+    payload = build_condition_runtime_config_payload(
+        condition,
+        cfg,
+        embedding_base_url=embedding_base_url,
+    )
     if cfg.dry_run:
-        print(f"[DRY-RUN] write runtime config: {path}")
+        print(f"[DRY-RUN] write runtime config: {path} (embedding={embedding_base_url or 'default'})")
         return path
     write_json_file(path, payload)
     return path
@@ -750,6 +854,7 @@ def default_condition_state(cfg: RuntimeConfig, condition: BatchCondition) -> di
     return {
         "batch_name": cfg.name,
         "condition_name": condition.name,
+        "variant": condition.variant,
         "group": condition.group,
         "severity": condition.severity,
         "run_name": "",
@@ -867,12 +972,26 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             meta = load_json_file(meta_path)
         except json.JSONDecodeError:
             meta = {}
+    variant_runtime = prepare_kabuda_variant_runtime(
+        base_dir=BASE_DIR,
+        variant=condition.variant,
+        severity=condition.severity,
+        output_dir=batch_runtime_persona_dir(cfg, condition),
+        dry_run=True,
+    )
 
     meta.update(
         {
             "trial_name": run_name,
             "condition_name": condition.name,
             "batch_name": cfg.name,
+            "variant": condition.variant,
+            "variant_short_name": VARIANT_SHORT_NAMES[condition.variant],
+            "variant_source_agent_name": variant_runtime.source_agent_name,
+            "variant_source_agent_dir": str(variant_runtime.source_agent_dir),
+            "variant_agent_config_file": str(variant_runtime.agent_config_path),
+            "variant_depression_config_file": str(variant_runtime.depression_config_path),
+            "variant_memory_injection_file": variant_runtime.memory_injection_config_path,
             "group": condition.group,
             "severity": condition.severity,
             "start": cfg.start,
@@ -882,7 +1001,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             "log_file": cfg.log_file,
             "scale_agent": cfg.agent,
             "group_overlay_file": GROUP_OVERLAY_FILES[condition.group].name,
-            "severity_config_file": SEVERITY_CONFIG_FILES[condition.severity].name,
+            "severity_config_file": str(variant_runtime.depression_config_path),
             "script": "runshells/run_batch_experiment.py",
         }
     )
@@ -959,11 +1078,20 @@ def ensure_condition_state_initialized(cfg: RuntimeConfig, condition: BatchCondi
     return state
 
 
-def run_condition(condition: BatchCondition, cfg: RuntimeConfig) -> str:
+def run_condition(
+    condition: BatchCondition,
+    cfg: RuntimeConfig,
+    *,
+    embedding_base_url: str | None = None,
+) -> str:
     state = ensure_condition_state_initialized(cfg, condition)
     run_name = resolve_condition_run_name(cfg, condition, state)
     simulation_stats = SimulationRunStats()
-    runtime_config_path = ensure_condition_runtime_config(cfg, condition)
+    runtime_config_path = ensure_condition_runtime_config(
+        cfg,
+        condition,
+        embedding_base_url=embedding_base_url,
+    )
     checkpoint_exists = condition_checkpoint_exists(run_name)
     resume_requested = should_resume_condition(cfg, condition, state)
 
@@ -983,9 +1111,11 @@ def run_condition(condition: BatchCondition, cfg: RuntimeConfig) -> str:
     print(f" 条件: {condition.name}")
     print("==========================================")
     print(f"  实际运行名:   {run_name}")
+    print(f"  variant:      {condition.variant}")
     print(f"  group:        {condition.group}")
     print(f"  severity:     {condition.severity}")
     print(f"  resume:       {resume_requested}")
+    print(f"  embedding:    {embedding_base_url or 'default'}")
     print("==========================================")
 
     update_condition_state(
@@ -1078,6 +1208,7 @@ def run_condition(condition: BatchCondition, cfg: RuntimeConfig) -> str:
                 "batch_name": cfg.name,
                 "condition_name": condition.name,
                 "run_name": run_name,
+                "variant": condition.variant,
                 "phase": "simulation",
                 "status": simulation_status,
                 "started_at": simulation_started_at.isoformat(timespec="seconds"),
@@ -1324,6 +1455,7 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
         "condition_name": condition.name,
         "run_name": run_name,
         "run_dir": str(run_dir),
+        "variant": condition.variant,
         "group": condition.group,
         "severity": condition.severity,
         "evaluations": evaluations,
@@ -1437,8 +1569,10 @@ def build_summary_payload(cfg: RuntimeConfig, results: list[dict], warnings: lis
         "conditions": results,
         "warnings": warnings,
         "trigger_labels": ordered_trigger_labels(results),
+        "variant_trajectory": aggregate_dimension_trajectory(results, dimension_key="variant", dimension_values=VARIANTS),
         "group_trajectory": aggregate_dimension_trajectory(results, dimension_key="group", dimension_values=GROUPS),
         "severity_trajectory": aggregate_dimension_trajectory(results, dimension_key="severity", dimension_values=SEVERITIES),
+        "variant_final_delta": aggregate_final_deltas(results, dimension_key="variant", dimension_values=VARIANTS),
         "group_final_delta": aggregate_final_deltas(results, dimension_key="group", dimension_values=GROUPS),
         "severity_final_delta": aggregate_final_deltas(results, dimension_key="severity", dimension_values=SEVERITIES),
         "group_severity_final_delta_matrix": build_group_severity_matrix(results),
@@ -1449,6 +1583,7 @@ def render_condition_trajectory_markdown(result: dict) -> list[str]:
     lines = []
     lines.append(f"### {result['condition_name']}\n")
     lines.append(f"- run_name: `{result['run_name']}`")
+    lines.append(f"- variant: `{result['variant']}`")
     lines.append(f"- group: `{result['group']}`")
     lines.append(f"- severity: `{result['severity']}`")
     lines.append("")
@@ -1555,6 +1690,14 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
 
     lines.extend(
         render_dimension_trajectory_markdown(
+            "按 Variant 的评估轨迹对比",
+            payload["variant_trajectory"],
+            VARIANTS,
+            payload["trigger_labels"],
+        )
+    )
+    lines.extend(
+        render_dimension_trajectory_markdown(
             "按 Group 的评估轨迹对比",
             payload["group_trajectory"],
             GROUPS,
@@ -1569,6 +1712,7 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
             payload["trigger_labels"],
         )
     )
+    lines.extend(render_final_delta_markdown("按 Variant 的最终变化对比", payload["variant_final_delta"], VARIANTS))
     lines.extend(render_final_delta_markdown("按 Group 的最终变化对比", payload["group_final_delta"], GROUPS))
     lines.extend(render_final_delta_markdown("按 Severity 的最终变化对比", payload["severity_final_delta"], SEVERITIES))
     lines.extend(render_group_severity_matrix_markdown(payload["group_severity_final_delta_matrix"]))
@@ -1638,7 +1782,13 @@ def main() -> None:
             future_map = {}
             for index, condition in enumerate(conditions_to_run, start=1):
                 print(f"\n##### [{index}/{len(conditions_to_run)}] {condition.name} #####")
-                future = executor.submit(run_condition, condition, cfg)
+                embedding_base_url = embedding_base_url_for_slot(cfg, index - 1)
+                future = executor.submit(
+                    run_condition,
+                    condition,
+                    cfg,
+                    embedding_base_url=embedding_base_url,
+                )
                 future_map[future] = condition
             for future in concurrent.futures.as_completed(future_map):
                 condition = future_map[future]

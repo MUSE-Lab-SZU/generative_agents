@@ -23,7 +23,7 @@
       "reflect_focus_topk": 4,
       "reflect_insights_topk": 1
     },
-    "chat_iter": 4,
+    "chat_iter": 3,
     "associate": {
       "embedding": {
         "provider": "openai",
@@ -38,16 +38,16 @@
       "relevance_weight": 5.0,
       "importance_weight": 1.0,
       "chat_retrieve": {
-        "mode": "semantic",
-        "similarity_top_k": 5
+        "mode": "direct",
+        "similarity_top_k": 3
       }
     },
     "chat_history": {
       "summary_window_minutes": 60480,
-      "max_read_items": 8,
-      "focus_retrieve_max": 20,
+      "max_read_items": 5,
+      "focus_retrieve_max": 10,
       "recent_turn_focus_n": 15,
-      "normal_chat_min_interval_minutes": 1440
+      "normal_chat_min_interval_minutes": 2880
     },
     "chat_memory": {
       "write_mode": "hybrid"
@@ -114,9 +114,9 @@
       {
         "rule_id": "fast_every_4step",
         "type": "interval_steps",
-        "interval_steps": 14,
+        "interval_steps": 6,
         "step_phase": 1,
-        "duration": 1440,
+        "duration": 2881,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
         "enabled": true

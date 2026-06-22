@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-17
+> 更新时间：2026-06-22
 
 ## 关键测试结果速查
 
@@ -28,6 +28,13 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-22：新增卡布达 variant 批量替换能力：`runshells/run_batch_experiment.py`的condition扩展为`Counsel-KBD1/KBD2/KBD3-Gx-SEV`格式，并支持`Counsel-ALL-G1-MILD`等通配选择；新增`runshells/kabuda_variant_runtime.py`按condition生成归一化运行时人设文件，运行时目标名仍保持`卡布达`，同时新增`memory_injections_kabuda2.json`和`memory_injections_kabuda3.json`匹配“被比较”“社交误会”两套压力源，并修复resume/post-scale读取checkpoint时覆盖自定义`config_path`的问题。
+- 2026-06-22：调整实验默认节奏与检索开销：`data/config.json`中将`chat_iter`降为3，chat记忆检索改为`direct`模式且`similarity_top_k`降为3，医患历史读取和focus检索数量下调；定期医患对话间隔从14步改为6步、单次持续时间改为2881分钟，普通居民聊天最小间隔改为2880分钟。
+- 2026-06-22：同步调整随机居民聊天实验组配置：`g3_random_resident_chat.json`和`g5_negative_resident_chat.json`的触发间隔从14步改为6步，便于在较短实验步数内完成更多对话触发与阶段评估观察。
+- 2026-06-22：增强批量实验脚本`runshells/run_batch_experiment.py`：默认仿真步数改为120，`--condition`支持重复传入并自动去重，可配合`--max-parallel`并行运行多个实验条件；新增`BATCH_EMBEDDING_BASE_URLS`配置，运行时按并行槽位把不同condition的embedding请求分流到多个BGE endpoint。
+- 2026-06-22：升级分阶段vLLM启动脚本`runshells/vllm_services_staged.sh`：默认将Qwen部署在GPU 0-1，将两个BGE-M3 embedding endpoint分别部署在GPU 2和GPU 3，新增`EMBED2_*`、`ENABLE_SECOND_EMBED`等配置，并补齐双embedding服务的启动、等待、状态、日志和停止逻辑。
+- 2026-06-22：优化本地记忆检索与对话控制：`modules/memory/associate.py`在无event/thought节点时直接返回，并按`retrieve_max`限制候选召回规模，避免每次全量检索；`modules/agent.py`修复聊天反思证据收集未记录已处理对象的问题，并让强制对话轮数预算至少为1，减少异常配置造成的轮数边界问题。
+- 2026-06-17：合并学长关于动态抑郁人设的更新
 - 2026-06-17：新增`runshells/recover_staged_eval_scores.py`脚本，作用是给中断实验的staged_eval补上score评分以及report，避免之前的实验浪费。
 - 2026-06-17：调整vllm启动参数和config.json相关参数，避免超出上下文限制
 - 2026-06-16：新建Dockerfile相关文件，vllm启动脚本新增多卡模式
