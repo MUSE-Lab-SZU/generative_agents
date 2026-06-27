@@ -104,7 +104,7 @@ SUMMARY_ONLY = False
 # 是否只打印命令，不实际执行
 DRY_RUN = False
 
-MAX_PARALLEL = 2
+MAX_PARALLEL = 1
 
 # 并行运行多个 condition 时，按顺序把 embedding 请求分散到多个 BGE endpoint。
 # 可用环境变量覆盖，例如：
@@ -956,7 +956,7 @@ def trigger_sort_key(label: str, completed_session_count: int) -> tuple[int, int
     if normalized == "T4":
         return (completed, 2, normalized)
     if normalized == "POST":
-        return (completed, 3, normalized)
+        return (10**9, 3, normalized)
     return (completed, 4, normalized)
 
 
@@ -1290,8 +1290,19 @@ def run_condition(
                 context=f"外置记忆审计 {run_name}",
                 dry_run=cfg.dry_run,
             )
-            run_external_memory_audit(run_name, cfg.agent, dry_run=cfg.dry_run)
-            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="external_memory_audit")
+            try:
+                run_external_memory_audit(run_name, cfg.agent, dry_run=cfg.dry_run)
+                update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="external_memory_audit")
+            except Exception as exc:
+                warning = f"external_memory_audit failed but was treated as optional: {exc}"
+                print(f"[WARN] {warning}")
+                update_condition_state(
+                    cfg,
+                    condition,
+                    run_name=run_name,
+                    last_completed_phase="external_memory_audit_optional_failed",
+                    error=warning,
+                )
     except Exception as exc:
         update_condition_state(
             cfg,

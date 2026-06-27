@@ -6,12 +6,12 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STATE_DIR="${STATE_DIR:-$PROJECT_DIR/.vllm}"
 LOG_DIR="${LOG_DIR:-$STATE_DIR/logs}"
 
-MODEL_ROOT="${MODEL_ROOT:-/mnt/nvme1/zyli/MODEL}"
+MODEL_ROOT="${MODEL_ROOT:-/share/home/tm866039793920000/a874457430/MODEL}"
 QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-$MODEL_ROOT/Qwen3-8B}"
 EMBED_MODEL_DIR="${EMBED_MODEL_DIR:-$MODEL_ROOT/bge-m3}"
 
-QWEN_GPU="${QWEN_GPU:-0}"
-EMBED_GPU="${EMBED_GPU:-2}"
+QWEN_GPUS="${QWEN_GPUS:-${QWEN_GPU:-0}}"
+EMBED_GPUS="${EMBED_GPUS:-${EMBED_GPU:-1}}"
 QWEN_PORT="${QWEN_PORT:-18000}"
 EMBED_PORT="${EMBED_PORT:-18001}"
 
@@ -23,10 +23,12 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 QWEN_DTYPE="${QWEN_DTYPE:-half}"
 EMBED_DTYPE="${EMBED_DTYPE:-half}"
-QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.85}"
-EMBED_GPU_MEMORY_UTILIZATION="${EMBED_GPU_MEMORY_UTILIZATION:-0.25}"
-QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-8192}"
+QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.90}"
+EMBED_GPU_MEMORY_UTILIZATION="${EMBED_GPU_MEMORY_UTILIZATION:-0.90}"
+QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-32768}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
+QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-}"
+EMBED_TENSOR_PARALLEL_SIZE="${EMBED_TENSOR_PARALLEL_SIZE:-}"
 
 QWEN_PID_FILE="$STATE_DIR/qwen3.pid"
 EMBED_PID_FILE="$STATE_DIR/bge_m3.pid"
@@ -52,6 +54,32 @@ check_model_dir() {
         echo "模型目录不存在: $model_dir" >&2
         exit 1
     fi
+}
+
+count_gpu_ids() {
+    local gpu_ids
+    gpu_ids="${1//[[:space:]]/}"
+
+    if [ -z "$gpu_ids" ]; then
+        echo 1
+        return 0
+    fi
+
+    local comma_count
+    comma_count="${gpu_ids//[^,]/}"
+    echo $((${#comma_count} + 1))
+}
+
+resolve_tensor_parallel_size() {
+    local explicit_value="$1"
+    local gpu_ids="$2"
+
+    if [ -n "$explicit_value" ]; then
+        echo "$explicit_value"
+        return 0
+    fi
+
+    count_gpu_ids "$gpu_ids"
 }
 
 is_pid_running() {
@@ -104,15 +132,16 @@ resolve_vllm_cmd() {
 start_service() {
     local service_name="$1"
     local model_dir="$2"
-    local gpu_id="$3"
+    local gpu_ids="$3"
     local port="$4"
     local served_name="$5"
     local dtype="$6"
     local gpu_memory_utilization="$7"
     local max_model_len="$8"
-    local runner_extra="$9"
-    local pid_file="${10}"
-    local log_file="${11}"
+    local tensor_parallel_size="$9"
+    local runner_extra="${10}"
+    local pid_file="${11}"
+    local log_file="${12}"
     local extra_args=()
 
     if is_pid_running "$pid_file"; then
@@ -123,7 +152,8 @@ start_service() {
     check_model_dir "$model_dir"
 
     echo "启动 $service_name"
-    echo "  GPU:    $gpu_id"
+    echo "  GPUs:   $gpu_ids"
+    echo "  TP:     $tensor_parallel_size"
     echo "  Port:   $port"
     echo "  Model:  $model_dir"
     echo "  Log:    $log_file"
@@ -134,13 +164,14 @@ start_service() {
         extra_args=($runner_extra)
     fi
 
-    # Keep options conservative because this host already has other long-lived vLLM services.
-    CUDA_VISIBLE_DEVICES="$gpu_id" nohup "${VLLM_CMD[@]}" serve "$model_dir" \
+    # Keep options conservative by default.  Set QWEN_GPUS/EMBED_GPUS to a
+    # comma-separated list such as 0,1,2,3 to enable tensor parallel inference.
+    CUDA_VISIBLE_DEVICES="$gpu_ids" nohup "${VLLM_CMD[@]}" serve "$model_dir" \
         --host "$HOST" \
         --port "$port" \
         --served-model-name "$served_name" \
         --dtype "$dtype" \
-        --tensor-parallel-size 1 \
+        --tensor-parallel-size "$tensor_parallel_size" \
         --gpu-memory-utilization "$gpu_memory_utilization" \
         --max-model-len "$max_model_len" \
         "${extra_args[@]}" \
@@ -168,9 +199,16 @@ stop_service() {
 }
 
 print_status() {
+    local qwen_tp
+    local embed_tp
+    qwen_tp="$(resolve_tensor_parallel_size "$QWEN_TENSOR_PARALLEL_SIZE" "$QWEN_GPUS")"
+    embed_tp="$(resolve_tensor_parallel_size "$EMBED_TENSOR_PARALLEL_SIZE" "$EMBED_GPUS")"
+
     echo "vLLM 服务状态"
     echo "  Qwen3 service : $(if is_pid_running "$QWEN_PID_FILE"; then echo "RUNNING pid=$(cat "$QWEN_PID_FILE")"; else echo "STOPPED"; fi)"
     echo "  BGE-M3 service: $(if is_pid_running "$EMBED_PID_FILE"; then echo "RUNNING pid=$(cat "$EMBED_PID_FILE")"; else echo "STOPPED"; fi)"
+    echo "  Qwen GPUs     : $QWEN_GPUS (tensor_parallel_size=$qwen_tp)"
+    echo "  Embed GPUs    : $EMBED_GPUS (tensor_parallel_size=$embed_tp)"
     echo "  Qwen URL      : http://127.0.0.1:$QWEN_PORT/v1/chat/completions"
     echo "  Embed URL     : http://127.0.0.1:$EMBED_PORT/v1/embeddings"
     echo "  Qwen Log      : $QWEN_LOG_FILE"
@@ -200,24 +238,33 @@ print_usage() {
 用法: $0 [start|stop|restart|status|print-config]
 
 默认规划：
-  Qwen3  -> GPU $QWEN_GPU, port $QWEN_PORT, model $QWEN_MODEL_DIR
-  BGE-M3 -> GPU $EMBED_GPU, port $EMBED_PORT, model $EMBED_MODEL_DIR
+  Qwen3  -> GPUs $QWEN_GPUS, port $QWEN_PORT, model $QWEN_MODEL_DIR
+  BGE-M3 -> GPUs $EMBED_GPUS, port $EMBED_PORT, model $EMBED_MODEL_DIR
 
 可覆盖环境变量：
   MODEL_ROOT, QWEN_MODEL_DIR, EMBED_MODEL_DIR
+  QWEN_GPUS, EMBED_GPUS, QWEN_TENSOR_PARALLEL_SIZE, EMBED_TENSOR_PARALLEL_SIZE
   QWEN_GPU, EMBED_GPU, QWEN_PORT, EMBED_PORT
   QWEN_NAME, EMBED_NAME, VLLM_BIN, PYTHON_BIN
+
+多卡示例：
+  1 卡: QWEN_GPUS=0 EMBED_GPUS=0 bash runshells/vllm_services.sh start
+  2 卡: QWEN_GPUS=0 EMBED_GPUS=1 bash runshells/vllm_services.sh start
+  4 卡: QWEN_GPUS=0,1,2 EMBED_GPUS=3 bash runshells/vllm_services.sh start
+  8 卡: QWEN_GPUS=0,1,2,3,4,5,6 EMBED_GPUS=7 bash runshells/vllm_services.sh start
 EOF
 }
 
 case "$ACTION" in
     start)
         resolve_vllm_cmd
-        start_service "Qwen3" "$QWEN_MODEL_DIR" "$QWEN_GPU" "$QWEN_PORT" "$QWEN_NAME" \
-            "$QWEN_DTYPE" "$QWEN_GPU_MEMORY_UTILIZATION" "$QWEN_MAX_MODEL_LEN" "" \
+        QWEN_RESOLVED_TP="$(resolve_tensor_parallel_size "$QWEN_TENSOR_PARALLEL_SIZE" "$QWEN_GPUS")"
+        EMBED_RESOLVED_TP="$(resolve_tensor_parallel_size "$EMBED_TENSOR_PARALLEL_SIZE" "$EMBED_GPUS")"
+        start_service "Qwen3" "$QWEN_MODEL_DIR" "$QWEN_GPUS" "$QWEN_PORT" "$QWEN_NAME" \
+            "$QWEN_DTYPE" "$QWEN_GPU_MEMORY_UTILIZATION" "$QWEN_MAX_MODEL_LEN" "$QWEN_RESOLVED_TP" "" \
             "$QWEN_PID_FILE" "$QWEN_LOG_FILE"
-        start_service "BGE-M3" "$EMBED_MODEL_DIR" "$EMBED_GPU" "$EMBED_PORT" "$EMBED_NAME" \
-            "$EMBED_DTYPE" "$EMBED_GPU_MEMORY_UTILIZATION" "$EMBED_MAX_MODEL_LEN" "--runner pooling --convert embed" \
+        start_service "BGE-M3" "$EMBED_MODEL_DIR" "$EMBED_GPUS" "$EMBED_PORT" "$EMBED_NAME" \
+            "$EMBED_DTYPE" "$EMBED_GPU_MEMORY_UTILIZATION" "$EMBED_MAX_MODEL_LEN" "$EMBED_RESOLVED_TP" "--runner pooling --convert embed" \
             "$EMBED_PID_FILE" "$EMBED_LOG_FILE"
         print_status
         ;;

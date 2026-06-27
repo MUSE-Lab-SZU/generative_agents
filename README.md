@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-22
+> 更新时间：2026-06-27
 
 ## 关键测试结果速查
 
@@ -28,6 +28,10 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-27：修复判断LLM读取“上次会话后评估结论”时跨阶段串用的问题：`modules/intervention_manager.py`会记录并校验`current_session`，只有同一阶段才复用历史评估结论；新阶段会显式注入“当前阶段刚开始/第一次对话”的状态说明，避免上一阶段结论被误判为当前阶段已完成步骤。
+- 2026-06-27：调整批量实验收尾逻辑：`runshells/run_batch_experiment.py`默认并行数改回1；`POST`评估排序固定放到最后；外置记忆审计失败时不再中断整个condition，而是记录`external_memory_audit_optional_failed`状态并继续保留前面实验结果。
+- 2026-06-27：更新容器/数据盘同步脚本：`runshells/sync_project_from_disk.sh`默认不删除目标目录额外文件，只有设置`PROJECT_SYNC_DELETE=1`才做严格镜像；新增`runshells/sync_results_to_disk_loop.sh`，可按固定间隔把容器内`results/`持续同步到数据盘，支持`RESULTS_SYNC_INTERVAL`、`RESULTS_SYNC_ONCE`、`RESULTS_SYNC_DRY_RUN`和`RESULTS_SYNC_DELETE`。
+- 2026-06-27：调整vLLM默认资源配置：`runshells/vllm_services.sh`默认将embedding服务放到GPU 1，Qwen和embedding的显存利用率默认均为0.90，并将Qwen默认上下文长度提升到32768；同时新增`data/prompts/intervention/dialog_judge-0627备份.txt`保存判断LLM提示词备份。
 - 2026-06-22：新增卡布达 variant 批量替换能力：`runshells/run_batch_experiment.py`的condition扩展为`Counsel-KBD1/KBD2/KBD3-Gx-SEV`格式，并支持`Counsel-ALL-G1-MILD`等通配选择；新增`runshells/kabuda_variant_runtime.py`按condition生成归一化运行时人设文件，运行时目标名仍保持`卡布达`，同时新增`memory_injections_kabuda2.json`和`memory_injections_kabuda3.json`匹配“被比较”“社交误会”两套压力源，并修复resume/post-scale读取checkpoint时覆盖自定义`config_path`的问题。
 - 2026-06-22：调整实验默认节奏与检索开销：`data/config.json`中将`chat_iter`降为3，chat记忆检索改为`direct`模式且`similarity_top_k`降为3，医患历史读取和focus检索数量下调；定期医患对话间隔从14步改为6步、单次持续时间改为2881分钟，普通居民聊天最小间隔改为2880分钟。
 - 2026-06-22：同步调整随机居民聊天实验组配置：`g3_random_resident_chat.json`和`g5_negative_resident_chat.json`的触发间隔从14步改为6步，便于在较短实验步数内完成更多对话触发与阶段评估观察。

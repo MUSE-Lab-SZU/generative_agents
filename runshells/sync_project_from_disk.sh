@@ -4,7 +4,7 @@ set -euo pipefail
 
 SOURCE_DIR="${1:-${PROJECT_SYNC_SRC:-}}"
 TARGET_DIR="${2:-${PROJECT_SYNC_DST:-${PROJECT_DIR:-/workspace/project}}}"
-PROJECT_SYNC_DELETE="${PROJECT_SYNC_DELETE:-1}"
+PROJECT_SYNC_DELETE="${PROJECT_SYNC_DELETE:-0}"
 PROJECT_SYNC_DRY_RUN="${PROJECT_SYNC_DRY_RUN:-0}"
 PROJECT_SYNC_INCLUDE_ENV="${PROJECT_SYNC_INCLUDE_ENV:-0}"
 
@@ -16,10 +16,14 @@ print_usage() {
 示例:
   bash runshells/sync_project_from_disk.sh /mnt/data/generative_agents-2
   PROJECT_SYNC_DRY_RUN=1 bash runshells/sync_project_from_disk.sh /mnt/data/generative_agents-2
-  PROJECT_SYNC_DELETE=0 bash runshells/sync_project_from_disk.sh /mnt/data/generative_agents-2
+  PROJECT_SYNC_DELETE=1 bash runshells/sync_project_from_disk.sh /mnt/data/generative_agents-2
 
 默认目标路径:
   ${TARGET_DIR}
+
+默认只覆盖源目录中存在且有更新的文件，不会删除目标目录中的其它文件。
+如确实要让目标目录和源目录严格一致:
+  PROJECT_SYNC_DELETE=1 bash runshells/sync_project_from_disk.sh /mnt/data/generative_agents-2
 
 默认不会同步:
   .env, results/, docs/, plans/, 模型目录, 缓存, 日志, Python cache
