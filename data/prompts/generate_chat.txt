@@ -1,7 +1,4 @@
-以下是对 ${agent} 的简要描述：
-${base_desc}
-
-${depression_chat_block}
+${base_desc_block}${depression_chat_block}
 ${meeting_prompt_injection}
 ${doctor_session_prompt_injection}
 ${doctor_consult_record_injection}

@@ -4771,7 +4771,7 @@ class InterventionManager:
         turn_no: int = 1,
         is_initiator: bool = False,
     ) -> Dict[str, Any]:
-        del forced, is_initiator
+        del is_initiator
         trace_context: Dict[str, Any] = {
             "evaluated": False,
             "memory_block": "",
@@ -4782,6 +4782,8 @@ class InterventionManager:
             "retrieval_hits": [],
             "summary_output": "",
         }
+        if not bool(forced):
+            return trace_context
         policy = self.get_consult_history_runtime_policy()
         if not bool(policy.get("enabled", False)):
             return trace_context
@@ -4874,6 +4876,8 @@ class InterventionManager:
         meeting_id: str,
     ) -> None:
         if not self._consult_history_enabled():
+            return
+        if not str(meeting_id or "").strip():
             return
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
         if not doctor or not patient:

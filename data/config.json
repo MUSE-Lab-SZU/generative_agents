@@ -19,7 +19,7 @@
         "request_timeout_seconds": 120
       },
       "interval": 1000,
-      "poignancy_max": 30,
+      "poignancy_max": 50,
       "reflect_focus_topk": 4,
       "reflect_insights_topk": 1
     },
@@ -44,7 +44,7 @@
     },
     "chat_history": {
       "summary_window_minutes": 60480,
-      "max_read_items": 5,
+      "max_read_items": 2,
       "focus_retrieve_max": 10,
       "recent_turn_focus_n": 15,
       "normal_chat_min_interval_minutes": 2880
@@ -147,7 +147,7 @@
       "rules": []
     },
     "order_extract": {
-      "enabled": true,
+      "enabled": false,
       "min_confidence": 0.3,
       "max_tasks_per_chat": 3
     },
