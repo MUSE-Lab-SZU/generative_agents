@@ -587,7 +587,6 @@ def test_llm_transition_decision_moves_to_candidate_stage():
                 "matched_current_stage": True,
                 "action": "advance",
                 "target_stage_id": "stage_b",
-                "confidence": 0.92,
                 "reason": "对话虽短，但测试判定器明确选择推进到候选节点。",
             },
             ensure_ascii=False,

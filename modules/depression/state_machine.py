@@ -289,7 +289,6 @@ class ComplaintGraphManager:
                 session_context=session_context,
                 conversation_content=conversation,
                 llm_cfg=llm_cfg,
-                fallback_signal=fallback_signal,
             )
         if not transition_signal:
             transition_signal = fallback_signal
@@ -951,7 +950,7 @@ class ComplaintGraphManager:
         conversation_content: str,
     ) -> Dict[str, Any]:
         """在没有 LLM 判定时，用轻量规则给出保守转移信号。"""
-        matched, confidence, reason = self._heuristic_match(
+        matched, score, reason = self._heuristic_match(
             current_stage=current_stage,
             session_context=session_context,
             conversation_content=conversation_content,
@@ -959,13 +958,13 @@ class ComplaintGraphManager:
         action = self._decide_action(
             current_stage=current_stage,
             matched=matched,
-            match_confidence=confidence,
+            match_confidence=score,
             session_context=session_context,
             conversation_content=conversation_content,
         )
         return {
             "matched": bool(matched),
-            "match_confidence": round(float(confidence), 4),
+            "match_confidence": round(float(score), 4),
             "match_reason": str(reason or "")[:180],
             "action": action,
             "next_graph": self._preview_future_graph(current_stage),
@@ -979,7 +978,6 @@ class ComplaintGraphManager:
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
-        fallback_signal: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """调用 LLM 判定本轮是否推进主诉节点。"""
         prompt = self._build_transition_prompt(
@@ -987,7 +985,6 @@ class ComplaintGraphManager:
             session_context=session_context,
             conversation_content=conversation_content,
             llm_cfg=llm_cfg,
-            fallback_signal=fallback_signal,
         )
         try:
             raw = str(completion_func(prompt) or "")
@@ -1002,7 +999,6 @@ class ComplaintGraphManager:
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
-        fallback_signal: Dict[str, Any],
     ) -> str:
         """构造主诉图推进判定 prompt。"""
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
@@ -1015,9 +1011,7 @@ class ComplaintGraphManager:
             "candidate_ids": candidate_ids,
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-            "fallback_signal": copy.deepcopy(fallback_signal if isinstance(fallback_signal, dict) else {}),
             "state_duration_minutes": round(float(self.get_state_duration()), 4),
-            "recent_dialogue_history": copy.deepcopy(self.dialogue_history[-3:]),
         }
         return render_prompt(
             "depression/graph_transition",
@@ -1037,21 +1031,16 @@ class ComplaintGraphManager:
         action = str(payload.get("action", "hold") or "hold").strip().lower()
         if action not in {"hold", "advance"}:
             action = "hold"
+        matched_current_stage = self._coerce_bool(
+            payload.get("matched_current_stage", action == "advance")
+        )
         target_id = str(
             payload.get("target_stage_id", payload.get("next_stage_id", "")) or ""
         ).strip()
-        if not target_id and action == "advance" and candidate_ids:
-            target_id = candidate_ids[0]
-        if action == "advance" and target_id not in candidate_ids:
+        if action == "advance" and not matched_current_stage:
             action = "hold"
             target_id = ""
-        confidence = self._bounded_float(
-            payload.get("confidence", payload.get("match_confidence", 0.0)),
-            0.0,
-            0.0,
-            1.0,
-        )
-        if action == "advance" and confidence < self.min_match_confidence:
+        if action == "advance" and target_id not in candidate_ids:
             action = "hold"
             target_id = ""
         if action != "advance":
@@ -1060,8 +1049,7 @@ class ComplaintGraphManager:
         if target_id:
             next_graph.append(target_id)
         return {
-            "matched": self._coerce_bool(payload.get("matched_current_stage", action != "hold")),
-            "match_confidence": round(float(confidence), 4),
+            "matched": bool(matched_current_stage),
             "match_reason": str(payload.get("reason", payload.get("match_reason", "")) or "")[:180],
             "action": action,
             "next_graph": next_graph,
@@ -1242,8 +1230,14 @@ class ComplaintGraphManager:
         matched = self._coerce_bool(
             payload.get("matched_current_stage", payload.get("matched", False))
         )
+        action = str(payload.get("action", "hold") or "hold").strip().lower()
+        if action not in {"hold", "advance", "replan"}:
+            action = "hold"
+        if action == "advance" and not matched:
+            action = "hold"
+        raw_match_confidence = payload.get("match_confidence", None)
         match_confidence = self._bounded_float(
-            payload.get("match_confidence", payload.get("confidence", 0.0)),
+            raw_match_confidence if raw_match_confidence is not None else (1.0 if matched else 0.0),
             0.0,
             0.0,
             1.0,
@@ -1251,9 +1245,6 @@ class ComplaintGraphManager:
         match_reason = str(
             payload.get("match_reason", payload.get("match_evidence", "")) or ""
         ).strip()[:180]
-        action = str(payload.get("action", "hold") or "hold").strip().lower()
-        if action not in {"hold", "advance", "replan"}:
-            action = "hold"
 
         raw_next = payload.get("next_graph", [])
         stage_updates = self._normalize_stage_updates(payload.get("stage_updates", []))
@@ -1268,11 +1259,6 @@ class ComplaintGraphManager:
                     text = str(item or "").strip()
                     if text:
                         next_graph.append(text)
-
-        if matched and match_confidence < self.min_match_confidence:
-            matched = False
-            if action == "advance":
-                action = "hold"
 
         return {
             "matched": bool(matched),
@@ -1540,7 +1526,7 @@ class ComplaintGraphManager:
         duration_minutes: float,
         source: str = "chat",
     ) -> None:
-        # stage_history 更像状态迁移日志，记录 from/to/action/confidence。
+        # stage_history 更像状态迁移日志，记录 from/to/action 和匹配证据。
         self.stage_history.append(
             {
                 "timestamp": self._now(),
