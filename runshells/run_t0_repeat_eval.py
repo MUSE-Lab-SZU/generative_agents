@@ -26,6 +26,7 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -194,6 +195,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=None, help="跳过已有完整结果")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false", help="不跳过已有完整结果")
     parser.add_argument("--force", action="store_true", help="覆盖已有 checkpoint 和评分结果")
+    parser.add_argument("--report-only", action="store_true", help="只汇总已有 T0 结果并生成报告，不调用量表/评分 worker")
+    parser.add_argument("--results-dir", default=None, help="已有结果目录，可指向 results/T0-KBD-1-6 或具体 t0-repeat-* 批次目录")
     parser.add_argument("--dry-run", action="store_true", help="只打印计划，不实际执行")
     return parser.parse_args()
 
@@ -506,6 +509,427 @@ def extract_safety(scored: dict[str, Any] | None) -> str:
         return "—"
     value = scored.get("safety_risk")
     return str(value) if value else "—"
+
+
+SCALE_ITEM_SCORE_KEYS = {
+    "PHQ-9": "phq9_scores",
+    "BDI-II": "bdi_ii_scores",
+}
+
+CN_SCORE_VALUES = {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+}
+
+
+def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict):
+                rows.append(item)
+    return rows
+
+
+def extract_item_scores(scored_result: dict[str, Any] | None, scale_name: str) -> list[int] | None:
+    item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
+    if not item_key or not isinstance(scored_result, dict):
+        return None
+    items = scored_result.get(item_key)
+    if not isinstance(items, list):
+        return None
+
+    scores: list[int] = []
+    for item in items:
+        score = item.get("score") if isinstance(item, dict) else None
+        if not isinstance(score, int) or score < 0 or score > 3:
+            return None
+        scores.append(score)
+    return scores
+
+
+def has_ambiguous_score_context(text: str, start: int, end: int) -> bool:
+    context = text[max(0, start - 18) : min(len(text), end + 28)]
+    return any(
+        marker in context
+        for marker in [
+            "或者",
+            "不确定",
+            "之间",
+            "两三",
+            "一两",
+            "也可能",
+            "选0感觉是骗人的",
+        ]
+    )
+
+
+def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
+    patterns = [
+        r"(?:我)?\s*(?:会|想|大概|可能|应该|还是|就|其实)?\s*(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])",
+        r"([0-3零一二两三])\s*分",
+        r"(?:评分的话|打分的话|大概|应该|可能|算是|算|就是|我觉得|我想|我会|应该是|大概是|可能是|差不多)\s*[，,。\.……\s]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
+        r"(?:^|[，,。\.……\s])([0-3零一二两三])\s*吧",
+        r"^[\s（\(\）\)……。,.，、嗯唔]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
+    ]
+    hits = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, str(answer or "")):
+            context = answer[max(0, match.start() - 6) : match.end() + 6]
+            if any(marker in context for marker in ["不想选", "不是选", "不能选", "不敢选"]):
+                continue
+            score = CN_SCORE_VALUES.get(match.group(1))
+            if score is None:
+                continue
+            hits.append((match.start(), match.end(), score))
+    if not hits:
+        return None, "none"
+
+    hits.sort(key=lambda item: (item[0], item[1]))
+    first_start, first_end, first_score = hits[0]
+    if has_ambiguous_score_context(answer, first_start, first_end):
+        return first_score, "ambiguous"
+    for start, _end, score in hits[1:]:
+        if start - first_end < 35 and score != first_score:
+            return first_score, "ambiguous"
+    return first_score, "direct"
+
+
+def scale_file_path(result: dict[str, Any], scale_name: str, file_key: str) -> Path:
+    scale_payload = result.get("scales", {}).get(scale_name, {})
+    if isinstance(scale_payload, dict):
+        raw_path = str(scale_payload.get(file_key, "") or "").strip()
+        if raw_path:
+            return Path(raw_path)
+    return Path("")
+
+
+def scored_payload_for_validation(result: dict[str, Any], scale_name: str) -> dict[str, Any] | None:
+    scale_payload = result.get("scales", {}).get(scale_name, {})
+    if isinstance(scale_payload, dict):
+        scored = scale_payload.get("score")
+        if isinstance(scored, dict) and scored:
+            return scored
+        scored_path = scale_file_path(result, scale_name, "scored_file")
+        if scored_path.is_file():
+            return load_optional_scored(scored_path)
+    return None
+
+
+def build_corrected_scale_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for result in results:
+        if result.get("status") not in {"completed", "skipped_existing", "dry_run"}:
+            continue
+        repeat_value = result.get("repeat")
+        repeat_label = f"r{int(repeat_value or 0):02d}" if repeat_value else "—"
+
+        for scale_name in SCALES:
+            scored_result = scored_payload_for_validation(result, scale_name)
+            if not scored_result:
+                continue
+            reported_total = extract_total(scored_result)
+            item_scores = extract_item_scores(scored_result, scale_name)
+            corrected_scores = list(item_scores) if item_scores is not None else []
+            override_count = 0
+            direct_answer_count = 0
+
+            answer_path = scale_file_path(result, scale_name, "answers_file")
+            if item_scores is not None and answer_path.is_file():
+                try:
+                    answers = load_jsonl_file(answer_path)
+                except (OSError, json.JSONDecodeError):
+                    answers = []
+                for answer_row in answers:
+                    item_id = answer_row.get("id")
+                    if not isinstance(item_id, int):
+                        continue
+                    if scale_name == "PHQ-9" and item_id == 10:
+                        continue
+                    if item_id < 1 or item_id > len(corrected_scores):
+                        continue
+                    answer_score, status = extract_direct_answer_score(str(answer_row.get("answer", "") or ""))
+                    if status != "direct" or answer_score is None:
+                        continue
+                    direct_answer_count += 1
+                    if corrected_scores[item_id - 1] != answer_score:
+                        corrected_scores[item_id - 1] = int(answer_score)
+                        override_count += 1
+
+            item_sum = sum(item_scores) if item_scores is not None else None
+            corrected_total = sum(corrected_scores) if corrected_scores else reported_total
+            records.append(
+                {
+                    "condition_name": result.get("condition_name", ""),
+                    "variant": result.get("variant", ""),
+                    "variant_short_name": result.get("variant_short_name", ""),
+                    "source_agent_name": result.get("source_agent_name", "—"),
+                    "severity": result.get("severity", ""),
+                    "severity_short_name": result.get("severity_short_name", "—"),
+                    "repeat": result.get("repeat"),
+                    "repeat_label": repeat_label,
+                    "scale": scale_name,
+                    "reported_total": reported_total,
+                    "item_sum_total": float(item_sum) if item_sum is not None else None,
+                    "corrected_total": float(corrected_total) if corrected_total is not None else None,
+                    "direct_answer_count": direct_answer_count,
+                    "override_count": override_count,
+                    "scored_file": str(scale_file_path(result, scale_name, "scored_file") or ""),
+                    "answers_file": str(answer_path or ""),
+                }
+            )
+    return records
+
+
+def build_scale_score_validation(results: list[dict[str, Any]]) -> dict[str, Any]:
+    total_mismatches = []
+    item_mismatches = []
+    checked_scored_files = 0
+    checked_answer_files = 0
+
+    for result in results:
+        if result.get("status") not in {"completed", "skipped_existing", "dry_run"}:
+            continue
+        repeat_label = f"r{int(result.get('repeat', 0) or 0):02d}" if result.get("repeat") else "—"
+        for scale_name in SCALES:
+            scored_result = scored_payload_for_validation(result, scale_name)
+            if not scored_result:
+                continue
+            checked_scored_files += 1
+
+            item_scores = extract_item_scores(scored_result, scale_name)
+            reported_total = extract_total(scored_result)
+            if item_scores is not None and reported_total is not None:
+                item_sum = sum(item_scores)
+                if float(item_sum) != float(reported_total):
+                    total_mismatches.append(
+                        {
+                            "condition_name": result.get("condition_name", ""),
+                            "repeat": repeat_label,
+                            "scale": scale_name,
+                            "item_sum": item_sum,
+                            "reported_total": reported_total,
+                            "delta": float(reported_total) - float(item_sum),
+                            "scored_file": str(scale_file_path(result, scale_name, "scored_file") or ""),
+                        }
+                    )
+
+            answer_path = scale_file_path(result, scale_name, "answers_file")
+            if item_scores is None or not answer_path.is_file():
+                continue
+            checked_answer_files += 1
+            try:
+                answers = load_jsonl_file(answer_path)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            for answer_row in answers:
+                item_id = answer_row.get("id")
+                if not isinstance(item_id, int):
+                    continue
+                if scale_name == "PHQ-9" and item_id == 10:
+                    continue
+                if item_id < 1 or item_id > len(item_scores):
+                    continue
+                answer_score, status = extract_direct_answer_score(str(answer_row.get("answer", "") or ""))
+                if status != "direct" or answer_score is None:
+                    continue
+                llm_score = item_scores[item_id - 1]
+                if answer_score != llm_score:
+                    item_mismatches.append(
+                        {
+                            "condition_name": result.get("condition_name", ""),
+                            "repeat": repeat_label,
+                            "scale": scale_name,
+                            "item_id": item_id,
+                            "llm_score": llm_score,
+                            "answer_score": answer_score,
+                            "answer_file": str(answer_path),
+                        }
+                    )
+
+    return {
+        "checked_scored_files": checked_scored_files,
+        "checked_answer_files": checked_answer_files,
+        "total_mismatches": total_mismatches,
+        "item_mismatches": item_mismatches,
+        "corrected_scores": build_corrected_scale_records(results),
+    }
+
+
+def render_validation_number(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.1f}"
+
+
+def group_corrected_records(records: list[dict[str, Any]], *keys: str) -> dict[tuple[Any, ...], list[dict[str, Any]]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(tuple(record.get(key) for key in keys), []).append(record)
+    return grouped
+
+
+def corrected_record_total(record: dict[str, Any]) -> float | None:
+    value = record.get("corrected_total")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def render_corrected_comparison_markdown(validation_payload: dict[str, Any]) -> list[str]:
+    records = validation_payload.get("corrected_scores", [])
+    if not isinstance(records, list):
+        records = []
+    records = [record for record in records if isinstance(record, dict)]
+
+    lines = []
+    lines.append("## 复核后对比附录\n")
+    lines.append("> 复核后总分计算规则：以 LLM 条目分为底稿；若回答文本中可明确抽取 0-3 分且与 LLM 条目分冲突，则用回答分覆盖该条目；最终总分使用复核后的条目分之和。\n")
+    lines.append(f"- 复核后总分记录数：{len(records)}")
+    lines.append(f"- 发生条目覆盖的记录数：{sum(1 for record in records if int(record.get('override_count', 0) or 0) > 0)}")
+    lines.append("")
+
+    lines.append("### 复核后重复稳定性对比\n")
+    for scale_name in SCALES:
+        scale_records = [record for record in records if record.get("scale") == scale_name]
+        lines.extend(
+            [
+                f"#### {scale_name}",
+                "",
+                "| 人设 | 严重程度 | n | 均值 | 标准差 | 最小 | 最大 | 极差 | 覆盖条目数 |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for (_variant, _severity), group in sorted(group_corrected_records(scale_records, "variant", "severity").items()):
+            totals = [corrected_record_total(record) for record in group]
+            valid = [float(value) for value in totals if value is not None]
+            if not valid:
+                continue
+            override_count = sum(int(record.get("override_count", 0) or 0) for record in group)
+            lines.append(
+                "| {persona} | {severity} | {n} | {avg} | {sd} | {minv} | {maxv} | {rangev} | {override_count} |".format(
+                    persona=group[0].get("source_agent_name", "—"),
+                    severity=group[0].get("severity_short_name", "—"),
+                    n=len(valid),
+                    avg=fmt(mean(valid)),
+                    sd=fmt(stddev(valid)),
+                    minv=fmt(min(valid)),
+                    maxv=fmt(max(valid)),
+                    rangev=fmt(max(valid) - min(valid)),
+                    override_count=override_count,
+                )
+            )
+        lines.append("")
+
+    lines.append("### 复核后按严重程度对比人设\n")
+    for scale_name in SCALES:
+        scale_records = [record for record in records if record.get("scale") == scale_name]
+        lines.extend(
+            [
+                f"#### {scale_name}",
+                "",
+                "| 严重程度 | 人设 | n | 均值 | 标准差 | 覆盖条目数 |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        rows = []
+        for (_severity, _variant), group in group_corrected_records(scale_records, "severity", "variant").items():
+            totals = [corrected_record_total(record) for record in group]
+            valid = [float(value) for value in totals if value is not None]
+            if not valid:
+                continue
+            rows.append(
+                (
+                    group[0].get("severity_short_name", "—"),
+                    group[0].get("source_agent_name", "—"),
+                    len(valid),
+                    mean(valid),
+                    stddev(valid),
+                    sum(int(record.get("override_count", 0) or 0) for record in group),
+                )
+            )
+        for severity, persona, n, avg, sd, override_count in sorted(rows):
+            lines.append(f"| {severity} | {persona} | {n} | {fmt(avg)} | {fmt(sd)} | {override_count} |")
+        lines.append("")
+
+    return lines
+
+
+def render_scale_score_validation_markdown(validation_payload: dict[str, Any]) -> list[str]:
+    total_mismatches = validation_payload.get("total_mismatches", [])
+    item_mismatches = validation_payload.get("item_mismatches", [])
+    if not isinstance(total_mismatches, list):
+        total_mismatches = []
+    if not isinstance(item_mismatches, list):
+        item_mismatches = []
+
+    lines = []
+    lines.append("## 评分结果校验附录\n")
+    lines.append("> 仅做结构化复核：总分差异为“条目分之和 vs LLM 总分”；异常条目仅统计回答中可明确抽取 0-3 分、且与 LLM 条目分不同的情况。\n")
+    lines.append(f"- 已复核 scored 文件数：{render_validation_number(validation_payload.get('checked_scored_files'))}")
+    lines.append(f"- 已复核 answered 文件数：{render_validation_number(validation_payload.get('checked_answer_files'))}")
+    lines.append(f"- 总分差异记录数：{len(total_mismatches)}")
+    lines.append(f"- 异常评分条目数：{len(item_mismatches)}")
+    lines.append("")
+
+    if total_mismatches:
+        lines.append("### 总分差异对比\n")
+        lines.append("| 条件 | 重复 | 量表 | 条目和 | LLM总分 | 差值 |")
+        lines.append("|------|------|------|--------|---------|------|")
+        for item in total_mismatches:
+            lines.append(
+                "| {condition} | {repeat} | {scale} | {item_sum} | {reported_total} | {delta} |".format(
+                    condition=item.get("condition_name", "—"),
+                    repeat=item.get("repeat", "—"),
+                    scale=item.get("scale", "—"),
+                    item_sum=render_validation_number(item.get("item_sum")),
+                    reported_total=render_validation_number(item.get("reported_total")),
+                    delta=render_validation_number(item.get("delta")),
+                )
+            )
+        lines.append("")
+
+    if item_mismatches:
+        lines.append("### 异常评分条目数值对比\n")
+        lines.append("| 条件 | 重复 | 量表 | 条目 | LLM分 | 回答分 |")
+        lines.append("|------|------|------|------|-------|--------|")
+        for item in item_mismatches:
+            lines.append(
+                "| {condition} | {repeat} | {scale} | {item_id} | {llm_score} | {answer_score} |".format(
+                    condition=item.get("condition_name", "—"),
+                    repeat=item.get("repeat", "—"),
+                    scale=item.get("scale", "—"),
+                    item_id=render_validation_number(item.get("item_id")),
+                    llm_score=render_validation_number(item.get("llm_score")),
+                    answer_score=render_validation_number(item.get("answer_score")),
+                )
+            )
+        lines.append("")
+
+    lines.extend(render_corrected_comparison_markdown(validation_payload))
+
+    return lines
 
 
 def run_task(task_payload: dict[str, Any]) -> dict[str, Any]:
@@ -882,13 +1306,121 @@ def render_markdown_report(cfg: RuntimeConfig, results: list[dict[str, Any]]) ->
             lines.append(f"| {item.get('condition_name', '—')} | {item.get('repeat', '—')} | {error} |")
         lines.append("")
 
+    lines.extend(render_scale_score_validation_markdown(build_scale_score_validation(results)))
+
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_outputs(cfg: RuntimeConfig, results: list[dict[str, Any]]) -> tuple[Path, Path]:
-    batch_dir = T0_OUTPUT_ROOT / cfg.batch_name
+def resolve_existing_batch_dir(raw_dir: str) -> Path:
+    root = (BASE_DIR / raw_dir).resolve() if not Path(raw_dir).is_absolute() else Path(raw_dir).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"已有结果目录不存在: {root}")
+
+    metadata_files = sorted(root.rglob("metadata.json"))
+    if not metadata_files:
+        raise FileNotFoundError(f"未在目录下找到 metadata.json: {root}")
+
+    batch_dirs = {path.parents[2] for path in metadata_files if len(path.parents) >= 3}
+    if len(batch_dirs) == 1:
+        return next(iter(batch_dirs))
+
+    direct_batch_dirs = [
+        path for path in sorted(batch_dirs)
+        if path.name.startswith("t0-repeat-") or path.parent.name == "t0_repeat_eval"
+    ]
+    if len(direct_batch_dirs) == 1:
+        return direct_batch_dirs[0]
+
+    available = "\n".join(str(path) for path in sorted(batch_dirs))
+    raise ValueError(f"检测到多个 T0 批次目录，请把 --results-dir 指到其中一个:\n{available}")
+
+
+def parse_snapshot_start_time(snapshot_name: str) -> str:
+    text = str(snapshot_name or "").strip()
+    if text.startswith("simulate-") and text.endswith(".json"):
+        value = text[len("simulate-") : -len(".json")]
+        if len(value) == 13 and value[8] == "-":
+            return f"{value[:8]}-{value[9:11]}:{value[11:13]}"
+    return ""
+
+
+def localize_metadata_paths(metadata_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+    localized = copy.deepcopy(result)
+    repeat_dir = metadata_path.parent
+    scales_dir = repeat_dir / "scales"
+    localized["metadata_path"] = str(metadata_path)
+    localized["scales_dir"] = str(scales_dir)
+    for scale_name in SCALES:
+        answers_path, scored_path = scale_paths(scales_dir, scale_name)
+        scale_payload = localized.setdefault("scales", {}).setdefault(scale_name, {})
+        if isinstance(scale_payload, dict):
+            scale_payload["answers_file"] = str(answers_path)
+            scale_payload["scored_file"] = str(scored_path)
+            scored = load_optional_scored(scored_path)
+            scale_payload["total"] = extract_total(scored)
+            scale_payload["severity_label"] = extract_severity(scored)
+            scale_payload["safety_risk"] = extract_safety(scored)
+            scale_payload["score"] = scored or {}
+    return localized
+
+
+def load_existing_results(batch_dir: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for metadata_path in sorted(batch_dir.glob("T0-*/r*/metadata.json")):
+        try:
+            result = load_json_file(metadata_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            results.append(
+                {
+                    "condition_name": metadata_path.parents[1].name,
+                    "repeat": metadata_path.parent.name.lstrip("r") or "—",
+                    "status": "failed",
+                    "error": f"metadata load failed: {exc}",
+                    "scales": {},
+                }
+            )
+            continue
+        results.append(localize_metadata_paths(metadata_path, result))
+    if not results:
+        raise FileNotFoundError(f"未在批次目录下找到 T0 metadata: {batch_dir}")
+    return results
+
+
+def build_report_config_from_existing(batch_dir: Path, results: list[dict[str, Any]]) -> RuntimeConfig:
+    condition_map: dict[str, T0Condition] = {}
+    repeat = 1
+    start_time = ""
+    for result in results:
+        condition_name = str(result.get("condition_name", "") or "")
+        variant = str(result.get("variant", "") or "")
+        severity = str(result.get("severity", "") or "")
+        if condition_name and variant and severity:
+            condition_map[condition_name] = T0Condition(condition_name, variant, severity)
+        try:
+            repeat = max(repeat, int(result.get("repeat", 1) or 1))
+        except (TypeError, ValueError):
+            pass
+        if not start_time:
+            start_time = parse_snapshot_start_time(str(result.get("snapshot", "") or ""))
+
+    conditions = sorted(condition_map.values(), key=lambda item: item.name)
+    return RuntimeConfig(
+        batch_name=batch_dir.name,
+        start_time=start_time or "from-existing-results",
+        stride=STRIDE,
+        repeat=repeat,
+        max_parallel=1,
+        skip_existing=True,
+        force=False,
+        dry_run=False,
+        conditions=conditions,
+    )
+
+
+def write_existing_report_outputs(batch_dir: Path, cfg: RuntimeConfig, results: list[dict[str, Any]]) -> tuple[Path, Path]:
     aggregate_path = batch_dir / "t0_repeat_results.json"
     report_path = batch_dir / "t0_repeat_report.md"
+    validation_payload = build_scale_score_validation(results)
     payload = {
         "batch_name": cfg.batch_name,
         "start_time": cfg.start_time,
@@ -901,6 +1433,50 @@ def write_outputs(cfg: RuntimeConfig, results: list[dict[str, Any]]) -> tuple[Pa
         ],
         "scales": SCALES,
         "results": results,
+        "scale_score_validation": validation_payload,
+        "report_only": True,
+    }
+    write_json_file(aggregate_path, payload)
+    report_path.write_text(render_markdown_report(cfg, results), encoding="utf-8")
+    print(f"[WRITE] {aggregate_path}")
+    print(f"[WRITE] {report_path}")
+    return aggregate_path, report_path
+
+
+def run_report_only(results_dir: str) -> tuple[Path, Path]:
+    batch_dir = resolve_existing_batch_dir(results_dir)
+    results = load_existing_results(batch_dir)
+    cfg = build_report_config_from_existing(batch_dir, results)
+    print("==========================================")
+    print(" T0 已有结果报告汇总")
+    print("==========================================")
+    print(f"  批次目录:     {batch_dir}")
+    print(f"  批次名称:     {cfg.batch_name}")
+    print(f"  条件数:       {len(cfg.conditions)}")
+    print(f"  metadata 数:  {len(results)}")
+    print(f"  重复次数:     {cfg.repeat}")
+    print("==========================================")
+    return write_existing_report_outputs(batch_dir, cfg, results)
+
+
+def write_outputs(cfg: RuntimeConfig, results: list[dict[str, Any]]) -> tuple[Path, Path]:
+    batch_dir = T0_OUTPUT_ROOT / cfg.batch_name
+    aggregate_path = batch_dir / "t0_repeat_results.json"
+    report_path = batch_dir / "t0_repeat_report.md"
+    validation_payload = build_scale_score_validation(results)
+    payload = {
+        "batch_name": cfg.batch_name,
+        "start_time": cfg.start_time,
+        "stride": cfg.stride,
+        "repeat": cfg.repeat,
+        "max_parallel": cfg.max_parallel,
+        "conditions": [
+            {"name": c.name, "variant": c.variant, "severity": c.severity}
+            for c in cfg.conditions
+        ],
+        "scales": SCALES,
+        "results": results,
+        "scale_score_validation": validation_payload,
     }
     if cfg.dry_run:
         print(f"[DRY-RUN] write aggregate: {aggregate_path}")
@@ -916,6 +1492,14 @@ def write_outputs(cfg: RuntimeConfig, results: list[dict[str, Any]]) -> tuple[Pa
 
 def main() -> None:
     args = parse_args()
+    if args.report_only:
+        if not normalize_selector(args.results_dir):
+            raise ValueError("--report-only 需要配合 --results-dir 指定已有结果目录。")
+        aggregate_path, report_path = run_report_only(str(args.results_dir))
+        print(f"\n[Done] 已基于已有结果生成报告: {report_path}")
+        print(f"[Done] 聚合数据: {aggregate_path}")
+        return
+
     cfg = resolve_runtime_config(args)
     print_effective_config(cfg)
     results = run_all_tasks(cfg)

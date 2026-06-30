@@ -6,7 +6,7 @@ import copy
 import json
 import os
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 from .context_analyzer import SessionContextBuilder
 from .emotion_inferencer import EmotionInferencer
@@ -36,7 +36,7 @@ class DepressionSimulationEngine:
 
     最重要的接口有两个：
     - `preview_interaction_prompt()`：只预览，不落盘状态；
-    - `commit_interaction()`：真正提交本轮并推进内部状态。
+    - `commit_event()`：真正提交本轮并推进内部状态。
     """
 
     def __init__(
@@ -77,46 +77,9 @@ class DepressionSimulationEngine:
             now_obj = _simulation_now()
         return now_obj if isinstance(now_obj, datetime) else _simulation_now()
 
-    def set_clock_provider(self, clock_provider: Optional[Callable[[], datetime]]) -> None:
-        """替换引擎时间源，并同步给主诉图管理器。"""
-        if callable(clock_provider):
-            self._clock_provider = clock_provider
-            self.graph_manager.set_now_provider(clock_provider)
-
     def set_base_prompt(self, base_prompt: str) -> None:
         """设置所有动态抑郁信息附着前的基础角色 prompt。"""
         self.base_prompt = str(base_prompt or "")
-
-    def process_interaction(
-        self,
-        location: str,
-        time_of_day: str,
-        other_agent: Optional[str] = None,
-        relationship: Optional[str] = None,
-        interaction_type: Optional[str] = None,
-        conversation_content: str = "",
-    ) -> str:
-        """提交一轮已发生互动并返回注入抑郁运行态后的完整 prompt。"""
-        # 这个接口会直接 commit，因此更适合“确认发生过的互动”；
-        # 如果只是为了生成 prompt 预览，优先看 `preview_interaction_prompt()`。
-        runtime = self.commit_interaction(
-            location=location,
-            time_of_day=time_of_day,
-            other_agent=other_agent,
-            relationship=relationship,
-            interaction_type=interaction_type,
-            conversation_content=conversation_content,
-        )
-        if not runtime.get("enabled", False):
-            return self.base_prompt
-        return self.prompt_builder.build_prompt(
-            base_prompt=self.base_prompt,
-            current_stage=runtime.get("current_stage", {}),
-            graph_snapshot=runtime.get("graph", {}),
-            session_context=runtime.get("session_context", {}),
-            activated_memories=runtime.get("memory_context", []),
-            emotion=runtime.get("emotion", {}),
-        )
 
     def preview_interaction_prompt(
         self,
@@ -126,12 +89,15 @@ class DepressionSimulationEngine:
         relationship: Optional[str] = None,
         interaction_type: Optional[str] = None,
         conversation_content: str = "",
-        llm_transition_signal: Optional[Dict[str, Any]] = None,
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
-        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
     ) -> str:
-        """预览一轮互动会生成的动态 prompt，但不写入真实主诉图状态。"""
+        """预览一轮互动会生成的动态 prompt：只读当前主诉节点，不判 advance/hold、不写状态。
+
+        是否推进主诉图属于提交层（commit_event）的职责，要依据角色真正说出的内容来判断；
+        而预览发生在角色开口之前，那句话还不存在，所以这里只用“当前节点 + 候选分支 +
+        瞬时情绪”渲染本轮该怎么说，绝不移动指针，也不调用 graph_transition 判定。
+        """
         if not self.enabled:
             return self.base_prompt
 
@@ -144,33 +110,14 @@ class DepressionSimulationEngine:
             interaction_type=interaction_type,
             conversation_content=conversation_content,
         )
-        # 第 2 步：克隆一个 manager 做 preview evaluate/commit，避免污染真实状态。
-        preview_manager = ComplaintGraphManager.from_dict(
-            self.graph_manager.to_dict(), now_provider=self._clock_provider
-        )
-        evaluation = preview_manager.evaluate_turn(
-            session_context=session_context,
-            conversation_content=conversation_content,
-            completion_func=roadmap_completion_func,
-            llm_cfg=roadmap_llm_cfg,
-            llm_signal=llm_transition_signal,
-        )
-        # 第 3 步：在克隆状态上提交预览评估。
-        preview_graph = preview_manager.commit_turn(copy.deepcopy(evaluation))
-        if callable(roadmap_completion_func):
-            preview_graph = preview_manager.ensure_graph_window(
-                session_context=session_context,
-                conversation_content=conversation_content,
-                completion_func=roadmap_completion_func,
-                llm_cfg=roadmap_llm_cfg,
-                record_evaluation=False,
-            )
-        current_stage = preview_manager.get_current_stage()
-        # 第 4 步：在 preview 后的节点上推断记忆和瞬时情绪。
+        # 第 2 步：直接读取真实状态机的当前节点，不克隆、不评估、不提交。
+        current_stage = self.graph_manager.get_current_stage()
+        graph_snapshot = self.graph_manager.get_graph_snapshot()
+        # 第 3 步：在当前节点上推断本轮瞬时情绪（只读，不碰主诉图）。
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
         emotion = self._infer_emotion(
             current_stage=current_stage,
-            graph_snapshot=preview_graph,
+            graph_snapshot=graph_snapshot,
             session_context=session_context,
             conversation_content=conversation_content,
             completion_func=emotion_completion_func or roadmap_completion_func,
@@ -178,46 +125,10 @@ class DepressionSimulationEngine:
         return self.prompt_builder.build_prompt(
             base_prompt=self.base_prompt,
             current_stage=current_stage,
-            graph_snapshot=preview_graph,
+            graph_snapshot=graph_snapshot,
             session_context=session_context,
             activated_memories=memory_context,
             emotion=emotion,
-        )
-
-    def commit_interaction(
-        self,
-        location: str,
-        time_of_day: str,
-        other_agent: Optional[str] = None,
-        relationship: Optional[str] = None,
-        interaction_type: Optional[str] = None,
-        conversation_content: str = "",
-        llm_transition_signal: Optional[Dict[str, Any]] = None,
-        roadmap_completion_func: Optional[Callable[[str], str]] = None,
-        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
-        emotion_completion_func: Optional[Callable[[str], str]] = None,
-    ) -> Dict[str, Any]:
-        """提交一轮对话互动，推进主诉图并返回本轮完整运行态快照。"""
-        if not self.enabled:
-            return self._disabled_runtime()
-
-        # commit 版本与 preview 共享同一条流水线，
-        # 差别在于这里会真正修改 `graph_manager` / `interaction_count`。
-        session_context = self.context_builder.build_context(
-            location=location,
-            time_of_day=time_of_day,
-            other_agent=other_agent,
-            relationship=relationship,
-            interaction_type=interaction_type,
-            conversation_content=conversation_content,
-        )
-        return self._commit_context(
-            session_context=session_context,
-            conversation_content=conversation_content,
-            llm_transition_signal=llm_transition_signal,
-            roadmap_completion_func=roadmap_completion_func,
-            roadmap_llm_cfg=roadmap_llm_cfg,
-            emotion_completion_func=emotion_completion_func,
         )
 
     def commit_event(
@@ -230,7 +141,6 @@ class DepressionSimulationEngine:
         other_agent: Optional[str] = None,
         relationship: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        llm_transition_signal: Optional[Dict[str, Any]] = None,
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
@@ -264,7 +174,6 @@ class DepressionSimulationEngine:
         return self._commit_context(
             session_context=session_context,
             conversation_content=event_content,
-            llm_transition_signal=llm_transition_signal,
             roadmap_completion_func=roadmap_completion_func,
             roadmap_llm_cfg=roadmap_llm_cfg,
             emotion_completion_func=emotion_completion_func,
@@ -274,7 +183,6 @@ class DepressionSimulationEngine:
         self,
         session_context: Dict[str, Any],
         conversation_content: str,
-        llm_transition_signal: Optional[Dict[str, Any]] = None,
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
@@ -290,7 +198,6 @@ class DepressionSimulationEngine:
             conversation_content=conversation_content,
             completion_func=roadmap_completion_func,
             llm_cfg=roadmap_llm_cfg,
-            llm_signal=llm_transition_signal,
         )
         graph_snapshot = self.graph_manager.commit_turn(evaluation)
         if callable(roadmap_completion_func):
@@ -472,77 +379,6 @@ class DepressionSimulationEngine:
             "interaction_count": self.interaction_count,
             "last_update": self.last_update_time.isoformat(),
         }
-
-    def force_stage(
-        self,
-        stage_id: str,
-        reason: str = "manual",
-        roadmap_completion_func: Optional[Callable[[str], str]] = None,
-        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """强制切换到指定主诉节点，并可选择让 LLM 重新补足候选分支。"""
-        self.graph_manager.force_stage(stage_id, reason=reason)
-        if callable(roadmap_completion_func):
-            session_context = self.context_builder.build_context(
-                location="",
-                time_of_day="",
-                other_agent="",
-                relationship="",
-                interaction_type="手动主诉图切换",
-                conversation_content=str(reason or "manual"),
-            )
-            self.graph_manager.ensure_graph_window(
-                session_context=session_context,
-                conversation_content=str(reason or "manual"),
-                completion_func=roadmap_completion_func,
-                llm_cfg=roadmap_llm_cfg,
-                record_evaluation=False,
-            )
-        self.last_update_time = self._now()
-
-    def force_state_transition(self, new_state: Any, reason: str = "manual") -> None:
-        """强制切换当前主诉节点，支持传入 stage 字典或字符串。"""
-        if isinstance(new_state, dict):
-            stage_id = str(new_state.get("id", new_state.get("label", "")) or "").strip()
-            if stage_id:
-                self.graph_manager.force_stage(stage_id, reason=reason)
-        else:
-            self.graph_manager.force_stage(str(new_state or "").strip(), reason=reason)
-        self.last_update_time = self._now()
-
-    def get_state_history(self) -> List[Dict[str, Any]]:
-        """读取主诉图管理器记录的历史状态变化。"""
-        return self.graph_manager.get_state_history()
-
-    def get_symptom_intensity(self, symptom: str) -> float:
-        """查询当前主诉节点上某个症状的强度值。"""
-        return self.graph_manager.get_symptom_intensity(symptom)
-
-    def simulate_therapy_progress(self, effectiveness: float = 0.1) -> None:
-        """保留的治疗进展模拟接口；当前版本不改变任何状态。"""
-        del effectiveness
-        return None
-
-    def reset(self) -> None:
-        """重置交互计数、缓存情绪、上下文、主诉图和记忆运行态。"""
-        self.interaction_count = 0
-        self.last_emotion = {}
-        self.last_session_context = {}
-        self.last_update_time = self._now()
-        self.graph_manager.reset()
-        self.memory_system.memory_context = []
-
-    @classmethod
-    def from_config_file(cls, config_path: str) -> "DepressionSimulationEngine":
-        """从 depression_config.json 路径创建引擎实例。"""
-        return cls(config=config_path)
-
-    @classmethod
-    def from_agent_dir(cls, agent_dir: str) -> "DepressionSimulationEngine":
-        """从 agent 目录创建引擎实例，默认读取其中的 depression_config.json。"""
-        agent_dir = os.path.abspath(str(agent_dir or ""))
-        config_path = os.path.join(agent_dir, "depression_config.json")
-        return cls(config={"config_path": config_path, "agent_dir": agent_dir})
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化引擎配置引用和各子系统运行态，用于存档或迁移。"""
