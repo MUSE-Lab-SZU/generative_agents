@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.7
+
+# Single-file image for the current GenerativeAgentsCN workspace.
+#
+# Build:
+#   docker build -f Dockerfile.txt -t generative-agents-cn-vllm:latest .
+#
+# Model weights are not copied into the image.  Download them later on the
+# remote platform with runshells/download_vllm_models.sh, or mount them under
+# /share/home/tm866039793920000/a874457430/MODEL.
+
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+
+LABEL maintainer="ZJU-REAL"
+LABEL description="GenerativeAgentsCN CUDA/vLLM project image"
+
+ARG PYTHON_VERSION=3.10
+ARG CONDA_ENV=llm-depression
+ARG MINICONDA_VERSION=py310_23.5.2-0
+ARG PYTORCH_VERSION=2.10.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCH_CUDA_VARIANT=cu129
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG VLLM_PIP_SPEC=vllm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN printf 'Acquire::http::Proxy "false";\nAcquire::https::Proxy "false";\n' \
+    > /etc/apt/apt.conf.d/00proxy
+
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    echo ${TZ} > /etc/timezone
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        less \
+        libffi-dev \
+        ninja-build \
+        openssh-server \
+        pkg-config \
+        procps \
+        rsync \
+        tmux \
+        vim \
+        wget \
+        zlib1g-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm -f /tmp/miniconda.sh
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+RUN conda config --system --set show_channel_urls yes && \
+    conda config --system --add channels conda-forge && \
+    conda config --system --set channel_priority strict && \
+    conda create -n ${CONDA_ENV} python=${PYTHON_VERSION} -y && \
+    conda clean -afy
+
+ENV PATH="/opt/conda/envs/${CONDA_ENV}/bin:/opt/conda/bin:${PATH}" \
+    CONDA_DEFAULT_ENV=${CONDA_ENV} \
+    CONDA_PREFIX=/opt/conda/envs/${CONDA_ENV}
+
+RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    pip config set global.trusted-host ${PIP_TRUSTED_HOST} && \
+    python -m pip install --upgrade pip setuptools wheel
+
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
+        "torch==${PYTORCH_VERSION}" \
+        "torchaudio==${TORCHAUDIO_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}" && \
+    python -c "import torch, torchaudio, torchvision; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('torchaudio', torchaudio.__version__); print('torchvision', torchvision.__version__)"
+
+RUN printf '%s\n' \
+        "torch==${PYTORCH_VERSION}+${TORCH_CUDA_VARIANT}" \
+        "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_VARIANT}" \
+        "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_VARIANT}" \
+        > /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt && \
+    pip install --no-cache-dir -U \
+        --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
+        -c /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt \
+        "${VLLM_PIP_SPEC}" \
+        modelscope && \
+    python -m pip show vllm && \
+    python -c "import torch, vllm; print('vllm', getattr(vllm, '__version__', 'unknown')); print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+RUN pip install --no-cache-dir jupyter jupyterlab ipykernel requests openai && \
+    python -m ipykernel install --sys-prefix --name ${CONDA_ENV} --display-name "Python (${CONDA_ENV})"
+
+RUN mkdir -p \
+        /workspace \
+        /workspace/project \
+        /workspace/models \
+        /workspace/hf-cache \
+        /workspace/modelscope-cache \
+        /root/.cache/huggingface/hub \
+        /model
+
+ENV HF_HOME=/workspace/hf-cache \
+    HUGGINGFACE_HUB_CACHE=/workspace/hf-cache/hub \
+    MODELSCOPE_CACHE=/workspace/modelscope-cache \
+    PROJECT_DIR=/workspace/project \
+    PYTHONPATH=/workspace/project
+
+RUN echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo "conda activate ${CONDA_ENV}" >> /root/.bashrc && \
+    echo 'cd /workspace/project 2>/dev/null || cd /workspace' >> /root/.bashrc
+
+WORKDIR /workspace/project
+
+# Install project dependencies before copying the full workspace so Docker can
+# reuse this layer when only source/config/prompt files change.
+COPY requirements_linux.txt requirements.txt /workspace/project/
+
+RUN pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
+        -c /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt \
+        -r requirements_linux.txt && \
+    python -c "import flask, openai, requests, torch, vllm; print('project deps ok; torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# .dockerignore removes results, docs, caches, local secrets, model weights,
+# and editor metadata.  Model weights should be downloaded or mounted later.
+COPY . /workspace/project/
+
+RUN mkdir -p /workspace/project/.vllm/logs /workspace/models /workspace/hf-cache /workspace/modelscope-cache /model && \
+    mkdir -p /workspace/project/results/checkpoints /workspace/project/results/compressed && \
+    if [ -d /workspace/project/runshells ]; then \
+        find /workspace/project/runshells -type f -name '*.sh' -exec chmod +x {} +; \
+    fi
+
+# Replay/Flask, vLLM chat, vLLM embedding, Jupyter.
+EXPOSE 5000 18000 18001 8888
+
+WORKDIR /workspace/project
+
+CMD ["/bin/bash"]

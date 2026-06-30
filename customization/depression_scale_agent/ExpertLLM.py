@@ -1,5 +1,4 @@
 import os
-os.environ["OPENAI_API_KEY"] = "sk-6cb4c63b197d463d94969ec253cec887"  ### DeepSeek API Key ###
 
 class ExpertLLM:
     def __init__(self, api_key=None, model="deepseek-chat", base_url="https://api.deepseek.com", timeout=60):

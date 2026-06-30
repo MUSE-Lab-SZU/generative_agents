@@ -1,0 +1,63 @@
+.git
+.gitignore
+.dockerignore
+.agents
+.codex
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Coverage / build artifacts
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Logs / temp files
+*.log
+*.pid
+*.out
+*.err
+*.tmp
+*.temp
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime outputs and large local assets
+results/
+docs/
+tests/
+.vllm/
+models/
+hf-cache/
+modelscope-cache/
+MODEL/
+model/

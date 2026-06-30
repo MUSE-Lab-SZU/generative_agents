@@ -265,6 +265,7 @@ class ComplaintGraphManager:
         current_stage = self.get_current_stage()
 
         normalized_signal = self._normalize_llm_signal(llm_signal)
+        using_external_signal = normalized_signal is not None
         if not normalized_signal and callable(completion_func) and self.llm_enabled:
             # 分支规划器只补候选，不参与本轮动作裁决。
             self.ensure_graph_window(
@@ -312,18 +313,21 @@ class ComplaintGraphManager:
         next_stage: Optional[Dict[str, Any]] = None
         if action == "advance":
             # advance 的前提：必须能推出一个候选节点。
-            # 如果 next_graph 不够长，就退回当前 stage 的 next_candidates。
-            if len(next_graph_ids) > 1:
-                next_stage = self._lookup_stage(next_graph_ids[1], stage_updates)
-            elif current_stage.get("next_candidates"):
-                candidate_id = str(current_stage.get("next_candidates", [""])[0] or "").strip()
-                if candidate_id and candidate_id in self.stage_catalog:
-                    next_graph_ids = [current_stage["id"], candidate_id]
-                    next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
+            # 外部 transition signal 只能选择已有候选，不能通过 next_graph 临时造节点。
+            candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
+            target_id = str(next_graph_ids[1] if len(next_graph_ids) > 1 else "").strip()
+            if target_id and target_id in candidate_ids:
+                next_stage = self._lookup_stage(target_id, stage_updates)
+            elif not target_id and not using_external_signal and candidate_ids:
+                target_id = candidate_ids[0]
+                next_graph_ids = [current_stage["id"], target_id]
+                next_stage = copy.deepcopy(self.stage_catalog[target_id])
             if not next_stage:
                 # 没有完整候选节点，也没有配置内已存在的候选时，
                 # 不凭规则臆造主诉节点。
                 action = "hold"
+                stage_updates = []
+                next_graph_ids = self._preview_future_graph(current_stage)
 
         # evaluation 是“提交前快照”：
         # 后续 commit_turn() 只消费这个 dict，不再重新做一次理解。
@@ -441,6 +445,14 @@ class ComplaintGraphManager:
             llm_signal=llm_transition_signal,
         )
         self.commit_turn(evaluation)
+        if callable(roadmap_completion_func):
+            self.ensure_graph_window(
+                session_context=session_context,
+                conversation_content=conversation_content,
+                completion_func=roadmap_completion_func,
+                llm_cfg=roadmap_llm_cfg,
+                record_evaluation=False,
+            )
         return str(evaluation.get("action", "hold")) == "advance"
 
     def initialize_graph_window(
@@ -911,7 +923,8 @@ class ComplaintGraphManager:
             return "hold"
         if self._coerce_bool(current_stage.get("is_terminal_stage", False)):
             return "hold"
-        next_candidates = current_stage.get("next_candidates", []) if isinstance(current_stage.get("next_candidates", []), list) else []
+        if not self._candidate_ids_for_stage(current_stage, self.window_size):
+            return "hold"
 
         semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
         topics = [str(item) for item in self._to_list(semantic.get("topics", []))]
@@ -926,8 +939,6 @@ class ComplaintGraphManager:
             return "advance"
         if detailed and match_confidence >= max(0.46, self.min_match_confidence * 0.80):
             return "advance"
-        if not next_candidates:
-            return "hold"
         return "hold"
 
     def _count_signal_hits(self, signals: Any, conversation: str, topics: List[str]) -> int:
