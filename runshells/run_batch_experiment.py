@@ -150,6 +150,7 @@ GROUP_OVERLAY_FILES = {
     "g1": GROUP_OVERLAY_DIR / "g1_doctor_intervention.json",
     "g2": GROUP_OVERLAY_DIR / "g2_no_intervention.json",
     "g3": GROUP_OVERLAY_DIR / "g3_random_resident_chat.json",
+    "g4": GROUP_OVERLAY_DIR / "g4_counseling_room.json",
     "g5": GROUP_OVERLAY_DIR / "g5_negative_resident_chat.json",
 }
 
@@ -191,6 +192,19 @@ ALL_CONDITIONS = [
     for severity in SEVERITIES
 ]
 
+COUNSEL_ROOM_TEMPLATE = BASE_DIR / "data" / "config_counsel_room.json"
+COUNSEL_ROOM_AGENTS = ["卡布达", "蜻蜓队长"]
+
+COUNSEL_ROOM_CONDITIONS = [
+    BatchCondition(
+        name=f"Counsel-KBD1-G4-{SEVERITY_SHORT_NAMES[severity]}",
+        variant="kbd1",
+        group="g4",
+        severity=severity,
+    )
+    for severity in SEVERITIES
+]
+
 
 @dataclass
 class RuntimeConfig:
@@ -213,6 +227,7 @@ class RuntimeConfig:
     resume_batch: bool
     resume_condition: str | None
     skip_completed: bool
+    counsel_room: bool
     conditions: list[BatchCondition]
 
 
@@ -251,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-agent-memory-vis", action="store_true", help="跳过角色记忆可视化")
     parser.add_argument("--run-external-memory-audit", action="store_true", help="显式开启外置记忆审计可视化")
     parser.add_argument("--skip-external-memory-audit", action="store_true", help="跳过外置记忆审计可视化")
+    parser.add_argument("--counsel-room", action="store_true", help="启动咨询室模式（7×6 小地图、卡布达+蜻蜓队长2 agent、config_counsel_room.json）")
     return parser.parse_args()
 
 
@@ -341,6 +357,10 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     if not base_name:
         base_name = generate_batch_name()
 
+    if args.counsel_room:
+        ALL_CONDITIONS[:] = COUNSEL_ROOM_CONDITIONS
+        GROUP_SELECTOR_ALIASES["G4"] = "g4"
+
     return RuntimeConfig(
         name=base_name,
         start=args.start if args.start is not None else START_TIME,
@@ -361,6 +381,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         resume_batch=bool(args.resume_batch),
         resume_condition=str(args.resume_condition or "").strip() or None,
         skip_completed=bool(args.skip_completed),
+        counsel_room=bool(args.counsel_room),
         conditions=resolve_conditions(args.condition),
     )
 
@@ -403,6 +424,7 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print("  Embedding URLs: " + ", ".join(cfg.embedding_base_urls))
     print(f"  续跑批次:     {cfg.resume_batch}")
     print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
+    print(f"  咨询室模式:   {cfg.counsel_room}")
     print(f"  跳过已完成:   {cfg.skip_completed}")
     print(f"  dry-run:      {cfg.dry_run}")
     print(f"  启动剩余空间: >= {format_bytes(MIN_FREE_DISK_BYTES_TO_START)}")
@@ -782,22 +804,38 @@ def build_condition_runtime_config_payload(
     *,
     embedding_base_url: str | None = None,
 ) -> dict[str, Any]:
-    template = load_json_file(runtime_config_template_path())
-    overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
-    merged = deep_merge_dict(template, overlay)
+    counsel_room = bool(getattr(cfg, 'counsel_room', False))
+
+    if counsel_room:
+        # === 咨询室模式分支 ===
+        template = load_json_file(COUNSEL_ROOM_TEMPLATE)
+        assets_root = "assets/counsel_room"
+        agents_list = list(COUNSEL_ROOM_AGENTS)
+        variant_kwargs = dict(assets_subdir="counsel_room", depression_assets_subdir="village")
+        agent_base_source_key = "agent_base"
+    else:
+        # === 原始村庄模式分支（不变） ===
+        template = load_json_file(runtime_config_template_path())
+        overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
+        template = deep_merge_dict(template, overlay)
+        assets_root = "assets/village"
+        agents_list = list(PERSONAS)
+        variant_kwargs = {}
+        agent_base_source_key = "agent"
+
     variant_runtime = prepare_kabuda_variant_runtime(
         base_dir=BASE_DIR,
         variant=condition.variant,
         severity=condition.severity,
         output_dir=batch_runtime_persona_dir(cfg, condition),
         dry_run=cfg.dry_run,
+        **variant_kwargs,
     )
-    assets_root = "assets/village"
     payload: dict[str, Any] = {
         "stride": cfg.stride,
         "time": {"start": cfg.start},
         "maze": {"path": f"{assets_root}/maze.json"},
-        "agent_base": copy.deepcopy(merged.get("agent", {})),
+        "agent_base": copy.deepcopy(template.get(agent_base_source_key, {})),
         "agents": {},
     }
     if embedding_base_url:
@@ -809,19 +847,13 @@ def build_condition_runtime_config_payload(
         )
         if isinstance(embedding_config, dict):
             embedding_config["base_url"] = embedding_base_url
-    intervention_config = copy.deepcopy(merged.get("intervention", {}))
-    staged_eval_config = copy.deepcopy(merged.get("staged_eval", {}))
-    checkpointing_config = copy.deepcopy(merged.get("checkpointing", {}))
-    if intervention_config:
-        payload["intervention"] = intervention_config
-        memory_injection_config = payload["intervention"].setdefault("memory_injection", {})
-        if isinstance(memory_injection_config, dict):
-            memory_injection_config["content_file"] = variant_runtime.memory_injection_config_path
-    if staged_eval_config:
-        payload["staged_eval"] = staged_eval_config
-    if checkpointing_config:
-        payload["checkpointing"] = checkpointing_config
-    for agent_name in PERSONAS:
+    for section_key in ("intervention", "staged_eval", "checkpointing"):
+        section_value = copy.deepcopy(template.get(section_key))
+        if section_value:
+            payload[section_key] = section_value
+    if "intervention" in payload and isinstance(payload["intervention"].get("memory_injection"), dict):
+        payload["intervention"]["memory_injection"]["content_file"] = variant_runtime.memory_injection_config_path
+    for agent_name in agents_list:
         payload["agents"][agent_name] = {
             "config_path": f"{assets_root}/agents/{agent_name.replace(' ', '_')}/agent.json",
         }
@@ -972,12 +1004,16 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             meta = load_json_file(meta_path)
         except json.JSONDecodeError:
             meta = {}
+    variant_kwargs = {}
+    if getattr(cfg, 'counsel_room', False):
+        variant_kwargs = dict(assets_subdir="counsel_room", depression_assets_subdir="village")
     variant_runtime = prepare_kabuda_variant_runtime(
         base_dir=BASE_DIR,
         variant=condition.variant,
         severity=condition.severity,
         output_dir=batch_runtime_persona_dir(cfg, condition),
         dry_run=True,
+        **variant_kwargs,
     )
 
     meta.update(

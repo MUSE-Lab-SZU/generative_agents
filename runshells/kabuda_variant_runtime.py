@@ -118,10 +118,15 @@ def prepare_kabuda_variant_runtime(
     output_dir: Path,
     dry_run: bool = False,
     runtime_agent_name: str = RUNTIME_AGENT_NAME,
+    assets_subdir: str = "village",
+    depression_assets_subdir: str | None = None,
 ) -> KabudaVariantRuntime:
     resolved_variant = resolve_variant(variant)
     if severity not in SEVERITY_CONFIG_NAMES:
         raise ValueError(f"unknown severity: {severity}")
+
+    if depression_assets_subdir is None:
+        depression_assets_subdir = assets_subdir
 
     source_agent_name = VARIANT_SOURCE_AGENT_NAMES[resolved_variant]
     source_agent_dir = (
@@ -129,12 +134,21 @@ def prepare_kabuda_variant_runtime(
         / "frontend"
         / "static"
         / "assets"
-        / "village"
+        / assets_subdir
         / "agents"
         / source_agent_name
     )
     source_agent_path = source_agent_dir / "agent.json"
-    source_depression_path = source_agent_dir / SEVERITY_CONFIG_NAMES[severity]
+    depression_agent_dir = (
+        Path(base_dir)
+        / "frontend"
+        / "static"
+        / "assets"
+        / depression_assets_subdir
+        / "agents"
+        / source_agent_name
+    )
+    source_depression_path = depression_agent_dir / SEVERITY_CONFIG_NAMES[severity]
     if not source_agent_path.is_file():
         raise FileNotFoundError(source_agent_path)
     if not source_depression_path.is_file():

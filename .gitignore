@@ -5,6 +5,7 @@
 !BDI-II评估提示词.md
 !PHQ-9评估提示词.md
 !SDS评估提示词.md
+!counsel_room_README.md
 
 # Python caches / bytecode
 __pycache__/
@@ -33,6 +34,8 @@ Thumbs.db
 
 # Experiment outputs and large artifacts
 results/
+Datasets/
+writing/
 *.pdf
 *.zip
 
