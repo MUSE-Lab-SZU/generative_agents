@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-28
+> 更新时间：2026-07-01
 
 ## 关键测试结果速查
 
@@ -28,6 +28,7 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-01：合并 `counsel_room` 分支，新增 `--counsel-room` 咨询室模式（7×6 小地图、仅卡布达+蜻蜓队长 2 agent、`config_counsel_room.json` 直载）；详见 [3.8 咨询室模式](#38-咨询室模式-g4---counsel-room)
 - 2026-06-28：将`data/prompts/intervention/dialog_judge.txt`纳入版本管理，并重写判断LLM提示词结构：显式区分“先判断医生下一句、再判断是否结束”，要求advice回应患者核心压力源，必要时用低门槛问题做压力源桥接；若不宜追问也必须说明治疗节奏原因，减少对话长期停留在泛低落/泛自责层面的情况。
 - 2026-06-28：优化对话Prompt基础人设注入：`generate_chat.txt`和`generate_chat_external_memory.txt`改用`${base_desc_block}`，`modules/prompt/scratch.py`仅在没有动态抑郁对话块时注入基础描述，避免基础人设与抑郁动态Prompt重复堆叠。
 - 2026-06-28：收紧医患历史检索触发条件：`modules/intervention_manager.py`仅在强制干预对话中评估咨询历史，并在写入医患历史前校验`meeting_id`非空，避免普通聊天或缺少会话ID时产生无效历史记录。
@@ -263,6 +264,16 @@ python start.py --name sim-test-0425 --resume --step 12 --stride 60 --verbose in
 - `--resume`：从已有同名 checkpoint 继续跑
 - `--verbose`：日志级别（`info`、`debug`），新功能增加时没留意这个`debug`模式，不知道有没有用
 - `--log`：日志文件名称，在`results/<name>/`目录下，默认`results/<name>/sim-xxx.log`
+- `--counsel-room`：启用咨询室模式（G4），等价于 `--runtime-config data/config_counsel_room.json`；详见 [3.8 咨询室模式](#38-咨询室模式-g4---counsel-room)
+
+### 3.2.1 咨询室模式单次运行
+
+```bash
+# 咨询室模式（--counsel-room 等效 --runtime-config data/config_counsel_room.json）
+python start.py --name sim-counsel-room --step 60 --stride 360 --start 20260607-09:30 --counsel-room --verbose info
+```
+
+咨询室模式下只加载卡布达（患者）和蜻蜓队长（医生）2 个 agent，地图为 7×6 小地图，`config_counsel_room.json` 作为完整配置直载（无需 group overlay）。
 
 ## 3.3 生成回放数据
 
@@ -365,6 +376,23 @@ python3 runshells/run_batch_experiment.py --name my-batch --resume-condition Cou
 
 脚本顶部常量可以直接改当前批次的 `RUN_NAME`、`STEP`、`STRIDE`、`SCALE_AGENT`，以及是否执行 `merge`、`post_scale`、`compress`、记忆可视化、外置记忆审计。
 
+#### 咨询室模式批量运行
+
+```bash
+# 全部 G4 条件（MILD / MOD / SEV）
+python3 runshells/run_batch_experiment.py --counsel-room
+
+# 指定严重度
+python3 runshells/run_batch_experiment.py --counsel-room --condition G4-MILD
+python3 runshells/run_batch_experiment.py --counsel-room --condition G4-MOD
+python3 runshells/run_batch_experiment.py --counsel-room --condition G4-SEV
+
+# 干跑预览
+python3 runshells/run_batch_experiment.py --counsel-room --dry-run
+```
+
+> ⚠️ `--counsel-room` **必须放在最前面**（在 `--condition` 等选项之前）。它会把 `ALL_CONDITIONS` 替换为仅 G4 的 3 个条件，并注入 `G4→g4` 映射；不加 `--counsel-room` 时 `G4` 别名无法识别。
+
 ### `staged_eval` 是怎么触发的
 
 - `start.py` 在首个 step 内先调用 `StagedEvalManager.maybe_run_t0(...)`，用于生成初始基线评估（`T0`）。
@@ -435,6 +463,70 @@ start.py 直接输出的仿真数据：
 - `questions/templates/`：量表题目定义（`.jsonl`，只读输入）
 - `questions/scoring_prompts/`：评分提示词（`*评估提示词.md`，只读输入）
 - `questions/adhoc/`：app.py 临时评估输出（`*_answered.jsonl`、`*_prompt_trace.*`）
+
+## 3.8 咨询室模式（G4 / `--counsel-room`）
+
+`--counsel-room` 是一个**复合开关**，在 `start.py` 和 `run_batch_experiment.py` 两个入口中共涉及 **11 项变更**（9 项行为 + 2 项资源）。
+
+### 3.8.1 快速使用
+
+```bash
+# 单次运行
+python start.py --name counsel-g4-mild --step 60 --stride 360 --start 20260607-09:30 --counsel-room --verbose info
+
+# 批量运行（全部 G4 条件）
+python3 runshells/run_batch_experiment.py --counsel-room
+
+# 批量指定严重度
+python3 runshells/run_batch_experiment.py --counsel-room --condition G4-MOD
+```
+
+### 3.8.2 变更全量清单
+
+| 层级 | # | 维度 | 村庄模式（默认） | `--counsel-room` 模式 |
+|------|---|------|------------------|----------------------|
+| **参数注册** | ① | `start.py` 参数 | — | 新增 `--counsel-room` action |
+| | ② | `run_batch_experiment.py` 参数 | — | 同上 |
+| **运行时配置** | ③ | 配置来源 (`start.py:501`) | 默认 config | `runtime_config = "data/config_counsel_room.json"` |
+| **批量条件** | ④ | ALL_CONDITIONS | G1-G5 × 严重度全量 | **仅 3 个** G4 条件（MILD/MOD/SEV） |
+| | ⑤ | GROUP_SELECTOR_ALIASES | G1/G2/G3/G5 | 额外注入 `G4→g4` |
+| **运行时负载** | ⑥ | 配置模板来源 | `config.json` + group overlay | **`config_counsel_room.json` 直载**（无 overlay） |
+| | ⑦ | `assets_root` | `"assets/village"`（50×50） | **`"assets/counsel_room"`**（7×6 小地图） |
+| | ⑧ | agents 列表 | 全部 6 个 agent | **仅 2 个**：卡布达、蜻蜓队长 |
+| | ⑨ | `variant_kwargs` | `{}` | `assets_subdir="counsel_room"`, `depression_assets_subdir="village"` |
+| | ⑩ | agent_base 格式键 | `"agent"`（v1 格式） | **`"agent_base"`**（v2 格式） |
+| **元数据** | ⑪ | `trial_meta.json` | — | 同上 variant_kwargs 写入 meta |
+
+### 3.8.3 资源文件变更
+
+| 资源 | 默认（村庄） | `--counsel-room` |
+|------|------------|-----------------|
+| **地图** | `assets/village/maze.json`（50×50） | `assets/counsel_room/maze.json`（**7×6** 仅咨询室） |
+| **卡布达 agent.json** | `assets/village/agents/卡布达/agent.json` | `assets/counsel_room/agents/卡布达/agent.json` |
+| **蜻蜓队长 agent.json** | `assets/village/agents/蜻蜓队长/agent.json` | `assets/counsel_room/agents/蜻蜓队长/agent.json` |
+| **depression_config** | —（不变） | 仍从 `village` 目录读取 |
+| **完整配置模板** | `data/config.json` + `experiments/config/groups/gN.json` overlay | **`data/config_counsel_room.json`**（单文件直载） |
+
+### 3.8.4 不变的部分
+
+以下系统组件在咨询室模式下**完全不变**：
+- CBT 治疗方案（10 session，与 G1 相同）
+- 评估量表（PHQ-9 / BDI-II / SDS）和时间点（T0→S4→S8→T4）
+- 对话法官 (Dialog Judge)
+- LLM 后端（Qwen3-8B 本地 / DeepSeek API）
+- 抑郁引擎（投诉链 + 认知偏置 + 情绪推断）
+- 批次参数（STEP=60, STRIDE=360）
+
+### 3.8.5 与 G1 的对照关系
+
+| 维度 | G1（医生干预） | G4（咨询室模式） |
+|------|--------------|----------------|
+| 患者 | 卡布达 + 金龟次郎 | **仅卡布达** |
+| 医生 | 蜻蜓队长 | 蜻蜓队长 |
+| 环境 | 50×50 小镇 | **7×6 咨询室**（限定空间） |
+| 配置格式 | v1: `agent` + overlay | **v2: `agent_base`** 直载 |
+| 治疗 | 完整 CBT | 相同 CBT |
+| 实验目的 | 基准治疗组 | 控制物理环境是否贡献额外效应 |
 
 ## 4. data/config.json 模块配置
 
