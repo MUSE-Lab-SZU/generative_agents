@@ -66,6 +66,9 @@ class Agent:
         self.chat_recent_turn_focus_n = self._resolve_chat_recent_turn_focus_n(
             self.chat_history_config.get("recent_turn_focus_n", 4)
         )
+        self.normal_chat_min_interval_minutes = self._resolve_normal_chat_min_interval_minutes(
+            self.chat_history_config.get("normal_chat_min_interval_minutes", 60)
+        )
         self.chat_memory_write_mode = self._resolve_chat_memory_write_mode(
             self.chat_memory_config.get("write_mode", "hybrid")
         )
@@ -77,11 +80,12 @@ class Agent:
             )
         )
         self.logger.info(
-            "[CHAT_HISTORY_READ_CFG] agent={} max_read_items={} focus_retrieve_max={} recent_turn_focus_n={}".format(
+            "[CHAT_HISTORY_READ_CFG] agent={} max_read_items={} focus_retrieve_max={} recent_turn_focus_n={} normal_chat_min_interval_minutes={}".format(
                 self.name,
                 self.chat_history_max_read_items,
                 self.chat_focus_retrieve_max,
                 self.chat_recent_turn_focus_n,
+                self.normal_chat_min_interval_minutes,
             )
         )
         self.logger.info(
@@ -412,8 +416,19 @@ class Agent:
         self._normalize_stale_forced_chat_action()
         events = self.move(status["coord"], status.get("path"))
         plan, _ = self.make_schedule()
+        lock = self.status.get("intervention", {}).get("lock", {}) if isinstance(self.status, dict) else {}
+        forced_lock_active = bool(
+            isinstance(lock, dict)
+            and lock.get("enabled", False)
+            and str(lock.get("meeting_id", "") or "").strip()
+            and str(lock.get("target_agent", "") or "").strip()
+        )
 
-        if (plan["describe"] == "sleeping" or "睡" in plan["describe"]) and self.is_awake():
+        if (
+            (plan["describe"] == "sleeping" or "睡" in plan["describe"])
+            and self.is_awake()
+            and not forced_lock_active
+        ):
             self.logger.info("{} is going to sleep...".format(self.name))
             address = self.spatial.find_address("睡觉", as_list=True)
             tiles = self.maze.get_address_tiles(address)
@@ -807,6 +822,7 @@ class Agent:
             for name, _ in self.chats:
                 if name == self.name or name in recorded:
                     continue
+                recorded.add(name)
                 res = self.associate.retrieve_chats(name)
                 if res and len(res) > 0:
                     node = res[-1]
@@ -1028,11 +1044,14 @@ class Agent:
     def _resolve_controlled_turn_limits(self, policy):
         budget = self.chat_iter
         min_turns = 1
-        max_turns = budget
 
         forced_chat_iter = int(policy.get("forced_chat_iter", -1) or -1)
         if forced_chat_iter != -1:
             budget = forced_chat_iter
+        if budget < 1:
+            budget = 1
+
+        max_turns = budget
 
         forced_chat_min_turns = int(policy.get("forced_chat_min_turns", -1) or -1)
         if forced_chat_min_turns != -1:
@@ -1044,8 +1063,6 @@ class Agent:
 
         if max_turns < min_turns:
             max_turns = min_turns
-        if budget < 1:
-            budget = 1
 
         return budget, min_turns, max_turns
 
@@ -1318,7 +1335,7 @@ class Agent:
 
         prev_self_ctx, prev_other_ctx = self._set_chat_route_ctx(other, forced=forced)
 
-        chats = self.associate.retrieve_chats(other.name)
+        chats = self.associate.retrieve_chats(other.name, force_direct=True)
         if chats:
             delta = utils.get_timer().get_delta(chats[0].create)
             self.logger.info(
@@ -1326,14 +1343,15 @@ class Agent:
                     self.name, other.name, delta, chats[0]
                 )
             )
-            if not forced and delta < 60:
+            if not forced and delta < self.normal_chat_min_interval_minutes:
                 self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
                 self.logger.info(
-                    "========== [{}][CHAT_BLOCKED] reason=delta_lt_60 self={} other={} delta={} ==========".format(
+                    "========== [{}][CHAT_BLOCKED] reason=delta_lt_min_interval self={} other={} delta={} min_interval={} ==========".format(
                         trace_scope,
                         self.name,
                         other.name,
                         delta,
+                        self.normal_chat_min_interval_minutes,
                     )
                 )
                 return False
@@ -2003,6 +2021,8 @@ class Agent:
                     forced_meeting_id = str(meeting_ctx.get("meeting_id", "") or "")
             except Exception:
                 forced_meeting_id = ""
+        if forced_meeting_id:
+            chat_meta_common["meeting_id"] = forced_meeting_id
 
         self.schedule_chat(
             chats,
@@ -2279,9 +2299,12 @@ class Agent:
             address=address or self.get_tile().get_address(),
             emoji=f"💬",
         )
+        pending_meta = copy.deepcopy(chat_meta or {})
+        if meeting_id and not pending_meta.get("meeting_id"):
+            pending_meta["meeting_id"] = meeting_id
         self._pending_chat_memory_meta = {
             "expire": chat_expire,
-            "meta": copy.deepcopy(chat_meta or {}),
+            "meta": pending_meta,
             "start": start,
             "duration": duration,
             "other": getattr(other, "name", ""),
@@ -2333,6 +2356,7 @@ class Agent:
                 event,
                 create=start,
                 expire=expire,
+                filling=chat_meta or {},
             )
             self._set_chat_dedup_marker(
                 node_id=getattr(node, "node_id", ""),
@@ -2546,6 +2570,12 @@ class Agent:
                 if isinstance(pending_expire, datetime.datetime):
                     expire = pending_expire
                 meta = pending.get("meta", {}) if isinstance(pending.get("meta"), dict) else {}
+                if filling is None:
+                    filling = copy.deepcopy(meta)
+                elif isinstance(filling, dict):
+                    merged_filling = copy.deepcopy(meta)
+                    merged_filling.update(filling)
+                    filling = merged_filling
                 override_address = self._normalize_address_list(
                     meta.get("memory_address_override", [])
                 )
@@ -2687,6 +2717,18 @@ class Agent:
         if recent_turn < 0:
             return default_recent_turn
         return recent_turn
+
+    def _resolve_normal_chat_min_interval_minutes(self, value):
+        default_interval = 60
+        if isinstance(value, bool):
+            return default_interval
+        try:
+            interval = int(value)
+        except Exception:
+            return default_interval
+        if interval <= 0:
+            return default_interval
+        return interval
 
     def _resolve_chat_memory_write_mode(self, value):
         mode = str(value or "hybrid").strip().lower()

@@ -741,9 +741,10 @@ def load_config(sim_name, snapshot_file=None):
         config["time"] = {"start": config["time"]}
     assets_root = os.path.join("assets", "village")
     for agent_name in config.get("agents", {}):
-        config["agents"][agent_name]["config_path"] = os.path.join(
-            assets_root, "agents", agent_name.replace(" ", "_"), "agent.json"
-        )
+        if not str(config["agents"][agent_name].get("config_path", "") or "").strip():
+            config["agents"][agent_name]["config_path"] = os.path.join(
+                assets_root, "agents", agent_name.replace(" ", "_"), "agent.json"
+            )
     return config
 
 

@@ -127,7 +127,7 @@ def test_generate_chat_template_keeps_persona_description_single_source():
     assert dynamic_prompt.count("=== 基础人格层 ===") == 1
 
 
-def test_chat_event_keeps_existing_jump_behavior():
+def test_chat_event_downgrades_legacy_jump_to_hold():
     engine = DepressionSimulationEngine(_engine_config())
 
     engine.commit_event(
@@ -143,8 +143,8 @@ def test_chat_event_keeps_existing_jump_behavior():
     )
 
     state = engine.get_current_state_info()
-    assert state["current_stage"]["id"] == "stage_b"
-    assert state["graph"]["last_evaluation"]["action"] == "jump"
+    assert state["current_stage"]["id"] == "stage_a"
+    assert state["graph"]["last_evaluation"]["action"] == "hold"
     assert state["graph"]["last_evaluation"]["source"] == "chat"
     assert state["graph"]["dialogue_history"][-1]["source"] == "chat"
     assert state["graph"]["dialogue_history"][-1]["evidence_ids"] == ["chat-1"]
@@ -587,7 +587,6 @@ def test_llm_transition_decision_moves_to_candidate_stage():
                 "matched_current_stage": True,
                 "action": "advance",
                 "target_stage_id": "stage_b",
-                "confidence": 0.92,
                 "reason": "对话虽短，但测试判定器明确选择推进到候选节点。",
             },
             ensure_ascii=False,

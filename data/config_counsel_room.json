@@ -1,5 +1,5 @@
 {
-  "agent": {
+  "agent_base": {
     "percept": {
       "mode": "box",
       "vision_r": 8,
@@ -19,11 +19,11 @@
         "request_timeout_seconds": 120
       },
       "interval": 1000,
-      "poignancy_max": 50,
+      "poignancy_max": 30,
       "reflect_focus_topk": 4,
       "reflect_insights_topk": 1
     },
-    "chat_iter": 3,
+    "chat_iter": 4,
     "associate": {
       "embedding": {
         "provider": "openai",
@@ -38,22 +38,21 @@
       "relevance_weight": 5.0,
       "importance_weight": 1.0,
       "chat_retrieve": {
-        "mode": "direct",
-        "similarity_top_k": 3
+        "mode": "semantic",
+        "similarity_top_k": 5
       }
     },
     "chat_history": {
-      "summary_window_minutes": 60480,
-      "max_read_items": 2,
-      "focus_retrieve_max": 10,
-      "recent_turn_focus_n": 15,
-      "normal_chat_min_interval_minutes": 2880
+      "summary_window_minutes": -1,
+      "max_read_items": -1,
+      "focus_retrieve_max": 15,
+      "recent_turn_focus_n": 15
     },
     "chat_memory": {
       "write_mode": "hybrid"
     },
     "external_memory": {
-      "enabled": false,
+      "enabled": true,
       "base_url": "http://localhost:8031",
       "timeout": 10.0,
       "read_mode": "chat_only",
@@ -68,6 +67,17 @@
         "session3.3-A_completed",
         "session4.2_completed"
       ]
+    }
+  },
+  "maze": {
+    "path": "assets/counsel_room/maze.json"
+  },
+  "agents": {
+    "卡布达": {
+      "config_path": "assets/counsel_room/agents/卡布达/agent.json"
+    },
+    "蜻蜓队长": {
+      "config_path": "assets/counsel_room/agents/蜻蜓队长/agent.json"
     }
   },
   "intervention": {
@@ -114,9 +124,9 @@
       {
         "rule_id": "fast_every_4step",
         "type": "interval_steps",
-        "interval_steps": 6,
-        "step_phase": 1,
-        "duration": 2881,
+        "interval_steps": 14,
+        "step_phase": 2,
+        "duration": 1440,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
         "enabled": true
@@ -147,7 +157,7 @@
       "rules": []
     },
     "order_extract": {
-      "enabled": false,
+      "enabled": true,
       "min_confidence": 0.3,
       "max_tasks_per_chat": 3
     },
@@ -335,7 +345,7 @@
     "memory_policy": {
       "enabled": true,
       "scope": "forced_chat_only",
-      "forced_chat_expire_days": -1,
+      "forced_chat_expire_days": 30,
       "retrieve_profile": {
         "recency_weight_multiplier": 1.0,
         "relevance_weight_multiplier": 1.0,
@@ -352,13 +362,6 @@
       }
     }
   },
-  "checkpointing": {
-    "enabled": true,
-    "mode": "consult_sparse",
-    "periodic_every_steps": 56,
-    "write_final_snapshot": true,
-    "write_on_staged_eval_trigger": true
-  },
   "staged_eval": {
     "enabled": true,
     "target_agent": "卡布达",
@@ -369,11 +372,18 @@
     "t4_after_steps": 8,
     "auto_stop_after_t4_done": true,
     "worker_script": "runshells/run_staged_eval_worker.py",
-    "worker_timeout_seconds": 7200,
+    "worker_timeout_seconds": 3600,
     "cleanup_tmp_storage": true,
     "scales": [
       "PHQ-9",
       "BDI-II"
     ]
+  },
+  "checkpointing": {
+    "enabled": true,
+    "mode": "consult_sparse",
+    "periodic_every_steps": 56,
+    "write_final_snapshot": true,
+    "write_on_staged_eval_trigger": true
   }
 }

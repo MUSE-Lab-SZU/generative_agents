@@ -634,7 +634,7 @@ class Scratch:
         def _status_des(a):
             event, loc = a.get_event(), ""
             if event.address:
-                loc = " 在 {}".format(" 的 ".join(event.address[-2:])) if len(event.address) >= 2 else (" 在 " + event.address[-1] if event.address else "")
+                loc = " 在 {} 的 {}".format(event.address[-2], event.address[-1])
             if not a.path:
                 return f"{a.name} 已经在 {event.get_describe(False)}{loc}"
             return f"{a.name} 正要去 {event.get_describe(False)}{loc}"
@@ -714,9 +714,21 @@ class Scratch:
         def _normalize_prompt_text(text):
             return " ".join(str(text or "").split())
 
-        recent_turn_focus_n = 4
-        if hasattr(agent, "get_chat_recent_turn_focus_n"):
-            recent_turn_focus_n = agent.get_chat_recent_turn_focus_n()
+        def _latest_other_utterance(chat_turns, other_name):
+            target = str(other_name or "").strip()
+            for speaker, text in reversed(list(chat_turns or [])):
+                if str(speaker or "").strip() != target:
+                    continue
+                utterance = str(text or "").strip()
+                if utterance:
+                    return utterance
+            return ""
+
+        latest_other_utterance = _latest_other_utterance(chats, other.name)
+        local_memory_query = (
+            latest_other_utterance
+            or "{} {}".format(other.name, relation).strip()
+        )
         focus_retrieve_max = 15
         if hasattr(agent, "get_chat_focus_retrieve_max"):
             focus_retrieve_max = agent.get_chat_focus_retrieve_max()
@@ -724,15 +736,8 @@ class Scratch:
         if memory_mode == "external":
             memory = str(external_memory_context or "")
         else:
-            focus = [relation, other.get_event().get_describe()]
-            if recent_turn_focus_n > 0 and len(chats) > recent_turn_focus_n:
-                focus.append(
-                    "; ".join(
-                        "{}: {}".format(n, t) for n, t in chats[-recent_turn_focus_n:]
-                    )
-                )
             nodes = agent.associate.retrieve_focus(
-                focus,
+                [local_memory_query],
                 focus_retrieve_max,
                 retrieval_profile=retrieval_profile,
             )
@@ -758,6 +763,8 @@ class Scratch:
             chat_nodes = agent.associate.retrieve_chats(
                 chat_history_target_name,
                 limit=max_read_items,
+                query=local_memory_query,
+                prefer_forced=True,
             )
             summary_window_minutes = 480
             if hasattr(agent, "get_chat_summary_window_minutes"):
@@ -778,14 +785,15 @@ class Scratch:
 
             if hasattr(agent, "logger") and agent.logger:
                 agent.logger.info(
-                    "[CHAT_HISTORY_INJECTION] agent={} other={} target={} window_minutes={} read_limit={} focus_retrieve_max={} recent_turn_focus_n={} total_chat_nodes={} kept_chat_nodes={}".format(
+                    "[CHAT_HISTORY_INJECTION] agent={} other={} target={} window_minutes={} read_limit={} focus_retrieve_max={} memory_query_source={} memory_query_chars={} total_chat_nodes={} kept_chat_nodes={}".format(
                         agent.name,
                         other.name,
                         chat_history_target_name,
                         summary_window_minutes,
                         max_read_items,
                         focus_retrieve_max,
-                        recent_turn_focus_n,
+                        "other_utterance" if latest_other_utterance else "fallback",
+                        len(local_memory_query),
                         len(chat_nodes),
                         kept_context_num,
                     )
@@ -804,18 +812,26 @@ class Scratch:
             conversation or "[对话尚未开始]"
         )
 
+        base_desc = self._base_desc()
+        base_desc_block = ""
+        if not str(depression_chat_block or "").strip():
+            base_desc_block = "以下是对 {} 的简要描述：\n{}\n\n".format(
+                agent.name,
+                base_desc,
+            )
+
         prompt = self.build_prompt(
             "generate_chat",
             {
                 "agent": agent.name,
-                "base_desc": self._base_desc(),
+                "base_desc_block": base_desc_block,
                 "depression_chat_block": depression_chat_block or "",
                 "meeting_prompt_injection": meeting_prompt_injection or "",
                 "doctor_session_prompt_injection": doctor_session_prompt_injection or "",
                 "doctor_consult_record_injection": doctor_consult_record_injection or "",
                 "consult_history_memory": consult_history_memory or "",
                 "memory": memory,
-                "address": "，".join(address[-2:]) if len(address) >= 2 else (address[-1] if address else ""),
+                "address": f"{address[-2]}，{address[-1]}",
                 "current_time": utils.get_timer().get_date("%H:%M"),
                 "previous_context": prev_context,
                 "current_context": curr_context,

@@ -41,3 +41,8 @@ results/
 
 # App.py adhoc outputs (large, regenerable)
 customization/depression_scale_agent/questions/adhoc/
+
+# counsel_room 分支专用文件（不与 doctor-agent 同步）
+frontend/static/assets/counsel_room/
+data/config_counsel_room.json
+counsel_context/maze_backups/

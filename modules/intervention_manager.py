@@ -2126,12 +2126,34 @@ class InterventionManager:
 
     def _get_session_eval_reason_for_judge(self, pair_key: str, current_session: str) -> str:
         self._ensure_session_eval_state_schema()
+        current_session_text = str(current_session or "").strip() or "unknown"
+
+        def _format_fresh_stage_state(first_dialog: bool) -> str:
+            status = "当前阶段第一次对话" if first_dialog else "当前阶段刚开始"
+            return (
+                "当前阶段：{}\n"
+                "阶段状态：{}；当前阶段已完成步骤：无。\n"
+                "说明：上一阶段若已有评估结论，仅表示上一阶段已完成或已退出，"
+                "不可视为当前阶段未完成步骤；请以本阶段会话Prompt作为当前阶段目标。"
+            ).format(current_session_text, status)
+
         state = self.state.setdefault("session_eval_state", {})
         latest = state.setdefault("latest_reason_by_pair", {})
         item = latest.get(str(pair_key or ""))
         if not isinstance(item, dict):
-            return ""
-        return str(item.get("reason", "") or "")
+            return _format_fresh_stage_state(first_dialog=True)
+
+        item_session = str(item.get("current_session", "") or "").strip()
+        reason_text = str(item.get("reason", "") or "").strip()
+        if item_session and item_session == current_session_text and reason_text:
+            return (
+                "当前阶段：{}\n"
+                "阶段状态：当前阶段延续中。\n"
+                "当前阶段历史评估结论：\n"
+                "{}"
+            ).format(current_session_text, reason_text)
+
+        return _format_fresh_stage_state(first_dialog=False)
 
     def _get_session_prompt_order(self) -> List[str]:
         intervention_cfg = self.config.get("intervention", {}) or {}
@@ -4749,7 +4771,7 @@ class InterventionManager:
         turn_no: int = 1,
         is_initiator: bool = False,
     ) -> Dict[str, Any]:
-        del forced, is_initiator
+        del is_initiator
         trace_context: Dict[str, Any] = {
             "evaluated": False,
             "memory_block": "",
@@ -4760,6 +4782,8 @@ class InterventionManager:
             "retrieval_hits": [],
             "summary_output": "",
         }
+        if not bool(forced):
+            return trace_context
         policy = self.get_consult_history_runtime_policy()
         if not bool(policy.get("enabled", False)):
             return trace_context
@@ -4852,6 +4876,8 @@ class InterventionManager:
         meeting_id: str,
     ) -> None:
         if not self._consult_history_enabled():
+            return
+        if not str(meeting_id or "").strip():
             return
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
         if not doctor or not patient:

@@ -30,12 +30,13 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # ─── 需要替换的配置文件路径 ─────────────────────────────────────
 AGENT_JSON = os.path.join(
-    BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "agent.json"
+    BASE_DIR, "frontend", "static", "assets", "counsel_room", "agents", "卡布达", "agent.json"
 )
 DEPRESSION_CONFIG = os.path.join(
-    BASE_DIR, "frontend", "static", "assets", "village", "agents", "卡布达", "depression_config.json"
+    BASE_DIR, "frontend", "static", "assets", "counsel_room", "agents", "卡布达", "depression_config.json"
 )
 GLOBAL_CONFIG = os.path.join(BASE_DIR, "data", "config.json")
+RUNTIME_CONFIG = os.path.join(BASE_DIR, "data", "config_counsel_room.json")
 
 # ─── 外部脚本 ─────────────────────────────────────────────────
 START_SCRIPT = os.path.join(BASE_DIR, "start.py")
@@ -106,6 +107,7 @@ BACKUP_FILES = {
     "agent.json": AGENT_JSON,
     "depression_config.json": DEPRESSION_CONFIG,
     "config.json": GLOBAL_CONFIG,
+    "runtime_config.json": RUNTIME_CONFIG,
 }
 
 # ─── 实验条件列表 ─────────────────────────────────────────────
@@ -166,12 +168,6 @@ SCALES: Dict[str, dict] = {
         "scoring_prompt": "BDI-II评估提示词.md",
         "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
         "items": 21,
-    },
-    "SDS": {
-        "question_file": "SDS-v2.jsonl",
-        "scoring_prompt": "SDS评估提示词.md",
-        "scoring_prompt_dir": os.path.join(BASE_DIR, "customization", "depression_scale_agent", "questions", "scoring_prompts"),
-        "items": 20,
     },
 }
 
@@ -303,7 +299,7 @@ def prepare_global_config(persona: str, dry_run: bool = False, local_llm: bool =
             print("    forced_llm → Ollama qwen3:32b")
         return
 
-    with open(GLOBAL_CONFIG, "r", encoding="utf-8") as f:
+    with open(RUNTIME_CONFIG, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     intervention = config.setdefault("intervention", {})
@@ -319,10 +315,10 @@ def prepare_global_config(persona: str, dry_run: bool = False, local_llm: bool =
         })
         forced_llm.pop("api_key_env", None)
 
-    with open(GLOBAL_CONFIG, "w", encoding="utf-8") as f:
+    with open(RUNTIME_CONFIG, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    print(f"  [OK] config.json → depression_dynamic.enabled={dynamic_enabled}")
+    print(f"  [OK] config_counsel_room.json → depression_dynamic.enabled={dynamic_enabled}")
     if local_llm:
         print("  [OK] config.json → forced_llm = Ollama qwen3:32b")
 
@@ -370,6 +366,7 @@ def run_simulation(trial_name: str, dry_run: bool = False, sim_step: int = SIM_S
         "--name", run_name,
         "--step", str(sim_step),
         "--stride", str(SIM_STRIDE),
+        "--runtime-config", "data/config_counsel_room.json",
     ]
     print(f"  [RUN] {' '.join(cmd)}")
     if dry_run:
@@ -675,7 +672,7 @@ def generate_report(dry_run: bool = False) -> None:
 
     报告 5 个 Section:
     1. 实验概况
-    2. 治疗前后量表对比（PHQ-9 / BDI-II / SDS）
+    2. 治疗前后量表对比（PHQ-9 / BDI-II）
     3. 逐次咨询效果轨迹
     4. 治疗效果汇总表
     5. 跨条件分析（严重程度、人设、交互效应、量表一致性、多轮稳定性）
@@ -920,7 +917,6 @@ def generate_report(dry_run: bool = False) -> None:
     lines.append("|------|------|------|----------|--------|------|------|--------|------|----------|----------|")
     lines.append("| PHQ-9 | 9 题 | 0-3 分/题 | 0-27 | 0-4 | 5-9 | 10-14 | 15-19 | 20-27 | 近 2 周 | 抑郁症状出现频率 |")
     lines.append("| BDI-II | 21 题 | 0-3 分/题 | 0-63 | 0-13 | 14-19 | 20-28 | — | 29-63 | 近 2 周 | 抑郁症状严重程度 |")
-    lines.append("| SDS | 20 题 | 1-4 分/题 | 20-80（标准分 ×1.25） | <50 | 50-59 | 60-69 | — | ≥70 | 近 1 周 | 抑郁症状出现频度 |")
     lines.append("")
     lines.append("- 治疗前 = 加载第一个仿真快照，agent 处于初始抑郁状态")
     lines.append("- 治疗后 = 加载最后一个仿真快照，agent 经历完整 CBT 治疗流程")
@@ -1228,7 +1224,7 @@ def generate_report(dry_run: bool = False) -> None:
     # Section 4: 治疗效果汇总表
     # ═══════════════════════════════════════════════════════════
     lines.append("## 4. 治疗效果汇总表\n")
-    lines.append("> **分别评估**：PHQ-9/BDI-II/SDS 分别问答 + ExpertLLM 逐题评分。")
+    lines.append("> **分别评估**：PHQ-9/BDI-II 分别问答 + ExpertLLM 逐题评分。")
     lines.append("> **30Q 合并评估**：30 道筛查问题一次性问答 + ExpertLLM 综合三量表评分。\n")
 
     # 检查是否有 30Q 数据
@@ -1963,7 +1959,7 @@ def run_30q_evaluation(
     """对每个实验条件的 checkpoint 运行 30Q 合并评估（治疗前/后各一次）。
 
     30Q = 30 道抑郁筛查问题一次性问答，然后用 30Q综合评估提示词.md 一次性评分
-    三个量表（PHQ-9/BDI-II/SDS）。
+    三个量表（PHQ-9/BDI-II）。
     结果保存为 scale_30Q_pre/post_scored.json。
     """
     scoring_prompt = os.path.join(BASE_DIR, "30Q综合评估提示词.md")

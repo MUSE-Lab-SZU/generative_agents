@@ -15,11 +15,11 @@ from modules.staged_eval_manager import StagedEvalManager
 
 personas = [
     "卡布达",  # 抑郁症患者
-    # "金龟次郎",  # 家人（否认型父母）
-    # "田德莉娜",  # 好友
-    # "呱呱蛙",  # 邻居
+    "金龟次郎",  # 家人（否认型父母）
+    "田德莉娜",  # 好友
+    "呱呱蛙",  # 邻居
     "蜻蜓队长",  # 心理医生
-    # "蟑螂恶霸" # 小混混
+    "蟑螂恶霸" # 小混混
 ]
 
 TRACE_STATE_SIDECAR_DIR = "trace_state_sidecars"
@@ -404,7 +404,8 @@ def get_config_from_log(checkpoints_folder):
     config["time"] = {"start": start_time.strftime("%Y%m%d-%H:%M")}
     agents = config["agents"]
     for a in agents:
-        config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
+        if not str(config["agents"][a].get("config_path", "") or "").strip():
+            config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
 
     return config
 
@@ -459,6 +460,7 @@ parser.add_argument("--stride", type=int, default=10, help="The step stride in m
 parser.add_argument("--verbose", type=str, default="debug", help="The verbose level")
 parser.add_argument("--log", type=str, default="", help="Name of the log file")
 parser.add_argument("--runtime-config", type=str, default="", help="Path to a per-run runtime config json")
+parser.add_argument("--counsel-room", action="store_true", help="Use the G4 counsel room config (shortcut for --runtime-config data/config_counsel_room.json)")
 args = parser.parse_args()
 
 
@@ -494,7 +496,8 @@ if __name__ == "__main__":
             exit(0)
         start_step = sim_config["step"]
     else:
-        sim_config = get_config(start_time, args.stride, personas, runtime_config_path=args.runtime_config)
+        runtime_config = args.runtime_config or ("data/config_counsel_room.json" if args.counsel_room else "")
+        sim_config = get_config(start_time, args.stride, personas, runtime_config_path=runtime_config)
         start_step = 0
 
     static_root = "frontend/static"

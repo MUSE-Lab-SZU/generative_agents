@@ -5,22 +5,24 @@
 输出字段固定为：
 {
   "matched_current_stage": true,
-  "action": "hold|advance|jump",
-  "target_stage_id": "候选节点id或空字符串",
-  "confidence": 0.0,
+  "action": "hold|advance",
+  "target_stage_id": "候选节点id；hold 时为空字符串",
   "reason": "10到120字，说明为什么停留或推进"
 }
 
-判定原则：
-1. action 默认应为 hold；只有本轮内容清楚触及 current_stage 且出现实质变化时才 advance。
-2. advance 只能选择 candidate_stages 中的一个直接候选节点，target_stage_id 必须来自 candidate_ids。
-3. 不要因为一句礼貌回应、泛泛低落、重复当前痛点而推进。
-4. 可以推进的证据包括：更具体地描述当前痛点、承认新的影响、暴露更真实的感受、从抽象评价转向可定位的生活/关系/功能困扰。
-5. 如果 current_stage 是终止节点，必须 hold。
-6. 如果没有 candidate_stages，必须 hold。
-7. jump 仅用于外部强制或极少数非常明确的跨节点证据；一般对话不要 jump。
-8. confidence 表示你对 action 的置信度，0 到 1 之间；低于 0.60 时应倾向 hold。
-9. fallback_signal 只是规则系统给你的参考，不要机械照抄；你需要基于 current_stage、candidate_stages 和 conversation_content 独立判断。
-10. 不要输出病情等级、诊断结论或治疗建议。
+字段含义：
+1. matched_current_stage：本轮内容是否确实围绕 current_stage 的主题、痛点或表达方式展开。如果谈到了当前节点，则为 true；如果只是寒暄、跑题或无法判断，则为 false。
+2. action：只能是 hold 或 advance。
+3. target_stage_id：只有 action 为 advance 时填写，且必须来自 candidate_ids；action 为 hold 时必须是空字符串。
+4. reason：说明采用 hold 或 advance 的关键依据，不要给出诊断、病情等级或治疗建议。
+
+更新逻辑：
+1. 先判断本轮内容是否触及 current_stage；如果没有触及，必须 hold。
+2. 如果 current_stage 是终止节点、candidate_stages 为空，或 candidate_ids 为空，必须 hold。
+3. 在确认触及 current_stage 后，再判断是否出现“足以进入某个直接候选分支”的新证据。只有能明确对应到一个 candidate_stage 时，才可以 advance。
+4. advance 适用于这些情况：角色把当前痛点说得更具体；承认了新的影响或后果；暴露出更真实、更深一层的感受；从抽象评价转向可定位的生活、关系、功能困扰；或本轮内容与某个候选分支的 summary、narrative_focus、core_belief 明确贴合。
+5. hold 适用于这些情况：只有礼貌回应或短促应答；只是泛泛低落；重复 current_stage 已有痛点但没有新方向；内容仍停留在当前节点的 hold_signals；本轮信息不足以判断。
+6. advance 不能自己创造新节点。若证据看似更适合非候选节点，仍然 hold。
+7. 最终应基于 current_stage、candidate_stages 和 conversation_content 独立判断。
 
 输入：${payload_json}

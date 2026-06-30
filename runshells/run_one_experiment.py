@@ -59,7 +59,7 @@ RUN_SIMULATION = True
 # 是否执行“merge 对话与咨询记录”阶段
 RUN_MERGE = True
 
-# 是否执行治疗后量表评估（PHQ-9 / BDI-II / SDS）
+# 是否执行治疗后量表评估（PHQ-9 / BDI-II）
 RUN_POST_SCALE = True
 
 # 是否执行治疗后 30Q 评估
@@ -96,6 +96,7 @@ SCORE_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_score_worker.py"
 WORKER_PYTHON = os.environ.get("GA_WORKER_PYTHON") or sys.executable
 SCALE_SCORING_DIR = BASE_DIR / "customization" / "depression_scale_agent" / "questions" / "scoring_prompts"
 THIRTY_Q_PROMPT = BASE_DIR / "30Q综合评估提示词.md"
+POST_EVAL_TIMEOUT_SECONDS = 2 * 60 * 60
 
 SCALES = {
     "PHQ-9": {
@@ -105,10 +106,6 @@ SCALES = {
     "BDI-II": {
         "question_file": "BDI-II-v2.jsonl",
         "scoring_prompt": "BDI-II评估提示词.md",
-    },
-    "SDS": {
-        "question_file": "SDS-v2.jsonl",
-        "scoring_prompt": "SDS评估提示词.md",
     },
 }
 
@@ -146,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="覆盖脚本前面的 DRY_RUN=True")
     parser.add_argument("--skip-sim", action="store_true", help="跳过仿真阶段")
     parser.add_argument("--skip-merge", action="store_true", help="跳过 merge 阶段")
-    parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II/SDS 评估")
+    parser.add_argument("--skip-post-scale", action="store_true", help="跳过治疗后 PHQ-9/BDI-II 评估")
     parser.add_argument("--run-30q", action="store_true", help="显式开启治疗后 30Q 评估")
     parser.add_argument("--skip-compress", action="store_true", help="跳过 compress.py")
     parser.add_argument("--run-agent-memory-vis", action="store_true", help="显式开启角色记忆可视化")
@@ -314,7 +311,7 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
                 "--output", str(answers_path),
             ],
             dry_run=dry_run,
-            timeout=1800,
+            timeout=POST_EVAL_TIMEOUT_SECONDS,
         )
 
         run_cmd(
@@ -326,7 +323,7 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
                 "--output", str(scored_path),
             ],
             dry_run=dry_run,
-            timeout=300,
+            timeout=POST_EVAL_TIMEOUT_SECONDS,
         )
 
         if not dry_run and scored_path.exists():

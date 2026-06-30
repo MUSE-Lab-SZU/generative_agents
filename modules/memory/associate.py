@@ -24,6 +24,7 @@ class Concept:
         create=None,
         expire=None,
         access=None,
+        **metadata,
     ):
         self.node_id = node_id
         self.node_type = node_type
@@ -37,6 +38,7 @@ class Concept:
         else:
             self.expire = self.create + datetime.timedelta(days=30)
         self.access = utils.to_date(access) if access else self.create
+        self.metadata = dict(metadata or {})
 
     def abstract(self):
         return {
@@ -57,7 +59,7 @@ class Concept:
 
     @classmethod
     def from_node(cls, node):
-        return cls(node.text, node.id_, **node.metadata)
+        return cls(node.text, node.id_, **(node.metadata or {}))
 
     @classmethod
     def from_event(cls, node_id, node_type, event, poignancy):
@@ -276,6 +278,34 @@ class Associate:
         self._prune_missing_memory_refs(node_type=node_type)
         return self.memory.get(node_type, [])
 
+    def _safe_node_filling(self, filling):
+        if not isinstance(filling, dict):
+            return {}
+        allowed = {
+            "forced",
+            "meeting_id",
+            "expire_days",
+            "retrieval_scope",
+        }
+        safe = {}
+        for key in allowed:
+            if key not in filling:
+                continue
+            value = filling.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                safe[key] = value
+            elif isinstance(value, int) and not isinstance(value, bool):
+                safe[key] = value
+            elif isinstance(value, float):
+                safe[key] = value
+            else:
+                text = str(value).strip()
+                if text:
+                    safe[key] = text
+        return safe
+
     def add_node(
         self,
         node_type,
@@ -298,6 +328,7 @@ class Associate:
             "expire": expire.strftime("%Y%m%d-%H:%M:%S"),
             "access": create.strftime("%Y%m%d-%H:%M:%S"),
         }
+        metadata.update(self._safe_node_filling(filling))
         node = self._index.add_node(event.get_describe(), metadata)
         memory = self._valid_memory_ids(node_type)
         memory.insert(0, node.id_)
@@ -522,9 +553,9 @@ class Associate:
         return mode
 
     def _retrieve_nodes(
-        self, node_type, text=None, limit=None, similarity_top_k=None
+        self, node_type, text=None, limit=None, similarity_top_k=None, node_ids=None
     ):
-        node_ids = self._valid_memory_ids(node_type)
+        node_ids = list(node_ids) if node_ids is not None else self._valid_memory_ids(node_type)
         final_limit = self._normalize_limit(
             self.retention if limit is None else limit,
             default=self.retention,
@@ -556,17 +587,28 @@ class Associate:
     def retrieve_thoughts(self, text=None, limit=None):
         return self._retrieve_nodes("thought", text=text, limit=limit)
 
-    def _retrieve_chats_direct(self, name=None, limit=None):
-        selected = []
-        for node_id in self._valid_memory_ids("chat"):
-            concept = self.find_concept(node_id)
-            if name:
-                if (
-                    concept.event.subject != name
-                    and concept.event.object != name
-                ):
-                    continue
-            selected.append(concept)
+    def _chat_matches_name(self, concept, name=None):
+        if not name:
+            return True
+        return concept.event.subject == name or concept.event.object == name
+
+    def _is_forced_chat(self, concept):
+        value = (getattr(concept, "metadata", {}) or {}).get("forced", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+
+    def _sort_chat_concepts(self, concepts, prefer_forced=False):
+        return sorted(
+            concepts,
+            key=lambda c: (
+                1 if prefer_forced and self._is_forced_chat(c) else 0,
+                c.create,
+            ),
+            reverse=True,
+        )
+
+    def _limit_chat_concepts(self, concepts, limit=None):
         final_limit = self._normalize_limit(
             self.retention if limit is None else limit,
             default=self.retention,
@@ -574,25 +616,81 @@ class Associate:
             minimum=1,
         )
         if final_limit == -1:
-            return selected
-        return selected[:final_limit]
+            return concepts
+        return concepts[:final_limit]
 
-    def retrieve_chats(self, name=None, limit=None, mode=None):
+    def _chat_candidate_concepts(self, name=None):
+        selected = []
+        for node_id in self._valid_memory_ids("chat"):
+            concept = self.find_concept(node_id)
+            if not self._chat_matches_name(concept, name=name):
+                continue
+            selected.append(concept)
+        return selected
+
+    def _retrieve_chats_direct(self, name=None, limit=None, prefer_forced=False):
+        selected = []
+        for concept in self._chat_candidate_concepts(name=name):
+            selected.append(concept)
+        selected = self._sort_chat_concepts(
+            selected,
+            prefer_forced=prefer_forced,
+        )
+        return self._limit_chat_concepts(selected, limit=limit)
+
+    def retrieve_chats(
+        self,
+        name=None,
+        limit=None,
+        mode=None,
+        query=None,
+        prefer_forced=False,
+        force_direct=False,
+    ):
         mode = self._resolve_chat_retrieve_mode(
             mode if mode is not None else self.chat_retrieve_mode
         )
-        if mode == "direct":
-            return self._retrieve_chats_direct(name=name, limit=limit)
-        text = ("对话 " + name) if name else None
+        if force_direct or mode == "direct":
+            return self._retrieve_chats_direct(
+                name=name,
+                limit=limit,
+                prefer_forced=prefer_forced,
+            )
+        candidates = self._chat_candidate_concepts(name=name)
+        if not candidates:
+            return []
+        text = str(query or "").strip()
+        if not text:
+            text = ("对话 " + name) if name else None
+        if not text:
+            candidates = self._sort_chat_concepts(
+                candidates,
+                prefer_forced=prefer_forced,
+            )
+            return self._limit_chat_concepts(candidates, limit=limit)
+        candidate_ids = [c.node_id for c in candidates]
         similarity_top_k = self.chat_similarity_top_k
         if similarity_top_k == -1:
-            similarity_top_k = max(1, len(self.memory["chat"]))
-        return self._retrieve_nodes(
+            similarity_top_k = max(1, len(candidate_ids))
+        retrieved = self._retrieve_nodes(
             "chat",
             text=text,
-            limit=limit,
+            limit=-1,
             similarity_top_k=similarity_top_k if text else None,
+            node_ids=candidate_ids,
         )
+        if prefer_forced:
+            seen = {c.node_id for c in retrieved}
+            for concept in candidates:
+                if concept.node_id in seen or not self._is_forced_chat(concept):
+                    continue
+                retrieved.append(concept)
+                seen.add(concept.node_id)
+        retrieved = self._sort_chat_concepts(
+            retrieved,
+            prefer_forced=prefer_forced,
+        )
+        return self._limit_chat_concepts(retrieved, limit=limit)
 
     def retrieve_focus(self, focus, retrieve_max=30, reduce_all=True, retrieval_profile=None):
         def _create_retriever(*args, **kwargs):
@@ -604,10 +702,20 @@ class Associate:
 
         retrieved = {}
         node_ids = self.memory["event"] + self.memory["thought"]
+        if not node_ids:
+            return [] if reduce_all else {text: [] for text in focus}
+        try:
+            candidate_top_k = int(retrieve_max)
+        except Exception:
+            candidate_top_k = 30
+        if candidate_top_k == -1:
+            candidate_top_k = len(node_ids)
+        else:
+            candidate_top_k = min(len(node_ids), max(1, candidate_top_k * 4))
         for text in focus:
             nodes = self._index.retrieve(
                 text,
-                similarity_top_k=len(node_ids),
+                similarity_top_k=candidate_top_k,
                 node_ids=node_ids,
                 retriever_creator=_create_retriever,
             )
