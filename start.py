@@ -15,6 +15,8 @@ from modules.staged_eval_manager import StagedEvalManager
 
 personas = [
     "卡布达",  # 抑郁症患者
+    # "卡布达2",  # 抑郁症患者
+    # "卡布达3",  # 抑郁症患者
     "金龟次郎",  # 家人（否认型父母）
     "田德莉娜",  # 好友
     "呱呱蛙",  # 邻居

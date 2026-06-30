@@ -12,7 +12,7 @@
         {
           "rule_id": "g5_random_negative_chat",
           "type": "interval_steps",
-          "interval_steps": 14,
+          "interval_steps": 6,
           "step_phase": 2,
           "target_patient": "卡布达",
           "resident_candidates": [

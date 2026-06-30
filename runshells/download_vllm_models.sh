@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-MODEL_ROOT="${MODEL_ROOT:-/mnt/nvme1/zyli/MODEL}"
+MODEL_ROOT="${MODEL_ROOT:-/share/home/tm866039793920000/a874457430/MODEL}"
 MODELSCOPE_BIN="${MODELSCOPE_BIN:-modelscope}"
 QWEN_REPO="${QWEN_REPO:-Qwen/Qwen3-8B}"
 EMBED_REPO="${EMBED_REPO:-BAAI/bge-m3}"

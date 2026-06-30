@@ -1,9 +1,9 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "name": "卡布达",
+  "name": "卡布达3",
   "complaint_graph": {
-    "initial_stage_id": "mild_job_loss_self_doubt",
+    "initial_stage_id": "mild_social_misread_self_doubt",
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
@@ -13,34 +13,34 @@
     },
     "stages": [
       {
-        "id": "mild_job_loss_self_doubt",
-        "label": "把失业理解成自己不够好",
-        "summary": "被辞退引发明显自我怀疑，但还没有完全扩展成整个人都失败。",
-        "core_belief": "我可能真的不够好，不然为什么会是我被辞退。",
-        "narrative_focus": ["失业", "自我怀疑", "怕被问近况", "尴尬", "勉强维持日常"],
+        "id": "mild_social_misread_self_doubt",
+        "label": "把社交误会理解成自己不讨人喜欢",
+        "summary": "一次公开误会让卡布达3变得谨慎和回避，但仍能维持必要外出和有限联系。",
+        "core_belief": "他们可能只是不好意思说，其实大家都觉得我很麻烦。",
+        "narrative_focus": ["社交误会", "被议论", "尴尬", "反复回想", "错峰出门"],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "low",
-          "repair_pattern": "先说自己还行，再补一点真实的不安"
+          "repair_pattern": "先说只是小误会，再补充自己其实一直在想"
         },
         "emotion_vector": {
-          "valence": 0.42,
-          "arousal": 0.36,
-          "defensiveness": 0.44,
-          "shame": 0.48,
-          "hopelessness": 0.28,
-          "trust": 0.44
+          "valence": 0.43,
+          "arousal": 0.42,
+          "defensiveness": 0.46,
+          "shame": 0.50,
+          "hopelessness": 0.26,
+          "trust": 0.42
         },
         "advance_signals": [
-          "能具体描述被辞退后的日常影响",
-          "承认自己有点难受",
-          "不再只用还好来带过"
+          "能区分实际发生的事和自己的猜测",
+          "承认自己害怕被评价",
+          "愿意尝试一次低压力联系"
         ],
         "hold_signals": [
-          "一直强调没事",
-          "避免谈被辞退的细节",
-          "把难受说成只是有点烦"
+          "一直强调别人肯定讨厌自己",
+          "回避误会发生的细节",
+          "把所有沉默都解释成责备"
         ],
         "relation_modifiers": {
           "治疗师": {
@@ -48,7 +48,7 @@
             "disclosure_delta": 0.14
           },
           "朋友": {
-            "trust_delta": 0.10,
+            "trust_delta": 0.08,
             "disclosure_delta": 0.08
           },
           "家人": {

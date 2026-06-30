@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-06-07
+> 更新时间：2026-06-28
 
 ## 关键测试结果速查
 
@@ -28,6 +28,27 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-06-28：将`data/prompts/intervention/dialog_judge.txt`纳入版本管理，并重写判断LLM提示词结构：显式区分“先判断医生下一句、再判断是否结束”，要求advice回应患者核心压力源，必要时用低门槛问题做压力源桥接；若不宜追问也必须说明治疗节奏原因，减少对话长期停留在泛低落/泛自责层面的情况。
+- 2026-06-28：优化对话Prompt基础人设注入：`generate_chat.txt`和`generate_chat_external_memory.txt`改用`${base_desc_block}`，`modules/prompt/scratch.py`仅在没有动态抑郁对话块时注入基础描述，避免基础人设与抑郁动态Prompt重复堆叠。
+- 2026-06-28：收紧医患历史检索触发条件：`modules/intervention_manager.py`仅在强制干预对话中评估咨询历史，并在写入医患历史前校验`meeting_id`非空，避免普通聊天或缺少会话ID时产生无效历史记录。
+- 2026-06-28：调整实验默认参数与压力源记忆：`data/config.json`把`poignancy_max`提高到50、医患历史读取条数降到2，并默认关闭`order_extract`；`data/intervention/memory_injections.json`强化卡布达“休学+试用期被辞退”压力链条及“我什么都做不好”的自动思维。
+- 2026-06-28：同步下调卡布达2/卡布达3运行时聊天轮数：`frontend/static/assets/village/agents/卡布达2/agent.json`和`卡布达3/agent.json`的`chat_iter`从18改为4，和当前较短对话实验节奏保持一致。
+- 2026-06-27：修复判断LLM读取“上次会话后评估结论”时跨阶段串用的问题：`modules/intervention_manager.py`会记录并校验`current_session`，只有同一阶段才复用历史评估结论；新阶段会显式注入“当前阶段刚开始/第一次对话”的状态说明，避免上一阶段结论被误判为当前阶段已完成步骤。
+- 2026-06-27：调整批量实验收尾逻辑：`runshells/run_batch_experiment.py`默认并行数改回1；`POST`评估排序固定放到最后；外置记忆审计失败时不再中断整个condition，而是记录`external_memory_audit_optional_failed`状态并继续保留前面实验结果。
+- 2026-06-27：更新容器/数据盘同步脚本：`runshells/sync_project_from_disk.sh`默认不删除目标目录额外文件，只有设置`PROJECT_SYNC_DELETE=1`才做严格镜像；新增`runshells/sync_results_to_disk_loop.sh`，可按固定间隔把容器内`results/`持续同步到数据盘，支持`RESULTS_SYNC_INTERVAL`、`RESULTS_SYNC_ONCE`、`RESULTS_SYNC_DRY_RUN`和`RESULTS_SYNC_DELETE`。
+- 2026-06-27：调整vLLM默认资源配置：`runshells/vllm_services.sh`默认将embedding服务放到GPU 1，Qwen和embedding的显存利用率默认均为0.90，并将Qwen默认上下文长度提升到32768；同时新增`data/prompts/intervention/dialog_judge-0627备份.txt`保存判断LLM提示词备份。
+- 2026-06-22：新增卡布达 variant 批量替换能力：`runshells/run_batch_experiment.py`的condition扩展为`Counsel-KBD1/KBD2/KBD3-Gx-SEV`格式，并支持`Counsel-ALL-G1-MILD`等通配选择；新增`runshells/kabuda_variant_runtime.py`按condition生成归一化运行时人设文件，运行时目标名仍保持`卡布达`，同时新增`memory_injections_kabuda2.json`和`memory_injections_kabuda3.json`匹配“被比较”“社交误会”两套压力源，并修复resume/post-scale读取checkpoint时覆盖自定义`config_path`的问题。
+- 2026-06-22：调整实验默认节奏与检索开销：`data/config.json`中将`chat_iter`降为3，chat记忆检索改为`direct`模式且`similarity_top_k`降为3，医患历史读取和focus检索数量下调；定期医患对话间隔从14步改为6步、单次持续时间改为2881分钟，普通居民聊天最小间隔改为2880分钟。
+- 2026-06-22：同步调整随机居民聊天实验组配置：`g3_random_resident_chat.json`和`g5_negative_resident_chat.json`的触发间隔从14步改为6步，便于在较短实验步数内完成更多对话触发与阶段评估观察。
+- 2026-06-22：增强批量实验脚本`runshells/run_batch_experiment.py`：默认仿真步数改为120，`--condition`支持重复传入并自动去重，可配合`--max-parallel`并行运行多个实验条件；新增`BATCH_EMBEDDING_BASE_URLS`配置，运行时按并行槽位把不同condition的embedding请求分流到多个BGE endpoint。
+- 2026-06-22：升级分阶段vLLM启动脚本`runshells/vllm_services_staged.sh`：默认将Qwen部署在GPU 0-1，将两个BGE-M3 embedding endpoint分别部署在GPU 2和GPU 3，新增`EMBED2_*`、`ENABLE_SECOND_EMBED`等配置，并补齐双embedding服务的启动、等待、状态、日志和停止逻辑。
+- 2026-06-22：优化本地记忆检索与对话控制：`modules/memory/associate.py`在无event/thought节点时直接返回，并按`retrieve_max`限制候选召回规模，避免每次全量检索；`modules/agent.py`修复聊天反思证据收集未记录已处理对象的问题，并让强制对话轮数预算至少为1，减少异常配置造成的轮数边界问题。
+- 2026-06-17：合并学长关于动态抑郁人设的更新
+- 2026-06-17：新增`runshells/recover_staged_eval_scores.py`脚本，作用是给中断实验的staged_eval补上score评分以及report，避免之前的实验浪费。
+- 2026-06-17：调整vllm启动参数和config.json相关参数，避免超出上下文限制
+- 2026-06-16：新建Dockerfile相关文件，vllm启动脚本新增多卡模式
+- 2026-06-15：改造本地医患对话记忆检索：聊天时用对方最近发言作为`retrieve_focus`和历史对话检索query，无对方发言时回退到`other.name + relation`；`retrieve_chats`新增`query`、`prefer_forced`、`force_direct`参数，间隔判断保持对象过滤+近期排序，prompt历史注入先限定对话对象再语义检索并优先召回forced chat；本地chat metadata新增`forced`、`meeting_id`、`expire_days`、`retrieval_scope`，并将`forced_chat_expire_days`设为`-1`以保留完整实验周期的医患咨询记忆。
+- 2026-06-14：调整对话触发时间，避免落到夜间睡眠时间。去掉SDS评估。
 - 2026-06-13：修复event记忆重复产生的问题
 - 2026-06-12：昨天做实验发现16h只跑了7个session对话，太长了。优化`modules/prompt/scratch.py`，使其可以根据`stride`调整计划decompose间隔。调整step=280、stride=720、每14步session对话1次（模拟现实的一周一次）
 - 2026-06-11：拉大step值（60->560）、把每4step/定期对话改成每28step/定期对话，模拟现实频率。治疗结束前只保留某些json快照，避免太多了不好审查。
