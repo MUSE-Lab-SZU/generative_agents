@@ -254,14 +254,12 @@ class ComplaintGraphManager:
             # 拿不到 LLM 判定时保持当前节点，只回填候选窗口。
             transition_signal = {
                 "matched": False,
-                "match_confidence": 0.0,
                 "match_reason": "no_llm_decision",
                 "action": "hold",
                 "next_graph": self._preview_future_graph(current_stage),
             }
 
         matched = bool(transition_signal.get("matched", False))
-        match_confidence = self._bounded_float(transition_signal.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(transition_signal.get("match_reason", "") or "")
         action = str(transition_signal.get("action", "hold") or "hold").strip().lower()
         next_graph_ids = self._normalize_graph_path(
@@ -297,7 +295,6 @@ class ComplaintGraphManager:
         evaluation = {
             "action": action,
             "matched": bool(matched),
-            "match_confidence": round(float(match_confidence), 4),
             "match_reason": self._clip_text(match_reason, limit=180),
             "current_stage": copy.deepcopy(current_stage),
             "next_stage": copy.deepcopy(next_stage) if isinstance(next_stage, dict) else None,
@@ -320,7 +317,6 @@ class ComplaintGraphManager:
         if action not in {"hold", "advance"}:
             action = "hold"
         matched = bool(evaluation.get("matched", False))
-        match_confidence = self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(evaluation.get("match_reason", "") or "")[:180]
         next_graph_value = evaluation.get("next_graph", [])
         next_graph = self._normalize_graph_path(next_graph_value, current_before.get("id", ""))
@@ -367,7 +363,6 @@ class ComplaintGraphManager:
         self.last_evaluation = {
             "action": action,
             "matched": matched,
-            "match_confidence": round(float(match_confidence), 4),
             "match_reason": match_reason,
             "source": source,
         }
@@ -383,7 +378,6 @@ class ComplaintGraphManager:
             from_stage=current_before,
             to_stage=current_after,
             matched=matched,
-            match_confidence=match_confidence,
             match_reason=match_reason,
             pointer_before=pointer_before,
             pointer_after=int(self.stage_index),
@@ -442,7 +436,6 @@ class ComplaintGraphManager:
                 self.last_evaluation = {
                     "action": "plan_branches",
                     "matched": False,
-                    "match_confidence": 0.0,
                     "match_reason": "planned {} candidate branches".format(len(child_ids)),
                     "source": str(source or "graph_window_expansion")[:32],
                 }
@@ -814,15 +807,8 @@ class ComplaintGraphManager:
         next_graph = [current_id]
         if target_id:
             next_graph.append(target_id)
-        match_confidence = self._bounded_float(
-            payload.get("match_confidence"),
-            1.0 if matched_current_stage else 0.0,
-            0.0,
-            1.0,
-        )
         return {
             "matched": bool(matched_current_stage),
-            "match_confidence": round(float(match_confidence), 4),
             "match_reason": str(payload.get("reason", payload.get("match_reason", "")) or "")[:180],
             "action": action,
             "next_graph": next_graph,
@@ -1145,7 +1131,6 @@ class ComplaintGraphManager:
             "stage_label": str(current_stage.get("label", "") or ""),
             "conversation_excerpt": self._clip_text(conversation_excerpt, limit=220),
             "matched": bool(evaluation.get("matched", False)),
-            "match_confidence": self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0),
             "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
             "action": str(evaluation.get("action", "hold") or "hold"),
             "other_agent": str(participants.get("other_agent", "") or ""),
@@ -1165,7 +1150,6 @@ class ComplaintGraphManager:
         from_stage: Dict[str, Any],
         to_stage: Dict[str, Any],
         matched: bool,
-        match_confidence: float,
         match_reason: str,
         pointer_before: int,
         pointer_after: int,
@@ -1183,7 +1167,6 @@ class ComplaintGraphManager:
                 "to_stage_id": str(to_stage.get("id", "") or ""),
                 "to_stage_label": str(to_stage.get("label", "") or ""),
                 "matched": bool(matched),
-                "match_confidence": round(float(match_confidence), 4),
                 "match_reason": str(match_reason or "")[:180],
                 "pointer_before": int(pointer_before),
                 "pointer_after": int(pointer_after),
