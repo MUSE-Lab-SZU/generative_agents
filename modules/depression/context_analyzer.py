@@ -77,38 +77,6 @@ class SessionContextBuilder:
             self.context_history = self.context_history[-100:]
         return context
 
-    def analyze_full_context(
-        self,
-        location: str,
-        time_of_day: str,
-        other_agent: Optional[str] = None,
-        relationship: Optional[str] = None,
-        interaction_type: Optional[str] = None,
-        conversation_content: str = "",
-    ) -> Dict[str, Any]:
-        return self.build_context(
-            location=location,
-            time_of_day=time_of_day,
-            other_agent=other_agent,
-            relationship=relationship,
-            interaction_type=interaction_type,
-            conversation_content=conversation_content,
-        )
-
-    def get_context_description(self) -> str:
-        if not self.current_context:
-            return "当前没有可用的会话上下文"
-        scene = self.current_context.get("scene", {}) if isinstance(self.current_context.get("scene", {}), dict) else {}
-        participants = self.current_context.get("participants", {}) if isinstance(self.current_context.get("participants", {}), dict) else {}
-        semantic = self.current_context.get("semantic_cues", {}) if isinstance(self.current_context.get("semantic_cues", {}), dict) else {}
-        topics = "、".join([str(item) for item in semantic.get("topics", [])[:3]]) or "未识别主题"
-        return "地点：{}；对象：{}；关系：{}；主题：{}".format(
-            scene.get("location", "未知"),
-            participants.get("other_agent", "未知"),
-            participants.get("relationship", "未知"),
-            topics,
-        )
-
     def _build_semantic_cues(
         self,
         conversation_content: str,
@@ -188,23 +156,6 @@ class SessionContextBuilder:
             "is_withdrawing": any(token in conversation_content for token in ["不想说", "不太想", "没必要", "懒得"]),
         }
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "self_name": self.self_name,
-            "current_context": copy.deepcopy(self.current_context),
-            "context_history": copy.deepcopy(self.context_history[-100:]),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "SessionContextBuilder":
-        payload = payload if isinstance(payload, dict) else {}
-        inst = cls(self_name=str(payload.get("self_name", "") or ""))
-        inst.current_context = copy.deepcopy(payload.get("current_context", {})) if isinstance(payload.get("current_context", {}), dict) else {}
-        history = payload.get("context_history", [])
-        if isinstance(history, list):
-            inst.context_history = [copy.deepcopy(item) for item in history if isinstance(item, dict)][-100:]
-        return inst
-
     @staticmethod
     def _clip_text(value: Any, limit: int = 220) -> str:
         text = str(value or "").strip()
@@ -223,6 +174,3 @@ class SessionContextBuilder:
             seen.add(text)
             results.append(text)
         return results
-
-
-ContextAnalyzer = SessionContextBuilder
