@@ -15,21 +15,28 @@
       {
         "id": "moderate_social_shame_withdrawal",
         "label": "把社交误会体验成持续羞耻和关系断裂",
-        "summary": "卡布达3把误会后的沉默和眼神都理解成排斥，开始明显减少外出和社交。",
+        "summary": "卡布达把误会后的沉默和眼神都理解成排斥，近两周睡眠、胃口、精力和专注都被羞耻感牵住。",
         "core_belief": "只要他们想到那件事，就会觉得我很糟糕，所以我最好别再出现。",
-        "narrative_focus": ["公开指责", "羞耻", "回避熟人", "反复检查消息", "关系断裂"],
+        "narrative_focus": [
+          "公开指责",
+          "羞耻",
+          "睡眠变浅",
+          "胃口变差",
+          "反复检查消息",
+          "关系断裂"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "flat_shame",
-          "repair_pattern": "说出担心后立刻改口，说可能是自己想太多"
+          "repair_pattern": "说出担心和睡不好后立刻改口，说可能是自己想太多"
         },
         "emotion_vector": {
-          "valence": 0.23,
+          "valence": 0.21,
           "arousal": 0.48,
           "defensiveness": 0.66,
           "shame": 0.74,
-          "hopelessness": 0.54,
+          "hopelessness": 0.58,
           "trust": 0.28
         },
         "advance_signals": [

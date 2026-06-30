@@ -15,21 +15,27 @@
       {
         "id": "mild_comparison_self_doubt",
         "label": "把被比较理解成自己不够好",
-        "summary": "反复听到别人被夸奖后，卡布达2开始明显自我怀疑，但仍能维持日常活动和有限社交。",
+        "summary": "反复听到别人被夸奖后，卡布达开始明显自我怀疑，夜里会反复想，胃口和专注也偶尔受影响。",
         "core_belief": "大家总是夸别人，可能是因为我真的没什么值得被看见的地方。",
-        "narrative_focus": ["被比较", "自我怀疑", "怕被问近况", "羡慕别人", "勉强维持日常"],
+        "narrative_focus": [
+          "被比较",
+          "自我怀疑",
+          "夜里反复想",
+          "胃口变浅",
+          "勉强维持日常"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "low",
-          "repair_pattern": "先说别人确实很优秀，再小声补一句自己好像差很多"
+          "repair_pattern": "先说别人确实很优秀，再小声补一句自己晚上会想很久"
         },
         "emotion_vector": {
-          "valence": 0.44,
+          "valence": 0.42,
           "arousal": 0.38,
           "defensiveness": 0.42,
           "shame": 0.48,
-          "hopelessness": 0.28,
+          "hopelessness": 0.3,
           "trust": 0.44
         },
         "advance_signals": [
@@ -48,7 +54,7 @@
             "disclosure_delta": 0.14
           },
           "朋友": {
-            "trust_delta": 0.10,
+            "trust_delta": 0.1,
             "disclosure_delta": 0.08
           },
           "家人": {

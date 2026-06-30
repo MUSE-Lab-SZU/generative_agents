@@ -12,16 +12,28 @@ from typing import Any
 
 
 RUNTIME_AGENT_NAME = "卡布达"
-VARIANTS = ["kbd1", "kbd2", "kbd3"]
+VARIANTS = ["kbd1", "kbd2", "kbd3", "kbd4", "kbd5", "kbd6", "kbd7", "kbd8", "kbd9"]
 VARIANT_SOURCE_AGENT_NAMES = {
     "kbd1": "卡布达",
     "kbd2": "卡布达2",
     "kbd3": "卡布达3",
+    "kbd4": "卡布达4",
+    "kbd5": "卡布达5",
+    "kbd6": "卡布达6",
+    "kbd7": "卡布达7",
+    "kbd8": "卡布达8",
+    "kbd9": "卡布达9",
 }
 VARIANT_SHORT_NAMES = {
     "kbd1": "KBD1",
     "kbd2": "KBD2",
     "kbd3": "KBD3",
+    "kbd4": "KBD4",
+    "kbd5": "KBD5",
+    "kbd6": "KBD6",
+    "kbd7": "KBD7",
+    "kbd8": "KBD8",
+    "kbd9": "KBD9",
 }
 VARIANT_SELECTOR_ALIASES = {
     "KBD1": "kbd1",
@@ -33,11 +45,29 @@ VARIANT_SELECTOR_ALIASES = {
     "KABUDA2": "kbd2",
     "KBD3": "kbd3",
     "KABUDA3": "kbd3",
+    "KBD4": "kbd4",
+    "KABUDA4": "kbd4",
+    "KBD5": "kbd5",
+    "KABUDA5": "kbd5",
+    "KBD6": "kbd6",
+    "KABUDA6": "kbd6",
+    "KBD7": "kbd7",
+    "KABUDA7": "kbd7",
+    "KBD8": "kbd8",
+    "KABUDA8": "kbd8",
+    "KBD9": "kbd9",
+    "KABUDA9": "kbd9",
 }
 MEMORY_INJECTION_CONFIG_PATHS = {
     "kbd1": "data/intervention/memory_injections.json",
     "kbd2": "data/intervention/memory_injections_kabuda2.json",
     "kbd3": "data/intervention/memory_injections_kabuda3.json",
+    "kbd4": "data/intervention/memory_injections_kabuda4.json",
+    "kbd5": "data/intervention/memory_injections_kabuda5.json",
+    "kbd6": "data/intervention/memory_injections_kabuda6.json",
+    "kbd7": "data/intervention/memory_injections_kabuda7.json",
+    "kbd8": "data/intervention/memory_injections_kabuda8.json",
+    "kbd9": "data/intervention/memory_injections_kabuda9.json",
 }
 SEVERITY_CONFIG_NAMES = {
     "mild": "depression_config_mild.json",
@@ -173,7 +203,7 @@ def prepare_kabuda_variant_runtime(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare normalized runtime files for a Kabuda variant")
-    parser.add_argument("--variant", required=True, help="kbd1, kbd2, kbd3, KBD1, KBD2, or KBD3")
+    parser.add_argument("--variant", required=True, help="kbd1..kbd9, KBD1..KBD9, or KABUDA1..KABUDA9")
     parser.add_argument("--severity", required=True, choices=sorted(SEVERITY_CONFIG_NAMES), help="mild/moderate/severe")
     parser.add_argument("--output-dir", required=True, help="Directory to write normalized runtime files")
     parser.add_argument("--base-dir", default=str(Path(__file__).resolve().parents[1]), help="Repository root")

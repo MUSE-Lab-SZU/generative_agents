@@ -15,22 +15,22 @@
       {
         "id": "severe_job_loss_total_collapse",
         "label": "把失业体验成整个人坍塌",
-        "summary": "被辞退被体验为彻底否定自我价值，低落、羞耻和无望感很重。",
+        "summary": "被辞退被体验为彻底否定自我价值，低落、羞耻和无望感很重；近两周兴趣、胃口、睡眠和精力都明显塌下去。",
         "core_belief": "连工作都保不住，说明我这个人可能真的没有可留住的价值。",
-        "narrative_focus": ["失业", "彻底失败", "强烈羞耻", "不想见人", "没有力气解释"],
+        "narrative_focus": ["失业", "彻底失败", "强烈羞耻", "吃不下", "睡不稳", "没有力气解释"],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "sealed",
           "tone": "flat_numb",
-          "repair_pattern": "回答很短，常停住；即使说出一点，也会马上关上"
+          "repair_pattern": "回答很短，常停住；但被问到近两周时，会低声承认多数日子都吃不下、睡不稳、没力气"
         },
         "emotion_vector": {
-          "valence": 0.10,
+          "valence": 0.08,
           "arousal": 0.34,
-          "defensiveness": 0.78,
+          "defensiveness": 0.74,
           "shame": 0.86,
-          "hopelessness": 0.82,
-          "trust": 0.16
+          "hopelessness": 0.86,
+          "trust": 0.18
         },
         "advance_signals": [
           "能说出日常功能明显受影响",

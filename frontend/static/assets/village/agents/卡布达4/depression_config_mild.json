@@ -1,9 +1,9 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "name": "卡布达",
+  "name": "卡布达4",
   "complaint_graph": {
-    "initial_stage_id": "mild_job_loss_self_doubt",
+    "initial_stage_id": "mild_kitchen_mistake_self_doubt",
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
@@ -13,46 +13,51 @@
     },
     "stages": [
       {
-        "id": "mild_job_loss_self_doubt",
-        "label": "把失业理解成自己不够好",
-        "summary": "被辞退引发明显自我怀疑，睡眠和胃口偶尔受影响，但还没有完全扩展成整个人都失败。",
-        "core_belief": "我可能真的不够好，不然为什么会是我被辞退。",
-        "narrative_focus": ["失业", "自我怀疑", "怕被问近况", "睡得不稳", "勉强维持日常"],
+        "id": "mild_kitchen_mistake_self_doubt",
+        "label": "把后厨失误理解成自己不够稳",
+        "summary": "一次出餐失误让卡布达开始怀疑自己，催单声偶尔影响睡眠和胃口。",
+        "core_belief": "我可能没有自己以为的那么稳，厨房一忙我就会出错。",
+        "narrative_focus": [
+          "后厨失误",
+          "自我怀疑",
+          "怕听到催单",
+          "睡得不稳",
+          "勉强维持日常"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "low",
-          "repair_pattern": "先说自己还行，再补一点睡不好或没胃口的真实不安"
+          "repair_pattern": "先说只是失误，再补一点听到厨房声音会紧张"
         },
         "emotion_vector": {
-          "valence": 0.40,
-          "arousal": 0.36,
+          "valence": 0.4,
+          "arousal": 0.38,
           "defensiveness": 0.44,
-          "shame": 0.48,
-          "hopelessness": 0.30,
-          "trust": 0.44
+          "shame": 0.5,
+          "hopelessness": 0.3,
+          "trust": 0.42
         },
         "advance_signals": [
-          "能具体描述被辞退后的日常影响",
+          "能具体描述压力后的日常影响",
           "承认自己有点难受",
           "不再只用还好来带过"
         ],
         "hold_signals": [
           "一直强调没事",
-          "避免谈被辞退的细节",
+          "避免谈具体细节",
           "把难受说成只是有点烦"
         ],
         "relation_modifiers": {
           "治疗师": {
-            "trust_delta": 0.12,
-            "disclosure_delta": 0.14
+            "trust_delta": 0.14,
+            "disclosure_delta": 0.16
           },
           "朋友": {
-            "trust_delta": 0.10,
-            "disclosure_delta": 0.08
+            "trust_delta": 0.08
           },
           "家人": {
-            "defensiveness_delta": 0.08
+            "defensiveness_delta": 0.12
           }
         },
         "next_candidates": [],

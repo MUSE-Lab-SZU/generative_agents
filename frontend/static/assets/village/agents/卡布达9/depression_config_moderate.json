@@ -1,9 +1,9 @@
 {
   "schema_version": "2.0.0",
   "enabled": true,
-  "name": "卡布达3",
+  "name": "卡布达9",
   "complaint_graph": {
-    "initial_stage_id": "moderate_social_shame_withdrawal",
+    "initial_stage_id": "moderate_archive_failure_shame",
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
@@ -13,40 +13,41 @@
     },
     "stages": [
       {
-        "id": "moderate_social_shame_withdrawal",
-        "label": "把社交误会体验成持续羞耻和关系断裂",
-        "summary": "卡布达把误会后的沉默和眼神都理解成排斥，开始明显减少外出和社交。",
-        "core_belief": "只要他们想到那件事，就会觉得我很糟糕，所以我最好别再出现。",
+        "id": "moderate_archive_failure_shame",
+        "label": "把归档出错体验成自己失职",
+        "summary": "卡布达把归档出错内化成稳定失职感，近两周睡眠、胃口、精力和专注都被核对牵住。",
+        "core_belief": "如果我连记录都守不住，可能真的不该再被信任。",
         "narrative_focus": [
-          "公开指责",
-          "羞耻",
-          "回避熟人",
-          "反复检查消息",
-          "关系断裂"
+          "归档出错",
+          "失职感",
+          "睡眠变差",
+          "没什么胃口",
+          "怕碰表格",
+          "反复核对"
         ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "flat_shame",
-          "repair_pattern": "说出担心后立刻改口，说可能是自己想太多"
+          "repair_pattern": "先承认一点睡不好、集中不了，再说可能是自己太小题大做"
         },
         "emotion_vector": {
-          "valence": 0.23,
-          "arousal": 0.48,
-          "defensiveness": 0.66,
-          "shame": 0.74,
-          "hopelessness": 0.54,
-          "trust": 0.28
+          "valence": 0.22,
+          "arousal": 0.44,
+          "defensiveness": 0.64,
+          "shame": 0.72,
+          "hopelessness": 0.6,
+          "trust": 0.3
         },
         "advance_signals": [
-          "开始具体描述回避哪些人和场所",
-          "承认自己在用猜测惩罚自己",
-          "愿意讨论修复关系的最小步骤"
+          "开始描述具体卡住的地方",
+          "承认自己很累",
+          "愿意讨论一个很小的可做步骤"
         ],
         "hold_signals": [
-          "继续把所有社交线索理解成排斥",
-          "拒绝任何澄清或联系",
-          "反复说自己不该再被看见"
+          "继续把事件归成自己这个人有问题",
+          "回避细节",
+          "否认帮助有意义"
         ],
         "relation_modifiers": {
           "治疗师": {

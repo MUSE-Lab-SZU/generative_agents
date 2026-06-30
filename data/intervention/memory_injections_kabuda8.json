@@ -1,0 +1,130 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "kbd_stress_event_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因旧伤复发和停训而感到压力上升",
+          "describe": "卡布达曾经是长跑选手，最近旧伤复发后不得不停训，此时感到压力上升，并担心自己最确定的部分也被拿走了。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_002",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因看见别人跑步而感到羞耻",
+          "describe": "看到别人轻松跑过公园时，卡布达会觉得自己已经退步，不敢和过去的队友打招呼。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_thought_003",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "如果不能跑步我还剩下什么",
+          "describe": "卡布达常担心自己即使做康复，也无法回到过去那个自律、有用的自己。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_004",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "一想到公园和旧成绩就会紧张",
+          "describe": "每当想到公园跑道、旧成绩或康复计划时，卡布达就会担心自己再也回不去了。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    },
+    {
+      "rule": "session_completed_memory_rule_kbd",
+      "items": [
+        {
+          "item_id": "kbd_s1_recovery_signal_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "感到羞耻",
+          "describe": "在回家的路上，卡布达看到有人在公园跑步，并立刻想起自己被迫停训的事实。",
+          "poignancy": 7,
+          "expire_days": 30,
+          "sessions": [
+            "session1"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "session1"
+          ]
+        },
+        {
+          "item_id": "kbd_s21_relapse_warning_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "感受到了安慰",
+          "describe": "在回家的路上，卡布达遇到旧队友，对方没有询问成绩，只问卡布达最近疼痛有没有缓一点。",
+          "poignancy": 8,
+          "expire_days": 30,
+          "sessions": [
+            "session2.1"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "session2.1"
+          ]
+        },
+        {
+          "item_id": "kbd_s44_self_therapist_identity_001",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我可以成为自己的支持者",
+          "describe": "在结束最后一次的会谈后，卡布达形成了“我可以不只靠成绩证明自己”的新认知。",
+          "poignancy": 8,
+          "expire_days": 30,
+          "sessions": [
+            "session4.4"
+          ],
+          "tags": [
+            "depression",
+            "positive",
+            "self_efficacy",
+            "session4.4"
+          ]
+        }
+      ]
+    }
+  ]
+}

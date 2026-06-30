@@ -15,21 +15,27 @@
       {
         "id": "mild_social_misread_self_doubt",
         "label": "把社交误会理解成自己不讨人喜欢",
-        "summary": "一次公开误会让卡布达3变得谨慎和回避，但仍能维持必要外出和有限联系。",
+        "summary": "一次公开误会让卡布达变得谨慎和回避，夜里会反复想，但仍能维持必要外出和有限联系。",
         "core_belief": "他们可能只是不好意思说，其实大家都觉得我很麻烦。",
-        "narrative_focus": ["社交误会", "被议论", "尴尬", "反复回想", "错峰出门"],
+        "narrative_focus": [
+          "社交误会",
+          "被议论",
+          "尴尬",
+          "睡前反复想",
+          "错峰出门"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "low",
-          "repair_pattern": "先说只是小误会，再补充自己其实一直在想"
+          "repair_pattern": "先说只是小误会，再补充自己晚上会反复想、睡得不踏实"
         },
         "emotion_vector": {
-          "valence": 0.43,
+          "valence": 0.41,
           "arousal": 0.42,
           "defensiveness": 0.46,
-          "shame": 0.50,
-          "hopelessness": 0.26,
+          "shame": 0.5,
+          "hopelessness": 0.28,
           "trust": 0.42
         },
         "advance_signals": [
