@@ -46,6 +46,23 @@ def _safe_file_stem(value: str) -> str:
     return str(value or "").replace("/", "_").replace("\\", "_").replace(" ", "_")
 
 
+def _normalize_scale_item_ids(raw_value: Any) -> set[int] | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, list):
+        raise ValueError("scale_item_ids values must be lists")
+    item_ids: set[int] = set()
+    for value in raw_value:
+        try:
+            item_id = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("scale_item_ids contains non-integer item id: {}".format(value))
+        if item_id <= 0:
+            raise ValueError("scale_item_ids contains non-positive item id: {}".format(value))
+        item_ids.add(item_id)
+    return item_ids
+
+
 def _trace_used_external_memory(trace_payload: Dict[str, Any]) -> bool:
     if not isinstance(trace_payload, dict):
         return False
@@ -92,9 +109,12 @@ def _evaluate(job: Dict[str, Any], tmp_storage_root: str) -> Dict[str, Any]:
     target_agent = str(job.get("target_agent", "") or "").strip()
     trigger_dir = os.path.abspath(str(job.get("trigger_dir", "") or "").strip())
     scale_question_files = job.get("scale_question_files", {}) or {}
+    scale_item_ids_raw = job.get("scale_item_ids", {}) or {}
     scales = job.get("scales", []) or []
     if not isinstance(scale_question_files, dict):
         raise ValueError("scale_question_files must be a dict")
+    if not isinstance(scale_item_ids_raw, dict):
+        raise ValueError("scale_item_ids must be a dict")
     if not isinstance(scales, list):
         raise ValueError("scales must be a list")
     if not target_agent:
@@ -121,11 +141,19 @@ def _evaluate(job: Dict[str, Any], tmp_storage_root: str) -> Dict[str, Any]:
         question_path = os.path.join(QUESTIONS_ROOT, question_file)
         if not os.path.exists(question_path):
             raise FileNotFoundError("question file not found: {}".format(question_path))
+        requested_item_ids = _normalize_scale_item_ids(scale_item_ids_raw.get(scale_name))
 
         answered_rows: List[Dict[str, Any]] = []
         trace_rows: List[Dict[str, Any]] = []
         scale_external_memory_read = False
         for index, item in enumerate(iter_jsonl(question_path), start=1):
+            item_id = item.get("id") if isinstance(item, dict) else index
+            try:
+                normalized_item_id = int(item_id)
+            except (TypeError, ValueError):
+                normalized_item_id = index
+            if requested_item_ids is not None and normalized_item_id not in requested_item_ids:
+                continue
             question = resolve_question(item)
             answer = session.answer_without_memory(question)
             trace_payload = session.get_last_answer_trace()
@@ -151,6 +179,7 @@ def _evaluate(job: Dict[str, Any], tmp_storage_root: str) -> Dict[str, Any]:
         scale_summaries[scale_name] = {
             "question_file": question_file,
             "question_count": len(answered_rows),
+            "requested_item_ids": sorted(requested_item_ids) if requested_item_ids is not None else [],
             "answers_file": answers_file,
             "trace_file": trace_file,
             "external_memory_read": scale_external_memory_read,

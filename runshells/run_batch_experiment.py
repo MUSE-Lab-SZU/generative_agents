@@ -152,6 +152,8 @@ GROUP_OVERLAY_FILES = {
     "g2": GROUP_OVERLAY_DIR / "g2_no_intervention.json",
     "g3": GROUP_OVERLAY_DIR / "g3_random_resident_chat.json",
     "g5": GROUP_OVERLAY_DIR / "g5_negative_resident_chat.json",
+    "g6": GROUP_OVERLAY_DIR / "g6_supportive_counseling.json",
+    "g7": GROUP_OVERLAY_DIR / "g7_memory_removed.json",
 }
 
 SEVERITY_SHORT_NAMES = {
@@ -160,7 +162,7 @@ SEVERITY_SHORT_NAMES = {
     "severe": "SEV",
 }
 SEVERITIES = ["mild", "moderate", "severe"]
-GROUPS = ["g1", "g2", "g3", "g5"]
+GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7"]
 WILDCARD_TOKENS = {"*", "ALL"}
 VARIANT_SELECTOR_ALIASES = dict(KABUDA_VARIANT_SELECTOR_ALIASES)
 GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
@@ -923,7 +925,7 @@ def format_delta(value: float | None, digits: int = 1) -> str:
     return f"{float(value):+.{digits}f}"
 
 
-def extract_scale_total(scored_result: dict) -> float | None:
+def extract_reported_scale_total(scored_result: dict) -> float | None:
     if not isinstance(scored_result, dict):
         return None
     for key in ["total_score", "total_score_raw", "standard_score"]:
@@ -941,6 +943,45 @@ SCALE_ITEM_SCORE_KEYS = {
     "PHQ-9": "phq9_scores",
     "BDI-II": "bdi_ii_scores",
 }
+
+SCALE_ITEM_COUNTS = {
+    "PHQ-9": 9,
+    "BDI-II": 21,
+}
+
+
+def phq9_severity(total: int | float) -> str:
+    if total <= 4:
+        return "无抑郁"
+    if total <= 9:
+        return "轻度抑郁"
+    if total <= 14:
+        return "中度抑郁"
+    if total <= 19:
+        return "中重度抑郁"
+    return "重度抑郁"
+
+
+def bdi_ii_severity(total: int | float) -> str:
+    if total <= 13:
+        return "无抑郁"
+    if total <= 19:
+        return "轻度抑郁"
+    if total <= 28:
+        return "中度抑郁"
+    return "重度抑郁"
+
+
+def expected_scale_severity(scale_name: str, total: int | float) -> str:
+    return phq9_severity(total) if scale_name == "PHQ-9" else bdi_ii_severity(total)
+
+
+def extract_scale_total(scored_result: dict, scale_name: str | None = None) -> float | None:
+    if scale_name:
+        item_scores = extract_item_scores(scored_result, scale_name)
+        if item_scores is not None:
+            return float(sum(item_scores))
+    return extract_reported_scale_total(scored_result)
 
 CN_SCORE_VALUES = {
     "0": 0,
@@ -981,6 +1022,9 @@ def extract_item_scores(scored_result: dict, scale_name: str) -> list[int] | Non
         if not isinstance(score, int) or score < 0 or score > 3:
             return None
         scores.append(score)
+    expected_count = SCALE_ITEM_COUNTS.get(scale_name)
+    if expected_count is not None and len(scores) != expected_count:
+        return None
     return scores
 
 
@@ -1066,7 +1110,7 @@ def build_scale_score_validation(results: list[dict]) -> dict:
                     continue
 
                 item_scores = extract_item_scores(scored_result, scale_name)
-                reported_total = extract_scale_total(scored_result)
+                reported_total = extract_reported_scale_total(scored_result)
                 if item_scores is not None and reported_total is not None:
                     item_sum = sum(item_scores)
                     if float(item_sum) != float(reported_total):
@@ -1118,9 +1162,13 @@ def build_scale_score_validation(results: list[dict]) -> dict:
     }
 
 
-def extract_scale_severity(scored_result: dict) -> str:
+def extract_scale_severity(scored_result: dict, scale_name: str | None = None) -> str:
     if not isinstance(scored_result, dict):
         return "—"
+    if scale_name:
+        item_scores = extract_item_scores(scored_result, scale_name)
+        if item_scores is not None:
+            return expected_scale_severity(scale_name, sum(item_scores))
     for key in ["severity", "severity_by_index", "severity_by_standard_score"]:
         value = scored_result.get(key)
         if value:
@@ -1537,11 +1585,19 @@ def ensure_staged_eval_scores(run_dir: Path, *, dry_run: bool) -> None:
             )
 
 
-def build_scale_snapshot(scored_result: dict | None, scored_path: Path | None = None) -> dict:
-    total_score = extract_scale_total(scored_result or {})
-    severity = extract_scale_severity(scored_result or {})
+def build_scale_snapshot(
+    scored_result: dict | None,
+    scored_path: Path | None = None,
+    scale_name: str | None = None,
+) -> dict:
+    item_scores = extract_item_scores(scored_result or {}, scale_name) if scale_name else None
+    total_score = extract_scale_total(scored_result or {}, scale_name)
+    reported_total = extract_reported_scale_total(scored_result or {})
+    severity = extract_scale_severity(scored_result or {}, scale_name)
     return {
         "total_score": total_score,
+        "reported_total_score": reported_total,
+        "score_source": "item_sum" if item_scores is not None else "reported_total",
         "severity": severity,
         "scored_file": str(scored_path) if scored_path is not None else "",
     }
@@ -1563,7 +1619,7 @@ def append_post_entry(evaluations: list[dict], run_dir: Path) -> None:
     scales_payload = {}
     for scale_name in SCALES:
         scored_result = post_payload.get(scale_name)
-        scales_payload[scale_name] = build_scale_snapshot(scored_result, scale_scores_path)
+        scales_payload[scale_name] = build_scale_snapshot(scored_result, scale_scores_path, scale_name)
 
     evaluations.append(
         {
@@ -1618,7 +1674,11 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
             for scale_name in SCALES:
                 scored_path = trigger_dir / f"{scale_name}_scored.json"
                 scored_result = load_json_file(scored_path) if scored_path.exists() else {}
-                scales_payload[scale_name] = build_scale_snapshot(scored_result, scored_path if scored_path.exists() else None)
+                scales_payload[scale_name] = build_scale_snapshot(
+                    scored_result,
+                    scored_path if scored_path.exists() else None,
+                    scale_name,
+                )
             evaluations.append(
                 {
                     "trigger_label": str(metadata.get("trigger_label", "") or ""),

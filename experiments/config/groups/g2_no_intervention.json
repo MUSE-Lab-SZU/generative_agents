@@ -31,5 +31,14 @@
     "memory_policy": {
       "enabled": true
     }
+  },
+  "staged_eval": {
+    "step_interval": {
+      "enabled": true,
+      "every_steps": 24,
+      "virtual_session_interval": 4,
+      "label_prefix": "session",
+      "max_triggers": 0
+    }
   }
 }

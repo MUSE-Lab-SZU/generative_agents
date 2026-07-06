@@ -83,6 +83,16 @@ class StagedEvalManager:
             return None
 
         last_result = None
+        step_result = self._maybe_run_step_interval_trigger(
+            runtime_config=runtime_config,
+            conversation=conversation,
+            step_no=step_no,
+            sim_time=sim_time,
+            snapshot_name=snapshot_name,
+        )
+        if step_result is not None:
+            last_result = step_result
+
         session_result = self._maybe_run_session_interval_trigger(
             runtime_config=runtime_config,
             conversation=conversation,
@@ -341,6 +351,63 @@ class StagedEvalManager:
             self._log("warning", f"[STAGED_EVAL] {trigger_label} failed: {exc}")
             return None
 
+    def _maybe_run_step_interval_trigger(
+        self,
+        runtime_config: Dict[str, Any],
+        conversation: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+    ) -> Dict[str, Any] | None:
+        step_cfg = self._step_interval_cfg()
+        if not bool(step_cfg.get("enabled", False)):
+            return None
+
+        every_steps = max(0, self._safe_int(step_cfg.get("every_steps", 0), 0))
+        if every_steps <= 0:
+            return None
+
+        current_step = max(0, self._safe_int(step_no, 0))
+        if current_step <= 0 or current_step % every_steps != 0:
+            return None
+
+        trigger_index = current_step // every_steps
+        max_triggers = max(0, self._safe_int(step_cfg.get("max_triggers", 0), 0))
+        if max_triggers > 0 and trigger_index > max_triggers:
+            return None
+
+        virtual_session_interval = max(
+            1,
+            self._safe_int(step_cfg.get("virtual_session_interval", self._cfg().get("session_interval", 1)), 1),
+        )
+        completed_session_count = int(trigger_index * virtual_session_interval)
+        label_prefix = str(step_cfg.get("label_prefix", "session") or "session").strip() or "session"
+        trigger_label = f"{label_prefix}_{completed_session_count}"
+        if self._is_label_finished_or_pending(trigger_label):
+            return None
+
+        try:
+            return self._enqueue_trigger(
+                trigger_label=trigger_label,
+                completed_session_count=completed_session_count,
+                runtime_config=runtime_config,
+                conversation=conversation,
+                step_no=current_step,
+                sim_time=sim_time,
+                snapshot_name=snapshot_name,
+                extra_metadata={
+                    "trigger_mode": "step_interval",
+                    "completed_session_count_source": "step_interval",
+                    "step_interval_every_steps": every_steps,
+                    "step_interval_virtual_session_interval": virtual_session_interval,
+                    "step_interval_trigger_index": int(trigger_index),
+                    "step_interval_label_prefix": label_prefix,
+                },
+            )
+        except Exception as exc:
+            self._log("warning", f"[STAGED_EVAL] {trigger_label} failed: {exc}")
+            return None
+
     def _maybe_run_t4_trigger(
         self,
         runtime_config: Dict[str, Any],
@@ -427,6 +494,10 @@ class StagedEvalManager:
             ),
             "cleanup_tmp_storage": bool(cfg.get("cleanup_tmp_storage", True)),
         }
+
+    def _step_interval_cfg(self) -> Dict[str, Any]:
+        cfg = self._cfg().get("step_interval", {}) or {}
+        return cfg if isinstance(cfg, dict) else {}
 
     def _target_agent(self) -> str:
         return str(self._cfg().get("target_agent", "") or "").strip()
@@ -563,6 +634,7 @@ class StagedEvalManager:
             "doctor_name": self._doctor_name(runtime_config),
             "session_interval": self._safe_int(self._cfg().get("session_interval", 0), 0),
             "max_completed_sessions": self._safe_int(self._cfg().get("max_completed_sessions", 0), 0),
+            "step_interval": copy.deepcopy(self._step_interval_cfg()),
             "t4_enabled": bool(self._cfg().get("t4_enabled", False)),
             "t4_after_steps": max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0)),
             "readonly_eval": True,
@@ -806,8 +878,16 @@ class StagedEvalManager:
             worker_success=worker_success,
         )
         if isinstance(queued_metadata, dict):
+            preserved_queued_keys = {
+                "trigger_mode",
+                "completed_session_count_source",
+                "step_interval_every_steps",
+                "step_interval_virtual_session_interval",
+                "step_interval_trigger_index",
+                "step_interval_label_prefix",
+            }
             for key, value in queued_metadata.items():
-                if key not in metadata:
+                if key not in metadata or key in preserved_queued_keys:
                     metadata[key] = value
         self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
         label = str(metadata.get("trigger_label", "") or "").strip()
@@ -888,6 +968,7 @@ class StagedEvalManager:
             "doctor_name": self._doctor_name(runtime_config),
             "session_interval": self._safe_int(self._cfg().get("session_interval", 0), 0),
             "max_completed_sessions": self._safe_int(self._cfg().get("max_completed_sessions", 0), 0),
+            "step_interval": copy.deepcopy(self._step_interval_cfg()),
             "t4_enabled": bool(self._cfg().get("t4_enabled", False)),
             "t4_after_steps": max(0, self._safe_int(self._cfg().get("t4_after_steps", 0), 0)),
             "readonly_eval": True,

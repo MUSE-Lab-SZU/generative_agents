@@ -1,0 +1,62 @@
+{
+  "intervention": {
+    "enabled": true,
+    "doctor": "蜻蜓队长",
+    "patients": [
+      "卡布达"
+    ],
+    "meeting_rules": [
+      {
+        "rule_id": "g6_supportive_counseling",
+        "type": "interval_steps",
+        "interval_steps": 6,
+        "step_phase": 1,
+        "duration": 2881,
+        "doctor": "蜻蜓队长",
+        "patient": "卡布达",
+        "enabled": true,
+        "meeting_kind": "doctor_consult",
+        "prompt_file": "data/prompts/intervention/supportive_counseling_doctor.txt",
+        "prompt_target": "doctor"
+      }
+    ],
+    "resident_chat_scheduler": {
+      "enabled": false
+    },
+    "order_extract": {
+      "enabled": false
+    },
+    "session_prompt_injection": {
+      "enabled": false
+    },
+    "forced_llm": {
+      "enabled": true
+    },
+    "dialog_judge": {
+      "enabled": false
+    },
+    "session_eval": {
+      "enabled": false
+    },
+    "consult_record": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": true
+    },
+    "depression_dynamic": {
+      "enabled": true
+    },
+    "memory_injection": {
+      "enabled": true,
+      "rules": {
+        "session_completed_memory_rule_kbd": {
+          "enabled": false
+        }
+      }
+    },
+    "memory_policy": {
+      "enabled": true
+    }
+  }
+}

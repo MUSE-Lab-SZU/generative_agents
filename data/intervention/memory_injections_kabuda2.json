@@ -65,66 +65,6 @@
           ]
         }
       ]
-    },
-    {
-      "rule": "session_completed_memory_rule_kbd",
-      "items": [
-        {
-          "item_id": "kbd_s1_recovery_signal_001",
-          "node_type": "event",
-          "subject": "卡布达",
-          "predicate": "此时",
-          "object": "感到羞耻",
-          "describe": "在回家的路上，卡布达听到熟人夸奖别人能干，并把这句话理解成自己不够好。",
-          "poignancy": 7,
-          "expire_days": 30,
-          "sessions": [
-            "session1"
-          ],
-          "tags": [
-            "depression",
-            "positive",
-            "session1"
-          ]
-        },
-        {
-          "item_id": "kbd_s21_relapse_warning_001",
-          "node_type": "event",
-          "subject": "卡布达",
-          "predicate": "此时",
-          "object": "感受到了安慰",
-          "describe": "在回家的路上，卡布达遇到了小时候的邻居，对方没有拿卡布达和别人比较，而是认真听卡布达说完了近况。",
-          "poignancy": 8,
-          "expire_days": 30,
-          "sessions": [
-            "session2.1"
-          ],
-          "tags": [
-            "depression",
-            "positive",
-            "session2.1"
-          ]
-        },
-        {
-          "item_id": "kbd_s44_self_therapist_identity_001",
-          "node_type": "thought",
-          "subject": "卡布达",
-          "predicate": "此时",
-          "object": "我可以成为自己的支持者",
-          "describe": "在结束最后一次的会谈后，卡布达形成了“我可以把别人的优秀和自己的价值分开”的新认知。",
-          "poignancy": 8,
-          "expire_days": 30,
-          "sessions": [
-            "session4.4"
-          ],
-          "tags": [
-            "depression",
-            "positive",
-            "self_efficacy",
-            "session4.4"
-          ]
-        }
-      ]
     }
   ]
 }

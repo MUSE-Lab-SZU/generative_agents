@@ -1,4 +1,17 @@
 {
+  "agent": {
+    "memory_write_control": {
+      "enabled": true,
+      "target_agents": [
+        "卡布达"
+      ],
+      "blocked_node_types": [
+        "event",
+        "thought",
+        "chat"
+      ]
+    }
+  },
   "intervention": {
     "enabled": true,
     "doctor": "蜻蜓队长",
@@ -10,12 +23,7 @@
       "enabled": false
     },
     "order_extract": {
-      "enabled": true,
-      "prompt_file": "data/prompts/extract_doctor_order.txt",
-      "max_tasks_per_chat": 3
-    },
-    "environment_model": {
-      "enabled": false
+      "enabled": true
     },
     "session_prompt_injection": {
       "enabled": true
@@ -39,7 +47,12 @@
       "enabled": true
     },
     "memory_injection": {
-      "enabled": true
+      "enabled": true,
+      "rules": {
+        "session_completed_memory_rule_kbd": {
+          "enabled": false
+        }
+      }
     },
     "memory_policy": {
       "enabled": true

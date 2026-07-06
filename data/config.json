@@ -11,9 +11,9 @@
     },
     "think": {
       "llm": {
-        "provider": "openai",
-        "model": "qwen3-8b-vllm",
-        "base_url": "http://127.0.0.1:18000/v1",
+        "provider": "ollama",
+        "model": "qwen3:8b-q4_K_M",
+        "base_url": "http://127.0.0.1:11434/v1",
         "api_key": "EMPTY",
         "retry": 3,
         "request_timeout_seconds": 120
@@ -21,14 +21,47 @@
       "interval": 1000,
       "poignancy_max": 50,
       "reflect_focus_topk": 4,
-      "reflect_insights_topk": 1
+      "reflect_insights_topk": 1,
+      "reflection_policy": {
+        "legacy_poignancy": {
+          "enabled": false
+        },
+        "periodic": {
+          "enabled": true,
+          "interval_steps": 6,
+          "targets": "all_agents"
+        },
+        "conditional": {
+          "enabled": true,
+          "rules": [
+            {
+              "event": "after_chat",
+              "meeting_kind": "doctor_consult",
+              "target_role": "patient",
+              "once_per_meeting": true
+            },
+            {
+              "event": "after_chat",
+              "meeting_kind": "resident_chat",
+              "target_role": "patient",
+              "once_per_meeting": true
+            },
+            {
+              "event": "environment_task_result",
+              "meeting_kind": "doctor_consult",
+              "target_role": "patient",
+              "once_per_task_batch": true
+            }
+          ]
+        }
+      }
     },
     "chat_iter": 3,
     "associate": {
       "embedding": {
-        "provider": "openai",
-        "model": "bge-m3-vllm",
-        "base_url": "http://127.0.0.1:18001/v1",
+        "provider": "ollama",
+        "model": "bge-m3:latest",
+        "base_url": "http://127.0.0.1:11434",
         "api_key": "EMPTY"
       },
       "retention": 32,
@@ -51,6 +84,11 @@
     },
     "chat_memory": {
       "write_mode": "hybrid"
+    },
+    "memory_write_control": {
+      "enabled": false,
+      "target_agents": [],
+      "blocked_node_types": []
     },
     "external_memory": {
       "enabled": false,
@@ -90,6 +128,7 @@
         "duration": 30,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
+        "prompt_target": "all",
         "enabled": false
       },
       {
@@ -100,6 +139,7 @@
         "duration": 30,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
+        "prompt_target": "all",
         "enabled": false
       },
       {
@@ -109,6 +149,7 @@
         "duration": 30,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
+        "prompt_target": "all",
         "enabled": false
       },
       {
@@ -119,6 +160,7 @@
         "duration": 2881,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
+        "prompt_target": "all",
         "enabled": true
       },
       {
@@ -129,6 +171,7 @@
         "duration": 1440,
         "doctor": "蜻蜓队长",
         "patient": "金龟次郎",
+        "prompt_target": "all",
         "enabled": false
       },
       {
@@ -139,6 +182,7 @@
         "duration": 30,
         "doctor": "蜻蜓队长",
         "patient": "卡布达",
+        "prompt_target": "all",
         "enabled": false
       }
     ],
@@ -148,8 +192,18 @@
     },
     "order_extract": {
       "enabled": false,
-      "min_confidence": 0.3,
+      "prompt_file": "data/prompts/extract_doctor_order.txt",
       "max_tasks_per_chat": 3
+    },
+    "environment_model": {
+      "enabled": false,
+      "route": "forced_llm",
+      "prompt_file": "data/prompts/intervention/environment_task_outcome.txt",
+      "retry": 2,
+      "poignancy": 9,
+      "expire_days": 30,
+      "max_agents_per_task": 3,
+      "reflect_after_injection": true
     },
     "session_prompt_injection": {
       "enabled": true,
@@ -183,7 +237,7 @@
         "forced_chat_min_turns": -1,
         "forced_chat_max_turns": -1,
         "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 9
+        "terminate_detection_tail_window_turns": 12
       },
       "agent_overrides": {
         "卡布达": {
@@ -299,7 +353,7 @@
           }
         },
         "session_completed_memory_rule_kbd": {
-          "enabled": true,
+          "enabled": false,
           "target_agent": "卡布达",
           "source": "会诊完成注入_多Session记忆_卡布达",
           "trigger": {
@@ -365,6 +419,13 @@
     "include_t0": true,
     "session_interval": 4,
     "max_completed_sessions": 1000,
+    "step_interval": {
+      "enabled": false,
+      "every_steps": 24,
+      "virtual_session_interval": 4,
+      "label_prefix": "session",
+      "max_triggers": 0
+    },
     "t4_enabled": true,
     "t4_after_steps": 8,
     "auto_stop_after_t4_done": true,
