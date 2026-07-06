@@ -41,11 +41,13 @@ class EmotionInferencer:
         parsed = self._parse_json_object(raw)
         if not isinstance(parsed, dict):
             return fallback
-        return self._sanitize(parsed, fallback)
+        return self._sanitize(parsed, fallback, payload)
 
     def build_prompt(self, payload: Dict[str, Any]) -> str:
         current_stage = json.dumps(payload.get("current_stage", {}) or {}, ensure_ascii=False)
-        graph_snapshot = json.dumps(payload.get("graph_snapshot", {}) or {}, ensure_ascii=False)
+        graph_snapshot = json.dumps(
+            self._slim_graph_snapshot(payload.get("graph_snapshot", {})), ensure_ascii=False
+        )
         session_context = json.dumps(payload.get("session_context", {}) or {}, ensure_ascii=False)
         previous_emotion = json.dumps(payload.get("previous_emotion", {}) or {}, ensure_ascii=False)
         conversation_content = self._clip_text(payload.get("conversation_content", ""), limit=1200)
@@ -59,6 +61,26 @@ class EmotionInferencer:
                 "conversation_content": conversation_content or "（暂无明确话语内容）",
             },
         )
+
+    @staticmethod
+    def _slim_graph_snapshot(graph_snapshot: Any) -> Dict[str, Any]:
+        """只保留与瞬时语气相关的字段，避免整份状态机快照（全部 stages、
+        stage_history、dialogue_history 等）给 LLM 引入无关的自由发挥空间。"""
+        graph_snapshot = graph_snapshot if isinstance(graph_snapshot, dict) else {}
+        window = graph_snapshot.get("current_graph_window", [])
+        window = window if isinstance(window, list) else []
+        candidate_branches = [
+            {
+                "label": str(stage.get("label", "") or ""),
+                "summary": str(stage.get("summary", "") or ""),
+            }
+            for stage in window[1:]
+            if isinstance(stage, dict)
+        ]
+        return {
+            "current_stage_label": str(graph_snapshot.get("current_stage_label", "") or ""),
+            "candidate_branches": candidate_branches,
+        }
 
     def build_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """基于 stage + relationship + flags 的规则化情绪兜底。"""
@@ -168,13 +190,26 @@ class EmotionInferencer:
             "source": "fallback",
         }
 
-    def _sanitize(self, parsed: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize(
+        self, parsed: Dict[str, Any], fallback: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         label = str(parsed.get("label", "") or "").strip() or str(fallback.get("label", "") or "")
         style = str(parsed.get("style", "") or "").strip() or str(fallback.get("style", "") or "")
         volatility_note = str(parsed.get("volatility_note", "") or "").strip() or str(fallback.get("volatility_note", "") or "")
         intensity = self._bounded_float(parsed.get("intensity"), fallback.get("intensity", 0.62), 0.0, 1.0)
         disclosure_level = self._bounded_float(parsed.get("disclosure_level"), fallback.get("disclosure_level", 0.28), 0.0, 1.0)
         defensiveness = self._bounded_float(parsed.get("defensiveness"), fallback.get("defensiveness", 0.55), 0.0, 1.0)
+
+        # LLM 路径此前完全不参照 previous_emotion，导致同一 stage 下逐轮数值可以
+        # 无约束跳变；这里补上与 build_fallback() 一致的连续性限幅，让 prompt 里
+        # “必须小幅、可逆摆动”的要求有代码层兜底，而不是只靠 LLM 自觉遵守。
+        previous = payload.get("previous_emotion", {}) if isinstance(payload, dict) else {}
+        previous = previous if isinstance(previous, dict) else {}
+        if str(previous.get("label", "") or "").strip() or "intensity" in previous:
+            intensity = self._clip_to_previous(intensity, previous.get("intensity"))
+            disclosure_level = self._clip_to_previous(disclosure_level, previous.get("disclosure_level"))
+            defensiveness = self._clip_to_previous(defensiveness, previous.get("defensiveness"))
+
         return {
             "label": label[:24],
             "style": style[:220],
@@ -267,6 +302,15 @@ class EmotionInferencer:
                 return "比上一轮稍微松一点，像是在被接住后短暂愿意多说一点。"
             return "比上一轮稍微松一点，但这种放松仍然不稳。"
         return "整体接近上一轮，只出现细小而可逆的情绪摆动。"
+
+    def _clip_to_previous(self, value: Any, previous_value: Any) -> float:
+        """把 value 相对 previous_value 的变化量限制在 volatility_limit 内。"""
+        current = self._bounded_float(value, 0.5, 0.0, 1.0)
+        if previous_value is None:
+            return current
+        previous = self._bounded_float(previous_value, current, 0.0, 1.0)
+        delta = self._clip_delta(current - previous, self.volatility_limit)
+        return self._bounded_float(previous + delta, current, 0.0, 1.0)
 
     @staticmethod
     def _contains_negative_cues(conversation: str) -> bool:
