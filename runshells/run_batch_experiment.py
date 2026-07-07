@@ -1277,6 +1277,39 @@ RESUMEABLE_CONDITION_STATUSES = {
     "postprocessing",
 }
 
+AGENT_MEMORY_VIS_NODE_TYPES = {"event", "thought", "chat"}
+
+
+def agent_memory_visualization_not_applicable(runtime_config_path: Path, agent_name: str) -> bool:
+    payload = load_optional_json_file(runtime_config_path) or {}
+    agent_base = payload.get("agent_base", {})
+    if not isinstance(agent_base, dict):
+        agent_base = {}
+    control = agent_base.get("memory_write_control", {})
+    if not isinstance(control, dict):
+        control = {}
+    if not bool(control.get("enabled", False)):
+        return False
+
+    target_agents = control.get("target_agents", [])
+    if isinstance(target_agents, str):
+        target_agents = [target_agents]
+    target_agent_names = {str(item) for item in target_agents}
+    if target_agent_names and agent_name not in target_agent_names:
+        return False
+
+    blocked_types = control.get("blocked_node_types", [])
+    if isinstance(blocked_types, str):
+        blocked_types = [blocked_types]
+    blocked_node_types = {
+        str(item).strip().lower()
+        for item in blocked_types
+        if str(item).strip()
+    }
+    if not blocked_node_types:
+        blocked_node_types = set(AGENT_MEMORY_VIS_NODE_TYPES)
+    return AGENT_MEMORY_VIS_NODE_TYPES.issubset(blocked_node_types)
+
 
 def is_disk_protection_error(exc: Exception) -> bool:
     message = str(exc or "")
@@ -1507,13 +1540,25 @@ def run_condition(
             run_compress(run_name, cfg)
             update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="compress")
         if cfg.run_agent_memory_vis:
-            ensure_free_disk_space(
-                min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
-                context=f"角色记忆可视化 {run_name}",
-                dry_run=cfg.dry_run,
-            )
-            run_agent_memory_visualization(run_name, cfg.agent, dry_run=cfg.dry_run)
-            update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="agent_memory_vis")
+            if agent_memory_visualization_not_applicable(runtime_config_path, cfg.agent):
+                print(
+                    "[SKIP] 角色记忆可视化不适用于当前条件："
+                    f"agent={cfg.agent} 的 event/thought/chat 本地记忆写入已被配置屏蔽"
+                )
+                update_condition_state(
+                    cfg,
+                    condition,
+                    run_name=run_name,
+                    last_completed_phase="agent_memory_vis_skipped",
+                )
+            else:
+                ensure_free_disk_space(
+                    min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
+                    context=f"角色记忆可视化 {run_name}",
+                    dry_run=cfg.dry_run,
+                )
+                run_agent_memory_visualization(run_name, cfg.agent, dry_run=cfg.dry_run)
+                update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="agent_memory_vis")
         if cfg.run_external_memory_audit:
             ensure_free_disk_space(
                 min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,

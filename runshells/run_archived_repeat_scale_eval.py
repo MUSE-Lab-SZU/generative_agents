@@ -1021,7 +1021,7 @@ def run_stability_reruns(cfg: RuntimeConfig, original_summary: dict[str, Any]) -
         analysis = build_stability_analysis(cfg, original_summary)
         pending = pending_stability_rerun_groups(analysis)
         if not pending:
-            print("[STABILITY] 无需补跑：所有不稳定条目已有多数分或没有不稳定条目")
+            print("[STABILITY] 无需补跑：所有不稳定条目已定稿或没有不稳定条目")
             break
 
         repeat_idx = cfg.repeat + extra_round
@@ -1330,12 +1330,18 @@ def strict_majority_score(scores: list[int]) -> tuple[int | None, dict[str, int]
     return None, vote_payload
 
 
-def final_review_score(scores: list[int]) -> tuple[int | None, dict[str, int], str, str]:
+def final_review_score(
+    scores: list[int],
+    *,
+    allow_lowest_tied_vote: bool,
+) -> tuple[int | None, dict[str, int], str, str]:
     majority, votes = strict_majority_score(scores)
     if majority is not None:
         return majority, votes, "strict_majority", ""
     if not votes:
         return None, votes, "unresolved", ""
+    if not allow_lowest_tied_vote:
+        return None, votes, "unresolved", "未达严格多数；等待补跑后定稿。"
 
     max_count = max(votes.values())
     candidates = sorted(int(score) for score, count in votes.items() if int(count) == max_count)
@@ -1392,8 +1398,21 @@ def build_stability_analysis(cfg: RuntimeConfig, original_summary: dict[str, Any
                         continue
                     initial_range = max(initial_scores) - min(initial_scores)
                     initially_unstable = initial_range >= cfg.stability_range_threshold
-                    final_score, votes, resolution_method, resolution_note = final_review_score(all_scores)
-                    strict_majority, _strict_votes = strict_majority_score(all_scores)
+                    initial_majority, _initial_votes = strict_majority_score(initial_scores)
+                    must_finish_extra_reruns = initially_unstable and initial_majority is None
+                    strict_majority, votes = strict_majority_score(all_scores)
+                    if must_finish_extra_reruns and len(extra_scores) < cfg.max_extra_repeat:
+                        final_score = None
+                        resolution_method = "unresolved"
+                        resolution_note = "已补跑 {}/{} 轮；等待补跑完成后定稿。".format(
+                            len(extra_scores),
+                            cfg.max_extra_repeat,
+                        )
+                    else:
+                        final_score, votes, resolution_method, resolution_note = final_review_score(
+                            all_scores,
+                            allow_lowest_tied_vote=True,
+                        )
                     if initially_unstable:
                         status = "resolved" if final_score is not None else "unresolved"
                     else:

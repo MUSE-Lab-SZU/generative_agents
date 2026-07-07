@@ -15,7 +15,7 @@
       "max_tasks_per_chat": 3
     },
     "environment_model": {
-      "enabled": false
+      "enabled": true
     },
     "session_prompt_injection": {
       "enabled": true

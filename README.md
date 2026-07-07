@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-07-06
+> 更新时间：2026-07-07
 
 ## 关键测试结果速查
 
@@ -28,6 +28,10 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-07：新增治疗完成后的回访模式：`session_prompt_injection.post_treatment_followup`默认启用并新增`data/prompts/intervention/post_treatment_followup.txt`，当医患CBT阶段已完成后不再推进新的session prompt，而是注入治疗后回访提示词；回访会谈可跳过会后阶段评估，且不会因已完成状态清空后续会谈规则，便于继续观察治疗结束后的状态、作业执行和风险变化。
+- 2026-07-07：补齐会谈完成计数状态：`modules/intervention_manager.py`新增`completed_meeting_state`，在强制医患会谈闭环时按医患pair记录完成次数、meeting_id和结束时间；`modules/staged_eval_manager.py`新增`intervention_completed_meeting`计数来源，使阶段评估在缺少咨询历史或跳过部分会后产物时仍能基于真实完成会谈数触发。
+- 2026-07-07：调整当前实验默认开关：`data/config.json`默认开启`intervention.order_extract`和`intervention.environment_model`，并在G1医生干预组启用环境模型；同时默认关闭`staged_eval.t4_enabled`和`auto_stop_after_t4_done`，避免T4完成后自动收尾影响后续回访/复评流程。
+- 2026-07-07：增强批量实验与复评流水线：`runshells/run_batch_experiment.py`会在`memory_write_control`屏蔽目标agent全部`event/thought/chat`本地记忆时跳过角色记忆可视化；新增`runshells/run_batch_then_repeat_eval.sh`串联“批量仿真 -> archived repeat scale eval”；`runshells/run_archived_repeat_scale_eval.py`对初始不稳定且无严格多数的条目会先等补跑轮次完成，再按定稿规则处理并更新稳定性提示文案。
 - 2026-07-06：接入“医生作业抽取 -> Environment Model -> 会后任务结果记忆”链路：`intervention.order_extract`改为只抽取医患双方已确认的`describe/date`任务，`intervention.environment_model`可通过`forced_llm`/`think_llm`/`custom_llm`生成作业落地结果，并经`MemoryInjectionManager.inject_many`写入患者及参与居民的`event`记忆；新增`data/prompts/intervention/environment_task_outcome.txt`、`environment_task_state.audit/reflected_batches`、`ENV_TASK_*`日志和任务结果后的可选反思触发，默认配置仍保持关闭。
 - 2026-07-06：新增可控反思触发策略：`data/config.json`的`agent.think.reflection_policy`支持旧`poignancy_max`阈值、每6步定期反思、会谈结束后条件反思和环境任务结果后的条件反思；`modules/agent.py`统一`reflect/trigger_reflection`入口并记录触发来源、会话上下文和反思去重状态，`modules/intervention_manager.py`按`meeting_kind`/`target_role`/`once_per_meeting`在医患会诊或居民聊天闭环后触发目标角色反思。
 - 2026-07-06：扩展强制会谈Prompt全链路追踪：`modules/agent.py`的`completion`支持显式`_forced_prompt_trace`参数，`modules/intervention_manager.py`可把`order_extract_llm`和`environment_model_llm`纳入`forced_prompt_trace_state`并在Markdown报告中统计对应调用次数，便于同时审查患者/医生发言、判断LLM、会后评估、医嘱抽取和环境模型输出。

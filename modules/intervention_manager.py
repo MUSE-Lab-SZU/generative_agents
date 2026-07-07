@@ -376,6 +376,13 @@ class InterventionManager:
             self._mark_resident_chat_completed(closed_patient_name)
             self.mark_step_flag("forced_consult_happened", True)
         elif closed_meeting_id:
+            self._mark_completed_meeting(
+                doctor_name=closed_doctor_name,
+                patient_name=closed_patient_name,
+                meeting_id=closed_meeting_id,
+                meeting_kind=closed_meeting_kind or "doctor_consult",
+                finished_at=start_time,
+            )
             self.mark_step_flag("forced_consult_happened", True)
         if skip_consult_artifacts:
             self._log_highlight(
@@ -427,49 +434,74 @@ class InterventionManager:
             if doctor_for_session and patient_for_session:
                 meeting_id_for_session = str(closed_meeting_id or meeting_id_s or meeting_id_o or "")
                 if meeting_id_for_session:
-                    session_eval_payload = self.evaluate_session_after_chat(
-                        doctor=doctor_for_session,
-                        patient=patient_for_session,
-                        chats=chats or [],
-                        summary=str(summary or ""),
-                        meeting_id=meeting_id_for_session,
-                        start_time=start_time,
-                    )
                     session_eval_end: Optional[bool] = None
-                    if isinstance(session_eval_payload, dict):
-                        current_session = ""
-                        try:
-                            state_for_session = self.session_prompt_injection.resolve_current_session(
+                    post_treatment_followup_active = self._is_post_treatment_followup_active_for_pair(
+                        doctor_for_session.name,
+                        patient_for_session.name,
+                    )
+                    skip_post_treatment_session_eval = bool(
+                        post_treatment_followup_active
+                        and self._should_skip_session_eval_for_post_treatment_followup()
+                    )
+                    if skip_post_treatment_session_eval:
+                        current_session = self._resolve_session_prompt_current_session(
+                            doctor_for_session.name,
+                            patient_for_session.name,
+                        )
+                        audit = {
+                            "applied": True,
+                            "pair_key": build_pair_key(doctor_for_session.name, patient_for_session.name),
+                            "session_before": current_session,
+                            "action": "post_treatment_followup",
+                            "current_session": current_session,
+                            "completed": True,
+                            "post_treatment_followup": True,
+                            "session_eval_skipped": True,
+                        }
+                        self._log_highlight(
+                            "SESSION_PROMPT_POST_TREATMENT_FOLLOWUP meeting_id={} pair={}<->{} session_eval_skipped=true".format(
+                                meeting_id_for_session,
                                 doctor_for_session.name,
                                 patient_for_session.name,
                             )
-                            if isinstance(state_for_session, dict):
-                                current_session = str(state_for_session.get("current_session", "") or "")
-                        except Exception:
-                            current_session = ""
-                        pair_key_for_session = build_pair_key(doctor_for_session.name, patient_for_session.name)
-                        reason_text = str(session_eval_payload.get("reason", "") or "")
-                        self._store_session_eval_reason(
-                            pair_key=pair_key_for_session,
-                            current_session=current_session,
-                            meeting_id=meeting_id_for_session,
-                            reason=reason_text,
                         )
-                        self.append_dialog_judge_trace_eval(
+                    else:
+                        session_eval_payload = self.evaluate_session_after_chat(
+                            doctor=doctor_for_session,
+                            patient=patient_for_session,
+                            chats=chats or [],
+                            summary=str(summary or ""),
                             meeting_id=meeting_id_for_session,
-                            pair_key=pair_key_for_session,
-                            step_time=self._resolve_trace_step_time(),
-                            normalized_eval_payload=session_eval_payload,
+                            start_time=start_time,
                         )
-                        session_eval_end = bool(session_eval_payload.get("session_end", False))
-                    audit = self.session_prompt_injection.on_chat_finished(
-                        doctor_name=doctor_for_session.name,
-                        patient_name=patient_for_session.name,
-                        chats=chats or [],
-                        meeting_id=meeting_id_for_session,
-                        now_str=self._fmt_dt(start_time),
-                        session_eval_end=session_eval_end,
-                    )
+                        if isinstance(session_eval_payload, dict):
+                            current_session = self._resolve_session_prompt_current_session(
+                                doctor_for_session.name,
+                                patient_for_session.name,
+                            )
+                            pair_key_for_session = build_pair_key(doctor_for_session.name, patient_for_session.name)
+                            reason_text = str(session_eval_payload.get("reason", "") or "")
+                            self._store_session_eval_reason(
+                                pair_key=pair_key_for_session,
+                                current_session=current_session,
+                                meeting_id=meeting_id_for_session,
+                                reason=reason_text,
+                            )
+                            self.append_dialog_judge_trace_eval(
+                                meeting_id=meeting_id_for_session,
+                                pair_key=pair_key_for_session,
+                                step_time=self._resolve_trace_step_time(),
+                                normalized_eval_payload=session_eval_payload,
+                            )
+                            session_eval_end = bool(session_eval_payload.get("session_end", False))
+                        audit = self.session_prompt_injection.on_chat_finished(
+                            doctor_name=doctor_for_session.name,
+                            patient_name=patient_for_session.name,
+                            chats=chats or [],
+                            meeting_id=meeting_id_for_session,
+                            now_str=self._fmt_dt(start_time),
+                            session_eval_end=session_eval_end,
+                        )
                     if session_eval_end is not None:
                         self._log_highlight(
                             "[SESSION_PROMPT_EVAL_END] meeting_id={} session_eval_end={} action={}".format(
@@ -545,9 +577,16 @@ class InterventionManager:
                             self._log_highlight(
                                 "MEMORY_INJECTION_SESSION_APPLY_ERROR detail={}".format(str(exc))
                             )
-                    if bool(audit.get("completed", False)):
+                    if str((audit or {}).get("action", "") or "").strip() == "completed_stop_injection":
                         self.mark_step_flag("treatment_completed_this_step", True)
-                    if self.stop_rule_scheduling_on_session_completed and bool(audit.get("completed", False)):
+                    if (
+                        self.stop_rule_scheduling_on_session_completed
+                        and bool(audit.get("completed", False))
+                        and not self._is_post_treatment_followup_active_for_pair(
+                            doctor_for_session.name,
+                            patient_for_session.name,
+                        )
+                    ):
                         purged = self._purge_patient_meetings(
                             patient_name=patient_for_session.name,
                             now=start_time,
@@ -3887,12 +3926,48 @@ class InterventionManager:
             return ""
         return ""
 
+    def _is_post_treatment_followup_active_for_pair(self, doctor_name: str, patient_name: str) -> bool:
+        manager = self.session_prompt_injection
+        if not manager or (not bool(getattr(manager, "enabled", False))):
+            return False
+        if not hasattr(manager, "is_post_treatment_followup_active"):
+            return False
+        try:
+            return bool(manager.is_post_treatment_followup_active(doctor_name, patient_name))
+        except Exception:
+            return False
+
+    def _should_skip_session_eval_for_post_treatment_followup(self) -> bool:
+        manager = self.session_prompt_injection
+        if not manager or (not bool(getattr(manager, "enabled", False))):
+            return False
+        if not hasattr(manager, "should_skip_session_eval_for_post_treatment_followup"):
+            return False
+        try:
+            return bool(manager.should_skip_session_eval_for_post_treatment_followup())
+        except Exception:
+            return False
+
+    def _resolve_session_prompt_current_session(self, doctor_name: str, patient_name: str) -> str:
+        manager = self.session_prompt_injection
+        if not manager or (not bool(getattr(manager, "enabled", False))):
+            return ""
+        try:
+            state = manager.resolve_current_session(doctor_name, patient_name)
+        except Exception:
+            return ""
+        if not isinstance(state, dict):
+            return ""
+        return str(state.get("current_session", "") or "")
+
     def _is_session_completed_for_pair(self, doctor_name: str, patient_name: str) -> bool:
         if not self.stop_rule_scheduling_on_session_completed:
             return False
         doctor = str(doctor_name or "").strip()
         patient = str(patient_name or "").strip()
         if (not doctor) or (not patient):
+            return False
+        if self._is_post_treatment_followup_active_for_pair(doctor, patient):
             return False
         if not self.session_prompt_injection or (not bool(getattr(self.session_prompt_injection, "enabled", False))):
             return False
@@ -3957,8 +4032,11 @@ class InterventionManager:
             parts = raw_key.split("::", 1)
             if len(parts) != 2:
                 continue
+            doctor = str(parts[0] or "").strip()
             patient = str(parts[1] or "").strip()
             if (not patient) or (patient in seen):
+                continue
+            if self._is_post_treatment_followup_active_for_pair(doctor, patient):
                 continue
             seen.add(patient)
             completed_patients.append(patient)
@@ -4001,6 +4079,7 @@ class InterventionManager:
             resident_chat_state["rules"] = {}
         if not isinstance(resident_chat_state.get("completed_counts_by_patient"), dict):
             resident_chat_state["completed_counts_by_patient"] = {}
+        self._ensure_completed_meeting_state_schema()
         environment_task_state = self.state.get("environment_task_state", {})
         if not isinstance(environment_task_state, dict):
             environment_task_state = {}
@@ -4069,6 +4148,72 @@ class InterventionManager:
             "RESIDENT_CHAT_COMPLETED_COUNT patient={} count={}".format(
                 patient,
                 completed_counts[patient],
+            )
+        )
+
+    def _ensure_completed_meeting_state_schema(self) -> None:
+        state = self.state.setdefault("completed_meeting_state", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.state["completed_meeting_state"] = state
+        if not isinstance(state.get("counts_by_pair"), dict):
+            state["counts_by_pair"] = {}
+        if not isinstance(state.get("meeting_ids_by_pair"), dict):
+            state["meeting_ids_by_pair"] = {}
+        if not isinstance(state.get("records_by_meeting_id"), dict):
+            state["records_by_meeting_id"] = {}
+
+    def _mark_completed_meeting(
+        self,
+        doctor_name: str,
+        patient_name: str,
+        meeting_id: str,
+        meeting_kind: str,
+        finished_at: Any,
+    ) -> None:
+        doctor = str(doctor_name or "").strip()
+        patient = str(patient_name or "").strip()
+        mid = str(meeting_id or "").strip()
+        if (not doctor) or (not patient) or (not mid):
+            return
+        self._ensure_state_schema()
+        completed_state = self.state.setdefault("completed_meeting_state", {})
+        counts_by_pair = completed_state.setdefault("counts_by_pair", {})
+        meeting_ids_by_pair = completed_state.setdefault("meeting_ids_by_pair", {})
+        records_by_meeting_id = completed_state.setdefault("records_by_meeting_id", {})
+        if not isinstance(counts_by_pair, dict):
+            counts_by_pair = {}
+            completed_state["counts_by_pair"] = counts_by_pair
+        if not isinstance(meeting_ids_by_pair, dict):
+            meeting_ids_by_pair = {}
+            completed_state["meeting_ids_by_pair"] = meeting_ids_by_pair
+        if not isinstance(records_by_meeting_id, dict):
+            records_by_meeting_id = {}
+            completed_state["records_by_meeting_id"] = records_by_meeting_id
+        if mid in records_by_meeting_id:
+            return
+
+        pair_key = build_pair_key(doctor, patient)
+        ids = meeting_ids_by_pair.setdefault(pair_key, [])
+        if not isinstance(ids, list):
+            ids = []
+            meeting_ids_by_pair[pair_key] = ids
+        if mid not in ids:
+            ids.append(mid)
+        counts_by_pair[pair_key] = len(ids)
+        records_by_meeting_id[mid] = {
+            "meeting_id": mid,
+            "pair_key": pair_key,
+            "doctor": doctor,
+            "patient": patient,
+            "meeting_kind": str(meeting_kind or "doctor_consult"),
+            "finished_at": self._fmt_dt(finished_at),
+        }
+        self._log_highlight(
+            "COMPLETED_MEETING_COUNT pair_key={} count={} meeting_id={}".format(
+                pair_key,
+                counts_by_pair[pair_key],
+                mid,
             )
         )
 

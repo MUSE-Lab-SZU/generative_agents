@@ -244,6 +244,10 @@ class StagedEvalManager:
         if doctor_count > 0:
             return doctor_count, "doctor_completed_meeting"
 
+        completed_meeting_count = self._compute_intervention_completed_meeting_count(runtime_config)
+        if completed_meeting_count > 0:
+            return completed_meeting_count, "intervention_completed_meeting"
+
         return 0, "none"
 
     def _compute_resident_chat_completed_count(self, runtime_config: Dict[str, Any]) -> int:
@@ -306,6 +310,41 @@ class StagedEvalManager:
         if completed_meeting_ids:
             return len(completed_meeting_ids)
         return fallback_history_count
+
+    def _compute_intervention_completed_meeting_count(self, runtime_config: Dict[str, Any]) -> int:
+        if not isinstance(runtime_config, dict):
+            return 0
+
+        state = runtime_config.get("intervention_state", {}) or {}
+        if not isinstance(state, dict):
+            return 0
+
+        completed_state = state.get("completed_meeting_state", {}) or {}
+        if not isinstance(completed_state, dict):
+            return 0
+
+        doctor_name = self._doctor_name(runtime_config)
+        target_agent = self._target_agent()
+        if not doctor_name or not target_agent:
+            return 0
+
+        pair_key = f"{doctor_name}::{target_agent}"
+        meeting_ids_by_pair = completed_state.get("meeting_ids_by_pair", {}) or {}
+        if isinstance(meeting_ids_by_pair, dict):
+            meeting_ids = meeting_ids_by_pair.get(pair_key, [])
+            if isinstance(meeting_ids, list):
+                unique_ids = {
+                    str(item or "").strip()
+                    for item in meeting_ids
+                    if str(item or "").strip()
+                }
+                if unique_ids:
+                    return len(unique_ids)
+
+        counts_by_pair = completed_state.get("counts_by_pair", {}) or {}
+        if not isinstance(counts_by_pair, dict):
+            return 0
+        return max(0, self._safe_int(counts_by_pair.get(pair_key, 0), 0))
 
     def _maybe_run_session_interval_trigger(
         self,

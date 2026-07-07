@@ -191,12 +191,12 @@
       "rules": []
     },
     "order_extract": {
-      "enabled": false,
+      "enabled": true,
       "prompt_file": "data/prompts/extract_doctor_order.txt",
       "max_tasks_per_chat": 3
     },
     "environment_model": {
-      "enabled": false,
+      "enabled": true,
       "route": "forced_llm",
       "prompt_file": "data/prompts/intervention/environment_task_outcome.txt",
       "retry": 2,
@@ -224,6 +224,11 @@
         "session4.4"
       ],
       "scope": "forced_chat_only",
+      "post_treatment_followup": {
+        "enabled": true,
+        "prompt_file": "data/prompts/intervention/post_treatment_followup.txt",
+        "skip_session_eval": true
+      },
       "stop_rule_scheduling_on_session_completed": true
     },
     "chat_controls": {
@@ -426,9 +431,9 @@
       "label_prefix": "session",
       "max_triggers": 0
     },
-    "t4_enabled": true,
+    "t4_enabled": false,
     "t4_after_steps": 8,
-    "auto_stop_after_t4_done": true,
+    "auto_stop_after_t4_done": false,
     "worker_script": "runshells/run_staged_eval_worker.py",
     "worker_timeout_seconds": 7200,
     "cleanup_tmp_storage": true,

@@ -24,6 +24,9 @@ class SessionPromptInjectionManager:
         ).strip()
         self.namespace = str(self.injection_cfg.get("namespace", "CBT") or "CBT").strip() or "CBT"
         self.advance_marker = str(self.injection_cfg.get("advance_marker", "[SESSION_END]") or "[SESSION_END]").strip()
+        self.post_treatment_followup_cfg = self._normalize_post_treatment_followup_cfg(
+            self.injection_cfg.get("post_treatment_followup", {}) or {}
+        )
 
         session_prompt_state = self.state.setdefault("session_prompt_state", {})
         if not isinstance(session_prompt_state, dict):
@@ -34,10 +37,11 @@ class SessionPromptInjectionManager:
             session_prompt_state["pairs"] = {}
 
         self._log(
-            "initialized enabled={} namespace={} order_size={}".format(
+            "initialized enabled={} namespace={} order_size={} post_treatment_followup_enabled={}".format(
                 self.enabled,
                 self.namespace,
                 len(self._order()),
+                bool(self.post_treatment_followup_cfg.get("enabled", False)),
             )
         )
 
@@ -55,6 +59,31 @@ class SessionPromptInjectionManager:
             self._log("skip inject reason=non_forced pair={}::{}".format(doctor_name, patient_name))
             return ""
 
+        state = self.resolve_current_session(doctor_name, patient_name)
+        if bool(state.get("completed", False)):
+            if self.is_post_treatment_followup_active(doctor_name, patient_name):
+                prompt_text = self.load_post_treatment_followup_prompt()
+                if prompt_text:
+                    state["last_meeting_id"] = str(meeting_id or state.get("last_meeting_id", ""))
+                    self._log_highlight(
+                        "inject pair={}::{} mode=post_treatment_followup forced={} meeting_id={}".format(
+                            doctor_name,
+                            patient_name,
+                            bool(forced),
+                            meeting_id,
+                        )
+                    )
+                    return (
+                        "<DOCTOR_SESSION_PROMPT_INJECTION>\n"
+                        + prompt_text
+                        + "\n</DOCTOR_SESSION_PROMPT_INJECTION>"
+                    )
+                self._log("skip inject reason=post_treatment_followup_prompt_empty pair={}::{}".format(doctor_name, patient_name))
+                return ""
+
+            self._log("skip inject reason=completed pair={}::{}".format(doctor_name, patient_name))
+            return ""
+
         order = self._order()
         if not order:
             self._log("skip inject reason=empty_order pair={}::{}".format(doctor_name, patient_name))
@@ -63,11 +92,6 @@ class SessionPromptInjectionManager:
         namespace_map = self.load_session_prompt_map()
         if not namespace_map:
             self._log("skip inject reason=empty_prompt_map pair={}::{}".format(doctor_name, patient_name))
-            return ""
-
-        state = self.resolve_current_session(doctor_name, patient_name)
-        if bool(state.get("completed", False)):
-            self._log("skip inject reason=completed pair={}::{}".format(doctor_name, patient_name))
             return ""
 
         session_id = str(state.get("current_session", "") or "")
@@ -286,6 +310,42 @@ class SessionPromptInjectionManager:
             return {}
         return namespace_map
 
+    def get_post_treatment_followup_policy(self) -> Dict[str, Any]:
+        return dict(self.post_treatment_followup_cfg)
+
+    def is_post_treatment_followup_enabled(self) -> bool:
+        return bool(self.enabled and self.post_treatment_followup_cfg.get("enabled", False))
+
+    def should_skip_session_eval_for_post_treatment_followup(self) -> bool:
+        return bool(
+            self.is_post_treatment_followup_enabled()
+            and self.post_treatment_followup_cfg.get("skip_session_eval", True)
+        )
+
+    def is_post_treatment_followup_active(self, doctor_name: str, patient_name: str) -> bool:
+        if not self.is_post_treatment_followup_enabled():
+            return False
+        doctor = str(doctor_name or "").strip()
+        patient = str(patient_name or "").strip()
+        if (not doctor) or (not patient):
+            return False
+        pairs = self._pairs_state()
+        state = pairs.get(self._pair_key(doctor, patient), {})
+        if not isinstance(state, dict):
+            return False
+        return bool(state.get("completed", False))
+
+    def load_post_treatment_followup_prompt(self) -> str:
+        path = str(self.post_treatment_followup_cfg.get("prompt_file", "") or "").strip()
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fp:
+                return fp.read().strip()
+        except Exception as err:
+            self._log("load post treatment followup prompt failed path={} err={}".format(path, err))
+            return ""
+
     def _find_next_available_session(
         self,
         order: List[str],
@@ -313,6 +373,16 @@ class SessionPromptInjectionManager:
             if sid not in result:
                 result.append(sid)
         return result
+
+    def _normalize_post_treatment_followup_cfg(self, raw: Any) -> Dict[str, Any]:
+        cfg = raw if isinstance(raw, dict) else {}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "prompt_file": str(
+                cfg.get("prompt_file", "data/prompts/intervention/post_treatment_followup.txt") or ""
+            ).strip(),
+            "skip_session_eval": bool(cfg.get("skip_session_eval", True)),
+        }
 
     def _pairs_state(self) -> Dict[str, Any]:
         session_prompt_state = self.state.setdefault("session_prompt_state", {})
