@@ -10,7 +10,12 @@
       "enabled": false
     },
     "order_extract": {
-      "enabled": true
+      "enabled": true,
+      "prompt_file": "data/prompts/extract_doctor_order.txt",
+      "max_tasks_per_chat": 3
+    },
+    "environment_model": {
+      "enabled": false
     },
     "session_prompt_injection": {
       "enabled": true

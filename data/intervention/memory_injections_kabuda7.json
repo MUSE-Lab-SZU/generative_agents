@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "kbd_stress_event_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因差评和退货增多而感到压力上升",
+          "describe": "卡布达经营的小网店最近差评和退货增多，此时感到压力上升，并担心自己让很多客户失望。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_002",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因消息提示音而感到羞耻",
+          "describe": "每次听到消息提示音时，卡布达都会担心又有人指出自己的问题，不敢立刻打开查看。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_thought_003",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我可能连小店都经营不好",
+          "describe": "卡布达常担心自己即使认真打包和回复，也无法阻止别人继续失望。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_004",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "一想到售后和评价就会紧张",
+          "describe": "每当想到退货、差评或未读消息时，卡布达就会担心自己又要面对新的否定。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

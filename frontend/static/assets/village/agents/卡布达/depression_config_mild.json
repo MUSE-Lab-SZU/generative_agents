@@ -15,21 +15,21 @@
       {
         "id": "mild_job_loss_self_doubt",
         "label": "把失业理解成自己不够好",
-        "summary": "被辞退引发明显自我怀疑，但还没有完全扩展成整个人都失败。",
+        "summary": "被辞退引发明显自我怀疑，睡眠和胃口偶尔受影响，但还没有完全扩展成整个人都失败。",
         "core_belief": "我可能真的不够好，不然为什么会是我被辞退。",
-        "narrative_focus": ["失业", "自我怀疑", "怕被问近况", "尴尬", "勉强维持日常"],
+        "narrative_focus": ["失业", "自我怀疑", "怕被问近况", "睡得不稳", "勉强维持日常"],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "low",
-          "repair_pattern": "先说自己还行，再补一点真实的不安"
+          "repair_pattern": "先说自己还行，再补一点睡不好或没胃口的真实不安"
         },
         "emotion_vector": {
-          "valence": 0.42,
+          "valence": 0.40,
           "arousal": 0.36,
           "defensiveness": 0.44,
           "shame": 0.48,
-          "hopelessness": 0.28,
+          "hopelessness": 0.30,
           "trust": 0.44
         },
         "advance_signals": [

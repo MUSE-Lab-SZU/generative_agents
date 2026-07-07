@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "kbd_stress_event_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因归档出错和返工而感到压力上升",
+          "describe": "卡布达最近一次数据归档出错造成返工，此时感到压力上升，并担心自己连最基本的细心都没有。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_002",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因碰到表格和记录而感到羞耻",
+          "describe": "每次看到表格和编号时，卡布达都会想起那次错误，担心别人已经不再信任自己。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_thought_003",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我可能不值得被托付任何记录",
+          "describe": "卡布达常担心自己即使反复核对，也还是会漏掉关键错误。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_004",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "一想到档案室和返工记录就会紧张",
+          "describe": "每当想到档案室、返工清单或未核对的表格时，卡布达就会担心自己再次出错。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

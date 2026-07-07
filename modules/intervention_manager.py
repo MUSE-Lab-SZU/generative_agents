@@ -3,8 +3,7 @@
 阶段 1 + 阶段 2 + 阶段 3：
 - 保持低侵入：通过 hook 接入，不重写主认知流程
 - 支持周期规则触发 meeting lock（weekly / interval_days / interval_minutes / interval_steps）
-- 会话后自动解锁并提取医嘱，写入患者 forced_tasks
-- make_schedule 阶段合并到日程（hard plan）
+- 会话后自动解锁并提取医嘱，可交给 Environment Model 生成任务结果记忆
 """
 
 from __future__ import annotations
@@ -82,10 +81,16 @@ class InterventionManager:
         )
         self.chat_controls_cfg = intervention_cfg.get("chat_controls", {}) or {}
         self.forced_llm_cfg = intervention_cfg.get("forced_llm", {}) or {}
+        self.environment_model_cfg = intervention_cfg.get("environment_model", {}) or {}
         self.consult_record_cfg = intervention_cfg.get("consult_record", {}) or {}
         self.consult_history_cfg = intervention_cfg.get("consult_history", {}) or {}
+        self.reflection_policy_cfg = (
+            ((config.get("agent", {}) or {}).get("think", {}) or {}).get("reflection_policy", {}) or {}
+        )
         self._consult_record_llm = None
         self._consult_record_llm_key = ""
+        self._environment_llm = None
+        self._environment_llm_key = ""
         self._think_llm = None
         self._think_llm_key = ""
         self._consult_history_indexes: Dict[str, Any] = {}
@@ -369,6 +374,7 @@ class InterventionManager:
         skip_consult_artifacts = closed_meeting_kind == "resident_chat"
         if skip_consult_artifacts and closed_meeting_id:
             self._mark_resident_chat_completed(closed_patient_name)
+            self.mark_step_flag("forced_consult_happened", True)
         elif closed_meeting_id:
             self.mark_step_flag("forced_consult_happened", True)
         if skip_consult_artifacts:
@@ -380,7 +386,7 @@ class InterventionManager:
                 )
             )
         else:
-            # 医患会话后尝试抽取医嘱并写入患者 forced_tasks
+            # 医患会话后尝试抽取医生作业，并交给环境模型生成任务结果记忆
             self._log_highlight(
                 "ORDER_EXTRACT_START speaker={} other={} chats={}".format(
                     getattr(speaker, "name", ""),
@@ -388,7 +394,14 @@ class InterventionManager:
                     len(chats or []),
                 )
             )
-            self._extract_and_queue_orders(speaker, other, chats)
+            self._extract_and_queue_orders(
+                speaker=speaker,
+                other=other,
+                chats=chats,
+                meeting_id=closed_meeting_id,
+                meeting_kind=closed_meeting_kind or "doctor_consult",
+                start_time=start_time,
+            )
 
             self._handle_consult_history_after_chat(
                 speaker=speaker,
@@ -548,6 +561,20 @@ class InterventionManager:
                             )
                         )
 
+        self._handle_conditional_reflection_after_chat(
+            speaker=speaker,
+            other=other,
+            chats=chats or [],
+            summary=str(summary or ""),
+            start_time=start_time,
+            meeting_id=closed_meeting_id,
+            meeting_kind=closed_meeting_kind or "doctor_consult",
+            doctor=doctor_for_session,
+            patient=patient_for_session,
+            closed_doctor_name=closed_doctor_name,
+            closed_patient_name=closed_patient_name,
+        )
+
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
         if not doctor or not patient:
             return
@@ -573,6 +600,229 @@ class InterventionManager:
                 bool(runtime_snapshot.get("long_term_changed", False)),
             )
         )
+
+    def _handle_conditional_reflection_after_chat(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        summary: str,
+        start_time: Any,
+        meeting_id: str,
+        meeting_kind: str,
+        doctor: Any = None,
+        patient: Any = None,
+        closed_doctor_name: str = "",
+        closed_patient_name: str = "",
+    ) -> None:
+        if not str(meeting_id or "").strip():
+            return
+        cfg = self._reflection_conditional_cfg()
+        if not self._safe_bool(cfg.get("enabled", True), True):
+            self._log_highlight(
+                "REFLECTION_AFTER_CHAT_SKIP meeting_id={} reason=conditional_disabled".format(
+                    str(meeting_id or "")
+                )
+            )
+            return
+        rules = cfg.get("rules", [])
+        if not isinstance(rules, list):
+            rules = []
+        if not rules:
+            rules = [self._default_after_chat_reflection_rule()]
+
+        if not (doctor and patient):
+            resolved_doctor, resolved_patient = self._resolve_doctor_patient_pair(speaker, other)
+            doctor = doctor or resolved_doctor
+            patient = patient or resolved_patient
+
+        agents_map = self._reflection_agents_map(speaker, other, doctor, patient)
+        transcript = to_conversation_text(chats or [])
+        matched = 0
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                continue
+            if not self._safe_bool(rule.get("enabled", True), True):
+                continue
+            if str(rule.get("event", "after_chat") or "after_chat").strip() != "after_chat":
+                continue
+            if not self._reflection_rule_matches_meeting_kind(rule, meeting_kind):
+                continue
+            targets = self._resolve_reflection_rule_targets(
+                rule=rule,
+                speaker=speaker,
+                other=other,
+                doctor=doctor,
+                patient=patient,
+                agents_map=agents_map,
+            )
+            if not targets:
+                self._log_highlight(
+                    "REFLECTION_AFTER_CHAT_SKIP meeting_id={} rule_index={} reason=target_empty".format(
+                        str(meeting_id or ""),
+                        idx,
+                    )
+                )
+                continue
+            matched += 1
+            once_per_meeting = self._safe_bool(rule.get("once_per_meeting", True), True)
+            for target_role, target in targets:
+                if target is None or not hasattr(target, "trigger_reflection"):
+                    continue
+                target_name = str(getattr(target, "name", "") or "")
+                if once_per_meeting and hasattr(target, "has_reflected_for_meeting"):
+                    try:
+                        if target.has_reflected_for_meeting(meeting_id):
+                            self._log_highlight(
+                                "REFLECTION_AFTER_CHAT_SKIP meeting_id={} target={} reason=already_reflected".format(
+                                    str(meeting_id or ""),
+                                    target_name,
+                                )
+                            )
+                            continue
+                    except Exception:
+                        pass
+                chat_node_id = ""
+                try:
+                    chat_node_id = self._resolve_latest_chat_node_id(target)
+                except Exception:
+                    chat_node_id = ""
+                context = {
+                    "event": "after_chat",
+                    "meeting_kind": str(meeting_kind or ""),
+                    "meeting_id": str(meeting_id or ""),
+                    "target_role": str(target_role or ""),
+                    "doctor": str(getattr(doctor, "name", "") or closed_doctor_name or ""),
+                    "patient": str(getattr(patient, "name", "") or closed_patient_name or ""),
+                    "speaker": str(getattr(speaker, "name", "") or ""),
+                    "other": str(getattr(other, "name", "") or ""),
+                    "chat_summary": str(summary or ""),
+                    "chat_transcript": transcript,
+                    "chat_node_id": str(chat_node_id or ""),
+                    "step": int(self.config.get("step", 0) or 0),
+                    "started_at": self._fmt_dt(start_time),
+                }
+                try:
+                    result = target.trigger_reflection(
+                        trigger_source="after_chat",
+                        trigger_context=context,
+                    )
+                    self._log_highlight(
+                        "REFLECTION_AFTER_CHAT_DONE meeting_id={} target={} role={} triggered={} reason={}".format(
+                            str(meeting_id or ""),
+                            target_name,
+                            str(target_role or ""),
+                            bool((result or {}).get("triggered", False)) if isinstance(result, dict) else bool(result),
+                            str((result or {}).get("reason", "") if isinstance(result, dict) else ""),
+                        )
+                    )
+                except Exception as exc:
+                    self._log_highlight(
+                        "REFLECTION_AFTER_CHAT_ERROR meeting_id={} target={} detail={}".format(
+                            str(meeting_id or ""),
+                            target_name,
+                            str(exc),
+                        )
+                    )
+        if matched <= 0:
+            self._log_highlight(
+                "REFLECTION_AFTER_CHAT_SKIP meeting_id={} meeting_kind={} reason=no_rule_matched".format(
+                    str(meeting_id or ""),
+                    str(meeting_kind or ""),
+                )
+            )
+
+    def _reflection_conditional_cfg(self) -> Dict[str, Any]:
+        policy = self.reflection_policy_cfg if isinstance(self.reflection_policy_cfg, dict) else {}
+        conditional = policy.get("conditional", {}) if isinstance(policy.get("conditional", {}), dict) else {}
+        if not conditional:
+            conditional = {
+                "enabled": True,
+                "rules": [self._default_after_chat_reflection_rule()],
+            }
+        return conditional
+
+    @staticmethod
+    def _default_after_chat_reflection_rule() -> Dict[str, Any]:
+        return {
+            "event": "after_chat",
+            "meeting_kind": "doctor_consult",
+            "target_role": "patient",
+            "once_per_meeting": True,
+        }
+
+    def _reflection_rule_matches_meeting_kind(self, rule: Dict[str, Any], meeting_kind: str) -> bool:
+        expected = rule.get("meeting_kind", "doctor_consult")
+        actual = str(meeting_kind or "doctor_consult").strip() or "doctor_consult"
+        if isinstance(expected, str):
+            text = expected.strip()
+            return text in {"", "*", "all"} or text == actual
+        if isinstance(expected, (list, tuple, set)):
+            normalized = {str(item or "").strip() for item in expected}
+            return "*" in normalized or "all" in normalized or actual in normalized
+        return False
+
+    def _reflection_agents_map(self, *agents: Any) -> Dict[str, Any]:
+        agents_map = dict(self._agents_ref) if isinstance(self._agents_ref, dict) else {}
+        for agent in agents:
+            name = str(getattr(agent, "name", "") or "")
+            if name and name not in agents_map:
+                agents_map[name] = agent
+        return agents_map
+
+    def _resolve_reflection_rule_targets(
+        self,
+        rule: Dict[str, Any],
+        speaker: Any,
+        other: Any,
+        doctor: Any,
+        patient: Any,
+        agents_map: Dict[str, Any],
+    ) -> List[Any]:
+        target_agents = rule.get("target_agents", [])
+        if isinstance(target_agents, str):
+            target_names = [target_agents]
+        elif isinstance(target_agents, (list, tuple, set)):
+            target_names = list(target_agents)
+        else:
+            target_names = []
+        if target_names:
+            results = []
+            seen = set()
+            for raw_name in target_names:
+                name = str(raw_name or "").strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                target = agents_map.get(name)
+                if target is not None:
+                    results.append(("target_agent", target))
+            return results
+
+        role = str(rule.get("target_role", "patient") or "patient").strip()
+        candidates = []
+        if role == "patient":
+            candidates = [("patient", patient)]
+        elif role == "doctor":
+            candidates = [("doctor", doctor)]
+        elif role == "speaker":
+            candidates = [("speaker", speaker)]
+        elif role == "other":
+            candidates = [("other", other)]
+        elif role in {"both", "pair", "doctor_patient"}:
+            candidates = [("doctor", doctor), ("patient", patient)]
+        else:
+            candidates = [(role, agents_map.get(role))]
+
+        results = []
+        seen = set()
+        for target_role, target in candidates:
+            name = str(getattr(target, "name", "") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            results.append((target_role, target))
+        return results
 
     def _get_patient_depression_runtime_snapshot(self, patient: Any) -> Dict[str, Any]:
         snapshot = {
@@ -2539,6 +2789,8 @@ class InterventionManager:
             "consult_history": 0,
             "judge_llm": 0,
             "session_eval_llm": 0,
+            "order_extract_llm": 0,
+            "environment_model_llm": 0,
             "unknown": 0,
         }
         for record in records:
@@ -2610,6 +2862,8 @@ class InterventionManager:
                 "- consult_history_count: `{}`".format(counts["consult_history"]),
                 "- judge_count: `{}`".format(counts["judge_llm"]),
                 "- session_eval_count: `{}`".format(counts["session_eval_llm"]),
+                "- order_extract_count: `{}`".format(counts["order_extract_llm"]),
+                "- environment_model_count: `{}`".format(counts["environment_model_llm"]),
                 "- unknown_count: `{}`".format(counts["unknown"]),
                 "- total_count: `{}`".format(len(records)),
                 "",
@@ -2748,8 +3002,20 @@ class InterventionManager:
         if changed:
             intervention["last_intervention_at"] = self._fmt_dt(now_dt)
 
-    def _extract_and_queue_orders(self, speaker: Any, other: Any, chats: Any) -> None:
+    def _extract_and_queue_orders(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        meeting_id: str = "",
+        meeting_kind: str = "doctor_consult",
+        start_time: Any = None,
+    ) -> None:
         if not self.order_extract.get("enabled", True):
+            return
+        env_policy = self.get_environment_model_runtime_policy()
+        if not bool(env_policy.get("enabled", False)):
+            self._log_highlight("ORDER_EXTRACT_SKIP reason=environment_model_disabled")
             return
 
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
@@ -2766,6 +3032,20 @@ class InterventionManager:
             patient.name,
             self._fmt_dt(self._now()),
             conversation,
+            prompt_file=str(self.order_extract.get("prompt_file", "") or "").strip(),
+            _forced_prompt_trace={
+                "enabled": True,
+                "other": patient,
+                "role": "order_extract_llm",
+                "source": "order_extract",
+                "meeting_id": str(meeting_id or ""),
+                "pair_key": build_pair_key(doctor.name, patient.name),
+                "meta": {
+                    "stage": "extract_doctor_order",
+                    "prompt_file": str(self.order_extract.get("prompt_file", "") or "").strip(),
+                    "max_tasks_per_chat": max(1, self._safe_int(self.order_extract.get("max_tasks_per_chat", 3), 3)),
+                },
+            },
         )
         tasks = []
         if isinstance(result, dict):
@@ -2773,30 +3053,22 @@ class InterventionManager:
         if not isinstance(tasks, list):
             return
 
-        min_conf = float(self.order_extract.get("min_confidence", 0.6) or 0.6)
         max_tasks = int(self.order_extract.get("max_tasks_per_chat", 3) or 3)
-
-        self._ensure_agent_state(patient)
-        queue = patient.status["intervention"]["forced_tasks"]
-
-        accepted = 0
+        accepted_tasks = []
         for task in tasks:
-            if accepted >= max_tasks:
+            if len(accepted_tasks) >= max_tasks:
                 break
             if not isinstance(task, dict):
                 continue
-            confidence = float(task.get("confidence", 0.0) or 0.0)
-            if confidence < min_conf:
-                continue
-            if not task.get("date") or not task.get("time") or not task.get("describe"):
+            if not task.get("date") or not task.get("describe"):
                 continue
 
             task_id = "order_{}_{}_{}".format(
                 self._fmt_dt(self._now()).replace(":", "").replace("-", ""),
                 patient.name,
-                accepted + 1,
+                len(accepted_tasks) + 1,
             )
-            queue.append(
+            accepted_tasks.append(
                 {
                     "task_id": task_id,
                     "source": "doctor_order",
@@ -2804,23 +3076,678 @@ class InterventionManager:
                     "patient": patient.name,
                     "describe": str(task.get("describe", "")).strip(),
                     "date": str(task.get("date", "")).strip(),
-                    "time": str(task.get("time", "")).strip(),
-                    "duration": int(task.get("duration", 30) or 30),
-                    "address_hint": str(task.get("address_hint", "")).strip(),
-                    "must_do": bool(task.get("must_do", True)),
-                    "confidence": confidence,
-                    "state": "pending",
                 }
             )
-            accepted += 1
 
-        if accepted > 0:
-            self._log(
-                "queued doctor orders: doctor={}, patient={}, count={}".format(
+        if not accepted_tasks:
+            self._log_highlight(
+                "ORDER_EXTRACT_EMPTY doctor={} patient={}".format(
                     doctor.name,
                     patient.name,
-                    accepted,
                 )
+            )
+            return
+
+        self._log(
+            "extracted doctor orders: doctor={}, patient={}, count={}".format(
+                doctor.name,
+                patient.name,
+                len(accepted_tasks),
+            )
+        )
+        self._apply_environment_task_outcomes(
+            doctor=doctor,
+            patient=patient,
+            tasks=accepted_tasks,
+            meeting_id=meeting_id,
+            meeting_kind=meeting_kind,
+            start_time=start_time,
+            env_policy=env_policy,
+        )
+
+    def get_environment_model_runtime_policy(self) -> Dict[str, Any]:
+        raw_cfg = self.environment_model_cfg if isinstance(self.environment_model_cfg, dict) else {}
+        default_policy = {
+            "enabled": False,
+            "route": "forced_llm",
+            "prompt_file": "data/prompts/intervention/environment_task_outcome.txt",
+            "retry": 2,
+            "poignancy": 5,
+            "expire_days": 30,
+            "max_agents_per_task": 3,
+            "reflect_after_injection": True,
+            "source": "defaults",
+            "llm": {},
+        }
+        if not isinstance(raw_cfg, dict):
+            return default_policy
+        policy = dict(default_policy)
+        policy["source"] = "environment_model_config"
+        policy["enabled"] = self._safe_bool(raw_cfg.get("enabled", False), False)
+        route = str(raw_cfg.get("route", default_policy["route"]) or default_policy["route"]).strip().lower()
+        if route not in {"forced_llm", "think_llm", "custom_llm"}:
+            route = default_policy["route"]
+        policy["route"] = route
+        prompt_file = str(raw_cfg.get("prompt_file", default_policy["prompt_file"]) or "").strip()
+        policy["prompt_file"] = prompt_file or default_policy["prompt_file"]
+        retry = self._safe_int(raw_cfg.get("retry", default_policy["retry"]), default_policy["retry"])
+        policy["retry"] = retry if retry >= 1 else default_policy["retry"]
+        policy["poignancy"] = max(1, self._safe_int(raw_cfg.get("poignancy", default_policy["poignancy"]), default_policy["poignancy"]))
+        policy["expire_days"] = max(1, self._safe_int(raw_cfg.get("expire_days", default_policy["expire_days"]), default_policy["expire_days"]))
+        policy["max_agents_per_task"] = max(
+            0,
+            self._safe_int(
+                raw_cfg.get("max_agents_per_task", default_policy["max_agents_per_task"]),
+                default_policy["max_agents_per_task"],
+            ),
+        )
+        policy["reflect_after_injection"] = self._safe_bool(
+            raw_cfg.get("reflect_after_injection", default_policy["reflect_after_injection"]),
+            default_policy["reflect_after_injection"],
+        )
+        llm_cfg = raw_cfg.get("llm", {})
+        policy["llm"] = copy.deepcopy(llm_cfg) if isinstance(llm_cfg, dict) else {}
+        return policy
+
+    def _build_environment_task_batch_id(self, patient: Any, meeting_id: str) -> str:
+        patient_name = str(getattr(patient, "name", "") or "patient").strip() or "patient"
+        meeting = str(meeting_id or "").strip()
+        stamp = self._fmt_dt(self._now()).replace(":", "").replace("-", "").replace(" ", "_")
+        if meeting:
+            return "envtask_{}_{}".format(meeting, patient_name)
+        return "envtask_{}_{}".format(stamp, patient_name)
+
+    def _build_environment_task_prompt(
+        self,
+        doctor: Any,
+        patient: Any,
+        tasks: List[Dict[str, Any]],
+        meeting_id: str,
+        meeting_kind: str,
+        task_batch_id: str,
+        agents_map: Dict[str, Any],
+        env_policy: Dict[str, Any],
+    ) -> str:
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(str(env_policy.get("prompt_file", "") or ""))
+        except Exception as exc:
+            self._log_highlight(
+                "ENV_TASK_PROMPT_LOAD_ERROR task_batch_id={} prompt_file={} detail={}".format(
+                    task_batch_id,
+                    str(env_policy.get("prompt_file", "") or ""),
+                    str(exc),
+                )
+            )
+            return ""
+        known_agents = sorted(
+            [
+                str(name or "").strip()
+                for name in (agents_map or {}).keys()
+                if str(name or "").strip()
+            ]
+        )
+        task_prompt_items = []
+        for task in tasks or []:
+            if not isinstance(task, dict):
+                continue
+            task_prompt_items.append(
+                {
+                    "describe": str(task.get("describe", "") or ""),
+                    "date": str(task.get("date", "") or ""),
+                }
+            )
+        task_json = json.dumps(task_prompt_items, ensure_ascii=False, indent=2)
+        patient_state_summary = self._build_patient_dynamic_state_text(
+            patient_agent=patient,
+            doctor_agent=doctor,
+        )
+        return self._render_prompt_template(
+            prompt_tpl,
+            {
+                "doctor": str(getattr(doctor, "name", "") or ""),
+                "patient": str(getattr(patient, "name", "") or ""),
+                "now": self._fmt_dt(self._now()),
+                "patient_state_summary": str(patient_state_summary or ""),
+                "known_agents": "\n".join(["- {}".format(name) for name in known_agents]),
+                "tasks_json": task_json,
+            },
+        )
+
+    def _call_environment_model_json(
+        self,
+        prompt_text: str,
+        retry: int,
+        doctor_agent: Any,
+        env_policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        route = str((env_policy or {}).get("route", "forced_llm") or "forced_llm").strip().lower()
+        if route == "think_llm":
+            return self._call_think_llm_json(
+                prompt_text=prompt_text,
+                retry=retry,
+                doctor_agent=doctor_agent,
+                caller="environment_task_outcome_think_llm",
+            )
+        runtime_cfg = self._resolve_environment_llm_runtime(env_policy)
+        retry_count = max(1, int(retry or runtime_cfg.get("retry", 2) or 2))
+        cache_key = "{}/{}/{}".format(
+            runtime_cfg.get("provider", ""),
+            runtime_cfg.get("model", ""),
+            runtime_cfg.get("base_url", ""),
+        )
+        if self._environment_llm is None or self._environment_llm_key != cache_key:
+            self._environment_llm = create_llm_model(runtime_cfg)
+            self._environment_llm_key = cache_key
+        payload = self._environment_llm.completion(
+            prompt_text,
+            retry=retry_count,
+            callback=self._json_loads_loose,
+            failsafe=None,
+            caller="environment_task_outcome",
+            temperature=float(runtime_cfg.get("temperature", 0.4) or 0.4),
+        )
+        if not isinstance(payload, dict):
+            raise ConsultRecordError(reason="environment_model_json_parse_failed", retryable=False)
+        return payload
+
+    def _resolve_environment_llm_runtime(self, env_policy: Dict[str, Any]) -> Dict[str, Any]:
+        route = str((env_policy or {}).get("route", "forced_llm") or "forced_llm").strip().lower()
+        if route == "custom_llm":
+            llm_cfg = copy.deepcopy((env_policy or {}).get("llm", {}) or {})
+            if not isinstance(llm_cfg, dict) or not llm_cfg:
+                raise ConsultRecordError(reason="environment_model_llm_missing", retryable=False)
+            api_key_env = str(llm_cfg.get("api_key_env", "") or "").strip()
+            if api_key_env and not str(llm_cfg.get("api_key", "") or "").strip():
+                llm_cfg["api_key"] = str(os.getenv(api_key_env, "") or "")
+            if not str(llm_cfg.get("api_key", "") or "").strip():
+                llm_cfg["api_key"] = "EMPTY"
+            llm_cfg["retry"] = self._safe_int(llm_cfg.get("retry", (env_policy or {}).get("retry", 2)), 2)
+            return llm_cfg
+        runtime_cfg = self.get_forced_llm_runtime_config()
+        if not runtime_cfg:
+            raise ConsultRecordError(reason="environment_model_forced_llm_unavailable", retryable=True)
+        runtime_cfg = copy.deepcopy(runtime_cfg)
+        runtime_cfg["retry"] = self._safe_int((env_policy or {}).get("retry", runtime_cfg.get("retry", 2)), runtime_cfg.get("retry", 2))
+        return runtime_cfg
+
+    def _normalize_environment_task_outcomes(
+        self,
+        payload: Dict[str, Any],
+        tasks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        raw = payload if isinstance(payload, dict) else {}
+        outcomes = raw.get("outcomes", raw.get("tasks", []))
+        if not isinstance(outcomes, list):
+            return []
+        normalized = []
+        max_tasks = len(tasks or [])
+        for idx, item in enumerate(outcomes):
+            if not isinstance(item, dict):
+                continue
+            raw_task_index = item.get("task_index", item.get("index", idx))
+            try:
+                task_index = int(raw_task_index)
+            except Exception:
+                task_index = idx
+            if task_index < 0 or task_index >= max_tasks:
+                continue
+            event_memory = str(item.get("event", "") or "").strip()
+            raw_agents = item.get("agents", item.get("social_agents", []))
+            if isinstance(raw_agents, str):
+                agents = [raw_agents]
+            elif isinstance(raw_agents, (list, tuple, set)):
+                agents = list(raw_agents)
+            else:
+                agents = []
+            normalized_agents = []
+            for raw_agent in agents:
+                agent_name = str(raw_agent or "").strip()
+                if agent_name and agent_name not in normalized_agents:
+                    normalized_agents.append(agent_name)
+            if not event_memory:
+                continue
+            normalized.append(
+                {
+                    "task_index": task_index,
+                    "event": event_memory,
+                    "agents": normalized_agents,
+                }
+            )
+        return normalized
+
+    def _build_environment_memory_payloads(
+        self,
+        outcomes: List[Dict[str, Any]],
+        tasks: List[Dict[str, Any]],
+        doctor: Any,
+        patient: Any,
+        agents_map: Dict[str, Any],
+        task_batch_id: str,
+        meeting_id: str,
+        meeting_kind: str,
+        env_policy: Dict[str, Any],
+        now: Any,
+    ) -> tuple:
+        patient_name = str(getattr(patient, "name", "") or "")
+        doctor_name = str(getattr(doctor, "name", "") or "")
+        known_agents = agents_map if isinstance(agents_map, dict) else {}
+        max_social = int(env_policy.get("max_agents_per_task", 3) or 3)
+        event_poignancy = int(env_policy.get("poignancy", 5) or 5)
+        expire_days = int(env_policy.get("expire_days", 30) or 30)
+        step_no = int(self.config.get("step", 0) or 0)
+        payloads_by_agent: Dict[str, Dict[str, Any]] = {}
+        summary_lines = []
+
+        def _payload_for(agent_name: str) -> Dict[str, Any]:
+            if agent_name not in payloads_by_agent:
+                payloads_by_agent[agent_name] = {
+                    "request_id": "envtask_{}_{}".format(task_batch_id, agent_name),
+                    "source": "environment_task_outcome",
+                    "target_agent": agent_name,
+                    "options": {
+                        "allow_partial_success": True,
+                        "dedup_mode": "global",
+                    },
+                    "meta": {
+                        "step": step_no,
+                        "scene": "environment_task_result",
+                        "meeting_id": str(meeting_id or ""),
+                        "meeting_kind": str(meeting_kind or ""),
+                        "task_batch_id": str(task_batch_id or ""),
+                        "doctor": doctor_name,
+                        "patient": patient_name,
+                    },
+                    "items": [],
+                }
+            return payloads_by_agent[agent_name]
+
+        for outcome in outcomes:
+            task_index = int(outcome.get("task_index", 0) or 0)
+            task = tasks[task_index] if 0 <= task_index < len(tasks) else {}
+            task_id = str(task.get("task_id", "task_{}".format(task_index + 1)) or "")
+            describe = str(task.get("describe", "") or "")
+            summary_lines.append(
+                "任务{}({}): {} -> {}".format(
+                    task_index + 1,
+                    task_id,
+                    describe,
+                    str(outcome.get("event", "") or ""),
+                )
+            )
+            event_memory = str(outcome.get("event", "") or "").strip()
+            if event_memory:
+                _payload_for(patient_name)["items"].append(
+                    {
+                        "item_id": "{}_event_{}_patient".format(task_id, task_index + 1),
+                        "node_type": "event",
+                        "subject": patient_name,
+                        "predicate": "此时",
+                        "object": "执行医生作业后形成结果",
+                        "describe": event_memory,
+                        "poignancy": event_poignancy,
+                        "expire_days": expire_days,
+                        "tags": ["environment_task_result", "doctor_order"],
+                        "meta": {
+                            "task_id": task_id,
+                            "task_index": task_index,
+                            "task_describe": describe,
+                        },
+                    }
+                )
+            social_count = 0
+            for agent_name in outcome.get("agents", []) or []:
+                if social_count >= max_social:
+                    break
+                agent_name = str(agent_name or "").strip()
+                if not agent_name:
+                    continue
+                if agent_name == patient_name:
+                    continue
+                if agent_name not in known_agents:
+                    self._log_highlight(
+                        "ENV_TASK_SOCIAL_MEMORY_SKIP task_batch_id={} task_id={} agent={} reason=unknown_agent".format(
+                            task_batch_id,
+                            task_id,
+                            agent_name,
+                        )
+                    )
+                    continue
+                _payload_for(agent_name)["items"].append(
+                    {
+                        "item_id": "{}_social_event_{}_{}".format(task_id, task_index + 1, social_count + 1),
+                        "node_type": "event",
+                        "subject": agent_name,
+                        "predicate": "此时",
+                        "object": "参与了患者医生作业相关互动",
+                        "describe": event_memory,
+                        "poignancy": event_poignancy,
+                        "expire_days": expire_days,
+                        "tags": ["environment_task_result", "doctor_order", "social_sync"],
+                        "meta": {
+                            "task_id": task_id,
+                            "task_index": task_index,
+                            "patient": patient_name,
+                            "task_describe": describe,
+                        },
+                    }
+                )
+                social_count += 1
+
+        payloads = [
+            payload
+            for payload in payloads_by_agent.values()
+            if isinstance(payload.get("items"), list) and payload.get("items")
+        ]
+        return payloads, summary_lines
+
+    def _count_injected_memory_results(self, result: Dict[str, Any]) -> int:
+        if not isinstance(result, dict):
+            return 0
+        total = 0
+        for item in result.get("results", []) or []:
+            if isinstance(item, dict):
+                total += int(item.get("injected", 0) or 0)
+        return total
+
+    def _append_environment_task_audit(
+        self,
+        task_batch_id: str,
+        meeting_id: str,
+        doctor: str,
+        patient: str,
+        tasks: List[Dict[str, Any]],
+        outcomes: List[Dict[str, Any]],
+        injection_result: Dict[str, Any],
+    ) -> None:
+        self._ensure_state_schema()
+        task_state = self.state.setdefault("environment_task_state", {})
+        if not isinstance(task_state, dict):
+            task_state = {}
+            self.state["environment_task_state"] = task_state
+        audit = task_state.setdefault("audit", [])
+        if not isinstance(audit, list):
+            audit = []
+            task_state["audit"] = audit
+        audit.append(
+            {
+                "task_batch_id": str(task_batch_id or ""),
+                "meeting_id": str(meeting_id or ""),
+                "doctor": str(doctor or ""),
+                "patient": str(patient or ""),
+                "created_at": self._fmt_dt(self._now()),
+                "tasks": copy.deepcopy(tasks),
+                "outcomes": copy.deepcopy(outcomes),
+                "injection_status": str((injection_result or {}).get("status", "") if isinstance(injection_result, dict) else ""),
+                "injected": self._count_injected_memory_results(injection_result),
+            }
+        )
+        if len(audit) > 500:
+            del audit[:-500]
+
+    def _handle_conditional_reflection_environment_task_result(
+        self,
+        patient: Any,
+        doctor: Any,
+        task_batch_id: str,
+        meeting_id: str,
+        meeting_kind: str,
+        tasks: List[Dict[str, Any]],
+        outcomes: List[Dict[str, Any]],
+        outcome_summary: str,
+    ) -> None:
+        if patient is None or not hasattr(patient, "trigger_reflection"):
+            return
+        cfg = self._reflection_conditional_cfg()
+        if not self._safe_bool(cfg.get("enabled", True), True):
+            self._log_highlight(
+                "REFLECTION_ENV_TASK_SKIP task_batch_id={} reason=conditional_disabled".format(task_batch_id)
+            )
+            return
+        rules = cfg.get("rules", [])
+        if not isinstance(rules, list):
+            rules = []
+        matched = 0
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                continue
+            if not self._safe_bool(rule.get("enabled", True), True):
+                continue
+            if str(rule.get("event", "") or "").strip() != "environment_task_result":
+                continue
+            target_role = str(rule.get("target_role", "patient") or "patient").strip()
+            if target_role not in {"patient", "all"}:
+                continue
+            if not self._reflection_rule_matches_meeting_kind(rule, meeting_kind):
+                continue
+            matched += 1
+            once_per_batch = self._safe_bool(rule.get("once_per_task_batch", True), True)
+            if once_per_batch and self._has_reflected_for_environment_task_batch(task_batch_id):
+                self._log_highlight(
+                    "REFLECTION_ENV_TASK_SKIP task_batch_id={} rule_index={} reason=already_reflected".format(
+                        task_batch_id,
+                        idx,
+                    )
+                )
+                continue
+            context = {
+                "event": "environment_task_result",
+                "meeting_kind": str(meeting_kind or ""),
+                "meeting_id": str(meeting_id or ""),
+                "task_batch_id": str(task_batch_id or ""),
+                "target_role": "patient",
+                "doctor": str(getattr(doctor, "name", "") or ""),
+                "patient": str(getattr(patient, "name", "") or ""),
+                "task_count": len(tasks or []),
+                "outcome_count": len(outcomes or []),
+                "chat_summary": str(outcome_summary or ""),
+                "step": int(self.config.get("step", 0) or 0),
+                "started_at": self._fmt_dt(self._now()),
+            }
+            try:
+                result = patient.trigger_reflection(
+                    trigger_source="environment_task_result",
+                    trigger_context=context,
+                )
+                self._mark_environment_task_reflected(task_batch_id, result)
+                self._log_highlight(
+                    "REFLECTION_ENV_TASK_DONE task_batch_id={} target={} triggered={} reason={}".format(
+                        task_batch_id,
+                        str(getattr(patient, "name", "") or ""),
+                        bool((result or {}).get("triggered", False)) if isinstance(result, dict) else bool(result),
+                        str((result or {}).get("reason", "") if isinstance(result, dict) else ""),
+                    )
+                )
+            except Exception as exc:
+                self._log_highlight(
+                    "REFLECTION_ENV_TASK_ERROR task_batch_id={} target={} detail={}".format(
+                        task_batch_id,
+                        str(getattr(patient, "name", "") or ""),
+                        str(exc),
+                    )
+                )
+        if matched <= 0:
+            self._log_highlight(
+                "REFLECTION_ENV_TASK_SKIP task_batch_id={} reason=no_rule_matched".format(task_batch_id)
+            )
+
+    def _has_reflected_for_environment_task_batch(self, task_batch_id: str) -> bool:
+        task_id = str(task_batch_id or "").strip()
+        if not task_id:
+            return False
+        self._ensure_state_schema()
+        task_state = self.state.setdefault("environment_task_state", {})
+        reflected = task_state.setdefault("reflected_batches", {})
+        return isinstance(reflected, dict) and task_id in reflected
+
+    def _mark_environment_task_reflected(self, task_batch_id: str, result: Any) -> None:
+        task_id = str(task_batch_id or "").strip()
+        if not task_id:
+            return
+        self._ensure_state_schema()
+        task_state = self.state.setdefault("environment_task_state", {})
+        reflected = task_state.setdefault("reflected_batches", {})
+        if not isinstance(reflected, dict):
+            reflected = {}
+            task_state["reflected_batches"] = reflected
+        reflected[task_id] = {
+            "triggered_at": self._fmt_dt(self._now()),
+            "triggered": bool((result or {}).get("triggered", False)) if isinstance(result, dict) else bool(result),
+            "reason": str((result or {}).get("reason", "") if isinstance(result, dict) else ""),
+        }
+
+    def _apply_environment_task_outcomes(
+        self,
+        doctor: Any,
+        patient: Any,
+        tasks: List[Dict[str, Any]],
+        meeting_id: str,
+        meeting_kind: str,
+        start_time: Any,
+        env_policy: Dict[str, Any],
+    ) -> None:
+        if not tasks:
+            return
+        agents_map = dict(self._agents_ref) if isinstance(self._agents_ref, dict) else {}
+        for agent in (doctor, patient):
+            name = str(getattr(agent, "name", "") or "")
+            if name and name not in agents_map:
+                agents_map[name] = agent
+
+        task_batch_id = self._build_environment_task_batch_id(patient, meeting_id)
+        prompt_text = self._build_environment_task_prompt(
+            doctor=doctor,
+            patient=patient,
+            tasks=tasks,
+            meeting_id=meeting_id,
+            meeting_kind=meeting_kind,
+            task_batch_id=task_batch_id,
+            agents_map=agents_map,
+            env_policy=env_policy,
+        )
+        if not prompt_text:
+            self._log_highlight(
+                "ENV_TASK_OUTCOME_SKIP task_batch_id={} reason=prompt_empty".format(task_batch_id)
+            )
+            return
+        try:
+            payload = self._call_environment_model_json(
+                prompt_text=prompt_text,
+                retry=int(env_policy.get("retry", 2) or 2),
+                doctor_agent=doctor,
+                env_policy=env_policy,
+            )
+            self.append_forced_prompt_trace_record(
+                speaker=doctor,
+                other=patient,
+                role="environment_model_llm",
+                prompt_text=prompt_text,
+                output=payload,
+                turn_no=-1,
+                meta={
+                    "source": "environment_task_outcome",
+                    "caller": "environment_task_outcome",
+                    "route": str(env_policy.get("route", "forced_llm") or "forced_llm"),
+                    "retry": int(env_policy.get("retry", 2) or 2),
+                    "prompt_file": str(env_policy.get("prompt_file", "") or ""),
+                    "task_count": len(tasks or []),
+                },
+                meeting_id=str(meeting_id or ""),
+                pair_key=build_pair_key(
+                    str(getattr(doctor, "name", "") or ""),
+                    str(getattr(patient, "name", "") or ""),
+                ),
+            )
+        except Exception as exc:
+            self.append_forced_prompt_trace_record(
+                speaker=doctor,
+                other=patient,
+                role="environment_model_llm",
+                prompt_text=prompt_text,
+                output={
+                    "error": str(exc),
+                    "status": "failed",
+                },
+                turn_no=-1,
+                meta={
+                    "source": "environment_task_outcome",
+                    "caller": "environment_task_outcome",
+                    "route": str(env_policy.get("route", "forced_llm") or "forced_llm"),
+                    "retry": int(env_policy.get("retry", 2) or 2),
+                    "prompt_file": str(env_policy.get("prompt_file", "") or ""),
+                    "task_count": len(tasks or []),
+                    "status": "failed",
+                },
+                meeting_id=str(meeting_id or ""),
+                pair_key=build_pair_key(
+                    str(getattr(doctor, "name", "") or ""),
+                    str(getattr(patient, "name", "") or ""),
+                ),
+            )
+            self._log_highlight(
+                "ENV_TASK_OUTCOME_ERROR task_batch_id={} reason={}".format(
+                    task_batch_id,
+                    str(exc),
+                )
+            )
+            return
+
+        outcomes = self._normalize_environment_task_outcomes(payload, tasks)
+        if not outcomes:
+            self._log_highlight(
+                "ENV_TASK_OUTCOME_EMPTY task_batch_id={} tasks={}".format(
+                    task_batch_id,
+                    len(tasks),
+                )
+            )
+            return
+
+        payloads, summary_lines = self._build_environment_memory_payloads(
+            outcomes=outcomes,
+            tasks=tasks,
+            doctor=doctor,
+            patient=patient,
+            agents_map=agents_map,
+            task_batch_id=task_batch_id,
+            meeting_id=meeting_id,
+            meeting_kind=meeting_kind,
+            env_policy=env_policy,
+            now=start_time,
+        )
+        if not payloads:
+            self._log_highlight(
+                "ENV_TASK_MEMORY_SKIP task_batch_id={} reason=payloads_empty".format(task_batch_id)
+            )
+            return
+
+        result = self.memory_injection.inject_many(agents=agents_map, payloads=payloads, now=start_time)
+        injected_count = self._count_injected_memory_results(result)
+        self._append_environment_task_audit(
+            task_batch_id=task_batch_id,
+            meeting_id=meeting_id,
+            doctor=str(getattr(doctor, "name", "") or ""),
+            patient=str(getattr(patient, "name", "") or ""),
+            tasks=tasks,
+            outcomes=outcomes,
+            injection_result=result,
+        )
+        self._log_highlight(
+            "ENV_TASK_MEMORY_DONE task_batch_id={} payloads={} injected={} status={}".format(
+                task_batch_id,
+                len(payloads),
+                injected_count,
+                str(result.get("status", "") if isinstance(result, dict) else ""),
+            )
+        )
+        if injected_count > 0 and self._safe_bool(env_policy.get("reflect_after_injection", True), True):
+            self._handle_conditional_reflection_environment_task_result(
+                patient=patient,
+                doctor=doctor,
+                task_batch_id=task_batch_id,
+                meeting_id=meeting_id,
+                meeting_kind=meeting_kind,
+                tasks=tasks,
+                outcomes=outcomes,
+                outcome_summary="\n".join(summary_lines),
             )
 
     def _resolve_active_meeting(self, a: Any, b: Any) -> Optional[Dict[str, Any]]:
@@ -2902,6 +3829,12 @@ class InterventionManager:
             return ""
         meeting = self.resolve_meeting_context(speaker, other, forced=forced)
         if not isinstance(meeting, dict):
+            return ""
+        prompt_target = str(meeting.get("prompt_target", "all") or "all").strip().lower()
+        speaker_name = str(getattr(speaker, "name", "") or "")
+        if prompt_target == "doctor" and speaker_name != str(meeting.get("doctor", "") or ""):
+            return ""
+        if prompt_target == "patient" and speaker_name != str(meeting.get("patient", "") or ""):
             return ""
         try:
             prompt_tpl = self._load_prompt_txt_or_raise(prompt_file)
@@ -3068,6 +4001,14 @@ class InterventionManager:
             resident_chat_state["rules"] = {}
         if not isinstance(resident_chat_state.get("completed_counts_by_patient"), dict):
             resident_chat_state["completed_counts_by_patient"] = {}
+        environment_task_state = self.state.get("environment_task_state", {})
+        if not isinstance(environment_task_state, dict):
+            environment_task_state = {}
+            self.state["environment_task_state"] = environment_task_state
+        if not isinstance(environment_task_state.get("audit"), list):
+            environment_task_state["audit"] = []
+        if not isinstance(environment_task_state.get("reflected_batches"), dict):
+            environment_task_state["reflected_batches"] = {}
         meeting_seq = self.state.get("meeting_seq", 0)
         try:
             meeting_seq = int(meeting_seq)
@@ -3318,6 +4259,7 @@ class InterventionManager:
                 "step_phase": rule.get("step_phase", ""),
                 "meeting_kind": str(rule.get("meeting_kind", "doctor_consult") or "doctor_consult"),
                 "prompt_file": str(rule.get("prompt_file", "") or ""),
+                "prompt_target": str(rule.get("prompt_target", "all") or "all"),
                 "meeting_source": str(rule.get("meeting_source", "meeting_rules") or "meeting_rules"),
             }
             queue.append(meeting_id)
@@ -3649,6 +4591,7 @@ class InterventionManager:
             "priority": "hard",
             "meeting_kind": str(rule.get("meeting_kind", "doctor_consult") or "doctor_consult"),
             "prompt_file": str(rule.get("prompt_file", "") or ""),
+            "prompt_target": str(rule.get("prompt_target", "all") or "all"),
             "meeting_source": str(rule.get("meeting_source", "meeting_rules") or "meeting_rules"),
         }
         self.state.setdefault("rule_last_trigger", {})[rule_id] = self._fmt_dt(now)

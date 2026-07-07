@@ -12,7 +12,7 @@
 
 也支持按条件筛选，例如：
     python3 runshells/run_batch_experiment.py --condition Counsel-KBD2-G1-MILD
-    python3 runshells/run_batch_experiment.py --condition Counsel-KBD3-ALL-MOD
+    python3 runshells/run_batch_experiment.py --condition Counsel-KBD9-ALL-MOD
     python3 runshells/run_batch_experiment.py --condition Counsel-G1-MILD
     python3 runshells/run_batch_experiment.py --condition Counsel-KBD2-G3-MOD --condition Counsel-KBD3-G5-MOD --max-parallel 2
 """
@@ -24,6 +24,7 @@ import concurrent.futures
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -152,6 +153,8 @@ GROUP_OVERLAY_FILES = {
     "g3": GROUP_OVERLAY_DIR / "g3_random_resident_chat.json",
     "g4": GROUP_OVERLAY_DIR / "g4_counseling_room.json",
     "g5": GROUP_OVERLAY_DIR / "g5_negative_resident_chat.json",
+    "g6": GROUP_OVERLAY_DIR / "g6_supportive_counseling.json",
+    "g7": GROUP_OVERLAY_DIR / "g7_memory_removed.json",
 }
 
 SEVERITY_SHORT_NAMES = {
@@ -160,7 +163,7 @@ SEVERITY_SHORT_NAMES = {
     "severe": "SEV",
 }
 SEVERITIES = ["mild", "moderate", "severe"]
-GROUPS = ["g1", "g2", "g3", "g5"]
+GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7"]
 WILDCARD_TOKENS = {"*", "ALL"}
 VARIANT_SELECTOR_ALIASES = dict(KABUDA_VARIANT_SELECTOR_ALIASES)
 GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
@@ -251,7 +254,7 @@ def parse_args() -> argparse.Namespace:
         "--condition",
         action="append",
         default=None,
-        help="只跑指定条件；可重复传入；支持 Counsel-KBD2-G1-MILD、Counsel-KBD3-ALL-MOD；旧格式 Counsel-G1-MILD 等价于 KBD1",
+        help="只跑指定条件；可重复传入；支持 Counsel-KBD2-G1-MILD、Counsel-KBD9-ALL-MOD；旧格式 Counsel-G1-MILD 等价于 KBD1",
     )
     parser.add_argument("--dry-run", action="store_true", help="覆盖脚本前面的 DRY_RUN=True")
     parser.add_argument("--max-parallel", type=int, default=None, help="并行运行的 condition 数，默认 2")
@@ -277,7 +280,7 @@ def generate_batch_name() -> str:
 def _available_condition_selector_examples() -> str:
     return ", ".join([
         "Counsel-KBD2-G1-MILD",
-        "Counsel-KBD3-ALL-MOD",
+        "Counsel-KBD9-ALL-MOD",
         "Counsel-ALL-G1-MILD",
         "Counsel-G1-MILD",
     ])
@@ -954,7 +957,7 @@ def format_delta(value: float | None, digits: int = 1) -> str:
     return f"{float(value):+.{digits}f}"
 
 
-def extract_scale_total(scored_result: dict) -> float | None:
+def extract_reported_scale_total(scored_result: dict) -> float | None:
     if not isinstance(scored_result, dict):
         return None
     for key in ["total_score", "total_score_raw", "standard_score"]:
@@ -968,9 +971,236 @@ def extract_scale_total(scored_result: dict) -> float | None:
     return None
 
 
-def extract_scale_severity(scored_result: dict) -> str:
+SCALE_ITEM_SCORE_KEYS = {
+    "PHQ-9": "phq9_scores",
+    "BDI-II": "bdi_ii_scores",
+}
+
+SCALE_ITEM_COUNTS = {
+    "PHQ-9": 9,
+    "BDI-II": 21,
+}
+
+
+def phq9_severity(total: int | float) -> str:
+    if total <= 4:
+        return "无抑郁"
+    if total <= 9:
+        return "轻度抑郁"
+    if total <= 14:
+        return "中度抑郁"
+    if total <= 19:
+        return "中重度抑郁"
+    return "重度抑郁"
+
+
+def bdi_ii_severity(total: int | float) -> str:
+    if total <= 13:
+        return "无抑郁"
+    if total <= 19:
+        return "轻度抑郁"
+    if total <= 28:
+        return "中度抑郁"
+    return "重度抑郁"
+
+
+def expected_scale_severity(scale_name: str, total: int | float) -> str:
+    return phq9_severity(total) if scale_name == "PHQ-9" else bdi_ii_severity(total)
+
+
+def extract_scale_total(scored_result: dict, scale_name: str | None = None) -> float | None:
+    if scale_name:
+        item_scores = extract_item_scores(scored_result, scale_name)
+        if item_scores is not None:
+            return float(sum(item_scores))
+    return extract_reported_scale_total(scored_result)
+
+CN_SCORE_VALUES = {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+}
+
+
+def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    rows.append(item)
+    return rows
+
+
+def extract_item_scores(scored_result: dict, scale_name: str) -> list[int] | None:
+    item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
+    if not item_key or not isinstance(scored_result, dict):
+        return None
+    items = scored_result.get(item_key)
+    if not isinstance(items, list):
+        return None
+
+    scores = []
+    for item in items:
+        score = item.get("score") if isinstance(item, dict) else None
+        if not isinstance(score, int) or score < 0 or score > 3:
+            return None
+        scores.append(score)
+    expected_count = SCALE_ITEM_COUNTS.get(scale_name)
+    if expected_count is not None and len(scores) != expected_count:
+        return None
+    return scores
+
+
+def score_file_for_evaluation(result: dict, evaluation: dict, scale_name: str) -> Path:
+    if evaluation.get("source") == "post_scale":
+        return Path(result["run_dir"]) / "scales" / f"{scale_name}_post_scored.json"
+    metadata_path = Path(str(evaluation.get("metadata_path", "") or ""))
+    if metadata_path.name == "metadata.json":
+        return metadata_path.parent / f"{scale_name}_scored.json"
+    scored_file = evaluation.get("scales", {}).get(scale_name, {}).get("scored_file", "")
+    return Path(str(scored_file or ""))
+
+
+def answer_file_for_evaluation(result: dict, evaluation: dict, scale_name: str) -> Path:
+    if evaluation.get("source") == "post_scale":
+        return Path(result["run_dir"]) / "scales" / f"{scale_name}_post_answered.jsonl"
+    metadata_path = Path(str(evaluation.get("metadata_path", "") or ""))
+    if metadata_path.name == "metadata.json":
+        return metadata_path.parent / f"{scale_name}_answered.jsonl"
+    scored_file = score_file_for_evaluation(result, evaluation, scale_name)
+    if scored_file.name.endswith("_scored.json"):
+        return scored_file.with_name(scored_file.name.replace("_scored.json", "_answered.jsonl"))
+    return Path("")
+
+
+def has_ambiguous_score_context(text: str, start: int, end: int) -> bool:
+    context = text[max(0, start - 18) : min(len(text), end + 28)]
+    return any(
+        marker in context
+        for marker in [
+            "或者",
+            "不确定",
+            "之间",
+            "两三",
+            "一两",
+            "也可能",
+            "选0感觉是骗人的",
+        ]
+    )
+
+
+def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
+    patterns = [
+        r"(?:我)?\s*(?:会|想|大概|可能|应该|还是|就|其实)?\s*(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])",
+        r"([0-3零一二两三])\s*分",
+        r"(?:评分的话|打分的话|大概|应该|可能|算是|算|就是|我觉得|我想|我会|应该是|大概是|可能是|差不多)\s*[，,。\.……\s]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
+        r"(?:^|[，,。\.……\s])([0-3零一二两三])\s*吧",
+        r"^[\s（\(\）\)……。,.，、嗯唔]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
+    ]
+    hits = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, str(answer or "")):
+            context = answer[max(0, match.start() - 6) : match.end() + 6]
+            if any(marker in context for marker in ["不想选", "不是选", "不能选", "不敢选"]):
+                continue
+            score = CN_SCORE_VALUES.get(match.group(1))
+            if score is None:
+                continue
+            hits.append((match.start(), match.end(), score))
+    if not hits:
+        return None, "none"
+    hits.sort(key=lambda item: (item[0], item[1]))
+    first_start, first_end, first_score = hits[0]
+    if has_ambiguous_score_context(answer, first_start, first_end):
+        return first_score, "ambiguous"
+    for start, _end, score in hits[1:]:
+        if start - first_end < 35 and score != first_score:
+            return first_score, "ambiguous"
+    return first_score, "direct"
+
+
+def build_scale_score_validation(results: list[dict]) -> dict:
+    total_mismatches = []
+    item_mismatches = []
+
+    for result in results:
+        for evaluation in result.get("evaluations", []):
+            trigger_label = str(evaluation.get("trigger_label", "") or "—")
+            for scale_name in SCALES:
+                scored_path = score_file_for_evaluation(result, evaluation, scale_name)
+                scored_result = load_optional_json_file(scored_path) if scored_path.is_file() else None
+                if not scored_result:
+                    continue
+
+                item_scores = extract_item_scores(scored_result, scale_name)
+                reported_total = extract_reported_scale_total(scored_result)
+                if item_scores is not None and reported_total is not None:
+                    item_sum = sum(item_scores)
+                    if float(item_sum) != float(reported_total):
+                        total_mismatches.append(
+                            {
+                                "condition_name": result.get("condition_name", ""),
+                                "trigger_label": trigger_label,
+                                "scale": scale_name,
+                                "item_sum": item_sum,
+                                "reported_total": reported_total,
+                                "delta": float(reported_total) - float(item_sum),
+                            }
+                        )
+
+                answer_path = answer_file_for_evaluation(result, evaluation, scale_name)
+                if item_scores is None or not answer_path.is_file():
+                    continue
+                try:
+                    answers = load_jsonl_file(answer_path)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                for answer_row in answers:
+                    item_id = answer_row.get("id")
+                    if not isinstance(item_id, int):
+                        continue
+                    if scale_name == "PHQ-9" and item_id == 10:
+                        continue
+                    if item_id < 1 or item_id > len(item_scores):
+                        continue
+                    answer_score, status = extract_direct_answer_score(str(answer_row.get("answer", "") or ""))
+                    if status != "direct" or answer_score is None:
+                        continue
+                    llm_score = item_scores[item_id - 1]
+                    if answer_score != llm_score:
+                        item_mismatches.append(
+                            {
+                                "condition_name": result.get("condition_name", ""),
+                                "trigger_label": trigger_label,
+                                "scale": scale_name,
+                                "item_id": item_id,
+                                "llm_score": llm_score,
+                                "answer_score": answer_score,
+                            }
+                        )
+
+    return {
+        "total_mismatches": total_mismatches,
+        "item_mismatches": item_mismatches,
+    }
+
+
+def extract_scale_severity(scored_result: dict, scale_name: str | None = None) -> str:
     if not isinstance(scored_result, dict):
         return "—"
+    if scale_name:
+        item_scores = extract_item_scores(scored_result, scale_name)
+        if item_scores is not None:
+            return expected_scale_severity(scale_name, sum(item_scores))
     for key in ["severity", "severity_by_index", "severity_by_standard_score"]:
         value = scored_result.get(key)
         if value:
@@ -1391,11 +1621,19 @@ def ensure_staged_eval_scores(run_dir: Path, *, dry_run: bool) -> None:
             )
 
 
-def build_scale_snapshot(scored_result: dict | None, scored_path: Path | None = None) -> dict:
-    total_score = extract_scale_total(scored_result or {})
-    severity = extract_scale_severity(scored_result or {})
+def build_scale_snapshot(
+    scored_result: dict | None,
+    scored_path: Path | None = None,
+    scale_name: str | None = None,
+) -> dict:
+    item_scores = extract_item_scores(scored_result or {}, scale_name) if scale_name else None
+    total_score = extract_scale_total(scored_result or {}, scale_name)
+    reported_total = extract_reported_scale_total(scored_result or {})
+    severity = extract_scale_severity(scored_result or {}, scale_name)
     return {
         "total_score": total_score,
+        "reported_total_score": reported_total,
+        "score_source": "item_sum" if item_scores is not None else "reported_total",
         "severity": severity,
         "scored_file": str(scored_path) if scored_path is not None else "",
     }
@@ -1417,7 +1655,7 @@ def append_post_entry(evaluations: list[dict], run_dir: Path) -> None:
     scales_payload = {}
     for scale_name in SCALES:
         scored_result = post_payload.get(scale_name)
-        scales_payload[scale_name] = build_scale_snapshot(scored_result, scale_scores_path)
+        scales_payload[scale_name] = build_scale_snapshot(scored_result, scale_scores_path, scale_name)
 
     evaluations.append(
         {
@@ -1472,7 +1710,11 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
             for scale_name in SCALES:
                 scored_path = trigger_dir / f"{scale_name}_scored.json"
                 scored_result = load_json_file(scored_path) if scored_path.exists() else {}
-                scales_payload[scale_name] = build_scale_snapshot(scored_result, scored_path if scored_path.exists() else None)
+                scales_payload[scale_name] = build_scale_snapshot(
+                    scored_result,
+                    scored_path if scored_path.exists() else None,
+                    scale_name,
+                )
             evaluations.append(
                 {
                     "trigger_label": str(metadata.get("trigger_label", "") or ""),
@@ -1623,6 +1865,7 @@ def build_summary_payload(cfg: RuntimeConfig, results: list[dict], warnings: lis
         "group_final_delta": aggregate_final_deltas(results, dimension_key="group", dimension_values=GROUPS),
         "severity_final_delta": aggregate_final_deltas(results, dimension_key="severity", dimension_values=SEVERITIES),
         "group_severity_final_delta_matrix": build_group_severity_matrix(results),
+        "scale_score_validation": build_scale_score_validation(results),
     }
 
 
@@ -1703,6 +1946,70 @@ def render_group_severity_matrix_markdown(matrix_payload: dict) -> list[str]:
     return lines
 
 
+def render_validation_number(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.1f}"
+
+
+def render_scale_score_validation_markdown(validation_payload: dict) -> list[str]:
+    total_mismatches = validation_payload.get("total_mismatches", [])
+    item_mismatches = validation_payload.get("item_mismatches", [])
+    if not isinstance(total_mismatches, list):
+        total_mismatches = []
+    if not isinstance(item_mismatches, list):
+        item_mismatches = []
+
+    lines = []
+    lines.append("## 评分结果校验附录\n")
+    lines.append("> 仅做结构化复核：总分差异为“条目分之和 vs LLM 总分”；异常条目仅统计回答中可明确抽取 0-3 分、且与 LLM 条目分不同的情况。\n")
+    lines.append(f"- 总分差异记录数：{len(total_mismatches)}")
+    lines.append(f"- 异常评分条目数：{len(item_mismatches)}")
+    lines.append("")
+
+    if total_mismatches:
+        lines.append("### 总分差异对比\n")
+        lines.append("| 条件 | 评估点 | 量表 | 条目和 | LLM总分 | 差值 |")
+        lines.append("|------|--------|------|--------|---------|------|")
+        for item in total_mismatches:
+            lines.append(
+                "| {condition} | {trigger} | {scale} | {item_sum} | {reported_total} | {delta} |".format(
+                    condition=item.get("condition_name", "—"),
+                    trigger=item.get("trigger_label", "—"),
+                    scale=item.get("scale", "—"),
+                    item_sum=render_validation_number(item.get("item_sum")),
+                    reported_total=render_validation_number(item.get("reported_total")),
+                    delta=render_validation_number(item.get("delta")),
+                )
+            )
+        lines.append("")
+
+    if item_mismatches:
+        lines.append("### 异常评分条目数值对比\n")
+        lines.append("| 条件 | 评估点 | 量表 | 条目 | LLM分 | 回答分 |")
+        lines.append("|------|--------|------|------|-------|--------|")
+        for item in item_mismatches:
+            lines.append(
+                "| {condition} | {trigger} | {scale} | {item_id} | {llm_score} | {answer_score} |".format(
+                    condition=item.get("condition_name", "—"),
+                    trigger=item.get("trigger_label", "—"),
+                    scale=item.get("scale", "—"),
+                    item_id=render_validation_number(item.get("item_id")),
+                    llm_score=render_validation_number(item.get("llm_score")),
+                    answer_score=render_validation_number(item.get("answer_score")),
+                )
+            )
+        lines.append("")
+
+    return lines
+
+
 def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
     results, warnings = collect_batch_results(cfg)
     if not results:
@@ -1763,6 +2070,7 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
     lines.extend(render_final_delta_markdown("按 Group 的最终变化对比", payload["group_final_delta"], GROUPS))
     lines.extend(render_final_delta_markdown("按 Severity 的最终变化对比", payload["severity_final_delta"], SEVERITIES))
     lines.extend(render_group_severity_matrix_markdown(payload["group_severity_final_delta_matrix"]))
+    lines.extend(render_scale_score_validation_markdown(payload["scale_score_validation"]))
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"[WRITE] {json_path}")

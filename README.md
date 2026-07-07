@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-07-01
+> 更新时间：2026-07-07（合并 doctor-agent 2026-07-06 更新）
 
 ## 关键测试结果速查
 
@@ -28,7 +28,23 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-06：接入”医生作业抽取 -> Environment Model -> 会后任务结果记忆”链路：`intervention.order_extract`改为只抽取医患双方已确认的`describe/date`任务，`intervention.environment_model`可通过`forced_llm`/`think_llm`/`custom_llm`生成作业落地结果，并经`MemoryInjectionManager.inject_many`写入患者及参与居民的`event`记忆；新增`data/prompts/intervention/environment_task_outcome.txt`、`environment_task_state.audit/reflected_batches`、`ENV_TASK_*`日志和任务结果后的可选反思触发，默认配置仍保持关闭。
+- 2026-07-06：新增可控反思触发策略：`data/config.json`的`agent.think.reflection_policy`支持旧`poignancy_max`阈值、每6步定期反思、会谈结束后条件反思和环境任务结果后的条件反思；`modules/agent.py`统一`reflect/trigger_reflection`入口并记录触发来源、会话上下文和反思去重状态，`modules/intervention_manager.py`按`meeting_kind`/`target_role`/`once_per_meeting`在医患会诊或居民聊天闭环后触发目标角色反思。
+- 2026-07-06：扩展强制会谈Prompt全链路追踪：`modules/agent.py`的`completion`支持显式`_forced_prompt_trace`参数，`modules/intervention_manager.py`可把`order_extract_llm`和`environment_model_llm`纳入`forced_prompt_trace_state`并在Markdown报告中统计对应调用次数，便于同时审查患者/医生发言、判断LLM、会后评估、医嘱抽取和环境模型输出。
+- 2026-07-06：收紧医嘱抽取、对话结束判断和普通居民聊天Prompt：`data/prompts/extract_doctor_order.txt`只保留双方已达成共识的会后任务，不再输出时间、地点、时长和置信度；`data/prompts/decide_chat_terminate.txt`明确普通居民聊天场景，并把道别、离开、去睡、让对方去忙、退缩式收束等纳入结束信号；中性/负面居民聊天Prompt限制治疗性安慰、情绪练习和行为激活式建议，`terminate_detection_tail_window_turns`从9扩到12。
+- 2026-07-06：新增G6支持性心理咨询实验组：`experiments/config/groups/g6_supportive_counseling.json`启用定期医患会谈但关闭CBT session prompt、判断LLM、会后评估和咨询记录，新增`data/prompts/intervention/supportive_counseling_doctor.txt`作为仅医生侧注入的支持性咨询提示词；`runshells/run_batch_experiment.py`同步把`g6`纳入批量condition选择。
+- 2026-07-06：新增G7记忆移除实验组与运行时记忆写入控制：`experiments/config/groups/g7_memory_removed.json`通过`agent.memory_write_control`屏蔽卡布达的`event`/`thought`/`chat`写入；`modules/agent.py`新增全局+角色局部配置合并、目标agent/节点类型匹配和`[MEMORY_WRITE_BLOCKED]`日志，默认配置在`data/config.json`中保持关闭，便于做”有干预但患者不形成新记忆”的消融对照。
+- 2026-07-06：扩展强制会谈Prompt注入粒度：`data/config.json`的`meeting_rules`新增`prompt_target`默认值`all`，`modules/intervention_manager.py`在排队会谈与规则触发时携带该字段，并支持`all`/`doctor`/`patient`三种注入目标，避免G6等条件把医生专用提示词误注入患者侧。
+- 2026-07-06：更新CBT与判断LLM提示词：`data/prompts/intervention_prompts.json`补齐并重写第三、第四阶段流程，突出”负面信念松动””防失败行为实验””未执行复盘””心理急救包”和最终毕业会谈等低门槛推进策略；`data/prompts/intervention/dialog_judge.txt`进一步限制`advice`只输出医生下一句的回复策略/提问意图，禁止生成可直接照抄的完整医生话术
+- 2026-07-06：增强存档重复量表复评的定稿与报告逻辑：`runshells/run_archived_repeat_scale_eval.py`默认开启条目稳定性补跑，新增`--reset-target-depression-state`和`--output-group`，可把复评结果映射到新group并可重置目标患者动态抑郁状态；报告主分数改为”评分复核后的条目最终分之和”，无严格多数条目按最高票并列分中的最低分定稿，同时保留重复均值、低分定稿条目、来源condition/group和扩展后的Group×Severity矩阵。
+- 2026-07-06：调整本地运行与仓库引用默认项：`data/config.json`默认LLM/embedding从vLLM OpenAI兼容端点切回本机Ollama（`qwen3:8b-q4_K_M`、`bge-m3:latest`）
+- 2026-07-05：增强`staged_eval`触发能力：`modules/staged_eval_manager.py`新增`staged_eval.step_interval`步数间隔触发，可按固定step生成虚拟`session_N`评估点并保留触发元数据；`data/config.json`默认关闭该模式，`experiments/config/groups/g2_no_intervention.json`为无干预组开启每24步、虚拟4个session间隔的阶段评估，便于无会诊完成事件时仍可得到纵向量表点。
+- 2026-07-05：关闭并移除卡布达系列”会诊完成后注入正向/恢复记忆”规则：`data/config.json`将`session_completed_memory_rule_kbd.enabled`改为`false`，`data/intervention/memory_injections*.json`删除KBD1到KBD9的`session_completed_memory_rule_kbd`条目，避免会后额外正向事件/认知记忆影响干预组与对照组的结果可比性。
+- 2026-07-05：改进批量实验量表汇总：`runshells/run_batch_experiment.py`新增PHQ-9/BDI-II预期条目数和程度分级函数，汇总时优先使用条目分合计计算`total_score`与`severity`，同时保留LLM报告的`reported_total_score`和`score_source`，减少总分字段与条目分不一致造成的报告偏差。
+- 2026-07-05：大幅增强存档重复量表复评：`runshells/run_archived_repeat_scale_eval.py`新增脚本顶部可调参数、`session_16`默认评估点、缺失原始summary时从`batch_state`/checkpoint自动合成摘要、按condition筛选、条目稳定性分析、仅对不稳定条目自适应补跑、校正总分参考和Markdown”条目稳定性与补跑”报告。
+- 2026-07-05：支持量表条目级补跑链路：`runshells/run_staged_eval_worker.py`新增`scale_item_ids`参数，可只回答/评分指定量表条目；配合归档复评脚本用于不稳定条目的追加抽样，而不必整份量表全部重跑。
 - 2026-07-01：合并 `counsel_room` 分支，新增 `--counsel-room` 咨询室模式（7×6 小地图、仅卡布达+蜻蜓队长 2 agent、`config_counsel_room.json` 直载）；详见 [3.8 咨询室模式](#38-咨询室模式-g4---counsel-room)
+- 2026-06-30：合并学长更新
 - 2026-06-28：将`data/prompts/intervention/dialog_judge.txt`纳入版本管理，并重写判断LLM提示词结构：显式区分“先判断医生下一句、再判断是否结束”，要求advice回应患者核心压力源，必要时用低门槛问题做压力源桥接；若不宜追问也必须说明治疗节奏原因，减少对话长期停留在泛低落/泛自责层面的情况。
 - 2026-06-28：优化对话Prompt基础人设注入：`generate_chat.txt`和`generate_chat_external_memory.txt`改用`${base_desc_block}`，`modules/prompt/scratch.py`仅在没有动态抑郁对话块时注入基础描述，避免基础人设与抑郁动态Prompt重复堆叠。
 - 2026-06-28：收紧医患历史检索触发条件：`modules/intervention_manager.py`仅在强制干预对话中评估咨询历史，并在写入医患历史前校验`meeting_id`非空，避免普通聊天或缺少会话ID时产生无效历史记录。

@@ -33,6 +33,9 @@ class Agent:
         self.reflect_insights_topk = self._resolve_reflect_insights_topk(
             self.think_config.get("reflect_insights_topk", 5)
         )
+        self.reflection_policy = self._resolve_reflection_policy(
+            self.think_config.get("reflection_policy", {})
+        )
         self.chat_iter = config["chat_iter"]
         global_chat_history = config.get("chat_history", {}) or {}
         local_chat_history = (config.get("_raw", {}) or {}).get("chat_history", {})
@@ -50,6 +53,14 @@ class Agent:
         if isinstance(global_chat_memory, dict):
             self.chat_memory_config.update(global_chat_memory)
         self.chat_memory_config.update(local_chat_memory)
+        global_memory_write_control = config.get("memory_write_control", {}) or {}
+        local_memory_write_control = (config.get("_raw", {}) or {}).get("memory_write_control", {})
+        if not isinstance(local_memory_write_control, dict):
+            local_memory_write_control = {}
+        self.memory_write_control_config = {}
+        if isinstance(global_memory_write_control, dict):
+            self.memory_write_control_config.update(global_memory_write_control)
+        self.memory_write_control_config.update(local_memory_write_control)
         self.storage_root = str(config.get("storage_root", "") or "")
         self.associate_embedding_config = copy.deepcopy(
             ((config.get("associate", {}) or {}).get("embedding", {}) or {})
@@ -133,6 +144,7 @@ class Agent:
         # status
         status = {"poignancy": 0}
         self.status = utils.update_dict(status, config.get("status", {}))
+        self._ensure_reflection_policy_state()
         self.plan = config.get("plan", {})
         self.intervention = None
         self.depression_dynamic_global = (
@@ -208,6 +220,7 @@ class Agent:
             self.scratch, "prompt_" + func_hint
         ), "Can not find func prompt_{} from scratch".format(func_hint)
         prompt_kwargs = dict(kwargs)
+        forced_prompt_trace = prompt_kwargs.pop("_forced_prompt_trace", None)
         depression_chat_ctx = None
         if func_hint == "generate_chat":
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
@@ -406,6 +419,50 @@ class Agent:
                     str(e),
                 )
             )
+        try:
+            if (
+                self.intervention
+                and isinstance(forced_prompt_trace, dict)
+                and bool(forced_prompt_trace.get("enabled", True))
+                and hasattr(self.intervention, "append_forced_prompt_trace_record")
+            ):
+                trace_other = forced_prompt_trace.get("other")
+                route_value = route if "route" in locals() else "fallback"
+                route_reason_value = route_reason if "route_reason" in locals() else "fallback_no_reason"
+                retry_value = 0
+                try:
+                    retry_value = int((prompt or {}).get("retry", 0) or 0)
+                except Exception:
+                    retry_value = 0
+                meta = forced_prompt_trace.get("meta", {})
+                meta = copy.deepcopy(meta) if isinstance(meta, dict) else {}
+                meta.update(
+                    {
+                        "source": str(forced_prompt_trace.get("source", "agent_completion_trace") or "agent_completion_trace"),
+                        "caller": str(func_hint or ""),
+                        "route": str(route_value or ""),
+                        "reason": str(route_reason_value or ""),
+                        "retry": retry_value,
+                    }
+                )
+                self.intervention.append_forced_prompt_trace_record(
+                    speaker=self,
+                    other=trace_other,
+                    role=str(forced_prompt_trace.get("role", "") or ""),
+                    prompt_text=str((prompt or {}).get("prompt", "") or ""),
+                    output=output,
+                    turn_no=int(forced_prompt_trace.get("turn_no", -1) or -1),
+                    meta=meta,
+                    meeting_id=str(forced_prompt_trace.get("meeting_id", "") or ""),
+                    pair_key=str(forced_prompt_trace.get("pair_key", "") or ""),
+                )
+        except Exception as e:
+            self.logger.warning(
+                "[FORCED_PROMPT_TRACE_APPEND_FAIL] agent={} explicit err={}".format(
+                    self.name,
+                    str(e),
+                )
+            )
         self.logger.debug(utils.block_msg(title, msg))
         if func_hint == "generate_chat" and depression_chat_ctx:
             self._commit_depression_generate_chat(depression_chat_ctx, output)
@@ -449,7 +506,9 @@ class Agent:
         if self.is_awake():
             self.percept()
             self.make_plan(agents)
-            self.reflect()
+            periodic_result = self._maybe_reflect_periodic()
+            if not bool((periodic_result or {}).get("triggered", False)):
+                self.reflect(trigger_source="legacy_poignancy")
         else:
             if self.action.finished():
                 self.action = self._determine_action()
@@ -726,7 +785,16 @@ class Agent:
         )
         return event
 
-    def reflect(self):
+    def reflect(self, trigger_source="legacy_poignancy", trigger_context=None):
+        trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
+        trigger_source = str(trigger_source or "legacy_poignancy").strip() or "legacy_poignancy"
+        if trigger_source == "legacy_poignancy":
+            if not self._legacy_reflection_enabled():
+                self._log_reflection_skip(trigger_source, "legacy_disabled", trigger_context)
+                return {"triggered": False, "reason": "legacy_disabled"}
+            if self.status["poignancy"] < self.think_config["poignancy_max"]:
+                return {"triggered": False, "reason": "poignancy_below_threshold"}
+
         recent_thought_limit = 16
         recent_thought_texts = set(
             self._normalize_dedup_text(n.describe)
@@ -758,17 +826,22 @@ class Agent:
             recent_thought_texts.add(normalized_thought)
             return node
 
-        if self.status["poignancy"] < self.think_config["poignancy_max"]:
-            return
         nodes = self.associate.retrieve_events() + self.associate.retrieve_thoughts()
-        if not nodes:
-            return
+        context_has_chat = bool(
+            str(trigger_context.get("chat_summary", "") or "").strip()
+            or str(trigger_context.get("chat_transcript", "") or "").strip()
+        )
+        if not nodes and not self.chats and not context_has_chat:
+            self._log_reflection_skip(trigger_source, "no_memory_or_chat", trigger_context)
+            return {"triggered": False, "reason": "no_memory_or_chat"}
         self.logger.info(
-            "{} reflect(P{}/{}) with {} concepts...".format(
+            "{} reflect(source={}, P{}/{}) with {} concepts and {} chats...".format(
                 self.name,
+                trigger_source,
                 self.status["poignancy"],
                 self.think_config["poignancy_max"],
                 len(nodes),
+                len(self.chats or []),
             )
         )
         nodes = sorted(nodes, key=lambda n: n.access, reverse=True)[
@@ -776,46 +849,48 @@ class Agent:
         ]
         # summary thought
         reflection_entries = []
-        focus = self.completion("reflect_focus", nodes, self.reflect_focus_topk)
-        retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
-        for r_nodes in retrieved.values():
-            thoughts = self.completion(
-                "reflect_insights",
-                r_nodes,
-                self.reflect_insights_topk,
-            )
-            reflect_block = ""
-            if self.depression_dynamic:
-                try:
-                    self.depression_dynamic.set_base_prompt(
-                        self._build_depression_base_prompt()
-                    )
-                    reflect_block = str(
-                        self.depression_dynamic.get_simple_prompt() or ""
-                    )
-                except Exception:
-                    reflect_block = ""
-            self.logger.info(
-                "========== [DEPR][REFLECT] agent={} reflect_block_len={} insights_count={} source={} ==========".format(
-                    self.name,
-                    len(reflect_block),
-                    len(thoughts or []),
-                    (
-                        "depression_engine"
-                        if self._depression_engine_ready()
-                        else "disabled"
-                    ),
+        focus = []
+        if nodes:
+            focus = self.completion("reflect_focus", nodes, self.reflect_focus_topk)
+            retrieved = self.associate.retrieve_focus(focus, reduce_all=False)
+            for r_nodes in retrieved.values():
+                thoughts = self.completion(
+                    "reflect_insights",
+                    r_nodes,
+                    self.reflect_insights_topk,
                 )
-            )
-            for thought, evidence in thoughts:
-                node = _add_thought(thought, evidence)
-                reflection_entries.append(
-                    {
-                        "thought": thought,
-                        "evidence": evidence,
-                        "node_id": getattr(node, "node_id", ""),
-                    }
+                reflect_block = ""
+                if self.depression_dynamic:
+                    try:
+                        self.depression_dynamic.set_base_prompt(
+                            self._build_depression_base_prompt()
+                        )
+                        reflect_block = str(
+                            self.depression_dynamic.get_simple_prompt() or ""
+                        )
+                    except Exception:
+                        reflect_block = ""
+                self.logger.info(
+                    "========== [DEPR][REFLECT] agent={} reflect_block_len={} insights_count={} source={} ==========".format(
+                        self.name,
+                        len(reflect_block),
+                        len(thoughts or []),
+                        (
+                            "depression_engine"
+                            if self._depression_engine_ready()
+                            else "disabled"
+                        ),
+                    )
                 )
+                for thought, evidence in thoughts:
+                    node = _add_thought(thought, evidence)
+                    reflection_entries.append(
+                        {
+                            "thought": thought,
+                            "evidence": evidence,
+                            "node_id": getattr(node, "node_id", ""),
+                        }
+                    )
         # summary chats
         if self.chats:
             recorded, evidence = set(), []
@@ -847,9 +922,25 @@ class Agent:
                     "node_id": getattr(node, "node_id", ""),
                 }
             )
-        self._commit_depression_reflection(focus, reflection_entries)
+        if not reflection_entries:
+            self._log_reflection_skip(trigger_source, "no_reflection_entries", trigger_context)
+            return {"triggered": False, "reason": "no_reflection_entries"}
+        runtime = self._commit_depression_reflection(
+            focus,
+            reflection_entries,
+            trigger_source=trigger_source,
+            trigger_context=trigger_context,
+        )
+        self._mark_reflection_triggered(trigger_source, trigger_context)
+        self._log_reflection_done(trigger_source, trigger_context, reflection_entries, runtime)
         self.status["poignancy"] = 0
         self.chats = []
+        return {
+            "triggered": True,
+            "reason": "success",
+            "entries": len(reflection_entries),
+            "depression_committed": bool(runtime),
+        }
 
     def find_path(self, agents):
         address = self.get_event().address
@@ -2545,6 +2636,42 @@ class Agent:
             return False
         return marker_fingerprint == self._build_self_percept_dedup_fingerprint(event)
 
+    def _memory_write_blocked(self, node_type):
+        cfg = self.memory_write_control_config if isinstance(self.memory_write_control_config, dict) else {}
+        if not bool(cfg.get("enabled", False)):
+            return False
+        target_agents = cfg.get("target_agents", [])
+        if isinstance(target_agents, str):
+            target_agents = [target_agents]
+        if target_agents and self.name not in {str(item) for item in target_agents}:
+            return False
+        blocked_types = cfg.get("blocked_node_types", [])
+        if isinstance(blocked_types, str):
+            blocked_types = [blocked_types]
+        blocked_types = {str(item).strip().lower() for item in blocked_types if str(item).strip()}
+        if not blocked_types:
+            blocked_types = {"event", "thought", "chat"}
+        return str(node_type or "").strip().lower() in blocked_types
+
+    def _build_blocked_memory_concept(self, node_type, event):
+        fingerprint = ""
+        try:
+            fingerprint = hashlib.sha1(
+                "{}||{}||{}".format(
+                    self.name,
+                    str(node_type or ""),
+                    event.get_describe() if event is not None else "",
+                ).encode("utf-8")
+            ).hexdigest()[:12]
+        except Exception:
+            fingerprint = "unknown"
+        return Concept.from_event(
+            "memory_blocked_{}".format(fingerprint),
+            str(node_type or "event"),
+            event,
+            poignancy=0,
+        )
+
     def _add_concept(
         self,
         e_type,
@@ -2553,6 +2680,19 @@ class Agent:
         expire=None,
         filling=None,
     ):
+        if self._memory_write_blocked(e_type):
+            if e_type == "chat":
+                self._pending_chat_memory_meta = None
+            node = self._build_blocked_memory_concept(e_type, event)
+            self.logger.info(
+                "[MEMORY_WRITE_BLOCKED] agent={} node_type={} node_id={} describe={}".format(
+                    self.name,
+                    e_type,
+                    getattr(node, "node_id", ""),
+                    event.get_describe() if event is not None else "",
+                )
+            )
+            return node
         if event.fit(None, "is", "idle"):
             poignancy = 1
         elif event.fit(None, "此时", "空闲"):
@@ -2618,6 +2758,183 @@ class Agent:
 
     def get_event(self, as_act=True):
         return self.action.event if as_act else self.action.obj_event
+
+    def _resolve_reflection_policy(self, value):
+        cfg = value if isinstance(value, dict) else {}
+        legacy_cfg = cfg.get("legacy_poignancy", {}) if isinstance(cfg.get("legacy_poignancy", {}), dict) else {}
+        periodic_cfg = cfg.get("periodic", {}) if isinstance(cfg.get("periodic", {}), dict) else {}
+        conditional_cfg = cfg.get("conditional", {}) if isinstance(cfg.get("conditional", {}), dict) else {}
+        interval_steps = self._safe_positive_int(periodic_cfg.get("interval_steps", 6), 6)
+        rules = conditional_cfg.get("rules", [])
+        if not isinstance(rules, list):
+            rules = []
+        return {
+            "legacy_poignancy": {
+                "enabled": self._safe_bool(legacy_cfg.get("enabled", True), True),
+            },
+            "periodic": {
+                "enabled": self._safe_bool(periodic_cfg.get("enabled", True), True),
+                "interval_steps": interval_steps,
+                "targets": periodic_cfg.get("targets", "all_agents"),
+            },
+            "conditional": {
+                "enabled": self._safe_bool(conditional_cfg.get("enabled", True), True),
+                "rules": copy.deepcopy(rules),
+            },
+        }
+
+    def _ensure_reflection_policy_state(self):
+        if not isinstance(self.status, dict):
+            self.status = {"poignancy": 0}
+        state = self.status.setdefault("reflection_policy", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.status["reflection_policy"] = state
+        state.setdefault("last_periodic_reflect_step", -1)
+        state.setdefault("conditional_meeting_ids", {})
+        if not isinstance(state.get("conditional_meeting_ids", {}), dict):
+            state["conditional_meeting_ids"] = {}
+        return state
+
+    def _legacy_reflection_enabled(self):
+        policy = self.reflection_policy.get("legacy_poignancy", {})
+        return self._safe_bool(policy.get("enabled", True), True)
+
+    def _periodic_reflection_enabled_for_agent(self):
+        policy = self.reflection_policy.get("periodic", {})
+        if not self._safe_bool(policy.get("enabled", True), True):
+            return False
+        targets = policy.get("targets", "all_agents")
+        if isinstance(targets, str):
+            target_text = targets.strip()
+            if target_text in {"all", "all_agents", "*"}:
+                return True
+            return target_text == self.name
+        if isinstance(targets, (list, tuple, set)):
+            normalized = {str(item or "").strip() for item in targets}
+            return self.name in normalized or "all_agents" in normalized or "*" in normalized
+        return False
+
+    def _current_reflection_step_no(self):
+        try:
+            if self.intervention is not None and isinstance(getattr(self.intervention, "config", None), dict):
+                return int(self.intervention.config.get("step", 0) or 0) + 1
+        except Exception:
+            return 0
+        return 0
+
+    def _maybe_reflect_periodic(self):
+        if not self._periodic_reflection_enabled_for_agent():
+            return {"triggered": False, "reason": "periodic_disabled"}
+        policy = self.reflection_policy.get("periodic", {})
+        interval_steps = self._safe_positive_int(policy.get("interval_steps", 6), 6)
+        step_no = self._current_reflection_step_no()
+        if step_no <= 0 or step_no % interval_steps != 0:
+            return {"triggered": False, "reason": "periodic_not_due"}
+        state = self._ensure_reflection_policy_state()
+        try:
+            last_step = int(state.get("last_periodic_reflect_step", -1) or -1)
+        except Exception:
+            last_step = -1
+        if last_step == step_no:
+            return {"triggered": False, "reason": "periodic_already_triggered"}
+        return self.reflect(
+            trigger_source="periodic_step",
+            trigger_context={
+                "event": "periodic_step",
+                "step": step_no,
+                "interval_steps": interval_steps,
+            },
+        )
+
+    def _mark_reflection_triggered(self, trigger_source, trigger_context):
+        state = self._ensure_reflection_policy_state()
+        source = str(trigger_source or "").strip()
+        trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
+        if source == "periodic_step":
+            try:
+                step_no = int(trigger_context.get("step", self._current_reflection_step_no()) or 0)
+            except Exception:
+                step_no = self._current_reflection_step_no()
+            if step_no > 0:
+                state["last_periodic_reflect_step"] = step_no
+        meeting_id = str(trigger_context.get("meeting_id", "") or "").strip()
+        if source == "after_chat" and meeting_id:
+            conditional = state.setdefault("conditional_meeting_ids", {})
+            if not isinstance(conditional, dict):
+                conditional = {}
+                state["conditional_meeting_ids"] = conditional
+            conditional[meeting_id] = {
+                "trigger_source": source,
+                "meeting_kind": str(trigger_context.get("meeting_kind", "") or ""),
+                "triggered_at": str(utils.get_timer().get_date("%Y%m%d-%H:%M:%S") or ""),
+            }
+
+    def has_reflected_for_meeting(self, meeting_id):
+        meeting_id = str(meeting_id or "").strip()
+        if not meeting_id:
+            return False
+        state = self._ensure_reflection_policy_state()
+        conditional = state.get("conditional_meeting_ids", {})
+        return isinstance(conditional, dict) and meeting_id in conditional
+
+    def trigger_reflection(self, trigger_source, trigger_context=None):
+        return self.reflect(trigger_source=trigger_source, trigger_context=trigger_context or {})
+
+    def _log_reflection_skip(self, trigger_source, reason, trigger_context):
+        trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
+        self.logger.info(
+            "[REFLECTION_TRIGGER] agent={} source={} result=skipped reason={} step={} meeting_id={}".format(
+                self.name,
+                str(trigger_source or ""),
+                str(reason or ""),
+                trigger_context.get("step", self._current_reflection_step_no()),
+                str(trigger_context.get("meeting_id", "") or ""),
+            )
+        )
+
+    def _log_reflection_done(self, trigger_source, trigger_context, entries, runtime):
+        trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
+        graph_action = ""
+        try:
+            graph_action = str((runtime or {}).get("evaluation", {}).get("action", "") or "")
+        except Exception:
+            graph_action = ""
+        self.logger.info(
+            "[REFLECTION_TRIGGER] agent={} source={} result=triggered step={} meeting_id={} entries={} depression_committed={} graph_action={}".format(
+                self.name,
+                str(trigger_source or ""),
+                trigger_context.get("step", self._current_reflection_step_no()),
+                str(trigger_context.get("meeting_id", "") or ""),
+                len(entries or []),
+                bool(runtime),
+                graph_action,
+            )
+        )
+
+    @staticmethod
+    def _safe_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value) if value is not None else bool(default)
+
+    @staticmethod
+    def _safe_positive_int(value, default):
+        if isinstance(value, bool):
+            return int(default)
+        try:
+            parsed = int(value)
+        except Exception:
+            return int(default)
+        return parsed if parsed > 0 else int(default)
 
     def _resolve_reflect_focus_topk(self, value):
         default_topk = 3
@@ -2963,10 +3280,21 @@ class Agent:
                 )
         return None
 
-    def _commit_depression_reflection(self, focus, entries):
+    def _commit_depression_reflection(
+        self,
+        focus,
+        entries,
+        trigger_source="legacy_poignancy",
+        trigger_context=None,
+    ):
         if not entries:
             return None
-        content, metadata = self._build_depression_reflection_payload(focus, entries)
+        content, metadata = self._build_depression_reflection_payload(
+            focus,
+            entries,
+            trigger_source=trigger_source,
+            trigger_context=trigger_context,
+        )
         return self._commit_depression_event(
             source="reflection",
             location=self._dynamic_location(),
@@ -2978,7 +3306,14 @@ class Agent:
             metadata=metadata,
         )
 
-    def _build_depression_reflection_payload(self, focus, entries):
+    def _build_depression_reflection_payload(
+        self,
+        focus,
+        entries,
+        trigger_source="legacy_poignancy",
+        trigger_context=None,
+    ):
+        trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
         focus_items = self._normalize_depression_text_list(focus, limit=5)
         thoughts, evidence_ids, thought_node_ids = [], [], []
         for entry in entries or []:
@@ -2999,6 +3334,18 @@ class Agent:
         thought_node_ids = self._dedupe_depression_texts(thought_node_ids, limit=20)
 
         rows = []
+        source_text = str(trigger_source or "").strip()
+        if source_text:
+            rows.append("触发来源：" + source_text)
+        meeting_id = str(trigger_context.get("meeting_id", "") or "").strip()
+        if meeting_id:
+            rows.append("会话ID：" + meeting_id[:80])
+        chat_summary = str(trigger_context.get("chat_summary", "") or "").strip()
+        if chat_summary:
+            rows.append("会话摘要：" + chat_summary[:240])
+        chat_transcript = str(trigger_context.get("chat_transcript", "") or "").strip()
+        if chat_transcript:
+            rows.append("会话片段：" + chat_transcript[:360])
         if focus_items:
             rows.append("反思焦点：" + "；".join(focus_items[:3]))
         if thoughts:
@@ -3008,6 +3355,14 @@ class Agent:
             rows.append("证据线索：" + "，".join(evidence_ids[:8]))
 
         metadata = {
+            "trigger_source": source_text,
+            "trigger_context": {
+                "event": str(trigger_context.get("event", "") or "")[:80],
+                "meeting_kind": str(trigger_context.get("meeting_kind", "") or "")[:80],
+                "meeting_id": meeting_id[:120],
+                "target_role": str(trigger_context.get("target_role", "") or "")[:40],
+                "chat_node_id": str(trigger_context.get("chat_node_id", "") or "")[:120],
+            },
             "focus": focus_items,
             "thought_count": len(thoughts),
             "thoughts": thoughts,

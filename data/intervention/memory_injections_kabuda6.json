@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "kbd_stress_event_001",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因连续退稿和压价而感到压力上升",
+          "describe": "卡布达最近连续被客户退稿和压价，此时感到压力上升，并担心自己真的没有审美和能力。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_002",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "因打开画板而感到羞耻",
+          "describe": "想到客户反复否定草稿时，卡布达会因为打开画板而感到羞耻，不敢提交新的版本。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_thought_003",
+          "node_type": "thought",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "我的作品可能没有任何价值",
+          "describe": "卡布达常担心自己即使熬夜修改，也只是在证明自己没有被需要的能力。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "kbd_stress_event_004",
+          "node_type": "event",
+          "subject": "卡布达",
+          "predicate": "此时",
+          "object": "一想到客户消息就会紧张",
+          "describe": "每当看到客户消息、报价或修改意见时，卡布达就会担心又一次被否定。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -15,21 +15,21 @@
       {
         "id": "moderate_job_loss_equals_self_failure",
         "label": "把失业理解成自己失败",
-        "summary": "被辞退不再只是工作事件，而是证明自己不行的重要证据。",
+        "summary": "被辞退不再只是工作事件，而是证明自己不行的重要证据；近两周睡眠、精力和胃口都被牵住。",
         "core_belief": "连工作都保不住，说明我可能真的没有什么价值。",
-        "narrative_focus": ["失业", "羞耻", "怕被问近况", "不想见人", "失败感"],
+        "narrative_focus": ["失业", "羞耻", "睡眠变差", "没什么胃口", "不想见人", "失败感"],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
           "tone": "flat_shame",
-          "repair_pattern": "先承认一点，再迅速淡化，好像不想让别人继续问"
+          "repair_pattern": "先承认一点睡不好、没力气，再迅速淡化，好像不想让别人继续问"
         },
         "emotion_vector": {
-          "valence": 0.24,
+          "valence": 0.22,
           "arousal": 0.44,
           "defensiveness": 0.64,
           "shame": 0.72,
-          "hopelessness": 0.56,
+          "hopelessness": 0.60,
           "trust": 0.30
         },
         "advance_signals": [

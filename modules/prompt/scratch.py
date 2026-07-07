@@ -904,16 +904,17 @@ class Scratch:
             "failsafe": failsafe,
         }
 
-    def prompt_extract_doctor_order(self, doctor, patient, now, conversation):
-        prompt = self.build_prompt(
-            "extract_doctor_order",
-            {
-                "doctor": doctor,
-                "patient": patient,
-                "now": now,
-                "conversation": conversation,
-            }
-        )
+    def prompt_extract_doctor_order(self, doctor, patient, now, conversation, prompt_file=""):
+        prompt_data = {
+            "doctor": doctor,
+            "patient": patient,
+            "now": now,
+            "conversation": conversation,
+        }
+        if str(prompt_file or "").strip():
+            prompt = self.build_prompt_by_file(prompt_file, prompt_data)
+        else:
+            prompt = self.build_prompt("extract_doctor_order", prompt_data)
 
         def _callback(response):
             text = response.strip()
@@ -928,19 +929,13 @@ class Scratch:
                 if not isinstance(task, dict):
                     continue
                 date = str(task.get("date", "")).strip()
-                time = str(task.get("time", "")).strip()
                 describe = str(task.get("describe", "")).strip()
-                if not date or not time or not describe:
+                if not date or not describe:
                     continue
                 normalized.append(
                     {
                         "describe": describe,
                         "date": date,
-                        "time": time,
-                        "duration": int(task.get("duration", 30) or 30),
-                        "address_hint": str(task.get("address_hint", "")).strip(),
-                        "must_do": bool(task.get("must_do", True)),
-                        "confidence": float(task.get("confidence", 0.0) or 0.0),
                     }
                 )
             return {"tasks": normalized}

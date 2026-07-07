@@ -1,0 +1,61 @@
+{
+  "agent": {
+    "memory_write_control": {
+      "enabled": true,
+      "target_agents": [
+        "卡布达"
+      ],
+      "blocked_node_types": [
+        "event",
+        "thought",
+        "chat"
+      ]
+    }
+  },
+  "intervention": {
+    "enabled": true,
+    "doctor": "蜻蜓队长",
+    "patients": [
+      "卡布达",
+      "金龟次郎"
+    ],
+    "resident_chat_scheduler": {
+      "enabled": false
+    },
+    "order_extract": {
+      "enabled": true
+    },
+    "session_prompt_injection": {
+      "enabled": true
+    },
+    "forced_llm": {
+      "enabled": true
+    },
+    "dialog_judge": {
+      "enabled": true
+    },
+    "session_eval": {
+      "enabled": true
+    },
+    "consult_record": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": true
+    },
+    "depression_dynamic": {
+      "enabled": true
+    },
+    "memory_injection": {
+      "enabled": true,
+      "rules": {
+        "session_completed_memory_rule_kbd": {
+          "enabled": false
+        }
+      }
+    },
+    "memory_policy": {
+      "enabled": true
+    }
+  }
+}

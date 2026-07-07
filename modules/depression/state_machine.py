@@ -8,7 +8,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from .prompt_templates import render_prompt
 
@@ -57,11 +57,6 @@ class ComplaintGraphManager:
     - `stage_history + dialogue_history`：运行过程留下的“证据轨迹”。
     """
 
-    STOPWORDS = {
-        "自己", "觉得", "感觉", "因为", "然后", "已经", "还是", "不是", "就是", "一个", "一种",
-        "有点", "这样", "那种", "事情", "问题", "别人", "什么", "没有", "不会", "如果", "真的",
-        "可能", "一直", "最近", "现在", "让我", "我们", "他们", "只是", "还有", "其实", "一下",
-    }
     DEFAULT_STAGE: Dict[str, Any] = {
         "id": "unconfigured_stage",
         "label": "尚未配置主诉图",
@@ -104,10 +99,6 @@ class ComplaintGraphManager:
         self._raw_graph_config = copy.deepcopy(graph_config)
         self.planner: Dict[str, Any] = copy.deepcopy(graph_config.get("planner", {}))
         self.window_size = self._bounded_int(self.planner.get("window_size"), 3, 1, 8)
-        self.min_match_confidence = self._bounded_float(
-            self.planner.get("min_match_confidence"), 0.60, 0.0, 1.0
-        )
-        self.allow_replan = self._coerce_bool(self.planner.get("allow_replan", True))
         self.llm_enabled = self._coerce_bool(self.planner.get("llm_enabled", True))
         self.max_dialog_history = self._bounded_int(
             self.planner.get("max_dialog_history"), 12, 4, 50
@@ -162,10 +153,6 @@ class ComplaintGraphManager:
             value = _simulation_now()
         return _coerce_datetime(value, fallback=_simulation_now)
 
-    def set_now_provider(self, now_provider: Optional[Callable[[], datetime]]) -> None:
-        if callable(now_provider):
-            self._now_provider = now_provider
-
     def reset(self) -> None:
         self.planned_graph = self._build_default_graph(self.initial_stage_id)
         self.stage_index = 0
@@ -216,32 +203,8 @@ class ComplaintGraphManager:
             "last_evaluation": copy.deepcopy(self.last_evaluation),
         }
 
-    def get_roadmap_snapshot(self) -> Dict[str, Any]:
-        return self.get_graph_snapshot()
-
-    def get_state_history(self) -> List[Dict[str, Any]]:
-        return copy.deepcopy(self.stage_history)
-
     def get_state_duration(self) -> float:
         return (self._now() - self.stage_start_time).total_seconds() / 60.0
-
-    def get_state_characteristics(self) -> Dict[str, float]:
-        stage = self.get_current_stage()
-        emotion = stage.get("emotion_vector", {}) if isinstance(stage.get("emotion_vector", {}), dict) else {}
-        disclosure = self._disclosure_to_score(stage.get("speaking_style", {}).get("disclosure", "guarded"))
-        return {
-            "valence": self._bounded_float(emotion.get("valence"), 0.25, 0.0, 1.0),
-            "arousal": self._bounded_float(emotion.get("arousal"), 0.35, 0.0, 1.0),
-            "defensiveness": self._bounded_float(emotion.get("defensiveness"), 0.55, 0.0, 1.0),
-            "shame": self._bounded_float(emotion.get("shame"), 0.40, 0.0, 1.0),
-            "hopelessness": self._bounded_float(emotion.get("hopelessness"), 0.35, 0.0, 1.0),
-            "trust": self._bounded_float(emotion.get("trust"), 0.20, 0.0, 1.0),
-            "disclosure": disclosure,
-        }
-
-    def get_symptom_intensity(self, symptom: str, time_of_day: Optional[str] = None) -> float:
-        del time_of_day
-        return self._bounded_float(self.get_state_characteristics().get(symptom), 0.0, 0.0, 1.0)
 
     def evaluate_turn(
         self,
@@ -249,23 +212,24 @@ class ComplaintGraphManager:
         conversation_content: str,
         completion_func: Optional[Callable[[str], str]] = None,
         llm_cfg: Optional[Dict[str, Any]] = None,
-        llm_signal: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """只评估，不提交。
 
         输出的是一个 evaluation dict，类似“事务草稿”：
         - 当前节点是否被触及；
         - 置信度如何；
-        - 动作是 hold / advance / replan；
+        - 动作是 hold 还是 advance；
         - 如果要前进，当前节点的候选分支是什么。
         真正改状态要等 `commit_turn()`。
+
+        动作判定只交给 LLM（graph_transition.txt）：没有可用的 completion_func
+        或判定结果时，一律默认 hold，不再走启发式规则或外部传入的信号。
         """
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation = str(conversation_content or "").strip()
         current_stage = self.get_current_stage()
 
-        normalized_signal = self._normalize_llm_signal(llm_signal)
-        if not normalized_signal and callable(completion_func) and self.llm_enabled:
+        if callable(completion_func) and self.llm_enabled:
             # 分支规划器只补候选，不参与本轮动作裁决。
             self.ensure_graph_window(
                 session_context=session_context,
@@ -276,13 +240,9 @@ class ComplaintGraphManager:
             )
             current_stage = self.get_current_stage()
 
-        fallback_signal = self._fallback_transition_signal(
-            current_stage=current_stage,
-            session_context=session_context,
-            conversation_content=conversation,
-        )
-        transition_signal = normalized_signal
-        if not transition_signal and callable(completion_func) and self.llm_enabled:
+        # 动作判定唯一来源：graph_transition.txt 的 LLM 输出。
+        transition_signal: Optional[Dict[str, Any]] = None
+        if callable(completion_func) and self.llm_enabled:
             transition_signal = self._infer_transition_signal(
                 completion_func=completion_func,
                 current_stage=current_stage,
@@ -291,51 +251,54 @@ class ComplaintGraphManager:
                 llm_cfg=llm_cfg,
             )
         if not transition_signal:
-            transition_signal = fallback_signal
+            # 拿不到 LLM 判定时保持当前节点，只回填候选窗口。
+            transition_signal = {
+                "matched": False,
+                "match_reason": "no_llm_decision",
+                "action": "hold",
+                "next_graph": self._preview_future_graph(current_stage),
+            }
 
         matched = bool(transition_signal.get("matched", False))
-        match_confidence = self._bounded_float(transition_signal.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(transition_signal.get("match_reason", "") or "")
         action = str(transition_signal.get("action", "hold") or "hold").strip().lower()
-        stage_updates = self._normalize_stage_updates(transition_signal.get("stage_updates", []))
-        next_graph_ids = self._normalize_next_graph(
+        next_graph_ids = self._normalize_graph_path(
             transition_signal.get("next_graph", self._preview_future_graph(current_stage)),
             current_stage["id"],
-            stage_updates,
         )
-        if action not in {"hold", "advance", "replan"}:
+        if action not in {"hold", "advance"}:
             action = "hold"
-
-        if action == "replan" and not self.allow_replan:
+        if action == "advance" and self._coerce_bool(current_stage.get("is_terminal_stage", False)):
+            # 终态节点不再向外推进，即便 LLM 给出了 advance。
             action = "hold"
 
         next_stage: Optional[Dict[str, Any]] = None
         if action == "advance":
-            # advance 的前提：必须能推出一个候选节点。
-            # 如果 next_graph 不够长，就退回当前 stage 的 next_candidates。
-            if len(next_graph_ids) > 1:
-                next_stage = self._lookup_stage(next_graph_ids[1], stage_updates)
-            elif current_stage.get("next_candidates"):
-                candidate_id = str(current_stage.get("next_candidates", [""])[0] or "").strip()
-                if candidate_id and candidate_id in self.stage_catalog:
-                    next_graph_ids = [current_stage["id"], candidate_id]
-                    next_stage = copy.deepcopy(self.stage_catalog[candidate_id])
+            # advance 的前提：必须能推出一个合法的下一节点。
+            # 合法目标只有一类：当前节点已有的候选分支；
+            # 禁止只给一个裸 id 就凭空推进到与当前节点无边的未知节点。
+            candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
+            target_id = str(next_graph_ids[1] if len(next_graph_ids) > 1 else "").strip()
+            if target_id and target_id in candidate_ids:
+                next_stage = copy.deepcopy(self.stage_catalog[target_id])
+            elif not target_id and candidate_ids:
+                target_id = candidate_ids[0]
+                next_graph_ids = [current_stage["id"], target_id]
+                next_stage = copy.deepcopy(self.stage_catalog[target_id])
             if not next_stage:
-                # 没有完整候选节点，也没有配置内已存在的候选时，
-                # 不凭规则臆造主诉节点。
+                # 没有可推进的候选时，不凭规则臆造主诉节点。
                 action = "hold"
+                next_graph_ids = self._preview_future_graph(current_stage)
 
         # evaluation 是“提交前快照”：
         # 后续 commit_turn() 只消费这个 dict，不再重新做一次理解。
         evaluation = {
             "action": action,
             "matched": bool(matched),
-            "match_confidence": round(float(match_confidence), 4),
             "match_reason": self._clip_text(match_reason, limit=180),
             "current_stage": copy.deepcopy(current_stage),
             "next_stage": copy.deepcopy(next_stage) if isinstance(next_stage, dict) else None,
             "next_graph": [str(item) for item in next_graph_ids],
-            "stage_updates": copy.deepcopy(stage_updates),
             "session_context": copy.deepcopy(session_context),
             "conversation_excerpt": self._clip_text(conversation, limit=220),
         }
@@ -345,18 +308,16 @@ class ComplaintGraphManager:
         """把 evaluation 真正写入状态机。
 
         这里最值得审查的点是：
-        - `hold/replan` 只更新当前节点候选分支；
+        - `hold` 只更新当前节点候选分支；
         - `advance` 选择一个候选分支成为新的当前节点。
         """
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         current_before = self.get_current_stage()
         action = str(evaluation.get("action", "hold") or "hold").strip().lower()
-        if action not in {"hold", "advance", "replan"}:
+        if action not in {"hold", "advance"}:
             action = "hold"
         matched = bool(evaluation.get("matched", False))
-        match_confidence = self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0)
         match_reason = str(evaluation.get("match_reason", "") or "")[:180]
-        self._materialize_stage_updates(evaluation.get("stage_updates", []))
         next_graph_value = evaluation.get("next_graph", [])
         next_graph = self._normalize_graph_path(next_graph_value, current_before.get("id", ""))
         session_context = (
@@ -373,12 +334,17 @@ class ComplaintGraphManager:
         # 记录在当前节点已经停留了多久，便于后续 history 分析。
         duration_minutes = self.get_state_duration()
 
-        if action in {"hold", "replan"}:
-            # hold/replan 只改当前节点的候选分支，不移动指针。
+        if action == "hold":
+            # hold 只改当前节点的候选分支，不移动指针。
             self._replace_future_graph(next_graph)
         elif action == "advance":
             target_stage_id = str(next_graph[1] if len(next_graph) > 1 else "").strip()
-            if target_stage_id and target_stage_id in self.stage_catalog:
+            # 防御性复检：只有当目标确实是当前节点的合法候选、且当前节点非终态时
+            # 才允许移动指针，否则降级为 hold。这样即便上游传入了被篡改的
+            # evaluation，状态机底层也不会推进到与当前节点无边的任意节点。
+            candidate_ids = self._candidate_ids_for_stage(current_before, self.window_size)
+            is_terminal = self._coerce_bool(current_before.get("is_terminal_stage", False))
+            if target_stage_id and target_stage_id in candidate_ids and not is_terminal:
                 # advance 表示从候选分支中选中一个节点，兄弟分支仍留在父节点上。
                 self._ensure_branch_candidates(current_before.get("id", ""), [target_stage_id])
                 self.planned_graph = self.planned_graph[: self.stage_index + 1]
@@ -386,6 +352,10 @@ class ComplaintGraphManager:
                     self.planned_graph.append(target_stage_id)
                 self.stage_index = len(self.planned_graph) - 1
                 self.stage_start_time = self._now()
+            else:
+                # 目标非法：不移动指针，按 hold 处理当前候选窗口。
+                action = "hold"
+                self._replace_future_graph(self._preview_future_graph(current_before))
         self._ensure_future_window()
         current_after = self.get_current_stage()
 
@@ -393,7 +363,6 @@ class ComplaintGraphManager:
         self.last_evaluation = {
             "action": action,
             "matched": matched,
-            "match_confidence": round(float(match_confidence), 4),
             "match_reason": match_reason,
             "source": source,
         }
@@ -409,7 +378,6 @@ class ComplaintGraphManager:
             from_stage=current_before,
             to_stage=current_after,
             matched=matched,
-            match_confidence=match_confidence,
             match_reason=match_reason,
             pointer_before=pointer_before,
             pointer_after=int(self.stage_index),
@@ -417,31 +385,6 @@ class ComplaintGraphManager:
             source=source,
         )
         return self.get_graph_snapshot()
-
-    def update_state(
-        self,
-        context_analysis: Dict,
-        llm_transition_signal: Optional[Dict[str, Any]] = None,
-        conversation_content: str = "",
-        roadmap_context: Optional[Dict[str, Any]] = None,
-        roadmap_completion_func: Optional[Callable[[str], str]] = None,
-        roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        session_context = context_analysis if isinstance(context_analysis, dict) else {}
-        if isinstance(roadmap_context, dict) and roadmap_context:
-            merged = copy.deepcopy(session_context)
-            merged.setdefault("runtime", {})
-            merged["runtime"]["roadmap_context"] = copy.deepcopy(roadmap_context)
-            session_context = merged
-        evaluation = self.evaluate_turn(
-            session_context=session_context,
-            conversation_content=conversation_content,
-            completion_func=roadmap_completion_func,
-            llm_cfg=roadmap_llm_cfg,
-            llm_signal=llm_transition_signal,
-        )
-        self.commit_turn(evaluation)
-        return str(evaluation.get("action", "hold")) == "advance"
 
     def initialize_graph_window(
         self,
@@ -493,47 +436,10 @@ class ComplaintGraphManager:
                 self.last_evaluation = {
                     "action": "plan_branches",
                     "matched": False,
-                    "match_confidence": 0.0,
                     "match_reason": "planned {} candidate branches".format(len(child_ids)),
                     "source": str(source or "graph_window_expansion")[:32],
                 }
         return self.get_graph_snapshot()
-
-    def force_stage(self, stage_id: str, reason: str = "manual") -> None:
-        stage_key = str(stage_id or "").strip()
-        if not stage_key:
-            return
-        if stage_key not in self.stage_catalog:
-            self.stage_catalog[stage_key] = self._sanitize_stage(
-                {"id": stage_key, "label": stage_key, "summary": stage_key},
-                source="manual",
-            )
-        previous_stage = self.get_current_stage()
-        duration_minutes = self.get_state_duration()
-        self.planned_graph = [stage_key]
-        self.stage_index = 0
-        self.stage_start_time = self._now()
-        current_stage = self.get_current_stage()
-        self._record_history(
-            action="jump",
-            from_stage=previous_stage,
-            to_stage=current_stage,
-            matched=True,
-            match_confidence=1.0,
-            match_reason=str(reason or "manual")[:180],
-            pointer_before=0,
-            pointer_after=0,
-            duration_minutes=duration_minutes,
-            source="manual",
-        )
-
-    def force_transition(self, new_state: Any, reason: str = "manual") -> None:
-        if isinstance(new_state, dict):
-            stage = self._sanitize_stage(new_state, source="manual")
-            self.stage_catalog[stage["id"]] = stage
-            self.force_stage(stage["id"], reason=reason)
-            return
-        self.force_stage(str(new_state or "").strip(), reason=reason)
 
     def to_dict(self) -> Dict[str, Any]:
         history_rows: List[Dict[str, Any]] = []
@@ -824,153 +730,6 @@ class ComplaintGraphManager:
                     break
             stage["next_candidates"] = normalized_candidates
 
-    def _heuristic_match(
-        self,
-        current_stage: Dict[str, Any],
-        session_context: Dict[str, Any],
-        conversation_content: str,
-    ) -> Tuple[bool, float, str]:
-        """启发式判断“本轮话语是否真的触及当前主诉节点”。
-
-        评分来源主要有三类：
-        1. 当前节点关键词与发言文本的 overlap；
-        2. 上下文识别出的 topics / speech_acts / stance；
-        3. 节点 advance / hold signals 的命中情况。
-        """
-        conversation = str(conversation_content or "").strip()
-        if not conversation:
-            return False, 0.0, "empty_utterance"
-
-        stage_focus = [str(item) for item in self._to_list(current_stage.get("narrative_focus", []))]
-        stage_text = " ".join(
-            [
-                str(current_stage.get("label", "") or ""),
-                str(current_stage.get("summary", "") or ""),
-                str(current_stage.get("core_belief", "") or ""),
-                " ".join(stage_focus),
-            ]
-        )
-        stage_keywords = self._extract_keywords(stage_text)
-        conversation_keywords = set(self._extract_keywords(conversation))
-        overlap = [kw for kw in stage_keywords if kw in conversation or kw in conversation_keywords]
-
-        semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
-        topics = [str(item) for item in self._to_list(semantic.get("topics", []))]
-        speech_acts = [str(item) for item in self._to_list(semantic.get("speech_acts", []))]
-        stance = [str(item) for item in self._to_list(semantic.get("stance", []))]
-
-        focus_hits = [item for item in stage_focus if item and any(item in topic or topic in item for topic in topics)]
-        signal_hits = self._count_signal_hits(current_stage.get("advance_signals", []), conversation, topics)
-        hold_alignment = self._count_signal_hits(current_stage.get("hold_signals", []), conversation, topics)
-
-        score = 0.0
-        if stage_keywords:
-            # overlap 反映“文本内容是否贴着当前节点的词在说”。
-            score += min(0.42, 0.10 * float(len(overlap)))
-        if focus_hits:
-            # focus_hits 更像“主题级命中”，不是字面关键词命中。
-            score += min(0.24, 0.12 * float(len(focus_hits)))
-        if "自我暴露" in speech_acts:
-            score += 0.10
-        if "具体叙述" in speech_acts:
-            # 具体叙述通常意味着角色没有只停留在空泛低落，而是开始触碰细节。
-            score += 0.10
-        if "含蓄求助" in speech_acts or "求助尝试" in speech_acts:
-            score += 0.06
-        if "谨慎" in stance or "试探" in stance:
-            score += 0.05
-        if hold_alignment > 0:
-            # 注意：hold_signals 命中也会加分。
-            # 这里的逻辑是“更确认当前节点被触及”，而不是“更倾向 advance”。
-            score += min(0.10, 0.04 * float(hold_alignment))
-        if signal_hits > 0:
-            score += min(0.10, 0.05 * float(signal_hits))
-
-        # threshold 会受 planner.min_match_confidence 影响，
-        # 但又被夹在 [0.32, 0.58] 范围里，避免配置极端化。
-        threshold = max(0.32, min(0.58, self.min_match_confidence * 0.72))
-        matched = score >= threshold
-        reason = "heuristic_score={:.3f}; overlap={}; topics={}; speech_acts={}".format(
-            score,
-            ",".join(overlap[:4]) if overlap else "none",
-            ",".join(topics[:3]) if topics else "none",
-            ",".join(speech_acts[:3]) if speech_acts else "none",
-        )
-        return matched, round(float(score), 4), reason
-
-    def _decide_action(
-        self,
-        current_stage: Dict[str, Any],
-        matched: bool,
-        match_confidence: float,
-        session_context: Dict[str, Any],
-        conversation_content: str,
-    ) -> str:
-        """在没有显式 LLM 指令时，用启发式规则决定节点动作。"""
-        if not matched:
-            return "hold"
-        if self._coerce_bool(current_stage.get("is_terminal_stage", False)):
-            return "hold"
-        next_candidates = current_stage.get("next_candidates", []) if isinstance(current_stage.get("next_candidates", []), list) else []
-
-        semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
-        topics = [str(item) for item in self._to_list(semantic.get("topics", []))]
-        speech_acts = [str(item) for item in self._to_list(semantic.get("speech_acts", []))]
-        advance_hits = self._count_signal_hits(current_stage.get("advance_signals", []), conversation_content, topics)
-        hold_hits = self._count_signal_hits(current_stage.get("hold_signals", []), conversation_content, topics)
-
-        # “具体叙述”被视为一个重要推进信号：
-        # 角色从抽象自责转向具体场景时，更可能真的触到了当前节点深处。
-        detailed = "具体叙述" in speech_acts or len(str(conversation_content or "")) >= 36
-        if advance_hits > hold_hits and (advance_hits > 0 or detailed):
-            return "advance"
-        if detailed and match_confidence >= max(0.46, self.min_match_confidence * 0.80):
-            return "advance"
-        if not next_candidates:
-            return "hold"
-        return "hold"
-
-    def _count_signal_hits(self, signals: Any, conversation: str, topics: List[str]) -> int:
-        count = 0
-        for signal in self._to_list(signals):
-            text = str(signal or "").strip()
-            if not text:
-                continue
-            # signal 同时支持两种命中方式：
-            # 1. 在原始对话文本里直接出现；
-            # 2. 在 context analyzer 抽出来的话题标签里出现。
-            if text in conversation or any(text in topic or topic in text for topic in topics):
-                count += 1
-        return count
-
-    def _fallback_transition_signal(
-        self,
-        current_stage: Dict[str, Any],
-        session_context: Dict[str, Any],
-        conversation_content: str,
-    ) -> Dict[str, Any]:
-        """在没有 LLM 判定时，用轻量规则给出保守转移信号。"""
-        matched, score, reason = self._heuristic_match(
-            current_stage=current_stage,
-            session_context=session_context,
-            conversation_content=conversation_content,
-        )
-        action = self._decide_action(
-            current_stage=current_stage,
-            matched=matched,
-            match_confidence=score,
-            session_context=session_context,
-            conversation_content=conversation_content,
-        )
-        return {
-            "matched": bool(matched),
-            "match_confidence": round(float(score), 4),
-            "match_reason": str(reason or "")[:180],
-            "action": action,
-            "next_graph": self._preview_future_graph(current_stage),
-            "stage_updates": [],
-        }
-
     def _infer_transition_signal(
         self,
         completion_func: Callable[[str], str],
@@ -1053,7 +812,6 @@ class ComplaintGraphManager:
             "match_reason": str(payload.get("reason", payload.get("match_reason", "")) or "")[:180],
             "action": action,
             "next_graph": next_graph,
-            "stage_updates": [],
         }
 
     def _stage_needs_branch_plan(self, stage: Dict[str, Any]) -> bool:
@@ -1221,132 +979,6 @@ class ComplaintGraphManager:
             {"payload_json": payload_json},
         )
 
-    def _normalize_llm_signal(self, payload: Any) -> Optional[Dict[str, Any]]:
-        # 把外部显式转移信号压缩成状态机能消费的受限结构。
-        # graph_planner 本身不再走这个入口。
-        if not isinstance(payload, dict):
-            return None
-
-        matched = self._coerce_bool(
-            payload.get("matched_current_stage", payload.get("matched", False))
-        )
-        action = str(payload.get("action", "hold") or "hold").strip().lower()
-        if action not in {"hold", "advance", "replan"}:
-            action = "hold"
-        if action == "advance" and not matched:
-            action = "hold"
-        raw_match_confidence = payload.get("match_confidence", None)
-        match_confidence = self._bounded_float(
-            raw_match_confidence if raw_match_confidence is not None else (1.0 if matched else 0.0),
-            0.0,
-            0.0,
-            1.0,
-        )
-        match_reason = str(
-            payload.get("match_reason", payload.get("match_evidence", "")) or ""
-        ).strip()[:180]
-
-        raw_next = payload.get("next_graph", [])
-        stage_updates = self._normalize_stage_updates(payload.get("stage_updates", []))
-        next_graph: List[str] = []
-        if isinstance(raw_next, list):
-            for item in raw_next:
-                if isinstance(item, dict):
-                    stage = self._sanitize_stage(item, source="llm")
-                    stage_updates = self._merge_stage_update(stage_updates, stage)
-                    next_graph.append(stage["id"])
-                else:
-                    text = str(item or "").strip()
-                    if text:
-                        next_graph.append(text)
-
-        return {
-            "matched": bool(matched),
-            "match_confidence": round(float(match_confidence), 4),
-            "match_reason": match_reason,
-            "action": action,
-            "next_graph": next_graph,
-            "stage_updates": stage_updates,
-        }
-
-    def _normalize_stage_updates(self, value: Any) -> List[Dict[str, Any]]:
-        updates: List[Dict[str, Any]] = []
-        seen = set()
-        for item in self._to_list(value):
-            if not isinstance(item, dict):
-                continue
-            stage = self._sanitize_stage(item, source=str(item.get("source", "llm") or "llm"))
-            stage_id = str(stage.get("id", "") or "").strip()
-            if not stage_id or stage_id in seen:
-                continue
-            seen.add(stage_id)
-            updates.append(stage)
-        return updates
-
-    def _merge_stage_update(self, updates: List[Dict[str, Any]], stage: Dict[str, Any]) -> List[Dict[str, Any]]:
-        stage_id = str(stage.get("id", "") or "").strip() if isinstance(stage, dict) else ""
-        if not stage_id:
-            return updates
-        results = [copy.deepcopy(item) for item in updates if str(item.get("id", "") or "").strip() != stage_id]
-        results.append(copy.deepcopy(stage))
-        return results
-
-    def _lookup_stage(self, stage_id: str, stage_updates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        stage_key = str(stage_id or "").strip()
-        if not stage_key:
-            return {}
-        if stage_key in self.stage_catalog:
-            return copy.deepcopy(self.stage_catalog[stage_key])
-        for stage in stage_updates or []:
-            if isinstance(stage, dict) and str(stage.get("id", "") or "").strip() == stage_key:
-                return copy.deepcopy(stage)
-        return {}
-
-    def _materialize_stage_updates(self, value: Any) -> None:
-        updates = self._normalize_stage_updates(value)
-        if not updates:
-            return
-        for stage in updates:
-            self.stage_catalog[stage["id"]] = copy.deepcopy(stage)
-        self._prune_unknown_next_candidates([stage["id"] for stage in updates])
-
-    def _normalize_next_graph(
-        self,
-        value: Any,
-        current_stage_id: str,
-        stage_updates: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[str]:
-        pending_ids = {
-            str(stage.get("id", "") or "").strip()
-            for stage in self._normalize_stage_updates(stage_updates or [])
-            if isinstance(stage, dict)
-        }
-        normalized: List[str] = []
-        seen = set()
-        for item in self._to_list(value):
-            stage_id = ""
-            if isinstance(item, dict):
-                stage = self._sanitize_stage(item, source=str(item.get("source", "llm") or "llm"))
-                stage_id = stage["id"]
-                pending_ids.add(stage_id)
-            else:
-                text = str(item or "").strip()
-                if text in self.stage_catalog or text in pending_ids:
-                    stage_id = text
-            if not stage_id or stage_id in seen:
-                continue
-            seen.add(stage_id)
-            normalized.append(stage_id)
-        current_id = str(current_stage_id or "").strip()
-        if not normalized and current_id:
-            return [current_id]
-        if current_id:
-            if current_id not in normalized:
-                normalized = [current_id] + normalized
-            elif normalized[0] != current_id:
-                normalized = [current_id] + [item for item in normalized if item != current_id]
-        return normalized
-
     def _normalize_graph_path(self, value: Any, current_stage_id: str) -> List[str]:
         current_id = str(current_stage_id or "").strip()
         normalized = self._normalize_graph_ids(value)
@@ -1499,7 +1131,6 @@ class ComplaintGraphManager:
             "stage_label": str(current_stage.get("label", "") or ""),
             "conversation_excerpt": self._clip_text(conversation_excerpt, limit=220),
             "matched": bool(evaluation.get("matched", False)),
-            "match_confidence": self._bounded_float(evaluation.get("match_confidence"), 0.0, 0.0, 1.0),
             "match_reason": str(evaluation.get("match_reason", "") or "")[:180],
             "action": str(evaluation.get("action", "hold") or "hold"),
             "other_agent": str(participants.get("other_agent", "") or ""),
@@ -1519,7 +1150,6 @@ class ComplaintGraphManager:
         from_stage: Dict[str, Any],
         to_stage: Dict[str, Any],
         matched: bool,
-        match_confidence: float,
         match_reason: str,
         pointer_before: int,
         pointer_after: int,
@@ -1537,7 +1167,6 @@ class ComplaintGraphManager:
                 "to_stage_id": str(to_stage.get("id", "") or ""),
                 "to_stage_label": str(to_stage.get("label", "") or ""),
                 "matched": bool(matched),
-                "match_confidence": round(float(match_confidence), 4),
                 "match_reason": str(match_reason or "")[:180],
                 "pointer_before": int(pointer_before),
                 "pointer_after": int(pointer_after),
@@ -1551,20 +1180,6 @@ class ComplaintGraphManager:
         if len(text) <= int(limit):
             return text
         return text[: max(0, int(limit) - 1)] + "…"
-
-    @classmethod
-    def _extract_keywords(cls, text: Any) -> List[str]:
-        source = str(text or "")
-        chunks = re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z0-9_\-]{3,}", source)
-        results: List[str] = []
-        seen = set()
-        for chunk in chunks:
-            token = str(chunk).strip()
-            if not token or token in cls.STOPWORDS or token in seen:
-                continue
-            seen.add(token)
-            results.append(token)
-        return results[:16]
 
     @staticmethod
     def _parse_json_object(raw: Any) -> Optional[Dict[str, Any]]:
@@ -1627,24 +1242,6 @@ class ComplaintGraphManager:
         num = max(int(lower), num)
         num = min(int(upper), num)
         return num
-
-    @staticmethod
-    def _disclosure_to_score(value: Any) -> float:
-        text = str(value or "").strip().lower()
-        mapping = {
-            "sealed": 0.10,
-            "guarded": 0.22,
-            "shielded": 0.18,
-            "cautious": 0.34,
-            "partial": 0.48,
-            "tentative": 0.44,
-            "open": 0.66,
-            "full": 0.82,
-        }
-        return float(mapping.get(text, 0.28))
-
-
-SymptomStateMachine = ComplaintGraphManager
 
 
 def _coerce_datetime(value: Any, fallback: Optional[Callable[[], datetime]] = None) -> datetime:
