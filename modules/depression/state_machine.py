@@ -210,6 +210,7 @@ class ComplaintGraphManager:
         self,
         session_context: Dict[str, Any],
         conversation_content: str,
+        counterpart_utterance: str = "",
         completion_func: Optional[Callable[[str], str]] = None,
         llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -248,6 +249,7 @@ class ComplaintGraphManager:
                 current_stage=current_stage,
                 session_context=session_context,
                 conversation_content=conversation,
+                counterpart_utterance=str(counterpart_utterance or "").strip(),
                 llm_cfg=llm_cfg,
             )
         if not transition_signal:
@@ -737,12 +739,14 @@ class ComplaintGraphManager:
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
+        counterpart_utterance: str = "",
     ) -> Optional[Dict[str, Any]]:
         """调用 LLM 判定本轮是否推进主诉节点。"""
         prompt = self._build_transition_prompt(
             current_stage=current_stage,
             session_context=session_context,
             conversation_content=conversation_content,
+            counterpart_utterance=counterpart_utterance,
             llm_cfg=llm_cfg,
         )
         try:
@@ -758,6 +762,7 @@ class ComplaintGraphManager:
         session_context: Dict[str, Any],
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
+        counterpart_utterance: str = "",
     ) -> str:
         """构造主诉图推进判定 prompt。"""
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
@@ -770,6 +775,7 @@ class ComplaintGraphManager:
             "candidate_ids": candidate_ids,
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
+            "counterpart_utterance": self._clip_text(counterpart_utterance, limit=text_limit),
             "state_duration_minutes": round(float(self.get_state_duration()), 4),
         }
         return render_prompt(

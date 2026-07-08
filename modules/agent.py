@@ -978,6 +978,7 @@ class Agent:
         other_agent="",
         relationship="",
         metadata=None,
+        counterpart_utterance="",
     ):
         """统一提交会影响主诉图的事件，仅允许对话和反思。"""
         if not self.depression_dynamic:
@@ -1000,6 +1001,7 @@ class Agent:
                 interaction_type=interaction_type,
                 content=event_content,
                 metadata=metadata if isinstance(metadata, dict) else {},
+                counterpart_utterance=counterpart_utterance,
                 roadmap_completion_func=self._depression_llm_completion,
                 emotion_completion_func=self._depression_llm_completion,
             )
@@ -1111,6 +1113,7 @@ class Agent:
             interaction_type=context["interaction_type"],
             content=utterance,
             metadata={"origin": "generate_chat", "evidence_ids": []},
+            counterpart_utterance=context.get("counterpart_utterance", ""),
         )
 
     def _build_depression_chat_context(self, other, relation_summary, chats):
@@ -1132,7 +1135,23 @@ class Agent:
             "relationship": relationship,
             "interaction_type": interaction_type,
             "conversation_content": conversation_content,
+            "counterpart_utterance": self._extract_counterpart_utterance(chats),
         }
+
+    def _extract_counterpart_utterance(self, chats):
+        """取交互对方（医生/居民等）在本轮之前说的最后一句话。
+
+        推进判定此前只看角色自己刚说出的话，看不到是谁、用什么方式促成了这次表达；
+        把对方这句话单独抽出来作为判定证据，既能让 advance/hold 参考互动方，
+        又不会污染基于角色话语构建的患者侧 semantic_cues。
+        """
+        self_name = str(getattr(self, "name", "") or "").strip()
+        for name, text in reversed(chats or []):
+            if str(name or "").strip() != self_name:
+                return str(text or "").strip()
+        if chats:
+            return str(chats[-1][1] or "").strip()
+        return ""
 
     def _dynamic_location(self):
         """把当前地图地址压缩成动态抑郁模块使用的位置文本。"""

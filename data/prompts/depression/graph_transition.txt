@@ -10,6 +10,10 @@
   "reason": "10到120字，说明为什么停留或推进"
 }
 
+输入说明：
+- conversation_content 是角色（患者）本轮说出的话，是判定推进的主要依据。
+- counterpart_utterance 是本轮交互对方（医生或其他居民等）说的话，可能为空。它是判定推进的辅助依据：帮助你理解角色这句话是在什么互动下说出来的。
+
 字段含义：
 1. matched_current_stage：本轮内容是否确实围绕 current_stage 的主题、痛点或表达方式展开。如果谈到了当前节点，则为 true；如果只是寒暄、跑题或无法判断，则为 false。
 2. action：只能是 hold 或 advance。
@@ -21,8 +25,9 @@
 2. 如果 current_stage 是终止节点、candidate_stages 为空，或 candidate_ids 为空，必须 hold。
 3. 在确认触及 current_stage 后，再判断是否出现“足以进入某个直接候选分支”的新证据。只有能明确对应到一个 candidate_stage 时，才可以 advance。
 4. advance 适用于这些情况：角色把当前痛点说得更具体；承认了新的影响或后果；暴露出更真实、更深一层的感受；从抽象评价转向可定位的生活、关系、功能困扰；或本轮内容与某个候选分支的 summary、narrative_focus、core_belief 明确贴合。
-5. hold 适用于这些情况：只有礼貌回应或短促应答；只是泛泛低落；重复 current_stage 已有痛点但没有新方向；内容仍停留在当前节点的 hold_signals；本轮信息不足以判断。
-6. advance 不能自己创造新节点。若证据看似更适合非候选节点，仍然 hold。
-7. 最终应基于 current_stage、candidate_stages 和 conversation_content 独立判断。
+5. 参考 counterpart_utterance 来判断角色的推进是否可信：若对方提供了推动改变的互动（被理解、被追问、被接住、得到具体引导），而角色随之暴露出可对应到某个候选分支的新内容，这类 advance 更可靠；若对方只是寒暄、说教或施压，而角色并没有实质推进，仍应 hold。counterpart_utterance 只做辅助，不能单凭对方的话在角色没有实质推进时 advance。
+6. hold 适用于这些情况：只有礼貌回应或短促应答；只是泛泛低落；重复 current_stage 已有痛点但没有新方向；内容仍停留在当前节点的 hold_signals；本轮信息不足以判断。
+7. advance 不能自己创造新节点。若证据看似更适合非候选节点，仍然 hold。
+8. 最终应基于 current_stage、candidate_stages、conversation_content，并结合 counterpart_utterance 独立判断。
 
 输入：${payload_json}
