@@ -141,6 +141,7 @@ class DepressionSimulationEngine:
         other_agent: Optional[str] = None,
         relationship: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        counterpart_utterance: str = "",
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
@@ -149,6 +150,9 @@ class DepressionSimulationEngine:
 
         事件仍复用 interaction 管线，只是在 session_context 中额外标记
         `runtime_event`，让状态记录能区分对话与反思等来源。
+        `counterpart_utterance` 是本轮交互对方（医生/居民等）说的话，
+        单独透传给主诉图推进判定，不并入 conversation_content，避免污染
+        基于角色话语构建的患者侧 semantic_cues。
         """
         if not self.enabled:
             return self._disabled_runtime()
@@ -174,6 +178,7 @@ class DepressionSimulationEngine:
         return self._commit_context(
             session_context=session_context,
             conversation_content=event_content,
+            counterpart_utterance=counterpart_utterance,
             roadmap_completion_func=roadmap_completion_func,
             roadmap_llm_cfg=roadmap_llm_cfg,
             emotion_completion_func=emotion_completion_func,
@@ -183,6 +188,7 @@ class DepressionSimulationEngine:
         self,
         session_context: Dict[str, Any],
         conversation_content: str,
+        counterpart_utterance: str = "",
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
@@ -196,6 +202,7 @@ class DepressionSimulationEngine:
         evaluation = self.graph_manager.evaluate_turn(
             session_context=session_context,
             conversation_content=conversation_content,
+            counterpart_utterance=counterpart_utterance,
             completion_func=roadmap_completion_func,
             llm_cfg=roadmap_llm_cfg,
         )
