@@ -80,6 +80,10 @@ class ResidentChatScheduler:
                 "patient": target_patient,
                 "meeting_kind": "resident_chat",
                 "prompt_file": str(rule.get("prompt_file", "") or "").strip(),
+                # Resident-chat prompts describe how the selected resident should
+                # respond.  In meeting terminology that resident occupies the
+                # `doctor` role, while the target agent occupies `patient`.
+                "prompt_target": str(rule.get("prompt_target", "doctor") or "doctor").strip(),
                 "meeting_source": "resident_chat_scheduler",
             }
             payloads.append(payload)

@@ -3,7 +3,15 @@
 # Single-file image for the current GenerativeAgentsCN workspace.
 #
 # Build:
-#   docker build -f docker/Dockerfile.txt -t generative-agents-cn-vllm:latest .
+#   docker build -f docker/Dockerfile.txt -t generative-agents-cn-vllm-ollama:latest .
+#
+# Build with a host proxy on Linux when the host proxy only listens on
+# 127.0.0.1:
+#   docker build --network=host \
+#     --build-arg HTTPS_PROXY=socks5h://127.0.0.1:21238 \
+#     --build-arg HTTP_PROXY=socks5h://127.0.0.1:21238 \
+#     --build-arg ALL_PROXY=socks5h://127.0.0.1:21238 \
+#     -f docker/Dockerfile.txt -t generative-agents-cn-vllm-ollama:latest .
 #
 # Model weights are not copied into the image.  Download them later on the
 # remote platform with runshells/download_vllm_models.sh, or mount them under
@@ -12,12 +20,15 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 LABEL maintainer="ZJU-REAL"
 LABEL description="GenerativeAgentsCN CUDA/vLLM project image"
 
 ARG PYTHON_VERSION=3.10
 ARG CONDA_ENV=llm-depression
 ARG MINICONDA_VERSION=py310_23.5.2-0
+ARG MINICONDA_DOWNLOAD_URL=
 ARG PYTORCH_VERSION=2.10.0
 ARG TORCHAUDIO_VERSION=2.10.0
 ARG TORCHVISION_VERSION=0.25.0
@@ -34,8 +45,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN printf 'Acquire::http::Proxy "false";\nAcquire::https::Proxy "false";\n' \
-    > /etc/apt/apt.conf.d/00proxy
+RUN set -euo pipefail; \
+    rm -f /etc/apt/apt.conf.d/00proxy; \
+    apt_http_proxy="${HTTP_PROXY:-${http_proxy:-}}"; \
+    apt_https_proxy="${HTTPS_PROXY:-${https_proxy:-}}"; \
+    if [[ "$apt_http_proxy" == http://* || "$apt_http_proxy" == https://* || "$apt_https_proxy" == http://* || "$apt_https_proxy" == https://* ]]; then \
+        { \
+            if [[ "$apt_http_proxy" == http://* || "$apt_http_proxy" == https://* ]]; then \
+                printf 'Acquire::http::Proxy "%s";\n' "$apt_http_proxy"; \
+            fi; \
+            if [[ "$apt_https_proxy" == http://* || "$apt_https_proxy" == https://* ]]; then \
+                printf 'Acquire::https::Proxy "%s";\n' "$apt_https_proxy"; \
+            fi; \
+        } > /etc/apt/apt.conf.d/01proxy; \
+    else \
+        rm -f /etc/apt/apt.conf.d/01proxy; \
+    fi
 
 RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
     sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
@@ -64,27 +89,44 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh -O /tmp/miniconda.sh && \
-    bash /tmp/miniconda.sh -b -p /opt/conda && \
+RUN set -euo pipefail; \
+    miniconda_url="${MINICONDA_DOWNLOAD_URL}"; \
+    if [ -z "$miniconda_url" ]; then \
+        miniconda_url="https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh"; \
+    fi; \
+    echo "Downloading Miniconda from ${miniconda_url}"; \
+    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+        curl --http1.1 -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 \
+        "$miniconda_url" -o /tmp/miniconda.sh; \
+    bash /tmp/miniconda.sh -b -p /opt/conda; \
     rm -f /tmp/miniconda.sh
 
 ENV PATH="/opt/conda/bin:${PATH}"
 
-RUN conda config --system --set show_channel_urls yes && \
-    conda config --system --add channels conda-forge && \
-    conda config --system --set channel_priority strict && \
-    conda create -n ${CONDA_ENV} python=${PYTHON_VERSION} -y && \
+RUN set -euo pipefail; \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
+    conda config --system --set show_channel_urls yes; \
+    conda config --system --remove-key channels || true; \
+    conda config --system --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge; \
+    conda config --system --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main; \
+    conda config --system --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r; \
+    conda config --system --set channel_priority strict; \
+    conda create -n ${CONDA_ENV} python=${PYTHON_VERSION} -y; \
     conda clean -afy
 
 ENV PATH="/opt/conda/envs/${CONDA_ENV}/bin:/opt/conda/bin:${PATH}" \
     CONDA_DEFAULT_ENV=${CONDA_ENV} \
     CONDA_PREFIX=/opt/conda/envs/${CONDA_ENV}
 
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+RUN set -euo pipefail; \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
+    pip config set global.index-url ${PIP_INDEX_URL} && \
     pip config set global.trusted-host ${PIP_TRUSTED_HOST} && \
     python -m pip install --upgrade pip setuptools wheel
 
-RUN pip install --no-cache-dir \
+RUN set -euo pipefail; \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
+    pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
         "torch==${PYTORCH_VERSION}" \
         "torchaudio==${TORCHAUDIO_VERSION}" \
@@ -96,6 +138,7 @@ RUN printf '%s\n' \
         "torchaudio==${TORCHAUDIO_VERSION}+${TORCH_CUDA_VARIANT}" \
         "torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA_VARIANT}" \
         > /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt && \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
     pip install --no-cache-dir -U \
         --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
         -c /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt \
@@ -104,13 +147,17 @@ RUN printf '%s\n' \
     python -m pip show vllm && \
     python -c "import torch, vllm; print('vllm', getattr(vllm, '__version__', 'unknown')); print('torch', torch.__version__, 'cuda', torch.version.cuda)"
 
-RUN pip install --no-cache-dir jupyter jupyterlab ipykernel requests openai && \
+RUN set -euo pipefail; \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
+    pip install --no-cache-dir jupyter jupyterlab ipykernel requests openai && \
     python -m ipykernel install --sys-prefix --name ${CONDA_ENV} --display-name "Python (${CONDA_ENV})"
 
 RUN mkdir -p \
         /workspace \
         /workspace/project \
         /workspace/models \
+        /workspace/ollama-models \
+        /workspace/clash \
         /workspace/hf-cache \
         /workspace/modelscope-cache \
         /root/.cache/huggingface/hub \
@@ -119,6 +166,10 @@ RUN mkdir -p \
 ENV HF_HOME=/workspace/hf-cache \
     HUGGINGFACE_HUB_CACHE=/workspace/hf-cache/hub \
     MODELSCOPE_CACHE=/workspace/modelscope-cache \
+    OLLAMA_HOST=0.0.0.0:11434 \
+    OLLAMA_MODELS=/workspace/ollama-models \
+    CLASH_DIR=/workspace/clash \
+    CLASH_HTTP_PROXY=http://127.0.0.1:7890 \
     PROJECT_DIR=/workspace/project \
     PYTHONPATH=/workspace/project
 
@@ -132,21 +183,94 @@ WORKDIR /workspace/project
 # reuse this layer when only source/config/prompt files change.
 COPY requirements_linux.txt requirements.txt environment.yml /workspace/project/
 
-RUN pip install --no-cache-dir \
+RUN set -euo pipefail; \
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; \
+    pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA_VARIANT} \
         -c /tmp/torch-${TORCH_CUDA_VARIANT}-constraints.txt \
         -r requirements_linux.txt && \
     python -c "import flask, openai, requests, torch, vllm; print('project deps ok; torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# Optional network tools stay below the heavy CUDA/Python/vLLM layers so
+# version changes or download retries do not evict those caches.
+ARG INSTALL_CLASH=0
+ARG MIHOMO_VERSION=v1.19.13
+ARG MIHOMO_DOWNLOAD_URL=
+
+RUN set -euo pipefail; \
+    if [ "${INSTALL_CLASH}" = "1" ]; then \
+        if ! command -v gzip >/dev/null 2>&1; then \
+            apt-get update; \
+            apt-get install -y --no-install-recommends gzip; \
+            apt-get clean; \
+            rm -rf /var/lib/apt/lists/*; \
+        fi; \
+        if [ -n "${MIHOMO_DOWNLOAD_URL}" ]; then \
+            mihomo_url="${MIHOMO_DOWNLOAD_URL}"; \
+        else \
+            mihomo_url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz"; \
+        fi; \
+        echo "Downloading mihomo from ${mihomo_url}"; \
+        curl --http1.1 -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 \
+            "${mihomo_url}" -o /tmp/mihomo.gz; \
+        gzip -dc /tmp/mihomo.gz > /usr/local/bin/mihomo; \
+        chmod +x /usr/local/bin/mihomo; \
+        rm -f /tmp/mihomo.gz; \
+        mihomo -v; \
+    else \
+        echo "Skip Mihomo/Clash install. Set --build-arg INSTALL_CLASH=1 to enable."; \
+    fi
+
+ARG INSTALL_OLLAMA=1
+ARG OLLAMA_RELEASE_VERSION=v0.31.1
+ARG OLLAMA_INSTALL_URL=https://ollama.com/install.sh
+ARG OLLAMA_TARBALL_URL=
+
+RUN set -euo pipefail; \
+    if [ "${INSTALL_OLLAMA}" != "1" ]; then \
+        echo "Skip Ollama install. Set --build-arg INSTALL_OLLAMA=1 to enable."; \
+    elif [ -n "${OLLAMA_TARBALL_URL}" ] || [ -n "${OLLAMA_RELEASE_VERSION}" ]; then \
+        ollama_tarball_url="${OLLAMA_TARBALL_URL}"; \
+        if [ -z "$ollama_tarball_url" ]; then \
+            ollama_tarball_url="https://github.com/ollama/ollama/releases/download/${OLLAMA_RELEASE_VERSION}/ollama-linux-amd64.tar.zst"; \
+        fi; \
+        case "${ollama_tarball_url}" in \
+            *.tar.zst*|*.tzst*) \
+                if ! command -v zstd >/dev/null 2>&1; then \
+                    apt-get update; \
+                    apt-get install -y --no-install-recommends zstd; \
+                    apt-get clean; \
+                    rm -rf /var/lib/apt/lists/*; \
+                fi; \
+                ;; \
+        esac; \
+        echo "Installing Ollama from tarball: ${ollama_tarball_url}"; \
+        curl --http1.1 -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 \
+            "${ollama_tarball_url}" -o /tmp/ollama-linux.archive; \
+        case "${ollama_tarball_url}" in \
+            *.tar.zst*|*.tzst*) zstd -dc /tmp/ollama-linux.archive | tar -xf - -C /usr/local ;; \
+            *) tar -xzf /tmp/ollama-linux.archive -C /usr/local ;; \
+        esac; \
+        rm -f /tmp/ollama-linux.archive; \
+        ollama --version; \
+    else \
+        echo "Downloading Ollama installer: ${OLLAMA_INSTALL_URL}"; \
+        curl --http1.1 -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 \
+            "${OLLAMA_INSTALL_URL}" -o /tmp/ollama-install.sh; \
+        OLLAMA_NO_START=1 sh /tmp/ollama-install.sh; \
+        rm -f /tmp/ollama-install.sh; \
+        ollama --version; \
+    fi
 
 # .dockerignore removes results, docs, caches, local secrets, model weights,
 # and editor metadata.  Model weights should be downloaded or mounted later.
 COPY . /workspace/project/
 
 RUN chmod +x /workspace/project/runshells/*.sh && \
-    mkdir -p /workspace/project/.vllm/logs /workspace/models /workspace/hf-cache /workspace/modelscope-cache /model
+    mkdir -p /workspace/project/.vllm/logs /workspace/project/.ollama/logs /workspace/project/.clash/logs /workspace/models /workspace/ollama-models /workspace/clash /workspace/hf-cache /workspace/modelscope-cache /model
 
-# Replay/Flask, vLLM chat, vLLM embedding, Jupyter.
-EXPOSE 5000 18000 18001 8888
+# Replay/Flask, Clash/Mihomo, Ollama, vLLM chat, vLLM embedding, Jupyter.
+EXPOSE 5000 7890 9090 11434 18000 18001 8888
 
 WORKDIR /workspace/project
 

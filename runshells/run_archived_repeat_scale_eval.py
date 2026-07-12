@@ -18,6 +18,7 @@ import concurrent.futures
 import copy
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,7 @@ DEFAULT_LABELS = ["T0", "session_4", "session_8", "session_12", "session_16", "T
 REPEAT_OUTPUT_SUBDIR = "repeat_scale_eval"
 STAGED_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_staged_eval_worker.py"
 CHECKPOINT_RESULTS_PREFIX = "/workspace/project/results"
+REPEAT_VLLM_ENV = "GA_REPEAT_USE_VLLM_MODELS"
 
 # ============================================================
 # ↓↓↓ 可调参数：直接修改这里即可；命令行 --xxx 会覆盖这里 ↓↓↓
@@ -539,11 +541,22 @@ def rewrite_path_string(value: str, cfg: RuntimeConfig) -> str:
     if not value:
         return value
     text = str(value)
+    if text.startswith(("http://", "https://")):
+        return text
     archive_root = str(cfg.archive_results_root)
+    if text == "results":
+        return archive_root
     if text.startswith(CHECKPOINT_RESULTS_PREFIX):
         return archive_root + text[len(CHECKPOINT_RESULTS_PREFIX):]
+    if text == CHECKPOINT_RESULTS_PREFIX:
+        return archive_root
     if text.startswith("results/"):
         return archive_root + text[len("results"):]
+    if text.endswith("/results"):
+        return archive_root
+    marker = "/results/"
+    if marker in text:
+        return archive_root + "/" + text.split(marker, 1)[1]
     return text
 
 
@@ -605,6 +618,94 @@ def reset_target_depression_state_if_needed(
     return runtime_config
 
 
+def env_flag_enabled(name: str) -> bool:
+    value = str(os.environ.get(name, "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def apply_runtime_model_env_override(runtime_config: dict[str, Any]) -> dict[str, Any]:
+    if not env_flag_enabled(REPEAT_VLLM_ENV):
+        return runtime_config
+    if not isinstance(runtime_config, dict):
+        return runtime_config
+
+    think_payload = {
+        "provider": "openai",
+        "model": os.environ.get("GA_REPEAT_VLLM_THINK_MODEL", "qwen3-8b-vllm"),
+        "base_url": os.environ.get("GA_REPEAT_VLLM_THINK_BASE_URL", "http://127.0.0.1:18000/v1"),
+        "api_key": os.environ.get("GA_REPEAT_VLLM_API_KEY", "EMPTY"),
+    }
+    embedding_payload = {
+        "provider": "openai",
+        "model": os.environ.get("GA_REPEAT_VLLM_EMBED_MODEL", "bge-m3-vllm"),
+        "base_url": os.environ.get("GA_REPEAT_VLLM_EMBED_BASE_URL", "http://127.0.0.1:18001/v1"),
+        "api_key": os.environ.get("GA_REPEAT_VLLM_API_KEY", "EMPTY"),
+    }
+    forced_llm_payload = {
+        "enabled": True,
+        "provider": "openai",
+        "model": think_payload["model"],
+        "base_url": think_payload["base_url"],
+        "api_key_env": "GA_REPEAT_VLLM_API_KEY",
+    }
+
+    agent_base = runtime_config.setdefault("agent_base", {})
+    if not isinstance(agent_base, dict):
+        agent_base = {}
+        runtime_config["agent_base"] = agent_base
+
+    think_cfg = agent_base.setdefault("think", {})
+    if not isinstance(think_cfg, dict):
+        think_cfg = {}
+        agent_base["think"] = think_cfg
+    llm_cfg = think_cfg.setdefault("llm", {})
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
+        think_cfg["llm"] = llm_cfg
+    llm_cfg.update(think_payload)
+
+    associate_cfg = agent_base.setdefault("associate", {})
+    if not isinstance(associate_cfg, dict):
+        associate_cfg = {}
+        agent_base["associate"] = associate_cfg
+    embedding_cfg = associate_cfg.setdefault("embedding", {})
+    if not isinstance(embedding_cfg, dict):
+        embedding_cfg = {}
+        associate_cfg["embedding"] = embedding_cfg
+    embedding_cfg.update(embedding_payload)
+
+    agents = runtime_config.get("agents", {})
+    if isinstance(agents, dict):
+        for agent_cfg in agents.values():
+            if not isinstance(agent_cfg, dict):
+                continue
+            local_think = agent_cfg.get("think")
+            if isinstance(local_think, dict) and isinstance(local_think.get("llm"), dict):
+                local_think["llm"].update(think_payload)
+            local_associate = agent_cfg.get("associate")
+            if isinstance(local_associate, dict) and isinstance(local_associate.get("embedding"), dict):
+                local_associate["embedding"].update(embedding_payload)
+
+    intervention_cfg = runtime_config.setdefault("intervention", {})
+    if not isinstance(intervention_cfg, dict):
+        intervention_cfg = {}
+        runtime_config["intervention"] = intervention_cfg
+    forced_llm_cfg = intervention_cfg.setdefault("forced_llm", {})
+    if not isinstance(forced_llm_cfg, dict):
+        forced_llm_cfg = {}
+        intervention_cfg["forced_llm"] = forced_llm_cfg
+    forced_llm_cfg.update(forced_llm_payload)
+
+    runtime_config["_repeat_runtime_model_override"] = {
+        "enabled": True,
+        "source": REPEAT_VLLM_ENV,
+        "think_llm": copy.deepcopy(think_payload),
+        "embedding": copy.deepcopy(embedding_payload),
+        "forced_llm": copy.deepcopy(forced_llm_payload),
+    }
+    return runtime_config
+
+
 def repeat_metadata_overrides(cfg: RuntimeConfig, condition: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if condition.get("source_condition_name"):
@@ -650,6 +751,7 @@ def build_staged_job(
             runtime_config,
             target_agent,
         )
+        job["runtime_config"] = apply_runtime_model_env_override(job["runtime_config"])
     job["trigger_dir"] = str(output_dir)
     job["worker_result_path"] = str(output_dir / "worker_result.json")
     job["tmp_root_parent"] = str(output_dir / "_tmp")
@@ -677,6 +779,7 @@ def build_post_job(
         runtime_config,
         target_agent,
     )
+    runtime_config = apply_runtime_model_env_override(runtime_config)
     evaluation = condition_evaluation(condition, "POST") or {}
     completed = int(evaluation.get("completed_session_count", 0) or 0)
     metadata = {
@@ -782,6 +885,25 @@ def score_scale_items(output_dir: Path, scale_name: str, item_ids: list[int], *,
     subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
 
 
+def worker_failure_detail(output_dir: Path) -> str:
+    worker_result = load_optional_json(output_dir / "worker_result.json") or {}
+    if not worker_result:
+        return f"worker_result.json not found under {output_dir}"
+    parts = []
+    status = str(worker_result.get("status", "") or "")
+    if status:
+        parts.append(f"worker_status={status}")
+    error = str(worker_result.get("error", "") or "")
+    if error:
+        parts.append(f"error={error}")
+    traceback_text = str(worker_result.get("traceback", "") or "")
+    if traceback_text:
+        lines = traceback_text.strip().splitlines()
+        tail = "\n".join(lines[-12:])
+        parts.append("traceback_tail:\n" + tail)
+    return "\n".join(parts) if parts else f"worker_result has no error detail: {output_dir / 'worker_result.json'}"
+
+
 def stability_task_complete(cfg: RuntimeConfig, task: StabilityRerunTask) -> bool:
     condition_name = str(task.condition.get("condition_name", ""))
     output_dir = repeat_label_dir(cfg, condition_name, task.repeat_idx, task.label)
@@ -850,7 +972,12 @@ def run_stability_rerun_task(cfg: RuntimeConfig, task: StabilityRerunTask) -> di
         write_json_file(job_path, job)
         cmd = [WORKER_PYTHON, str(STAGED_WORKER_SCRIPT), "--job", str(job_path)]
         print(f"[RUN] {' '.join(cmd)}")
-        subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
+        try:
+            subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"staged worker failed with returncode={exc.returncode}\n{worker_failure_detail(output_dir)}"
+            ) from exc
 
     for scale_name, item_ids in job["scale_item_ids"].items():
         score_scale_items(output_dir, scale_name, item_ids, dry_run=cfg.dry_run)
@@ -925,7 +1052,12 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
         write_json_file(job_path, job)
         cmd = [WORKER_PYTHON, str(STAGED_WORKER_SCRIPT), "--job", str(job_path)]
         print(f"[RUN] {' '.join(cmd)}")
-        subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
+        try:
+            subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"staged worker failed with returncode={exc.returncode}\n{worker_failure_detail(output_dir)}"
+            ) from exc
 
     for scale_name in SCALES:
         score_scale_answers(output_dir, scale_name, dry_run=cfg.dry_run)
@@ -2120,6 +2252,12 @@ def main() -> None:
                         error=item.get("error", ""),
                     )
                 )
+        if task_results and all(item.get("status") == "error" for item in task_results):
+            details = "\n\n".join(warnings[:3])
+            raise RuntimeError(
+                "所有重复评估 answer worker 都失败，停止生成空报告。"
+                + (f"\n\n前几个错误:\n{details}" if details else "")
+            )
         stability_results = run_stability_reruns(cfg, original_summary)
         for item in stability_results:
             if item.get("status") == "error":

@@ -240,13 +240,17 @@ class StagedEvalManager:
         if resident_count > 0:
             return resident_count, "resident_chat"
 
-        doctor_count = self._compute_doctor_completed_meeting_count(runtime_config)
-        if doctor_count > 0:
-            return doctor_count, "doctor_completed_meeting"
-
         completed_meeting_count = self._compute_intervention_completed_meeting_count(runtime_config)
         if completed_meeting_count > 0:
             return completed_meeting_count, "intervention_completed_meeting"
+
+        # completed_meeting_state counts every finished doctor consultation,
+        # including post-treatment follow-ups that intentionally skip session
+        # evaluation. Keep session_eval_state only as a compatibility fallback
+        # for older checkpoints created before completed_meeting_state existed.
+        doctor_count = self._compute_doctor_completed_meeting_count(runtime_config)
+        if doctor_count > 0:
+            return doctor_count, "doctor_completed_meeting"
 
         return 0, "none"
 

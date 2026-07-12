@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-07-07
+> 更新时间：2026-07-08
 
 ## 关键测试结果速查
 
@@ -28,6 +28,14 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-12：优化强制医患对话的判断LLM提示词：改为围绕当前阶段唯一缺口进行“承接后最小推进”，明确防重复探索、阶段适配与约18个医生轮次的收束节奏；`advice`统一为包含当前缺口、承接、动作、提问意图和避免重复项的单行结构，并使终止判断与回复策略保持一致。
+- 2026-07-12：修正并强化居民聊天干预：`ResidentChatScheduler`默认将居民侧设为`prompt_target=doctor`，G3/G5组显式指定该目标并新增回归测试，确保中性社交和负面支持提示词只注入被选中居民；同时收紧中性聊天的安慰/实际帮助边界，规范负面支持的伤害强度、篇幅及快速收束方式。
+- 2026-07-12：`runshells/run_batch_then_repeat_eval.sh`支持通过`--repeat-count`和`--max-parallel`运行多轮独立的“批量仿真→重复量表复评”流水线；每轮自动使用`-01`、`-02`等独立名称、summary和日志，并提供进度、失败轮次汇总及中断时的子进程清理。
+- 2026-07-12：修复回访对话未正确计入staged_eval计数问题。
+- 2026-07-10：合并学长更新
+- 2026-07-08：增强 Docker 镜像对 Ollama/Clash 一体化运行的支持：`docker/Dockerfile.txt`默认镜像标签改为`generative-agents-cn-vllm-ollama`，支持 Linux host proxy 构建、Miniconda/conda 清华镜像下载、可选安装 Mihomo/Clash 和 Ollama，并新增`/workspace/ollama-models`、`/workspace/clash`、`.ollama/.clash`日志目录及`7890/9090/11434`端口暴露；`docker/Dockerfile-0708.txt`保留原vLLM镜像模板快照便于回退对照。
+- 2026-07-08：新增 Ollama 与 Clash/Mihomo 服务脚本：`runshells/ollama_services.sh`可从`data/config.json`读取chat/embedding模型和端口，支持`start/stop/restart/status/print-config`、GPU绑定、模型预加载和本地OpenAI兼容端点提示；`runshells/download_ollama_models.sh`可按配置拉取Ollama模型并支持`PROXY_URL`；`runshells/clash_services.sh`可启动代理、下载订阅配置、输出代理环境变量，并串联`download-ollama`下载模型。
+- 2026-07-08：新增未完成实验的即时重复量表复评入口：`runshells/run_immediate_repeat_scale_eval.py`可基于指定checkpoint的最新`simulate-*.json`和`storage/`即时生成`NOW`评估点，刷新runtime_config中的本地记忆索引，自动合成缺失的原始summary，并委托`run_archived_repeat_scale_eval.py`执行重复量表、稳定性补跑和报告汇总；支持`--labels auto`、`--include-now`、`--report-only`、`--reset-target-depression-state`、`--output-group`和`--use-vllm-models`。
 - 2026-07-07：新增治疗完成后的回访模式：`session_prompt_injection.post_treatment_followup`默认启用并新增`data/prompts/intervention/post_treatment_followup.txt`，当医患CBT阶段已完成后不再推进新的session prompt，而是注入治疗后回访提示词；回访会谈可跳过会后阶段评估，且不会因已完成状态清空后续会谈规则，便于继续观察治疗结束后的状态、作业执行和风险变化。
 - 2026-07-07：补齐会谈完成计数状态：`modules/intervention_manager.py`新增`completed_meeting_state`，在强制医患会谈闭环时按医患pair记录完成次数、meeting_id和结束时间；`modules/staged_eval_manager.py`新增`intervention_completed_meeting`计数来源，使阶段评估在缺少咨询历史或跳过部分会后产物时仍能基于真实完成会谈数触发。
 - 2026-07-07：调整当前实验默认开关：`data/config.json`默认开启`intervention.order_extract`和`intervention.environment_model`，并在G1医生干预组启用环境模型；同时默认关闭`staged_eval.t4_enabled`和`auto_stop_after_t4_done`，避免T4完成后自动收尾影响后续回访/复评流程。

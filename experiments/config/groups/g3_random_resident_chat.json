@@ -22,7 +22,8 @@
           ],
           "selection_strategy": "random_no_repeat",
           "duration": 1440,
-          "prompt_file": "data/prompts/intervention/resident_chat_neutral_social.txt"
+          "prompt_file": "data/prompts/intervention/resident_chat_neutral_social.txt",
+          "prompt_target": "doctor"
         }
       ]
     },
