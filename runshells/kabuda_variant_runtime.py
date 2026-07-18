@@ -148,13 +148,25 @@ def prepare_kabuda_variant_runtime(
     output_dir: Path,
     dry_run: bool = False,
     runtime_agent_name: str = RUNTIME_AGENT_NAME,
+    agent_source_subdir: str = "village",
 ) -> KabudaVariantRuntime:
     resolved_variant = resolve_variant(variant)
     if severity not in SEVERITY_CONFIG_NAMES:
         raise ValueError(f"unknown severity: {severity}")
 
     source_agent_name = VARIANT_SOURCE_AGENT_NAMES[resolved_variant]
+    # agent.json 来源可切换：咨询室模式传 "counsel_room" 以取咨询室版空间限制配置；
+    # 抑郁配置始终取村庄按严重度三件套（depression_config_{mild,moderate,severe}.json）
     source_agent_dir = (
+        Path(base_dir)
+        / "frontend"
+        / "static"
+        / "assets"
+        / agent_source_subdir
+        / "agents"
+        / source_agent_name
+    )
+    depression_source_dir = (
         Path(base_dir)
         / "frontend"
         / "static"
@@ -164,7 +176,7 @@ def prepare_kabuda_variant_runtime(
         / source_agent_name
     )
     source_agent_path = source_agent_dir / "agent.json"
-    source_depression_path = source_agent_dir / SEVERITY_CONFIG_NAMES[severity]
+    source_depression_path = depression_source_dir / SEVERITY_CONFIG_NAMES[severity]
     if not source_agent_path.is_file():
         raise FileNotFoundError(source_agent_path)
     if not source_depression_path.is_file():

@@ -4,12 +4,78 @@ import argparse
 from datetime import datetime, timedelta
 
 from modules.maze import Maze
-from start import personas
 
 file_markdown = "simulation.md"
 file_movement = "movement.json"
 
 frames_per_step = 60  # 每个step包含的帧数
+
+# 村庄模式的角色花名册兜底值（与 start.personas 保持一致）。
+# 仅在存档目录里没有任何 simulate-*.json 时作为最后兜底使用——正常回放时
+# 角色花名册由 _resolve_run_context 从存档动态读取。
+# 注意：不能写成 ``from start import personas``——start.py 在模块顶层调用了
+# parse_args()，导入即会消费 sys.argv，导致本脚本新增的 --assets-root 参数被
+# start 的 parser 误判为「unrecognized arguments」。
+_DEFAULT_VILLAGE_PERSONAS = [
+    "卡布达",
+    "金龟次郎",
+    "田德莉娜",
+    "呱呱蛙",
+    "蜻蜓队长",
+    "蟑螂恶霸",
+]
+
+
+def _assets_base(assets_root):
+    """根据 assets 子目录名（village / counsel_room）返回完整资源根路径。"""
+    return f"frontend/static/assets/{assets_root}"
+
+
+def _resolve_run_context(checkpoints_folder, assets_root_override=None):
+    """确定回放所需的 assets_root 与角色花名册。
+
+    assets_root 优先级：显式参数 > 从首个 simulate-*.json 自动检测 > 默认 village。
+    角色花名册始终取自存档的 ``agents`` 字段（咨询室仅 卡布达 + 蜻蜓队长，村庄为
+    全部 6 人）——它与 assets_root 天然耦合，故不单独设参数；存档缺失时回退到
+    _DEFAULT_VILLAGE_PERSONAS。
+
+    自动检测依据：每个存档里都嵌入了运行时配置，其中 ``maze.path`` 对咨询室
+    运行为 ``assets/counsel_room/maze.json``、对村庄运行为 ``assets/village/maze.json``。
+    """
+    assets_root = assets_root_override
+    roster = None
+
+    try:
+        names = sorted(
+            n for n in os.listdir(checkpoints_folder)
+            if n.startswith("simulate-") and n.endswith(".json")
+        )
+    except OSError:
+        names = []
+
+    if names:
+        try:
+            with open(os.path.join(checkpoints_folder, names[0]), "r", encoding="utf-8") as f:
+                snap = json.load(f)
+        except (OSError, ValueError):
+            snap = {}
+
+        if assets_root is None:
+            maze_field = snap.get("maze")
+            maze_path = ""
+            if isinstance(maze_field, dict):
+                maze_path = str(maze_field.get("path", "") or "")
+            assets_root = "counsel_room" if "counsel_room" in maze_path else "village"
+
+        agents = snap.get("agents")
+        if isinstance(agents, dict) and agents:
+            roster = list(agents.keys())
+
+    if assets_root is None:
+        assets_root = "village"
+    if roster is None:
+        roster = list(_DEFAULT_VILLAGE_PERSONAS)
+    return assets_root, roster
 
 
 # 从存档文件中读取stride
@@ -105,12 +171,12 @@ def get_depression_runtime_snapshot(agent_data):
 
 
 # 插入第0帧数据（Agent的初始状态）
-def insert_frame0(init_pos, movement, agent_name):
+def insert_frame0(init_pos, movement, agent_name, assets_root):
     key = "0"
     if key not in movement.keys():
         movement[key] = dict()
 
-    json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+    json_path = f"{_assets_base(assets_root)}/agents/{agent_name}/agent.json"
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
         address = json_data["spatial"]["address"]["living_area"]
@@ -129,7 +195,7 @@ def insert_frame0(init_pos, movement, agent_name):
 
 
 # 从所有存档文件中提取数据（用于回放）
-def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
+def generate_movement(checkpoints_folder, compressed_folder, compressed_file, assets_root):
     movement_file = os.path.join(compressed_folder, compressed_file)
 
     conversation_file = "conversation.json"
@@ -163,7 +229,7 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
     last_location = dict()
 
     # 加载地图数据，用于计算Agent移动路径
-    json_path = "frontend/static/assets/village/maze.json"
+    json_path = f"{_assets_base(assets_root)}/maze.json"
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
         maze = Maze(json_data, None)
@@ -186,7 +252,7 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
             for agent_name, agent_data in agents.items():
                 # 插入第0帧
                 if agent_name not in persona_init_pos:
-                    insert_frame0(persona_init_pos, all_movement, agent_name)
+                    insert_frame0(persona_init_pos, all_movement, agent_name, assets_root)
 
                 source_coord = last_location.get(agent_name, all_movement["0"][agent_name])["movement"]
                 target_coord = agent_data["coord"]
@@ -264,7 +330,7 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
 
 
 # 生成Markdown文档
-def generate_report(checkpoints_folder, compressed_folder, compressed_file):
+def generate_report(checkpoints_folder, compressed_folder, compressed_file, assets_root, roster):
     last_state = dict()
 
     conversation_file = "conversation.json"
@@ -275,8 +341,8 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file):
 
     def extract_description():
         markdown_content = "# 基础人设\n\n"
-        for agent_name in personas:
-            json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+        for agent_name in roster:
+            json_path = f"{_assets_base(assets_root)}/agents/{agent_name}/agent.json"
             with open(json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
                 markdown_content += f"## {agent_name}\n\n"
@@ -368,6 +434,13 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--name", type=str, default="", help="the name of the simulation")
+parser.add_argument(
+    "--assets-root",
+    type=str,
+    default=None,
+    help="assets 子目录名（village 或 counsel_room）；默认从存档自动检测。"
+         "角色花名册始终从存档自动读取，与 assets_root 耦合，无需单独指定。",
+)
 args = parser.parse_args()
 
 
@@ -383,5 +456,8 @@ if __name__ == "__main__":
     compressed_folder = f"results/compressed/{name}"
     os.makedirs(compressed_folder, exist_ok=True)
 
-    generate_report(checkpoints_folder, compressed_folder, file_markdown)
-    generate_movement(checkpoints_folder, compressed_folder, file_movement)
+    assets_root, roster = _resolve_run_context(checkpoints_folder, args.assets_root)
+    print(f"[compress] assets_root={assets_root} roster={roster}")
+
+    generate_report(checkpoints_folder, compressed_folder, file_markdown, assets_root, roster)
+    generate_movement(checkpoints_folder, compressed_folder, file_movement, assets_root)

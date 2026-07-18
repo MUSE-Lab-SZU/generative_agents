@@ -157,6 +157,11 @@ GROUP_OVERLAY_FILES = {
     "g9": GROUP_OVERLAY_DIR / "g9_positive_resident_chat.json",
 }
 
+# 咨询室模式（--counsel-room）：独立于 group 矩阵，只跑卡布达+蜻蜓队长、6×7 地图、
+# 用 data/config_counsel_room.json 作为最小 overlay 与 config.json 合并
+COUNSEL_ROOM_OVERLAY = BASE_DIR / "data" / "config_counsel_room.json"
+COUNSEL_ROOM_AGENTS = ["卡布达", "蜻蜓队长"]
+
 SEVERITY_SHORT_NAMES = {
     "mild": "MILD",
     "moderate": "MOD",
@@ -195,6 +200,17 @@ ALL_CONDITIONS = [
     for severity in SEVERITIES
 ]
 
+# 咨询室专属条件：仅 kbd1 × 3 severity，group 标签 "g4" 仅作元数据标记，不进 GROUPS/GROUP_OVERLAY_FILES
+COUNSEL_ROOM_CONDITIONS = [
+    BatchCondition(
+        name=f"Counsel-G4-{SEVERITY_SHORT_NAMES[severity]}",
+        variant="kbd1",
+        group="g4",
+        severity=severity,
+    )
+    for severity in SEVERITIES
+]
+
 
 @dataclass
 class RuntimeConfig:
@@ -218,6 +234,7 @@ class RuntimeConfig:
     resume_condition: str | None
     skip_completed: bool
     conditions: list[BatchCondition]
+    counsel_room: bool = False
 
 
 @dataclass
@@ -255,6 +272,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-agent-memory-vis", action="store_true", help="跳过角色记忆可视化")
     parser.add_argument("--run-external-memory-audit", action="store_true", help="显式开启外置记忆审计可视化")
     parser.add_argument("--skip-external-memory-audit", action="store_true", help="跳过外置记忆审计可视化")
+    parser.add_argument(
+        "--counsel-room",
+        action="store_true",
+        help="咨询室模式：6×7 地图、卡布达+蜻蜓队长、data/config_counsel_room.json 作为最小 overlay",
+    )
     return parser.parse_args()
 
 
@@ -337,6 +359,42 @@ def resolve_conditions(condition_names: str | list[str] | None) -> list[BatchCon
     return conditions
 
 
+def resolve_counsel_room_conditions(condition_names: str | list[str] | None) -> list[BatchCondition]:
+    """咨询室模式条件解析：独立于 group 选择器，只在 COUNSEL_ROOM_CONDITIONS 里选。
+
+    支持：None/ALL/Counsel-G4-ALL → 全部 3 条；Counsel-G4-MILD/MOD/SEV → 按严重度。
+    """
+    if not condition_names:
+        return list(COUNSEL_ROOM_CONDITIONS)
+
+    selectors = [condition_names] if isinstance(condition_names, str) else condition_names
+    chosen: list[BatchCondition] = []
+    seen_names: set[str] = set()
+    for selector in selectors:
+        norm = str(selector or "").strip().upper()
+        wildcard = norm in {"ALL", "*", "COUNSEL-G4-ALL", "G4-ALL"}
+        for condition in COUNSEL_ROOM_CONDITIONS:
+            severity_token = norm.split("-")[-1] if norm.startswith("COUNSEL-G4-") else ""
+            match = wildcard or condition.name.upper() == norm or (
+                norm.startswith("COUNSEL-G4-")
+                and SEVERITY_SELECTOR_ALIASES.get(severity_token) == condition.severity
+            )
+            if match and condition.name not in seen_names:
+                chosen.append(condition)
+                seen_names.add(condition.name)
+    if not chosen:
+        available = ", ".join(c.name for c in COUNSEL_ROOM_CONDITIONS)
+        raise ValueError(f"咨询室模式下未找到条件: {condition_names}; 可用: {available}")
+    return chosen
+
+
+def resolve_conditions_for_mode(cfg: RuntimeConfig, selector: str | list[str] | None) -> list[BatchCondition]:
+    """按当前模式（咨询室/普通）选择对应的条件解析器。"""
+    if cfg.counsel_room:
+        return resolve_counsel_room_conditions(selector)
+    return resolve_conditions(selector)
+
+
 def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     summary_only = bool(SUMMARY_ONLY)
     base_name = (args.name if args.name is not None else RUN_NAME).strip()
@@ -365,7 +423,12 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         resume_batch=bool(args.resume_batch),
         resume_condition=str(args.resume_condition or "").strip() or None,
         skip_completed=bool(args.skip_completed),
-        conditions=resolve_conditions(args.condition),
+        conditions=(
+            resolve_counsel_room_conditions(args.condition)
+            if args.counsel_room
+            else resolve_conditions(args.condition)
+        ),
+        counsel_room=bool(args.counsel_room),
     )
 
 
@@ -404,6 +467,7 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  跑记忆可视化: {cfg.run_agent_memory_vis}")
     print(f"  跑外置审计:   {cfg.run_external_memory_audit}")
     print(f"  并行度:       {cfg.max_parallel}")
+    print(f"  咨询室模式:   {cfg.counsel_room}")
     print("  Embedding URLs: " + ", ".join(cfg.embedding_base_urls))
     print(f"  续跑批次:     {cfg.resume_batch}")
     print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
@@ -835,17 +899,33 @@ def build_condition_runtime_config_payload(
     *,
     embedding_base_url: str | None = None,
 ) -> dict[str, Any]:
-    template = load_json_file(runtime_config_template_path())
-    overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
-    merged = deep_merge_dict(template, overlay)
-    variant_runtime = prepare_kabuda_variant_runtime(
-        base_dir=BASE_DIR,
-        variant=condition.variant,
-        severity=condition.severity,
-        output_dir=batch_runtime_persona_dir(cfg, condition),
-        dry_run=cfg.dry_run,
-    )
-    assets_root = "assets/village"
+    if cfg.counsel_room:
+        template = load_json_file(runtime_config_template_path())
+        overlay = load_json_file(COUNSEL_ROOM_OVERLAY)
+        merged = deep_merge_dict(template, overlay)
+        variant_runtime = prepare_kabuda_variant_runtime(
+            base_dir=BASE_DIR,
+            variant=condition.variant,
+            severity=condition.severity,
+            output_dir=batch_runtime_persona_dir(cfg, condition),
+            dry_run=cfg.dry_run,
+            agent_source_subdir="counsel_room",
+        )
+        assets_root = "assets/counsel_room"
+        agent_roster = COUNSEL_ROOM_AGENTS
+    else:
+        template = load_json_file(runtime_config_template_path())
+        overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
+        merged = deep_merge_dict(template, overlay)
+        variant_runtime = prepare_kabuda_variant_runtime(
+            base_dir=BASE_DIR,
+            variant=condition.variant,
+            severity=condition.severity,
+            output_dir=batch_runtime_persona_dir(cfg, condition),
+            dry_run=cfg.dry_run,
+        )
+        assets_root = "assets/village"
+        agent_roster = PERSONAS
     payload: dict[str, Any] = {
         "stride": cfg.stride,
         "time": {"start": cfg.start},
@@ -874,7 +954,7 @@ def build_condition_runtime_config_payload(
         payload["staged_eval"] = staged_eval_config
     if checkpointing_config:
         payload["checkpointing"] = checkpointing_config
-    for agent_name in PERSONAS:
+    for agent_name in agent_roster:
         payload["agents"][agent_name] = {
             "config_path": f"{assets_root}/agents/{agent_name.replace(' ', '_')}/agent.json",
         }
@@ -1258,6 +1338,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
         severity=condition.severity,
         output_dir=batch_runtime_persona_dir(cfg, condition),
         dry_run=True,
+        agent_source_subdir="counsel_room" if cfg.counsel_room else "village",
     )
 
     meta.update(
@@ -1280,7 +1361,11 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             "verbose": cfg.verbose,
             "log_file": cfg.log_file,
             "scale_agent": cfg.agent,
-            "group_overlay_file": GROUP_OVERLAY_FILES[condition.group].name,
+            "group_overlay_file": (
+                COUNSEL_ROOM_OVERLAY.name
+                if cfg.counsel_room
+                else GROUP_OVERLAY_FILES[condition.group].name
+            ),
             "severity_config_file": str(variant_runtime.depression_config_path),
             "script": "runshells/run_batch_experiment.py",
         }
@@ -1377,7 +1462,7 @@ def should_resume_condition(cfg: RuntimeConfig, condition: BatchCondition, state
     if cfg.resume_batch:
         return str(state.get("status", "") or "") in RESUMEABLE_CONDITION_STATUSES
     if cfg.resume_condition:
-        resume_targets = {item.name for item in resolve_conditions(cfg.resume_condition)}
+        resume_targets = {item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)}
         return condition.name in resume_targets
     return False
 
@@ -2154,7 +2239,7 @@ def prepare_conditions_for_execution(cfg: RuntimeConfig) -> tuple[list[BatchCond
     notes: list[str] = []
     resume_targets = set()
     if cfg.resume_condition:
-        resume_targets = {item.name for item in resolve_conditions(cfg.resume_condition)}
+        resume_targets = {item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)}
 
     for condition in cfg.conditions:
         state = read_condition_state(cfg, condition)

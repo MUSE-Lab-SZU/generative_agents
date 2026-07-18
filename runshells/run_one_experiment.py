@@ -193,6 +193,36 @@ def run_cmd(cmd: list[str], *, dry_run: bool, timeout: Optional[int] = None) -> 
     subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=timeout)
 
 
+def detect_assets_root(name: str) -> str:
+    """从 checkpoint 的首个 simulate-*.json 推断回放所需的 assets 子目录。
+
+    存档里嵌入了运行时配置，``maze.path`` 含 ``counsel_room`` 即咨询室（6×7），
+    否则按村庄（50×50）处理。读不到任何存档时安全回退到 ``village``。
+    用于给 compress.py 显式传递 ``--assets-root``。
+    """
+    checkpoint_dir = CHECKPOINTS_ROOT / name
+    if not checkpoint_dir.is_dir():
+        return "village"
+    try:
+        names = sorted(
+            p for p in checkpoint_dir.iterdir()
+            if p.name.startswith("simulate-") and p.name.endswith(".json")
+        )
+    except OSError:
+        return "village"
+    for path in names:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "village"
+        maze_field = data.get("maze")
+        maze_path = ""
+        if isinstance(maze_field, dict):
+            maze_path = str(maze_field.get("path", "") or "")
+        return "counsel_room" if "counsel_room" in maze_path else "village"
+    return "village"
+
+
 def ensure_checkpoint_state(name: str, *, resume: bool, dry_run: bool) -> None:
     if dry_run:
         return
@@ -462,7 +492,12 @@ def main() -> None:
         run_post_30q(cfg.name, cfg.agent, dry_run=cfg.dry_run)
 
     if cfg.run_compress:
-        run_cmd([sys.executable, str(COMPRESS_SCRIPT), "--name", cfg.name], dry_run=cfg.dry_run, timeout=1800)
+        assets_root = detect_assets_root(cfg.name)
+        run_cmd(
+            [sys.executable, str(COMPRESS_SCRIPT), "--name", cfg.name, "--assets-root", assets_root],
+            dry_run=cfg.dry_run,
+            timeout=1800,
+        )
 
     if cfg.run_agent_memory_vis:
         run_agent_memory_visualization(cfg.name, cfg.agent, dry_run=cfg.dry_run)
