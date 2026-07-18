@@ -200,15 +200,20 @@ ALL_CONDITIONS = [
     for severity in SEVERITIES
 ]
 
-# 咨询室专属条件：仅 kbd1 × 3 severity，group 标签 "g4" 仅作元数据标记，不进 GROUPS/GROUP_OVERLAY_FILES
+def _make_counsel_condition(variant: str, severity: str) -> BatchCondition:
+    """构造咨询室条件。kbd1 沿用旧名 Counsel-G4-{SEV}（向后兼容）；
+    其余变体用 Counsel-{SHORT}-G4-{SEV}。"""
+    if variant == "kbd1":
+        name = f"Counsel-G4-{SEVERITY_SHORT_NAMES[severity]}"
+    else:
+        name = f"Counsel-{VARIANT_SHORT_NAMES[variant]}-G4-{SEVERITY_SHORT_NAMES[severity]}"
+    return BatchCondition(name=name, variant=variant, group="g4", severity=severity)
+
+
+# 咨询室默认条件集：kbd1 × 3 severity（不传 --condition 时跑这些）。
+# 其他变体（kbd2..9）通过 4-token 选择器按需构造，见 resolve_counsel_room_conditions。
 COUNSEL_ROOM_CONDITIONS = [
-    BatchCondition(
-        name=f"Counsel-G4-{SEVERITY_SHORT_NAMES[severity]}",
-        variant="kbd1",
-        group="g4",
-        severity=severity,
-    )
-    for severity in SEVERITIES
+    _make_counsel_condition("kbd1", severity) for severity in SEVERITIES
 ]
 
 
@@ -360,9 +365,14 @@ def resolve_conditions(condition_names: str | list[str] | None) -> list[BatchCon
 
 
 def resolve_counsel_room_conditions(condition_names: str | list[str] | None) -> list[BatchCondition]:
-    """咨询室模式条件解析：独立于 group 选择器，只在 COUNSEL_ROOM_CONDITIONS 里选。
+    """咨询室模式条件解析：独立于 group 选择器，支持 kbd1-9 变体。
 
-    支持：None/ALL/Counsel-G4-ALL → 全部 3 条；Counsel-G4-MILD/MOD/SEV → 按严重度。
+    选择器（不传 = 默认 kbd1 × 3）：
+      Counsel-G4-MILD / Counsel-G4-MOD / Counsel-G4-SEV / Counsel-G4-ALL   → kbd1
+      Counsel-KBD2-G4-MILD / Counsel-KBD2-G4-MOD / Counsel-KBD2-G4-ALL     → 指定变体
+      Counsel-ALL-G4-MILD                                                   → 全 9 变体 × 该严重度
+      Counsel-ALL-G4-ALL                                                    → 全 9 变体 × 3 严重度（27）
+      ALL / *                                                               → 默认 kbd1 × 3
     """
     if not condition_names:
         return list(COUNSEL_ROOM_CONDITIONS)
@@ -371,20 +381,41 @@ def resolve_counsel_room_conditions(condition_names: str | list[str] | None) -> 
     chosen: list[BatchCondition] = []
     seen_names: set[str] = set()
     for selector in selectors:
-        norm = str(selector or "").strip().upper()
-        wildcard = norm in {"ALL", "*", "COUNSEL-G4-ALL", "G4-ALL"}
-        for condition in COUNSEL_ROOM_CONDITIONS:
-            severity_token = norm.split("-")[-1] if norm.startswith("COUNSEL-G4-") else ""
-            match = wildcard or condition.name.upper() == norm or (
-                norm.startswith("COUNSEL-G4-")
-                and SEVERITY_SELECTOR_ALIASES.get(severity_token) == condition.severity
+        norm = str(selector or "").strip()
+        up = norm.upper()
+        if up in {"ALL", "*"}:
+            for cond in COUNSEL_ROOM_CONDITIONS:
+                if cond.name not in seen_names:
+                    chosen.append(cond)
+                    seen_names.add(cond.name)
+            continue
+
+        tokens = [t.strip().upper() for t in norm.split("-")]
+        if len(tokens) == 3 and tokens[0] == "COUNSEL" and tokens[1] == "G4":
+            var_tok, sev_tok = "KBD1", tokens[2]
+        elif len(tokens) == 4 and tokens[0] == "COUNSEL" and tokens[2] == "G4":
+            var_tok, sev_tok = tokens[1], tokens[3]
+        else:
+            raise ValueError(
+                f"咨询室条件格式无法识别: {norm}（示例：Counsel-G4-MILD、"
+                f"Counsel-KBD2-G4-MOD、Counsel-ALL-G4-ALL）"
             )
-            if match and condition.name not in seen_names:
-                chosen.append(condition)
-                seen_names.add(condition.name)
+
+        try:
+            var_keys = None if var_tok in WILDCARD_TOKENS else [VARIANT_SELECTOR_ALIASES[var_tok]]
+            sev_keys = None if sev_tok in WILDCARD_TOKENS else [SEVERITY_SELECTOR_ALIASES[sev_tok]]
+        except KeyError as exc:
+            raise ValueError(f"咨询室条件含未知 token: {norm}（{exc}）") from exc
+
+        for v in (VARIANTS if var_keys is None else var_keys):
+            for s in (SEVERITIES if sev_keys is None else sev_keys):
+                cond = _make_counsel_condition(v, s)
+                if cond.name not in seen_names:
+                    chosen.append(cond)
+                    seen_names.add(cond.name)
+
     if not chosen:
-        available = ", ".join(c.name for c in COUNSEL_ROOM_CONDITIONS)
-        raise ValueError(f"咨询室模式下未找到条件: {condition_names}; 可用: {available}")
+        raise ValueError(f"咨询室模式下未找到条件: {condition_names}")
     return chosen
 
 

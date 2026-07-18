@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -155,18 +156,7 @@ def prepare_kabuda_variant_runtime(
         raise ValueError(f"unknown severity: {severity}")
 
     source_agent_name = VARIANT_SOURCE_AGENT_NAMES[resolved_variant]
-    # agent.json 来源可切换：咨询室模式传 "counsel_room" 以取咨询室版空间限制配置；
-    # 抑郁配置始终取村庄按严重度三件套（depression_config_{mild,moderate,severe}.json）
-    source_agent_dir = (
-        Path(base_dir)
-        / "frontend"
-        / "static"
-        / "assets"
-        / agent_source_subdir
-        / "agents"
-        / source_agent_name
-    )
-    depression_source_dir = (
+    village_agent_dir = (
         Path(base_dir)
         / "frontend"
         / "static"
@@ -175,8 +165,45 @@ def prepare_kabuda_variant_runtime(
         / "agents"
         / source_agent_name
     )
-    source_agent_path = source_agent_dir / "agent.json"
-    source_depression_path = depression_source_dir / SEVERITY_CONFIG_NAMES[severity]
+    source_depression_path = village_agent_dir / SEVERITY_CONFIG_NAMES[severity]
+
+    # agent.json 来源：
+    # - 村庄模式（默认）：直接取村庄变体。
+    # - 咨询室模式：若 counsel_room/agents/{name}/agent.json 存在（kbd1 手工版）则直接用；
+    #   否则（kbd2..9）取村庄变体 persona，并叠加咨询室空间模板——spatial/coord/currently
+    #   取自 counsel_room/agents/{runtime_agent_name}/agent.json。抑郁配置始终取村庄按严重度三件套。
+    counsel_spatial_template: Path | None = None
+    if agent_source_subdir == "counsel_room":
+        counsel_agent_path = (
+            Path(base_dir)
+            / "frontend"
+            / "static"
+            / "assets"
+            / "counsel_room"
+            / "agents"
+            / source_agent_name
+            / "agent.json"
+        )
+        if counsel_agent_path.is_file():
+            source_agent_path = counsel_agent_path
+            source_agent_dir = counsel_agent_path.parent
+        else:
+            source_agent_path = village_agent_dir / "agent.json"
+            source_agent_dir = village_agent_dir
+            counsel_spatial_template = (
+                Path(base_dir)
+                / "frontend"
+                / "static"
+                / "assets"
+                / "counsel_room"
+                / "agents"
+                / runtime_agent_name
+                / "agent.json"
+            )
+    else:
+        source_agent_path = village_agent_dir / "agent.json"
+        source_agent_dir = village_agent_dir
+
     if not source_agent_path.is_file():
         raise FileNotFoundError(source_agent_path)
     if not source_depression_path.is_file():
@@ -187,6 +214,13 @@ def prepare_kabuda_variant_runtime(
         source_name=source_agent_name,
         runtime_name=runtime_agent_name,
     )
+    if counsel_spatial_template is not None:
+        if not counsel_spatial_template.is_file():
+            raise FileNotFoundError(counsel_spatial_template)
+        template = load_json_file(counsel_spatial_template)
+        for field in ("spatial", "coord", "currently"):
+            if field in template:
+                agent_payload[field] = copy.deepcopy(template[field])
     depression_payload = normalize_runtime_agent_name(
         load_json_file(source_depression_path),
         source_name=source_agent_name,
