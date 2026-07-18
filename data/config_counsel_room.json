@@ -1,0 +1,27 @@
+{
+  "agent": {
+    "think": {
+      "llm": {
+        "provider": "openai",
+        "model": "qwen3-8b-vllm",
+        "base_url": "http://127.0.0.1:18000/v1",
+        "api_key": "EMPTY",
+        "retry": 3,
+        "request_timeout_seconds": 300
+      }
+    },
+    "associate": {
+      "embedding": {
+        "provider": "openai",
+        "model": "bge-m3-vllm",
+        "base_url": "http://127.0.0.1:18001/v1",
+        "api_key": "EMPTY"
+      }
+    }
+  },
+  "intervention": {
+    "patients": [
+      "卡布达"
+    ]
+  }
+}
