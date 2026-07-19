@@ -14,11 +14,18 @@ import argparse
 import json
 import os
 import sys
+import time
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, os.path.join(BASE_DIR, "customization", "depression_scale_agent"))
 
 from ExpertLLM import ExpertLLM
+from modules.model.llm_model import (
+    format_call_error_details,
+    safe_exception_message_for_log,
+)
 
 
 def main():
@@ -52,6 +59,7 @@ def main():
 
     # 调用 ExpertLLM
     print(f"[INFO] 调用 ExpertLLM...")
+    llm_started_at = time.monotonic()
     try:
         llm = ExpertLLM()
         reply = llm.generate(user_prompt, system_prompt=system_prompt)
@@ -59,7 +67,24 @@ def main():
             print(f"[ERROR] ExpertLLM 返回空")
             sys.exit(1)
     except Exception as e:
-        print(f"[ERROR] ExpertLLM 调用失败: {e}")
+        details = format_call_error_details(
+            e,
+            caller="repeat_eval_score",
+            stage="request",
+            provider="openai",
+            model=os.getenv("EXPERT_LLM_MODEL") or "deepseek-chat",
+            base_url=os.getenv("EXPERT_LLM_BASE_URL") or "https://api.deepseek.com",
+            attempt=1,
+            total_attempts=1,
+            retrying=False,
+            elapsed_ms=(time.monotonic() - llm_started_at) * 1000,
+        )
+        print(
+            "[ERROR] ExpertLLM 调用失败: {} | [LLM_CALL_ERROR] {}".format(
+                safe_exception_message_for_log(e),
+                details,
+            )
+        )
         sys.exit(1)
 
     # 解析 JSON

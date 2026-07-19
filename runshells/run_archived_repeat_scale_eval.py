@@ -16,18 +16,21 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
-import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from scipy.stats import t as student_t
 
 from run_one_experiment import (
     BASE_DIR,
@@ -46,11 +49,7 @@ from run_batch_experiment import (
     aggregate_dimension_trajectory,
     aggregate_final_deltas,
     apply_trajectory_deltas,
-    build_group_severity_matrix,
-    build_scale_score_validation,
-    build_scale_snapshot,
-    extract_scale_severity,
-    extract_scale_total,
+    extract_direct_answer_score,
     expected_scale_severity,
     format_delta,
     format_number,
@@ -60,7 +59,6 @@ from run_batch_experiment import (
     render_condition_trajectory_markdown,
     render_dimension_trajectory_markdown,
     render_final_delta_markdown,
-    render_group_severity_matrix_markdown,
     render_scale_score_validation_markdown,
     resolve_conditions,
     trigger_sort_key,
@@ -73,6 +71,16 @@ REPEAT_OUTPUT_SUBDIR = "repeat_scale_eval"
 STAGED_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_staged_eval_worker.py"
 CHECKPOINT_RESULTS_PREFIX = "/workspace/project/results"
 REPEAT_VLLM_ENV = "GA_REPEAT_USE_VLLM_MODELS"
+SNAPSHOT_BUNDLE_SCHEMA_VERSION = 1
+AGGREGATION_METHOD_VERSION = "fixed_complete_scale_reviewed_v2"
+SCALE_ITEM_SCORE_KEYS = {
+    "PHQ-9": "phq9_scores",
+    "BDI-II": "bdi_ii_scores",
+}
+SCALE_ITEM_COUNTS = {
+    "PHQ-9": 9,
+    "BDI-II": 21,
+}
 
 # ============================================================
 # ↓↓↓ 可调参数：直接修改这里即可；命令行 --xxx 会覆盖这里 ↓↓↓
@@ -88,7 +96,7 @@ ORIGINAL_SUMMARY = None
 NAME = None
 
 # 每个评估点完整重复评估次数
-REPEAT = 3
+REPEAT = 10
 
 # 评估点；可填字符串 "T0,POST"，也可直接使用 ",".join(DEFAULT_LABELS)
 LABELS = ",".join(DEFAULT_LABELS)
@@ -102,23 +110,20 @@ MAX_PARALLEL = 1
 # 是否覆盖已有重复输出
 FORCE = False
 
+# 是否断点续跑：复用完整的 answered/scored，只补齐缺失阶段
+RESUME_PARTIAL = True
+
 # 是否只打印计划，不实际执行
 DRY_RUN = False
 
 # 是否只基于已有重复结果重新生成报告
 REPORT_ONLY = False
 
-# 是否检测条目评分稳定性，并只对不稳定条目追加补跑
-STABILITY_RERUN = True
-
-# 每个不稳定条目最多追加补跑轮数
-MAX_EXTRA_REPEAT = 4
-
-# 条目分数极差达到该值时判为不稳定；1 表示重复分数不完全一致即不稳定
-STABILITY_RANGE_THRESHOLD = 1
-
 # 是否把目标患者动态抑郁状态重置为初始 depression_config 状态后复评
 RESET_TARGET_DEPRESSION_STATE = False
+
+# 旧 staged job 没有按时间点冻结 storage。默认拒绝；只有显式开启才复用最终 storage。
+ALLOW_LEGACY_FINAL_STORAGE = False
 
 # 复评输出使用的新 group 标签，例如 "g8"；留空则沿用原始 condition
 OUTPUT_GROUP = ""
@@ -138,12 +143,11 @@ class RuntimeConfig:
     conditions: list[str]
     max_parallel: int
     force: bool
+    resume_partial: bool
     dry_run: bool
     report_only: bool
-    stability_rerun: bool
-    max_extra_repeat: int
-    stability_range_threshold: int
     reset_target_depression_state: bool
+    allow_legacy_final_storage: bool
     output_group: str
 
 
@@ -152,14 +156,6 @@ class RepeatTask:
     condition: dict[str, Any]
     label: str
     repeat_idx: int
-
-
-@dataclass(frozen=True)
-class StabilityRerunTask:
-    condition: dict[str, Any]
-    label: str
-    repeat_idx: int
-    scale_item_ids: dict[str, list[int]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,17 +169,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--original-summary", default=ORIGINAL_SUMMARY, help="原始 *_summary.json；默认自动从 reports 目录选择")
     parser.add_argument("--name", default=NAME, help="输出批次名，默认 repeat-scale-<MMdd-HHmm>")
-    parser.add_argument("--repeat", type=int, default=REPEAT, help="每个评估点重复次数")
+    parser.add_argument("--repeat", type=int, default=REPEAT, help="每个评估点固定完整重复次数，默认 10")
     parser.add_argument("--labels", default=LABELS, help="逗号分隔评估点")
     parser.add_argument("--condition", action="append", default=None, help="只处理指定 condition，可重复传入")
     parser.add_argument("--max-parallel", type=int, default=MAX_PARALLEL, help="并行任务数")
     parser.add_argument("--force", action=argparse.BooleanOptionalAction, default=FORCE, help="覆盖已有重复输出")
+    parser.add_argument(
+        "--resume-partial",
+        action=argparse.BooleanOptionalAction,
+        default=RESUME_PARTIAL,
+        help="复用已完整生成的 answered/scored，只补齐缺失的回答、评分和后续步骤",
+    )
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=DRY_RUN, help="只打印计划，不实际执行")
     parser.add_argument("--report-only", action=argparse.BooleanOptionalAction, default=REPORT_ONLY, help="只基于已有重复结果重新生成报告")
-    parser.add_argument("--stability-rerun", action=argparse.BooleanOptionalAction, default=STABILITY_RERUN, help="检测条目评分稳定性，并只对不稳定条目追加补跑")
-    parser.add_argument("--max-extra-repeat", type=int, default=MAX_EXTRA_REPEAT, help="每个不稳定条目最多追加补跑轮数")
-    parser.add_argument("--stability-range-threshold", type=int, default=STABILITY_RANGE_THRESHOLD, help="条目分数极差达到该值时判为不稳定")
     parser.add_argument("--reset-target-depression-state", action=argparse.BooleanOptionalAction, default=RESET_TARGET_DEPRESSION_STATE, help="把目标患者动态抑郁状态重置为初始 depression_config 状态后复评")
+    parser.add_argument(
+        "--allow-legacy-final-storage",
+        action=argparse.BooleanOptionalAction,
+        default=ALLOW_LEGACY_FINAL_STORAGE,
+        help="允许旧 staged job 复用最终 storage；结果会被标记为非严格历史快照",
+    )
     parser.add_argument("--output-group", default=OUTPUT_GROUP, help="复评输出使用的新 group 标签，例如 G8；留空则沿用原始 condition")
     return parser.parse_args()
 
@@ -354,12 +359,11 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         conditions=list(args.condition if args.condition is not None else CONDITIONS),
         max_parallel=max_parallel,
         force=bool(args.force),
+        resume_partial=bool(args.resume_partial),
         dry_run=bool(args.dry_run),
         report_only=bool(args.report_only),
-        stability_rerun=bool(args.stability_rerun),
-        max_extra_repeat=max(0, int(args.max_extra_repeat or 0)),
-        stability_range_threshold=max(1, int(args.stability_range_threshold or 1)),
         reset_target_depression_state=bool(args.reset_target_depression_state),
+        allow_legacy_final_storage=bool(args.allow_legacy_final_storage),
         output_group=str(args.output_group or "").strip().lower(),
     )
 
@@ -440,14 +444,13 @@ def print_effective_config(cfg: RuntimeConfig, original_summary: dict[str, Any])
     print(f"  tasks:           {task_count} answer jobs, {score_count} score jobs")
     print(f"  max_parallel:    {cfg.max_parallel}")
     print(f"  force:           {cfg.force}")
+    print(f"  resume-partial:  {cfg.resume_partial}")
     print(f"  dry-run:         {cfg.dry_run}")
     print(f"  report-only:     {cfg.report_only}")
-    print(f"  stability-rerun: {cfg.stability_rerun}")
+    print(f"  aggregation:     {AGGREGATION_METHOD_VERSION}")
     print(f"  reset depression:{cfg.reset_target_depression_state}")
+    print(f"  legacy storage:  {cfg.allow_legacy_final_storage}")
     print(f"  output group:    {cfg.output_group or '(source)'}")
-    if cfg.stability_rerun:
-        print(f"  max-extra-repeat:{cfg.max_extra_repeat}")
-        print(f"  item range thres:{cfg.stability_range_threshold}")
     print("==========================================")
 
 
@@ -524,6 +527,142 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(item, dict):
                 rows.append(item)
     return rows
+
+
+def normalized_item_ids(rows: list[dict[str, Any]]) -> list[int] | None:
+    item_ids: list[int] = []
+    for row in rows:
+        try:
+            item_id = int(row.get("id"))
+        except (TypeError, ValueError):
+            return None
+        if item_id <= 0:
+            return None
+        item_ids.append(item_id)
+    return item_ids
+
+
+def expected_answer_item_ids(job: dict[str, Any], scale_name: str) -> list[int]:
+    requested = (job.get("scale_item_ids", {}) or {}).get(scale_name)
+    if requested is not None:
+        return sorted({int(item_id) for item_id in requested})
+
+    question_file = str((job.get("scale_question_files", {}) or {}).get(scale_name, "") or "").strip()
+    if not question_file:
+        raise ValueError(f"missing question file for scale: {scale_name}")
+    question_path = (
+        BASE_DIR
+        / "customization"
+        / "depression_scale_agent"
+        / "questions"
+        / "templates"
+        / question_file
+    )
+    rows = load_jsonl(question_path)
+    item_ids = normalized_item_ids(rows)
+    if not rows or item_ids is None:
+        raise ValueError(f"invalid question template: {question_path}")
+    return sorted(item_ids)
+
+
+def answer_file_complete(output_dir: Path, job: dict[str, Any], scale_name: str) -> bool:
+    answers_path = output_dir / f"{scale_name}_answered.jsonl"
+    if not answers_path.is_file():
+        return False
+    try:
+        rows = load_jsonl(answers_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not rows or any("answer" not in row for row in rows):
+        return False
+    observed_ids = normalized_item_ids(rows)
+    if observed_ids is None or len(observed_ids) != len(set(observed_ids)):
+        return False
+    try:
+        expected_ids = expected_answer_item_ids(job, scale_name)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return sorted(observed_ids) == expected_ids
+
+
+def score_result_complete(
+    path: Path,
+    scale_name: str,
+) -> bool:
+    payload = load_optional_json(path)
+    if not payload or payload.get("parse_error") or payload.get("raw_reply"):
+        return False
+    if str(payload.get("scale", "") or "") != scale_name:
+        return False
+
+    raw_items = payload.get(SCALE_ITEM_SCORE_KEYS.get(scale_name, ""))
+    return (
+        isinstance(raw_items, list)
+        and len(raw_items) == expected_item_count(scale_name)
+        and len(extract_scored_item_records(payload, scale_name)) == expected_item_count(scale_name)
+    )
+
+
+def resume_scales_for_answers(
+    cfg: RuntimeConfig,
+    output_dir: Path,
+    job: dict[str, Any],
+    target_scales: list[str],
+) -> list[str]:
+    if not cfg.resume_partial or cfg.force:
+        return list(target_scales)
+    return [
+        scale_name
+        for scale_name in target_scales
+        if not answer_file_complete(output_dir, job, scale_name)
+    ]
+
+
+def run_answer_worker(
+    cfg: RuntimeConfig,
+    output_dir: Path,
+    job: dict[str, Any],
+    target_scales: list[str],
+    *,
+    description: str,
+) -> tuple[Path | None, dict[str, Any]]:
+    missing_scales = resume_scales_for_answers(cfg, output_dir, job, target_scales)
+    reused_scales = [scale_name for scale_name in target_scales if scale_name not in missing_scales]
+    if reused_scales:
+        print(f"[RESUME] reuse answered: {output_dir} ({', '.join(reused_scales)})")
+    if not missing_scales:
+        print(f"[RESUME] all answers complete; skip staged worker: {output_dir}")
+        return None, {
+            "resumed_answer_scales": [],
+            "reused_answer_scales": reused_scales,
+        }
+
+    worker_job = copy.deepcopy(job)
+    worker_job["scales"] = missing_scales
+    partial_resume = bool(reused_scales)
+    job_path = output_dir / ("resume_job.json" if partial_resume else "job.json")
+    result_path = output_dir / ("resume_worker_result.json" if partial_resume else "worker_result.json")
+    worker_job["worker_result_path"] = str(result_path)
+
+    if cfg.dry_run:
+        print(f"[DRY-RUN] write {description}: {job_path} (scales={', '.join(missing_scales)})")
+        print(f"[DRY-RUN] run staged worker: {STAGED_WORKER_SCRIPT} --job {job_path}")
+    else:
+        write_json_file(job_path, worker_job)
+        cmd = [WORKER_PYTHON, str(STAGED_WORKER_SCRIPT), "--job", str(job_path)]
+        print(f"[RUN] {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"staged worker failed with returncode={exc.returncode}\n"
+                f"{worker_failure_detail(output_dir, result_path=result_path)}"
+            ) from exc
+
+    return result_path, {
+        "resumed_answer_scales": missing_scales,
+        "reused_answer_scales": reused_scales,
+    }
 
 
 def latest_snapshot_name(checkpoint_dir: Path) -> str:
@@ -719,11 +858,178 @@ def repeat_metadata_overrides(cfg: RuntimeConfig, condition: dict[str, Any]) -> 
     return payload
 
 
+def public_model_config(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    allowed = ("provider", "model", "base_url", "temperature", "top_p", "seed")
+    return {key: copy.deepcopy(raw.get(key)) for key in allowed if key in raw}
+
+
+def evaluation_protocol_metadata(cfg: RuntimeConfig, job: dict[str, Any]) -> dict[str, Any]:
+    runtime_config = job.get("runtime_config", {}) if isinstance(job.get("runtime_config"), dict) else {}
+    agent_config = runtime_config.get("agent", {}) if isinstance(runtime_config.get("agent"), dict) else {}
+    think_config = agent_config.get("think", {}) if isinstance(agent_config.get("think"), dict) else {}
+    target_agent = str(job.get("target_agent", "") or "")
+    agents_config = runtime_config.get("agents", {}) if isinstance(runtime_config.get("agents"), dict) else {}
+    target_config = agents_config.get(target_agent, {}) if isinstance(agents_config.get(target_agent), dict) else {}
+    target_think_config = target_config.get("think", {}) if isinstance(target_config.get("think"), dict) else {}
+    intervention = runtime_config.get("intervention", {}) if isinstance(runtime_config.get("intervention"), dict) else {}
+    scale_question_files = job.get("scale_question_files", {}) if isinstance(job.get("scale_question_files"), dict) else {}
+    return {
+        "method_version": AGGREGATION_METHOD_VERSION,
+        "expected_repeats": cfg.repeat,
+        "scales": list(SCALES),
+        "scale_order": list(SCALES),
+        "scale_question_files": {
+            scale_name: str(scale_question_files.get(scale_name, SCALES[scale_name]["question_file"]))
+            for scale_name in SCALES
+        },
+        "scale_scoring_prompts": {
+            scale_name: SCALES[scale_name]["scoring_prompt"]
+            for scale_name in SCALES
+        },
+        "snapshot_name": str(job.get("snapshot_name", "") or ""),
+        "target_agent": target_agent,
+        "context_isolation": "fresh_worker_and_chat_session_per_repeat; answer_without_memory_per_item",
+        "think_llm": public_model_config(think_config.get("llm")),
+        "target_agent_think_llm": public_model_config(target_think_config.get("llm")),
+        "forced_llm": public_model_config(intervention.get("forced_llm")),
+        "seed_controlled": bool(
+            (isinstance(think_config.get("llm"), dict) and think_config["llm"].get("seed") is not None)
+            or (
+                isinstance(target_think_config.get("llm"), dict)
+                and target_think_config["llm"].get("seed") is not None
+            )
+        ),
+        "api_call_date": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def condition_evaluation(condition: dict[str, Any], label: str) -> dict[str, Any] | None:
     for evaluation in condition.get("evaluations", []) or []:
         if str(evaluation.get("trigger_label", "")) == label:
             return evaluation
     return None
+
+
+def canonical_json_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_bundle_path(source_dir: Path, raw_relpath: Any, field_name: str) -> Path:
+    relpath_text = str(raw_relpath or "").strip()
+    relpath = Path(relpath_text)
+    if not relpath_text or relpath.is_absolute():
+        raise ValueError(f"invalid snapshot bundle {field_name}: {raw_relpath}")
+    source_root = source_dir.resolve()
+    resolved = (source_root / relpath).resolve()
+    try:
+        resolved.relative_to(source_root)
+    except ValueError as exc:
+        raise ValueError(f"snapshot bundle {field_name} escapes trigger directory: {raw_relpath}") from exc
+    return resolved
+
+
+def validate_snapshot_bundle(source_dir: Path, job: dict[str, Any], label: str) -> Path:
+    bundle = job.get("snapshot_bundle")
+    if not isinstance(bundle, dict) or not bundle:
+        raise ValueError(f"staged job has no historical snapshot bundle: {source_dir / 'job.json'}")
+    if int(bundle.get("schema_version", 0) or 0) != SNAPSHOT_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported snapshot bundle schema: {bundle.get('schema_version')}")
+    if str(bundle.get("storage_scope", "") or "") != "full":
+        raise ValueError(f"snapshot bundle is not full storage: {source_dir}")
+
+    storage_root = resolve_bundle_path(source_dir, bundle.get("storage_relpath"), "storage_relpath")
+    manifest_path = resolve_bundle_path(source_dir, bundle.get("manifest_relpath"), "manifest_relpath")
+    if not storage_root.is_dir():
+        raise FileNotFoundError(f"snapshot storage not found: {storage_root}")
+    manifest = load_optional_json(manifest_path)
+    if manifest is None:
+        raise FileNotFoundError(f"snapshot manifest not found or invalid: {manifest_path}")
+
+    if int(manifest.get("schema_version", 0) or 0) != SNAPSHOT_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(f"snapshot manifest schema mismatch: {manifest_path}")
+    if str(manifest.get("artifact_kind", "") or "") != "repeat_eval_snapshot":
+        raise ValueError(f"snapshot manifest artifact kind mismatch: {manifest_path}")
+    if str(manifest.get("trigger_label", "") or "") != str(label or ""):
+        raise ValueError(f"snapshot manifest label mismatch: expected={label} path={manifest_path}")
+
+    runtime_digest = canonical_json_sha256(job.get("runtime_config", {}))
+    conversation_digest = canonical_json_sha256(job.get("conversation", {}) or {})
+    expected_runtime_digest = str(manifest.get("runtime_config_sha256", "") or "")
+    expected_conversation_digest = str(manifest.get("conversation_sha256", "") or "")
+    if runtime_digest != expected_runtime_digest or runtime_digest != str(bundle.get("runtime_config_sha256", "") or ""):
+        raise ValueError(f"snapshot runtime_config digest mismatch: {source_dir / 'job.json'}")
+    if conversation_digest != expected_conversation_digest or conversation_digest != str(bundle.get("conversation_sha256", "") or ""):
+        raise ValueError(f"snapshot conversation digest mismatch: {source_dir / 'job.json'}")
+
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ValueError(f"snapshot manifest files must be a list: {manifest_path}")
+    seen_paths: set[str] = set()
+    total_size = 0
+    for record in files:
+        if not isinstance(record, dict):
+            raise ValueError(f"invalid snapshot manifest file record: {manifest_path}")
+        relpath = str(record.get("path", "") or "")
+        if not relpath or relpath in seen_paths:
+            raise ValueError(f"invalid or duplicate snapshot file path: {relpath}")
+        seen_paths.add(relpath)
+        file_path = resolve_bundle_path(storage_root, relpath, "files.path")
+        if not file_path.is_file():
+            raise FileNotFoundError(f"snapshot bundle file missing: {file_path}")
+        size = file_path.stat().st_size
+        expected_size = int(record.get("size", -1))
+        if size != expected_size:
+            raise ValueError(f"snapshot bundle file size mismatch: {file_path}")
+        if file_sha256(file_path) != str(record.get("sha256", "") or ""):
+            raise ValueError(f"snapshot bundle file hash mismatch: {file_path}")
+        total_size += size
+    actual_paths = {
+        path.relative_to(storage_root).as_posix()
+        for path in storage_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_paths != seen_paths:
+        missing = sorted(seen_paths - actual_paths)
+        unexpected = sorted(actual_paths - seen_paths)
+        raise ValueError(
+            f"snapshot bundle file set mismatch: missing={missing[:5]} unexpected={unexpected[:5]}"
+        )
+    if len(files) != int(manifest.get("file_count", -1)):
+        raise ValueError(f"snapshot bundle file count mismatch: {manifest_path}")
+    if total_size != int(manifest.get("total_size", -1)):
+        raise ValueError(f"snapshot bundle total size mismatch: {manifest_path}")
+    return storage_root
+
+
+def target_external_memory_enabled(runtime_config: dict[str, Any], target_agent: str) -> bool:
+    agent_base = runtime_config.get("agent_base", {}) if isinstance(runtime_config, dict) else {}
+    base_external = agent_base.get("external_memory", {}) if isinstance(agent_base, dict) else {}
+    agents = runtime_config.get("agents", {}) if isinstance(runtime_config, dict) else {}
+    target_cfg = agents.get(target_agent, {}) if isinstance(agents, dict) else {}
+    local_external = target_cfg.get("external_memory", {}) if isinstance(target_cfg, dict) else {}
+    effective = copy.deepcopy(base_external) if isinstance(base_external, dict) else {}
+    if isinstance(local_external, dict):
+        effective.update(local_external)
+    return bool(effective.get("enabled", False))
 
 
 def build_staged_job(
@@ -737,11 +1043,45 @@ def build_staged_job(
     checkpoint_dir = checkpoints_root(cfg) / run_name
     source_dir = checkpoint_dir / "staged_eval" / label
     source_job_path = source_dir / "job.json"
-    job = load_optional_json(source_job_path)
-    if job is None:
+    source_job = load_optional_json(source_job_path)
+    if source_job is None:
         raise FileNotFoundError(f"missing staged job: {source_job_path}")
     metadata = load_optional_json(source_dir / "metadata.json") or {}
-    job = rewrite_paths(copy.deepcopy(job), cfg)
+    source_target_agent = str(
+        source_job.get("target_agent", "") or target_agent_for_condition(condition, checkpoint_dir)
+    )
+    source_runtime_config = source_job.get("runtime_config", {})
+    if not isinstance(source_runtime_config, dict):
+        raise ValueError(f"staged job runtime_config must be an object: {source_job_path}")
+    if target_external_memory_enabled(source_runtime_config, source_target_agent):
+        raise ValueError(
+            f"strict historical repeat does not support external memory reads: {source_job_path}"
+        )
+
+    if isinstance(source_job.get("snapshot_bundle"), dict) and source_job.get("snapshot_bundle"):
+        storage_source_root = validate_snapshot_bundle(source_dir, source_job, label)
+        integrity_metadata = {
+            "historical_snapshot_integrity": "verified_bundle",
+            "snapshot_bundle_verified": True,
+            "snapshot_bundle_manifest": str(source_dir / str(source_job["snapshot_bundle"].get("manifest_relpath", ""))),
+        }
+    else:
+        if not bool(getattr(cfg, "allow_legacy_final_storage", False)):
+            raise ValueError(
+                "legacy staged job has no timepoint storage snapshot; "
+                "rerun with --allow-legacy-final-storage only if an unverified historical input is acceptable: "
+                f"{source_job_path}"
+            )
+        storage_source_root = checkpoint_dir / "storage"
+        if not storage_source_root.is_dir():
+            raise FileNotFoundError(f"legacy final storage not found: {storage_source_root}")
+        integrity_metadata = {
+            "historical_snapshot_integrity": "unverified_legacy",
+            "snapshot_bundle_verified": False,
+            "legacy_final_storage_used": True,
+        }
+
+    job = rewrite_paths(copy.deepcopy(source_job), cfg)
     target_agent = str(job.get("target_agent", "") or target_agent_for_condition(condition, checkpoint_dir))
     job["target_agent"] = target_agent
     runtime_config = job.get("runtime_config", {})
@@ -755,9 +1095,10 @@ def build_staged_job(
     job["trigger_dir"] = str(output_dir)
     job["worker_result_path"] = str(output_dir / "worker_result.json")
     job["tmp_root_parent"] = str(output_dir / "_tmp")
-    job["storage_source_root"] = str(checkpoint_dir / "storage")
+    job["storage_source_root"] = str(storage_source_root)
     job["cleanup_tmp_storage"] = True
     job["run_name"] = run_name
+    metadata.update(integrity_metadata)
     return job, metadata
 
 
@@ -835,60 +1176,11 @@ def score_scale_answers(output_dir: Path, scale_name: str, *, dry_run: bool) -> 
     subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
 
 
-def item_scoring_prompt(scale_name: str, item_ids: list[int]) -> str:
-    item_list = ", ".join(str(item_id) for item_id in sorted(item_ids))
-    timeframe = "过去两周" if scale_name == "PHQ-9" else "近两周（包括今天）"
-    return f"""你是一位专业、严谨、温和的“{scale_name}条目评分Agent”。
-你的任务是只根据输入中的个别量表条目问答，对这些条目分别给出0-3分评分。
-
-评分范围：
-- 0分：无该症状或完全没有。
-- 1分：轻度、有几天、略有变化。
-- 2分：中度、超过一半天数、明显或经常。
-- 3分：重度、几乎每天、总是、完全不能或不堪忍受。
-
-要求：
-1. 只评分输入中出现的条目，不要补全整套量表。
-2. 只输出目标条目：{item_list}。
-3. 每个条目必须给出唯一整数分数，范围为0-3。
-4. 每个条目必须引用用户原文片段作为basis。
-5. 时间范围按{timeframe}理解。
-
-必须严格输出JSON，不要输出多余解释：
-{{
-  "scale": "{scale_name}",
-  "item_scores": [
-    {{"id": 条目id, "score": 分数, "basis": "依据用户原文片段"}}
-  ]
-}}
-"""
-
-
-def score_scale_items(output_dir: Path, scale_name: str, item_ids: list[int], *, dry_run: bool) -> None:
-    answers_path = output_dir / f"{scale_name}_answered.jsonl"
-    scored_path = output_dir / f"{scale_name}_item_scored.json"
-    prompt_path = output_dir / f"{scale_name}_item_scoring_prompt.md"
-    cmd = [
-        WORKER_PYTHON,
-        str(SCORE_WORKER_SCRIPT),
-        "--answers",
-        str(answers_path),
-        "--scoring-prompt",
-        str(prompt_path),
-        "--output",
-        str(scored_path),
-    ]
-    print(f"[RUN] {' '.join(cmd)}")
-    if dry_run:
-        return
-    prompt_path.write_text(item_scoring_prompt(scale_name, item_ids), encoding="utf-8")
-    subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
-
-
-def worker_failure_detail(output_dir: Path) -> str:
-    worker_result = load_optional_json(output_dir / "worker_result.json") or {}
+def worker_failure_detail(output_dir: Path, *, result_path: Path | None = None) -> str:
+    result_path = result_path or (output_dir / "worker_result.json")
+    worker_result = load_optional_json(result_path) or {}
     if not worker_result:
-        return f"worker_result.json not found under {output_dir}"
+        return f"worker result not found: {result_path}"
     parts = []
     status = str(worker_result.get("status", "") or "")
     if status:
@@ -901,105 +1193,46 @@ def worker_failure_detail(output_dir: Path) -> str:
         lines = traceback_text.strip().splitlines()
         tail = "\n".join(lines[-12:])
         parts.append("traceback_tail:\n" + tail)
-    return "\n".join(parts) if parts else f"worker_result has no error detail: {output_dir / 'worker_result.json'}"
-
-
-def stability_task_complete(cfg: RuntimeConfig, task: StabilityRerunTask) -> bool:
-    condition_name = str(task.condition.get("condition_name", ""))
-    output_dir = repeat_label_dir(cfg, condition_name, task.repeat_idx, task.label)
-    if not (output_dir / "metadata.json").is_file():
-        return False
-    return all(
-        (output_dir / f"{scale_name}_item_scored.json").is_file()
-        for scale_name in task.scale_item_ids
-    )
-
-
-def run_stability_rerun_task(cfg: RuntimeConfig, task: StabilityRerunTask) -> dict[str, Any]:
-    condition = task.condition
-    condition_name = str(condition.get("condition_name", ""))
-    run_name = str(condition.get("run_name", "") or "").strip()
-    output_dir = repeat_label_dir(cfg, condition_name, task.repeat_idx, task.label)
-    checkpoint_dir = checkpoints_root(cfg) / run_name
-    if not checkpoint_dir.is_dir():
-        raise FileNotFoundError(f"checkpoint not found: {checkpoint_dir}")
-
-    if stability_task_complete(cfg, task) and not cfg.force:
-        print(f"[SKIP] stability complete: {condition_name} r{task.repeat_idx:02d} {task.label}")
-        return {
-            "condition_name": condition_name,
-            "label": task.label,
-            "repeat": task.repeat_idx,
-            "status": "skipped",
-        }
-
-    if cfg.force and output_dir.exists() and not cfg.dry_run:
-        shutil.rmtree(output_dir)
-    if not cfg.dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-    if task.label == "POST":
-        job, source_metadata = build_post_job(cfg, condition, task.repeat_idx, output_dir)
-    else:
-        job, source_metadata = build_staged_job(cfg, condition, task.label, task.repeat_idx, output_dir)
-    target_scales = sorted(task.scale_item_ids)
-    job["scales"] = target_scales
-    job["scale_item_ids"] = {
-        scale_name: sorted({int(item_id) for item_id in item_ids})
-        for scale_name, item_ids in task.scale_item_ids.items()
-    }
-
-    metadata = copy.deepcopy(source_metadata)
-    metadata.update(
-        {
-            "repeat_batch_name": cfg.name,
-            "repeat": task.repeat_idx,
-            "condition_name": condition_name,
-            "run_name": run_name,
-            "trigger_label": task.label,
-            "source_repeat_mode": "stability_adaptive_item_rerun",
-            "scale_item_ids": job["scale_item_ids"],
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            **repeat_metadata_overrides(cfg, condition),
-        }
-    )
-
-    job_path = output_dir / "job.json"
-    if cfg.dry_run:
-        print(f"[DRY-RUN] write item-rerun job: {job_path}")
-        print(f"[DRY-RUN] run staged worker: {STAGED_WORKER_SCRIPT} --job {job_path}")
-    else:
-        write_json_file(job_path, job)
-        cmd = [WORKER_PYTHON, str(STAGED_WORKER_SCRIPT), "--job", str(job_path)]
-        print(f"[RUN] {' '.join(cmd)}")
-        try:
-            subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"staged worker failed with returncode={exc.returncode}\n{worker_failure_detail(output_dir)}"
-            ) from exc
-
-    for scale_name, item_ids in job["scale_item_ids"].items():
-        score_scale_items(output_dir, scale_name, item_ids, dry_run=cfg.dry_run)
-
-    if not cfg.dry_run:
-        worker_result = load_optional_json(output_dir / "worker_result.json") or {}
-        metadata["worker_result"] = worker_result
-        write_json_file(output_dir / "metadata.json", metadata)
-    return {
-        "condition_name": condition_name,
-        "label": task.label,
-        "repeat": task.repeat_idx,
-        "status": "ok",
-    }
+    return "\n".join(parts) if parts else f"worker_result has no error detail: {result_path}"
 
 
 def task_complete(cfg: RuntimeConfig, task: RepeatTask) -> bool:
     condition_name = str(task.condition.get("condition_name", ""))
     output_dir = repeat_label_dir(cfg, condition_name, task.repeat_idx, task.label)
-    if not (output_dir / "metadata.json").is_file():
+    metadata = load_optional_json(output_dir / "metadata.json")
+    if not isinstance(metadata, dict) or not metadata:
         return False
-    return all((output_dir / f"{scale_name}_scored.json").is_file() for scale_name in SCALES)
+    metadata_repeat = metadata.get("repeat")
+    if (
+        str(metadata.get("condition_name", "") or "") != condition_name
+        or str(metadata.get("trigger_label", "") or "") != task.label
+        or not isinstance(metadata_repeat, int)
+        or isinstance(metadata_repeat, bool)
+        or metadata_repeat != task.repeat_idx
+        or not isinstance(metadata.get("evaluation_protocol"), dict)
+    ):
+        return False
+    job = load_optional_json(output_dir / "job.json")
+    if not job:
+        return False
+    return all(
+        answer_file_complete(output_dir, job, scale_name)
+        and score_result_complete(output_dir / f"{scale_name}_scored.json", scale_name)
+        for scale_name in SCALES
+    )
+
+
+def select_resumable_job(
+    cfg: RuntimeConfig,
+    job_path: Path,
+    rebuilt_job: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    if not cfg.resume_partial or cfg.force:
+        return rebuilt_job, False
+    existing_job = load_optional_json(job_path)
+    if not isinstance(existing_job, dict) or not existing_job:
+        return rebuilt_job, False
+    return existing_job, True
 
 
 def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
@@ -1030,6 +1263,11 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
     else:
         job, source_metadata = build_staged_job(cfg, condition, task.label, task.repeat_idx, output_dir)
 
+    job_path = output_dir / "job.json"
+    active_job, preserve_existing_job = select_resumable_job(cfg, job_path, job)
+    if not cfg.dry_run and not preserve_existing_job:
+        write_json_file(job_path, active_job)
+
     metadata = copy.deepcopy(source_metadata)
     metadata.update(
         {
@@ -1038,33 +1276,41 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
             "condition_name": condition_name,
             "run_name": run_name,
             "trigger_label": task.label,
-            "source_repeat_mode": "rerun_answers_and_scores",
+            "source_repeat_mode": "fixed_complete_scale_repeat",
+            "evaluation_protocol": evaluation_protocol_metadata(cfg, active_job),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             **repeat_metadata_overrides(cfg, condition),
         }
     )
 
-    job_path = output_dir / "job.json"
-    if cfg.dry_run:
-        print(f"[DRY-RUN] write job: {job_path}")
-        print(f"[DRY-RUN] run staged worker: {STAGED_WORKER_SCRIPT} --job {job_path}")
-    else:
-        write_json_file(job_path, job)
-        cmd = [WORKER_PYTHON, str(STAGED_WORKER_SCRIPT), "--job", str(job_path)]
-        print(f"[RUN] {' '.join(cmd)}")
-        try:
-            subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=POST_EVAL_TIMEOUT_SECONDS)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"staged worker failed with returncode={exc.returncode}\n{worker_failure_detail(output_dir)}"
-            ) from exc
+    result_path, resume_metadata = run_answer_worker(
+        cfg,
+        output_dir,
+        active_job,
+        list(SCALES),
+        description="job",
+    )
+
+    if not cfg.dry_run:
+        for scale_name in SCALES:
+            if not answer_file_complete(output_dir, active_job, scale_name):
+                raise RuntimeError(f"answer worker produced incomplete answers: {output_dir} ({scale_name})")
 
     for scale_name in SCALES:
+        scored_path = output_dir / f"{scale_name}_scored.json"
+        if cfg.resume_partial and not cfg.force and score_result_complete(scored_path, scale_name):
+            print(f"[RESUME] reuse score: {scored_path}")
+            continue
         score_scale_answers(output_dir, scale_name, dry_run=cfg.dry_run)
+        if not cfg.dry_run and not score_result_complete(scored_path, scale_name):
+            raise RuntimeError(f"score worker produced invalid item scores: {scored_path}")
 
     if not cfg.dry_run:
         worker_result = load_optional_json(output_dir / "worker_result.json") or {}
         metadata["worker_result"] = worker_result
+        metadata.update(resume_metadata)
+        if result_path and result_path.name != "worker_result.json":
+            metadata["resume_worker_result"] = load_optional_json(result_path) or {}
         write_json_file(output_dir / "metadata.json", metadata)
     return {
         "condition_name": condition_name,
@@ -1087,10 +1333,12 @@ def run_tasks(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> list[dict
     tasks = build_tasks(cfg, original_summary)
     print(f"[PLAN] {len(tasks)} answer jobs, {len(tasks) * len(SCALES)} score jobs")
     if cfg.dry_run:
+        results = []
         for task in tasks:
             condition_name = str(task.condition.get("condition_name", ""))
             print(f"[DRY-RUN] {condition_name} r{task.repeat_idx:02d} {task.label}")
-        return []
+            results.append(run_repeat_task(cfg, task))
+        return results
 
     if cfg.max_parallel <= 1:
         results = []
@@ -1137,144 +1385,167 @@ def run_tasks(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> list[dict
     return results
 
 
-def condition_map_by_name(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def stddev(values: list[float]) -> float | None:
+    """Sample standard deviation (ddof=1)."""
+    if len(values) < 2:
+        return None
+    avg = sum(values) / len(values)
+    return math.sqrt(sum((value - avg) ** 2 for value in values) / (len(values) - 1))
+
+
+def linear_quantile(values: list[float], probability: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * probability
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    fraction = position - lower_index
+    return ordered[lower_index] + fraction * (ordered[upper_index] - ordered[lower_index])
+
+
+def describe_scores(values: list[float]) -> dict[str, Any]:
+    scores = [float(value) for value in values]
+    if not scores:
+        return {
+            "count": 0,
+            "mean": None,
+            "sample_sd": None,
+            "mean_absolute_deviation": None,
+            "ci95": {"lower": None, "upper": None, "method": "student_t", "df": None},
+            "median": None,
+            "q1": None,
+            "q3": None,
+            "iqr": None,
+            "trimmed_mean_drop_one_each": None,
+            "min": None,
+            "max": None,
+        }
+    score_mean = sum(scores) / len(scores)
+    sample_sd = stddev(scores)
+    ci_lower = None
+    ci_upper = None
+    degrees_of_freedom = len(scores) - 1 if len(scores) >= 2 else None
+    if sample_sd is not None and degrees_of_freedom is not None:
+        critical = float(student_t.ppf(0.975, degrees_of_freedom))
+        margin = critical * sample_sd / math.sqrt(len(scores))
+        ci_lower = score_mean - margin
+        ci_upper = score_mean + margin
+    q1 = linear_quantile(scores, 0.25)
+    q3 = linear_quantile(scores, 0.75)
+    ordered = sorted(scores)
+    trimmed_mean = None
+    if len(ordered) >= 3:
+        trimmed_values = ordered[1:-1]
+        trimmed_mean = sum(trimmed_values) / len(trimmed_values)
     return {
-        str(condition.get("condition_name", "") or ""): condition
-        for condition in selected_conditions(cfg, original_summary)
+        "count": len(scores),
+        "mean": score_mean,
+        "sample_sd": sample_sd,
+        "mean_absolute_deviation": sum(abs(value - score_mean) for value in scores) / len(scores),
+        "ci95": {
+            "lower": ci_lower,
+            "upper": ci_upper,
+            "method": "student_t",
+            "df": degrees_of_freedom,
+        },
+        "median": linear_quantile(scores, 0.5),
+        "q1": q1,
+        "q3": q3,
+        "iqr": (q3 - q1) if q1 is not None and q3 is not None else None,
+        "trimmed_mean_drop_one_each": trimmed_mean,
+        "min": min(scores),
+        "max": max(scores),
     }
 
 
-def run_stability_reruns(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> list[dict[str, Any]]:
-    if not cfg.stability_rerun or cfg.max_extra_repeat <= 0:
-        return []
-    all_results: list[dict[str, Any]] = []
-    conditions = condition_map_by_name(cfg, original_summary)
-    for extra_round in range(1, cfg.max_extra_repeat + 1):
-        analysis = build_stability_analysis(cfg, original_summary)
-        pending = pending_stability_rerun_groups(analysis)
-        if not pending:
-            print("[STABILITY] 无需补跑：所有不稳定条目已定稿或没有不稳定条目")
-            break
-
-        repeat_idx = cfg.repeat + extra_round
-        tasks: list[StabilityRerunTask] = []
-        for (condition_name, label), scale_item_ids in sorted(pending.items()):
-            condition = conditions.get(condition_name)
-            if not condition:
-                continue
-            tasks.append(
-                StabilityRerunTask(
-                    condition=condition,
-                    label=label,
-                    repeat_idx=repeat_idx,
-                    scale_item_ids=scale_item_ids,
-                )
-            )
-        print(f"[STABILITY] round {extra_round}/{cfg.max_extra_repeat}: {len(tasks)} item-rerun jobs")
-        if cfg.dry_run:
-            for task in tasks:
-                condition_name = str(task.condition.get("condition_name", ""))
-                print(
-                    f"[DRY-RUN] stability {condition_name} r{task.repeat_idx:02d} "
-                    f"{task.label}: {task.scale_item_ids}"
-                )
-            break
-
-        if cfg.max_parallel <= 1:
-            for task in tasks:
-                condition_name = str(task.condition.get("condition_name", ""))
-                try:
-                    result = run_stability_rerun_task(cfg, task)
-                    print(f"[RESULT] stability {condition_name} r{task.repeat_idx:02d} {task.label}: {result['status']}")
-                    all_results.append(result)
-                except Exception as exc:
-                    print(f"[ERROR] stability {condition_name} r{task.repeat_idx:02d} {task.label}: {exc}")
-                    all_results.append(
-                        {
-                            "condition_name": condition_name,
-                            "label": task.label,
-                            "repeat": task.repeat_idx,
-                            "status": "error",
-                            "error": str(exc),
-                        }
-                    )
-            continue
-
-        with concurrent.futures.ProcessPoolExecutor(max_workers=cfg.max_parallel) as executor:
-            future_map = {executor.submit(run_stability_rerun_task, cfg, task): task for task in tasks}
-            for future in concurrent.futures.as_completed(future_map):
-                task = future_map[future]
-                condition_name = str(task.condition.get("condition_name", ""))
-                try:
-                    result = future.result()
-                    print(f"[RESULT] stability {condition_name} r{task.repeat_idx:02d} {task.label}: {result['status']}")
-                    all_results.append(result)
-                except Exception as exc:
-                    print(f"[ERROR] stability {condition_name} r{task.repeat_idx:02d} {task.label}: {exc}")
-                    all_results.append(
-                        {
-                            "condition_name": condition_name,
-                            "label": task.label,
-                            "repeat": task.repeat_idx,
-                            "status": "error",
-                            "error": str(exc),
-                        }
-                    )
-    return all_results
-
-
-def stddev(values: list[float]) -> float | None:
-    if not values:
-        return None
-    if len(values) == 1:
-        return 0.0
-    avg = sum(values) / len(values)
-    return math.sqrt(sum((value - avg) ** 2 for value in values) / len(values))
-
-
-def choose_repeated_severity(rows: list[dict[str, Any]], mean_score: float | None) -> str:
-    severities = [str(row.get("severity", "") or "") for row in rows if row.get("severity")]
-    if not severities:
-        return "—"
-    counts = Counter(severities)
-    max_count = max(counts.values())
-    candidates = sorted(severity for severity, count in counts.items() if count == max_count)
-    if len(candidates) == 1 or mean_score is None:
-        return candidates[0]
-    best = None
-    best_distance = None
-    for row in rows:
-        severity = str(row.get("severity", "") or "")
-        if severity not in candidates:
-            continue
-        score = row.get("total_score")
-        if score is None:
-            continue
-        distance = abs(float(score) - float(mean_score))
-        if best is None or best_distance is None or distance < best_distance:
-            best = severity
-            best_distance = distance
-    return best or candidates[0]
+def summarize_categories(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    categories = [str(row.get("severity", "") or "") for row in rows if row.get("severity")]
+    if not categories:
+        return {
+            "counts": {},
+            "proportions": {},
+            "modal_categories": [],
+            "modal_confidence": None,
+            "uncertainty": None,
+            "pairwise_flip_rate": None,
+            "any_flip": False,
+        }
+    counts = Counter(categories)
+    total = len(categories)
+    highest = max(counts.values())
+    modal_categories = sorted(category for category, count in counts.items() if count == highest)
+    agreeing_pairs = sum(count * (count - 1) // 2 for count in counts.values())
+    total_pairs = total * (total - 1) // 2
+    return {
+        "counts": {category: int(count) for category, count in sorted(counts.items())},
+        "proportions": {category: count / total for category, count in sorted(counts.items())},
+        "modal_categories": modal_categories,
+        "modal_confidence": highest / total,
+        "uncertainty": 1.0 - highest / total,
+        "pairwise_flip_rate": (1.0 - agreeing_pairs / total_pairs) if total_pairs else 0.0,
+        "any_flip": len(counts) > 1,
+    }
 
 
 def summarize_scale_repeats(rows: list[dict[str, Any]], scale_name: str) -> dict[str, Any]:
-    scores = [
-        float(row["total_score"])
+    expected_repeats = len(rows)
+    valid_rows = [row for row in rows if row.get("status") == "ok" and row.get("total_score") is not None]
+    scores = [float(row["total_score"]) for row in valid_rows]
+    missing_repeats = [
+        int(row.get("repeat", 0) or 0)
         for row in rows
-        if row.get("total_score") is not None
+        if row.get("status") != "ok" or row.get("total_score") is None
     ]
-    score_mean = mean(scores)
-    severity_votes = dict(Counter(str(row.get("severity", "") or "—") for row in rows))
+    complete = len(valid_rows) == expected_repeats and not missing_repeats
+    diagnostics = describe_scores(scores)
+    categories = summarize_categories(valid_rows)
+    sensitivity = {
+        "median_total": diagnostics["median"] if complete else None,
+        "trimmed_mean_drop_one_each": diagnostics["trimmed_mean_drop_one_each"] if complete else None,
+        "r01_total": next(
+            (float(row["total_score"]) for row in valid_rows if int(row.get("repeat", 0) or 0) == 1),
+            None,
+        ) if complete else None,
+    }
+    modes = categories["modal_categories"] if complete else []
+    severity = modes[0] if len(modes) == 1 else ("并列（{}）".format("/".join(modes)) if modes else "—")
     return {
-        "total_score": score_mean,
-        "severity": choose_repeated_severity(rows, score_mean),
+        "total_score": diagnostics["mean"] if complete else None,
+        "severity": severity,
+        "score_source": "repeat_reviewed_total_mean",
         "scored_file": "",
         "repeat_runs": rows,
-        "mean": score_mean,
-        "stddev": stddev(scores),
-        "min": min(scores) if scores else None,
-        "max": max(scores) if scores else None,
-        "severity_votes": severity_votes,
+        "expected_repeats": expected_repeats,
+        "valid_repeats": len(valid_rows),
+        "missing_repeats": missing_repeats,
+        "aggregation_status": "complete" if complete else "incomplete",
+        "mean": diagnostics["mean"] if complete else None,
+        "sample_sd": diagnostics["sample_sd"] if complete else None,
+        "stddev": diagnostics["sample_sd"] if complete else None,
+        "mean_absolute_deviation": diagnostics["mean_absolute_deviation"] if complete else None,
+        "ci95": diagnostics["ci95"] if complete else {"lower": None, "upper": None, "method": "student_t", "df": None},
+        "median": diagnostics["median"] if complete else None,
+        "q1": diagnostics["q1"] if complete else None,
+        "q3": diagnostics["q3"] if complete else None,
+        "iqr": diagnostics["iqr"] if complete else None,
+        "trimmed_mean_drop_one_each": diagnostics["trimmed_mean_drop_one_each"] if complete else None,
+        "min": diagnostics["min"] if complete else None,
+        "max": diagnostics["max"] if complete else None,
+        "category_counts": categories["counts"] if complete else {},
+        "category_proportions": categories["proportions"] if complete else {},
+        "modal_categories": modes,
+        "modal_confidence": categories["modal_confidence"] if complete else None,
+        "category_uncertainty": categories["uncertainty"] if complete else None,
+        "category_pairwise_flip_rate": categories["pairwise_flip_rate"] if complete else None,
+        "any_category_flip": categories["any_flip"] if complete else False,
+        "severity_votes": categories["counts"] if complete else {},
+        "sensitivity_analysis": sensitivity,
+        "partial_statistics": diagnostics if not complete else None,
     }
 
 
@@ -1285,51 +1556,112 @@ def load_repeat_rows(cfg: RuntimeConfig, condition_name: str, label: str, scale_
         scored_path = output_dir / f"{scale_name}_scored.json"
         answers_path = output_dir / f"{scale_name}_answered.jsonl"
         scored = load_optional_json(scored_path)
-        if scored is None:
+        job = load_optional_json(output_dir / "job.json")
+        item_records = extract_scored_item_records(scored, scale_name)
+        answers_complete = bool(job) and answer_file_complete(output_dir, job, scale_name)
+        try:
+            answer_rows = load_jsonl(answers_path) if answers_complete else []
+        except (OSError, json.JSONDecodeError):
+            answer_rows = []
+            answers_complete = False
+        score_complete = score_result_complete(scored_path, scale_name)
+        if scored is None or not answers_complete or not score_complete:
             rows.append(
                 {
                     "repeat": repeat_idx,
-                    "status": "missing",
+                    "status": "missing" if scored is None else "invalid",
                     "answer_file": str(answers_path),
                     "scored_file": str(scored_path),
                     "total_score": None,
+                    "reported_total_score": scored.get("total_score") if isinstance(scored, dict) else None,
+                    "llm_item_scores": [],
+                    "llm_item_sum_total": None,
+                    "reviewed_item_scores": [],
+                    "reviewed_total_score": None,
                     "severity": "—",
+                    "item_scores": [],
+                    "direct_answer_count": 0,
+                    "direct_answer_reviews": [],
+                    "answer_override_count": 0,
+                    "answer_overrides": [],
                 }
             )
             continue
+        review = build_reviewed_item_scores(item_records, answer_rows, scale_name)
+        reviewed_total = float(review["reviewed_total_score"])
         rows.append(
             {
                 "repeat": repeat_idx,
                 "status": "ok",
                 "answer_file": str(answers_path),
                 "scored_file": str(scored_path),
-                "total_score": extract_scale_total(scored, scale_name),
-                "severity": extract_scale_severity(scored, scale_name),
+                "score_source": "reviewed_item_sum",
+                "total_score": reviewed_total,
+                "reported_total_score": scored.get("total_score"),
+                "llm_item_scores": review["llm_item_scores"],
+                "llm_item_sum_total": review["llm_item_sum_total"],
+                "reviewed_item_scores": review["reviewed_item_scores"],
+                "reviewed_total_score": reviewed_total,
+                "severity": expected_scale_severity(scale_name, reviewed_total),
+                "item_scores": review["reviewed_item_scores"],
+                "direct_answer_count": review["direct_answer_count"],
+                "direct_answer_reviews": review["direct_answer_reviews"],
+                "answer_override_count": review["answer_override_count"],
+                "answer_overrides": review["answer_overrides"],
             }
         )
     return rows
 
 
-SCALE_ITEM_SCORE_KEYS = {
-    "PHQ-9": "phq9_scores",
-    "BDI-II": "bdi_ii_scores",
-}
-
-
 def expected_item_count(scale_name: str) -> int:
-    return 9 if scale_name == "PHQ-9" else 21
+    return SCALE_ITEM_COUNTS[scale_name]
 
 
 def normalize_score(value: Any) -> int | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    try:
-        score = int(value)
-    except (TypeError, ValueError):
-        return None
+    score = value
     if score < 0 or score > 3:
         return None
     return score
+
+
+def parse_scored_item_id(item_label: Any, scale_name: str) -> int | None:
+    text = str(item_label or "").strip().upper()
+    if scale_name == "PHQ-9":
+        identifier_pattern = r"PHQ\s*(?:第\s*)?([0-9]+)"
+        valid_ids = set(range(1, 10))
+    elif scale_name == "BDI-II":
+        identifier_pattern = r"BDI(?:-II)?\s*(?:第\s*)?([0-9]+)"
+        valid_ids = set(range(1, 22))
+    else:
+        return None
+    identifiers = [int(value) for value in re.findall(identifier_pattern, text)]
+    prefix_match = re.match(rf"^{identifier_pattern}", text)
+    if not prefix_match or len(identifiers) != 1 or identifiers[0] not in valid_ids:
+        return None
+    return identifiers[0]
+
+
+def extract_unambiguous_answer_score(answer: str) -> tuple[int | None, str]:
+    answer_score, status = extract_direct_answer_score(answer)
+    if status != "direct" or answer_score is None:
+        return answer_score, status
+
+    score_values = {"0": 0, "1": 1, "2": 2, "3": 3, "零": 0, "一": 1, "二": 2, "两": 2, "三": 3}
+    explicit_tokens = re.findall(
+        r"(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])|([0-3零一二两三])\s*分",
+        str(answer or ""),
+    )
+    explicit_scores = {
+        score_values[token]
+        for groups in explicit_tokens
+        for token in groups
+        if token
+    }
+    if len(explicit_scores) > 1:
+        return None, "ambiguous"
+    return answer_score, status
 
 
 def extract_scored_item_records(scored: dict[str, Any] | None, scale_name: str) -> dict[int, dict[str, Any]]:
@@ -1337,57 +1669,19 @@ def extract_scored_item_records(scored: dict[str, Any] | None, scale_name: str) 
         return {}
     item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
     items = scored.get(item_key) if item_key else None
-    if not isinstance(items, list):
+    expected_count = expected_item_count(scale_name)
+    if not isinstance(items, list) or len(items) != expected_count:
         return {}
     records: dict[int, dict[str, Any]] = {}
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
-            continue
+            return {}
+        item_id = parse_scored_item_id(item.get("item"), scale_name)
+        if item_id != index or item_id in records:
+            return {}
         score = normalize_score(item.get("score"))
         if score is None:
-            continue
-        records[index] = {
-            "item_id": index,
-            "score": score,
-            "item": str(item.get("item", "") or ""),
-            "basis": str(item.get("basis", "") or ""),
-        }
-    return records
-
-
-def extract_partial_item_records(
-    scored: dict[str, Any] | None,
-    scale_name: str,
-    expected_ids: list[int] | None = None,
-) -> dict[int, dict[str, Any]]:
-    if not isinstance(scored, dict):
-        return {}
-    items = scored.get("item_scores")
-    if not isinstance(items, list):
-        item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
-        items = scored.get(item_key) if item_key else None
-    if not isinstance(items, list):
-        return {}
-
-    expected_ids = sorted({int(item_id) for item_id in expected_ids or []})
-    records: dict[int, dict[str, Any]] = {}
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            continue
-        raw_item_id = (
-            item.get("id")
-            if item.get("id") is not None
-            else item.get("item_id", item.get("question_id"))
-        )
-        if raw_item_id is None and len(items) == len(expected_ids):
-            raw_item_id = expected_ids[index - 1]
-        try:
-            item_id = int(raw_item_id)
-        except (TypeError, ValueError):
-            continue
-        score = normalize_score(item.get("score"))
-        if score is None:
-            continue
+            return {}
         records[item_id] = {
             "item_id": item_id,
             "score": score,
@@ -1397,317 +1691,54 @@ def extract_partial_item_records(
     return records
 
 
-def load_stability_samples(
-    cfg: RuntimeConfig,
-    condition_name: str,
-    label: str,
+def build_reviewed_item_scores(
+    item_records: dict[int, dict[str, Any]],
+    answer_rows: list[dict[str, Any]],
     scale_name: str,
-) -> list[dict[str, Any]]:
-    samples: list[dict[str, Any]] = []
-    for repeat_idx in range(1, cfg.repeat + 1):
-        output_dir = repeat_label_dir(cfg, condition_name, repeat_idx, label)
-        scored_path = output_dir / f"{scale_name}_scored.json"
-        answers_path = output_dir / f"{scale_name}_answered.jsonl"
-        for item_id, item in extract_scored_item_records(load_optional_json(scored_path), scale_name).items():
-            samples.append(
-                {
-                    "condition_name": condition_name,
-                    "trigger_label": label,
-                    "scale": scale_name,
-                    "item_id": item_id,
-                    "repeat": repeat_idx,
-                    "source": "full_repeat",
-                    "score": item["score"],
-                    "item": item.get("item", ""),
-                    "basis": item.get("basis", ""),
-                    "answer_file": str(answers_path),
-                    "scored_file": str(scored_path),
-                }
-            )
+) -> dict[str, Any]:
+    expected_count = expected_item_count(scale_name)
+    llm_item_scores = [int(item_records[item_id]["score"]) for item_id in range(1, expected_count + 1)]
+    reviewed_item_scores = list(llm_item_scores)
+    direct_answer_count = 0
+    direct_answer_reviews: list[dict[str, Any]] = []
+    overrides: list[dict[str, Any]] = []
 
-    for repeat_idx in range(cfg.repeat + 1, cfg.repeat + cfg.max_extra_repeat + 1):
-        output_dir = repeat_label_dir(cfg, condition_name, repeat_idx, label)
-        metadata = load_optional_json(output_dir / "metadata.json") or {}
-        scale_item_ids = metadata.get("scale_item_ids", {}) if isinstance(metadata, dict) else {}
-        expected_ids = scale_item_ids.get(scale_name, []) if isinstance(scale_item_ids, dict) else []
-        scored_path = output_dir / f"{scale_name}_item_scored.json"
-        answers_path = output_dir / f"{scale_name}_answered.jsonl"
-        for item_id, item in extract_partial_item_records(load_optional_json(scored_path), scale_name, expected_ids).items():
-            samples.append(
-                {
-                    "condition_name": condition_name,
-                    "trigger_label": label,
-                    "scale": scale_name,
-                    "item_id": item_id,
-                    "repeat": repeat_idx,
-                    "source": "item_rerun",
-                    "score": item["score"],
-                    "item": item.get("item", ""),
-                    "basis": item.get("basis", ""),
-                    "answer_file": str(answers_path),
-                    "scored_file": str(scored_path),
-                }
-            )
-    return samples
-
-
-def strict_majority_score(scores: list[int]) -> tuple[int | None, dict[str, int]]:
-    votes = Counter(scores)
-    vote_payload = {str(score): int(count) for score, count in sorted(votes.items())}
-    if not scores:
-        return None, vote_payload
-    best_score, best_count = votes.most_common(1)[0]
-    if best_count > len(scores) / 2:
-        return int(best_score), vote_payload
-    return None, vote_payload
-
-
-def final_review_score(
-    scores: list[int],
-    *,
-    allow_lowest_tied_vote: bool,
-) -> tuple[int | None, dict[str, int], str, str]:
-    majority, votes = strict_majority_score(scores)
-    if majority is not None:
-        return majority, votes, "strict_majority", ""
-    if not votes:
-        return None, votes, "unresolved", ""
-    if not allow_lowest_tied_vote:
-        return None, votes, "unresolved", "未达严格多数；等待补跑后定稿。"
-
-    max_count = max(votes.values())
-    candidates = sorted(int(score) for score, count in votes.items() if int(count) == max_count)
-    selected = candidates[0]
-    return (
-        selected,
-        votes,
-        "lowest_tied_vote",
-        "无严格多数；按最高票并列分中的最低分定稿。",
-    )
-
-
-def build_stability_analysis(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> dict[str, Any]:
-    item_rows: list[dict[str, Any]] = []
-    rerun_records: list[dict[str, Any]] = []
-    for condition in selected_conditions(cfg, original_summary):
-        condition_name = str(condition.get("condition_name", "") or "")
-        for repeat_idx in range(cfg.repeat + 1, cfg.repeat + cfg.max_extra_repeat + 1):
-            for label in cfg.labels:
-                output_dir = repeat_label_dir(cfg, condition_name, repeat_idx, label)
-                metadata = load_optional_json(output_dir / "metadata.json")
-                if not metadata or metadata.get("source_repeat_mode") != "stability_adaptive_item_rerun":
-                    continue
-                rerun_records.append(
-                    {
-                        "condition_name": condition_name,
-                        "trigger_label": label,
-                        "repeat": repeat_idx,
-                        "scale_item_ids": metadata.get("scale_item_ids", {}),
-                        "metadata_file": str(output_dir / "metadata.json"),
-                    }
-                )
-
-        for label in cfg.labels:
-            for scale_name in SCALES:
-                samples = load_stability_samples(cfg, condition_name, label, scale_name)
-                by_item: dict[int, list[dict[str, Any]]] = {}
-                for sample in samples:
-                    by_item.setdefault(int(sample["item_id"]), []).append(sample)
-                for item_id in sorted(by_item):
-                    group = sorted(by_item[item_id], key=lambda item: int(item.get("repeat", 0) or 0))
-                    initial_scores = [
-                        int(item["score"])
-                        for item in group
-                        if item.get("source") == "full_repeat"
-                    ]
-                    extra_scores = [
-                        int(item["score"])
-                        for item in group
-                        if item.get("source") == "item_rerun"
-                    ]
-                    all_scores = [int(item["score"]) for item in group]
-                    if not initial_scores:
-                        continue
-                    initial_range = max(initial_scores) - min(initial_scores)
-                    initially_unstable = initial_range >= cfg.stability_range_threshold
-                    initial_majority, _initial_votes = strict_majority_score(initial_scores)
-                    must_finish_extra_reruns = initially_unstable and initial_majority is None
-                    strict_majority, votes = strict_majority_score(all_scores)
-                    if must_finish_extra_reruns and len(extra_scores) < cfg.max_extra_repeat:
-                        final_score = None
-                        resolution_method = "unresolved"
-                        resolution_note = "已补跑 {}/{} 轮；等待补跑完成后定稿。".format(
-                            len(extra_scores),
-                            cfg.max_extra_repeat,
-                        )
-                    else:
-                        final_score, votes, resolution_method, resolution_note = final_review_score(
-                            all_scores,
-                            allow_lowest_tied_vote=True,
-                        )
-                    if initially_unstable:
-                        status = "resolved" if final_score is not None else "unresolved"
-                    else:
-                        status = "stable"
-                    item_rows.append(
-                        {
-                            "condition_name": condition_name,
-                            "trigger_label": label,
-                            "scale": scale_name,
-                            "item_id": item_id,
-                            "item": next((str(item.get("item", "") or "") for item in group if item.get("item")), ""),
-                            "initial_scores": initial_scores,
-                            "extra_scores": extra_scores,
-                            "scores": all_scores,
-                            "initial_range": initial_range,
-                            "range": max(all_scores) - min(all_scores) if all_scores else None,
-                            "votes": votes,
-                            "majority_score": final_score,
-                            "strict_majority_score": strict_majority,
-                            "resolution_method": resolution_method,
-                            "resolution_note": resolution_note,
-                            "initially_unstable": initially_unstable,
-                            "status": status,
-                            "samples": group,
-                        }
-                    )
-
-    scale_counts: dict[str, dict[str, int]] = {}
-    for scale_name in SCALES:
-        scale_rows = [row for row in item_rows if row.get("scale") == scale_name and row.get("initially_unstable")]
-        scale_counts[scale_name] = {
-            "unstable_item_count": len(scale_rows),
-            "resolved_count": sum(1 for row in scale_rows if row.get("status") == "resolved"),
-            "unresolved_count": sum(1 for row in scale_rows if row.get("status") == "unresolved"),
-        }
-
-    adjusted_totals = build_stability_adjusted_totals(item_rows)
-    return {
-        "enabled": cfg.stability_rerun,
-        "range_threshold": cfg.stability_range_threshold,
-        "max_extra_repeat": cfg.max_extra_repeat,
-        "item_rows": item_rows,
-        "unstable_items": [row for row in item_rows if row.get("initially_unstable")],
-        "scale_counts": scale_counts,
-        "rerun_records": rerun_records,
-        "adjusted_totals": adjusted_totals,
-    }
-
-
-def build_stability_adjusted_totals(item_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for row in item_rows:
-        grouped.setdefault(
-            (
-                str(row.get("condition_name", "") or ""),
-                str(row.get("trigger_label", "") or ""),
-                str(row.get("scale", "") or ""),
-            ),
-            [],
-        ).append(row)
-
-    totals: list[dict[str, Any]] = []
-    for (condition_name, label, scale_name), rows in sorted(grouped.items()):
-        expected_count = expected_item_count(scale_name)
-        score_by_item = {
-            int(row.get("item_id", 0) or 0): row.get("majority_score")
-            for row in rows
-            if row.get("majority_score") is not None
-        }
-        unresolved = [
-            int(row.get("item_id", 0) or 0)
-            for row in rows
-            if row.get("initially_unstable") and row.get("status") == "unresolved"
-        ]
-        tie_break_items = [
-            int(row.get("item_id", 0) or 0)
-            for row in rows
-            if row.get("resolution_method") == "lowest_tied_vote"
-        ]
-        adjusted_total = None
-        severity = "—"
-        if len(score_by_item) == expected_count:
-            adjusted_total = float(sum(int(score_by_item[item_id]) for item_id in sorted(score_by_item)))
-            severity = expected_scale_severity(scale_name, adjusted_total)
-        totals.append(
-            {
-                "condition_name": condition_name,
-                "trigger_label": label,
-                "scale": scale_name,
-                "expected_item_count": expected_count,
-                "scored_item_count": len(score_by_item),
-                "adjusted_total": adjusted_total,
-                "adjusted_severity": severity,
-                "unresolved_item_ids": sorted(unresolved),
-                "tie_break_item_ids": sorted(tie_break_items),
-            }
-        )
-    return totals
-
-
-def apply_reviewed_scale_totals(results: list[dict[str, Any]], analysis: dict[str, Any]) -> None:
-    adjusted_totals = analysis.get("adjusted_totals", []) if isinstance(analysis, dict) else []
-    if not isinstance(adjusted_totals, list):
-        adjusted_totals = []
-    by_key = {
-        (
-            str(row.get("condition_name", "") or ""),
-            str(row.get("trigger_label", "") or ""),
-            str(row.get("scale", "") or ""),
-        ): row
-        for row in adjusted_totals
-        if isinstance(row, dict)
-    }
-
-    for result in results:
-        condition_name = str(result.get("condition_name", "") or "")
-        for evaluation in result.get("evaluations", []) or []:
-            label = str(evaluation.get("trigger_label", "") or "")
-            for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
-                reviewed = by_key.get((condition_name, label, scale_name))
-                if not reviewed or reviewed.get("adjusted_total") is None:
-                    continue
-                scale_payload["repeat_mean_total"] = scale_payload.get("total_score")
-                scale_payload["repeat_mean_severity"] = scale_payload.get("severity")
-                scale_payload["total_score"] = reviewed.get("adjusted_total")
-                scale_payload["severity"] = reviewed.get("adjusted_severity", "—")
-                scale_payload["score_source"] = "reviewed_item_final_scores"
-                scale_payload["reviewed_item_count"] = reviewed.get("scored_item_count", 0)
-                scale_payload["expected_item_count"] = reviewed.get("expected_item_count", 0)
-                scale_payload["review_unresolved_item_ids"] = reviewed.get("unresolved_item_ids", [])
-                scale_payload["review_tie_break_item_ids"] = reviewed.get("tie_break_item_ids", [])
-                if reviewed.get("tie_break_item_ids"):
-                    scale_payload["review_note"] = "含无严格多数条目，按最高票并列分中的最低分定稿。"
-                else:
-                    scale_payload["review_note"] = "评分复核后总分为条目最终分之和。"
-
-        apply_trajectory_deltas(result.get("evaluations", []))
-        final_deltas = {}
-        for scale_name in SCALES:
-            final_delta = None
-            for evaluation in result.get("evaluations", []):
-                delta = evaluation["scales"].get(scale_name, {}).get("delta_from_baseline")
-                if delta is not None:
-                    final_delta = delta
-            final_deltas[scale_name] = final_delta
-        result["final_deltas"] = final_deltas
-
-
-def pending_stability_rerun_groups(analysis: dict[str, Any]) -> dict[tuple[str, str], dict[str, list[int]]]:
-    pending: dict[tuple[str, str], dict[str, list[int]]] = {}
-    rows = analysis.get("unstable_items", []) if isinstance(analysis, dict) else []
-    for row in rows:
-        if row.get("status") != "unresolved":
+    for row in answer_rows:
+        item_id = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
             continue
-        key = (str(row.get("condition_name", "") or ""), str(row.get("trigger_label", "") or ""))
-        scale_name = str(row.get("scale", "") or "")
-        item_id = int(row.get("item_id", 0) or 0)
-        if not scale_name or item_id <= 0:
+        if scale_name == "PHQ-9" and item_id == 10:
             continue
-        pending.setdefault(key, {}).setdefault(scale_name, []).append(item_id)
+        if item_id < 1 or item_id > expected_count:
+            continue
+        answer_text = str(row.get("answer", "") or "")
+        answer_score, status = extract_unambiguous_answer_score(answer_text)
+        if status != "direct" or answer_score is None:
+            continue
+        direct_answer_count += 1
+        llm_score = reviewed_item_scores[item_id - 1]
+        review_detail = {
+            "item_id": item_id,
+            "llm_score": llm_score,
+            "answer_score": int(answer_score),
+            "overridden": llm_score != answer_score,
+            "answer_excerpt": answer_text[:200],
+        }
+        direct_answer_reviews.append(review_detail)
+        if llm_score == answer_score:
+            continue
+        reviewed_item_scores[item_id - 1] = int(answer_score)
+        overrides.append(review_detail)
+
     return {
-        key: {scale: sorted(set(item_ids)) for scale, item_ids in scale_map.items()}
-        for key, scale_map in pending.items()
+        "llm_item_scores": llm_item_scores,
+        "llm_item_sum_total": float(sum(llm_item_scores)),
+        "reviewed_item_scores": reviewed_item_scores,
+        "reviewed_total_score": float(sum(reviewed_item_scores)),
+        "direct_answer_count": direct_answer_count,
+        "direct_answer_reviews": direct_answer_reviews,
+        "answer_override_count": len(overrides),
+        "answer_overrides": overrides,
     }
 
 
@@ -1738,6 +1769,11 @@ def build_condition_result(cfg: RuntimeConfig, condition: dict[str, Any]) -> dic
                 "sim_time": str(metadata.get("sim_time", "") or ""),
                 "snapshot_name": str(metadata.get("snapshot_name", "") or ""),
                 "source": "repeat_scale_eval",
+                "historical_snapshot_integrity": str(
+                    metadata.get("historical_snapshot_integrity", "") or ""
+                ),
+                "snapshot_bundle_verified": metadata.get("snapshot_bundle_verified"),
+                "legacy_final_storage_used": bool(metadata.get("legacy_final_storage_used", False)),
                 "metadata_path": str(repeat_label_dir(cfg, condition_name, 1, label) / "metadata.json"),
                 "scales": scales_payload,
             }
@@ -1775,56 +1811,254 @@ def build_condition_result(cfg: RuntimeConfig, condition: dict[str, Any]) -> dic
 
 
 def build_repeat_validation(results: list[dict[str, Any]]) -> dict[str, Any]:
-    synthetic_results: list[dict[str, Any]] = []
+    total_mismatches: list[dict[str, Any]] = []
+    item_mismatches: list[dict[str, Any]] = []
     for result in results:
-        for repeat_idx in range(1, 1000):
-            has_repeat = False
-            evaluations = []
-            for evaluation in result.get("evaluations", []):
-                scales = {}
-                for scale_name, scale_payload in evaluation.get("scales", {}).items():
-                    for row in scale_payload.get("repeat_runs", []) or []:
-                        if int(row.get("repeat", 0) or 0) != repeat_idx:
+        for evaluation in result.get("evaluations", []):
+            trigger_label = str(evaluation.get("trigger_label", "") or "—")
+            for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
+                for row in scale_payload.get("repeat_runs", []) or []:
+                    if row.get("status") != "ok":
+                        continue
+                    repeat_idx = int(row.get("repeat", 0) or 0)
+                    reported_total = row.get("reported_total_score")
+                    llm_item_sum = row.get("llm_item_sum_total")
+                    try:
+                        reported_number = float(reported_total)
+                        item_sum_number = float(llm_item_sum)
+                    except (TypeError, ValueError):
+                        reported_number = None
+                        item_sum_number = None
+                    if (
+                        reported_number is not None
+                        and item_sum_number is not None
+                        and reported_number != item_sum_number
+                    ):
+                        total_mismatches.append(
+                            {
+                                "condition_name": result.get("condition_name", ""),
+                                "trigger_label": f"{trigger_label}/r{repeat_idx:02d}",
+                                "scale": scale_name,
+                                "item_sum": item_sum_number,
+                                "reported_total": reported_number,
+                                "delta": reported_number - item_sum_number,
+                            }
+                        )
+                    for override in row.get("answer_overrides", []) or []:
+                        if not isinstance(override, dict):
                             continue
-                        if row.get("status") != "ok":
-                            continue
-                        has_repeat = True
-                        scales[scale_name] = {
-                            "total_score": row.get("total_score"),
-                            "severity": row.get("severity"),
-                            "scored_file": row.get("scored_file"),
-                        }
-                if scales:
-                    evaluations.append(
-                        {
-                            "trigger_label": f"{evaluation.get('trigger_label', '')}/r{repeat_idx:02d}",
-                            "completed_session_count": evaluation.get("completed_session_count", 0),
-                            "sim_time": evaluation.get("sim_time", ""),
-                            "snapshot_name": evaluation.get("snapshot_name", ""),
-                            "source": "staged_eval",
-                            "metadata_path": "",
-                            "scales": scales,
-                        }
-                    )
-            if not has_repeat:
-                if repeat_idx == 1:
-                    continue
-                break
-            synthetic_results.append(
+                        item_mismatches.append(
+                            {
+                                "condition_name": result.get("condition_name", ""),
+                                "trigger_label": f"{trigger_label}/r{repeat_idx:02d}",
+                                "scale": scale_name,
+                                "item_id": override.get("item_id"),
+                                "llm_score": override.get("llm_score"),
+                                "answer_score": override.get("answer_score"),
+                            }
+                        )
+    return {
+        "total_mismatches": total_mismatches,
+        "item_mismatches": item_mismatches,
+    }
+
+
+SENSITIVITY_METHODS = {
+    "median_total": ("median_total", "median_total"),
+    "trimmed_mean": ("trimmed_mean_drop_one_each", "trimmed_mean_drop_one_each"),
+    "r01": ("r01_total", "r01_total"),
+}
+
+
+def sensitivity_condition_results(results: list[dict[str, Any]], metric_key: str) -> list[dict[str, Any]]:
+    transformed: list[dict[str, Any]] = []
+    for source_result in results:
+        result = {
+            key: copy.deepcopy(source_result.get(key))
+            for key in (
+                "condition_name",
+                "run_name",
+                "variant",
+                "group",
+                "severity",
+                "source_condition_name",
+                "source_group",
+            )
+        }
+        evaluations = []
+        for source_evaluation in source_result.get("evaluations", []) or []:
+            scales = {}
+            for scale_name, source_scale_payload in (source_evaluation.get("scales", {}) or {}).items():
+                sensitivity = source_scale_payload.get("sensitivity_analysis", {}) or {}
+                value = sensitivity.get(metric_key)
+                scales[scale_name] = {
+                    "total_score": value,
+                    "severity": expected_scale_severity(scale_name, float(value)) if value is not None else "—",
+                }
+            evaluations.append(
                 {
-                    **result,
-                    "run_dir": "",
-                    "evaluations": evaluations,
+                    "trigger_label": source_evaluation.get("trigger_label", ""),
+                    "completed_session_count": source_evaluation.get("completed_session_count", 0),
+                    "sim_time": source_evaluation.get("sim_time", ""),
+                    "snapshot_name": source_evaluation.get("snapshot_name", ""),
+                    "source": "repeat_scale_eval_sensitivity",
+                    "scales": scales,
                 }
             )
-    try:
-        return build_scale_score_validation(synthetic_results)
-    except Exception as exc:
-        return {
-            "total_mismatches": [],
-            "item_mismatches": [],
-            "error": str(exc),
+        result["evaluations"] = evaluations
+        apply_trajectory_deltas(evaluations)
+        result["final_deltas"] = {
+            scale_name: next(
+                (
+                    evaluation.get("scales", {}).get(scale_name, {}).get("delta_from_baseline")
+                    for evaluation in reversed(evaluations)
+                    if evaluation.get("scales", {}).get(scale_name, {}).get("delta_from_baseline") is not None
+                ),
+                None,
+            )
+            for scale_name in SCALES
         }
+        transformed.append(result)
+    return transformed
+
+
+def build_sensitivity_analysis(cfg: RuntimeConfig, results: list[dict[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for method_name, (_label, metric_key) in SENSITIVITY_METHODS.items():
+        method_results = sensitivity_condition_results(results, metric_key)
+        payload[method_name] = {
+            "conditions": method_results,
+            "group_values": report_group_values(cfg),
+            "variant_trajectory": aggregate_dimension_trajectory(
+                method_results, dimension_key="variant", dimension_values=VARIANTS
+            ),
+            "group_trajectory": aggregate_dimension_trajectory(
+                method_results, dimension_key="group", dimension_values=report_group_values(cfg)
+            ),
+            "severity_trajectory": aggregate_dimension_trajectory(
+                method_results, dimension_key="severity", dimension_values=SEVERITIES
+            ),
+            "variant_final_delta": aggregate_final_deltas(
+                method_results, dimension_key="variant", dimension_values=VARIANTS
+            ),
+            "group_final_delta": aggregate_final_deltas(
+                method_results, dimension_key="group", dimension_values=report_group_values(cfg)
+            ),
+            "severity_final_delta": aggregate_final_deltas(
+                method_results, dimension_key="severity", dimension_values=SEVERITIES
+            ),
+        }
+    return payload
+
+
+def calculate_icc_one_way(matrix: list[list[float]]) -> dict[str, Any]:
+    target_count = len(matrix)
+    repeat_count = len(matrix[0]) if matrix else 0
+    base = {
+        "method": "one_way_random_absolute_agreement",
+        "target_count": target_count,
+        "repeat_count": repeat_count,
+        "icc_1_1": None,
+        "icc_1_k": None,
+        "reason": "",
+    }
+    if target_count < 2:
+        base["reason"] = "insufficient_targets"
+        return base
+    if repeat_count < 2 or any(len(row) != repeat_count for row in matrix):
+        base["reason"] = "insufficient_or_unequal_repeats"
+        return base
+    target_means = [sum(row) / repeat_count for row in matrix]
+    grand_mean = sum(target_means) / target_count
+    ms_between = repeat_count * sum((value - grand_mean) ** 2 for value in target_means) / (target_count - 1)
+    within_sum_squares = sum(
+        sum((value - target_mean) ** 2 for value in row)
+        for row, target_mean in zip(matrix, target_means)
+    )
+    ms_within = within_sum_squares / (target_count * (repeat_count - 1))
+    denominator = ms_between + (repeat_count - 1) * ms_within
+    if math.isclose(denominator, 0.0, abs_tol=1e-12):
+        base["reason"] = "zero_total_variance"
+        return base
+    base["icc_1_1"] = (ms_between - ms_within) / denominator
+    if math.isclose(ms_between, 0.0, abs_tol=1e-12):
+        base["reason"] = "zero_between_target_variance_for_icc_1_k"
+    else:
+        base["icc_1_k"] = (ms_between - ms_within) / ms_between
+    base["ms_between"] = ms_between
+    base["ms_within"] = ms_within
+    return base
+
+
+def build_reliability_analysis(results: list[dict[str, Any]], labels: list[str], repeat: int) -> dict[str, Any]:
+    by_scale: dict[str, Any] = {}
+    for scale_name in SCALES:
+        label_payload: dict[str, Any] = {}
+        for label in labels:
+            matrix: list[list[float]] = []
+            target_names: list[str] = []
+            excluded_targets: list[str] = []
+            for result in results:
+                condition_name = str(result.get("condition_name", "") or "")
+                evaluation = next(
+                    (
+                        item
+                        for item in result.get("evaluations", []) or []
+                        if str(item.get("trigger_label", "") or "") == label
+                    ),
+                    None,
+                )
+                scale_payload = (evaluation.get("scales", {}) or {}).get(scale_name, {}) if evaluation else {}
+                rows = scale_payload.get("repeat_runs", []) if isinstance(scale_payload, dict) else []
+                scores = [
+                    float(row["total_score"])
+                    for row in rows or []
+                    if row.get("status") == "ok" and row.get("total_score") is not None
+                ]
+                if scale_payload.get("aggregation_status") == "complete" and len(scores) == repeat:
+                    matrix.append(scores)
+                    target_names.append(condition_name)
+                else:
+                    excluded_targets.append(condition_name)
+            item = calculate_icc_one_way(matrix)
+            item["targets"] = target_names
+            item["excluded_targets"] = excluded_targets
+            label_payload[label] = item
+        by_scale[scale_name] = label_payload
+    return {
+        "unit": "condition/persona target within each scale and trigger label",
+        "complete_repeats_required": repeat,
+        "by_scale": by_scale,
+    }
+
+
+def build_report_completion(results: list[dict[str, Any]]) -> dict[str, Any]:
+    incomplete_targets: list[dict[str, Any]] = []
+    total_targets = 0
+    for result in results:
+        for evaluation in result.get("evaluations", []) or []:
+            for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
+                total_targets += 1
+                if scale_payload.get("aggregation_status") == "complete":
+                    continue
+                incomplete_targets.append(
+                    {
+                        "condition_name": result.get("condition_name", ""),
+                        "trigger_label": evaluation.get("trigger_label", ""),
+                        "scale": scale_name,
+                        "missing_repeats": list(scale_payload.get("missing_repeats", []) or []),
+                        "valid_repeats": int(scale_payload.get("valid_repeats", 0) or 0),
+                        "expected_repeats": int(scale_payload.get("expected_repeats", 0) or 0),
+                    }
+                )
+    ready = total_targets > 0 and not incomplete_targets
+    return {
+        "status": "complete" if ready else "incomplete",
+        "ready_for_final_report": ready,
+        "total_scale_targets": total_targets,
+        "complete_scale_targets": total_targets - len(incomplete_targets),
+        "incomplete_scale_targets": incomplete_targets,
+    }
 
 
 def build_summary_payload(
@@ -1832,21 +2066,33 @@ def build_summary_payload(
     original_summary: dict[str, Any],
     warnings: list[str],
 ) -> dict[str, Any]:
-    stability_analysis = build_stability_analysis(cfg, original_summary)
     results = []
     for condition in selected_conditions(cfg, original_summary):
         result = build_condition_result(cfg, condition)
         if result is not None:
             results.append(result)
-    apply_reviewed_scale_totals(results, stability_analysis)
+    sensitivity_analysis = build_sensitivity_analysis(cfg, results)
+    reliability_analysis = build_reliability_analysis(results, ordered_trigger_labels(results), cfg.repeat)
+    completion = build_report_completion(results)
     return {
         "batch_name": cfg.name,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "aggregation_method_version": AGGREGATION_METHOD_VERSION,
+        "evaluation_protocol": {
+            "expected_repeats": cfg.repeat,
+            "scales": list(SCALES),
+            "scale_order": list(SCALES),
+            "strict_complete_k": True,
+            "primary_score": "mean_of_complete_reviewed_scale_totals",
+            "within_repeat_review": "direct_unambiguous_answer_score_overrides_llm_item_score",
+            "repeat_unit": "same agent and frozen snapshot; Monte Carlo measurement repeat, not independent patient",
+        },
         "source_original_summary": str(cfg.original_summary),
         "archive_results_root": str(cfg.archive_results_root),
         "repeat": cfg.repeat,
         "labels": cfg.labels,
         "summary_only": cfg.report_only,
+        "completion": completion,
         "conditions": results,
         "warnings": warnings,
         "trigger_labels": ordered_trigger_labels(results),
@@ -1859,7 +2105,8 @@ def build_summary_payload(
         "severity_final_delta": aggregate_final_deltas(results, dimension_key="severity", dimension_values=SEVERITIES),
         "group_severity_final_delta_matrix": build_repeat_group_severity_matrix(cfg, results),
         "scale_score_validation": build_repeat_validation(results),
-        "stability_analysis": stability_analysis,
+        "sensitivity_analysis": sensitivity_analysis,
+        "reliability_analysis": reliability_analysis,
         "original_diff": build_original_diff(original_summary, results),
     }
 
@@ -1901,8 +2148,8 @@ def build_original_diff(original_summary: dict[str, Any], results: list[dict[str
                     "trigger_label": label,
                     "scale": scale_name,
                     "original_total": original_total,
-                    "reviewed_total": repeat_total,
-                    "repeat_mean_total": scale_payload.get("repeat_mean_total"),
+                    "repeat_total": repeat_total,
+                    "repeat_mean_total": scale_payload.get("mean"),
                     "delta": delta,
                     "original_severity": original.get("severity", "—"),
                     "repeat_severity": scale_payload.get("severity", "—"),
@@ -1950,8 +2197,8 @@ def render_original_diff_markdown(diff: dict[str, Any]) -> list[str]:
         )
     lines.append("")
     lines.append("### 明细\n")
-    lines.append("| 条件 | 评估点 | 量表 | 原总分 | 复核总分 | 重复均值 | Δ | 原程度 | 复核程度 | 重复标准差 | 缺失重复 |")
-    lines.append("|------|--------|------|--------|----------|----------|---|--------|----------|------------|----------|")
+    lines.append("| 条件 | 评估点 | 量表 | 原总分 | 固定K均值 | Δ | 原程度 | 众数程度 | 样本SD | 缺失重复 |")
+    lines.append("|------|--------|------|--------|-----------|---|--------|----------|--------|----------|")
     for row in rows:
         missing = ",".join(f"r{int(item):02d}" for item in row.get("missing_repeats", []) if item) or "—"
         original_severity = row.get("original_severity", "—")
@@ -1959,12 +2206,11 @@ def render_original_diff_markdown(diff: dict[str, Any]) -> list[str]:
         if row.get("severity_changed"):
             repeat_severity = f"**{repeat_severity}**"
         lines.append(
-            "| {condition} | {label} | {scale} | {orig} | {reviewed} | {mean} | {delta} | {orig_sev} | {repeat_sev} | {std} | {missing} |".format(
+            "| {condition} | {label} | {scale} | {orig} | {mean} | {delta} | {orig_sev} | {repeat_sev} | {std} | {missing} |".format(
                 condition=row.get("condition_name", "—"),
                 label=row.get("trigger_label", "—"),
                 scale=row.get("scale", "—"),
                 orig=format_number(row.get("original_total")),
-                reviewed=format_number(row.get("reviewed_total")),
                 mean=format_number(row.get("repeat_mean_total")),
                 delta=format_delta(row.get("delta")),
                 orig_sev=original_severity,
@@ -1982,8 +2228,8 @@ def render_repeat_detail_markdown(results: list[dict[str, Any]]) -> list[str]:
     lines.append("## 重复评分明细附录\n")
     for result in results:
         lines.append(f"### {result.get('condition_name', '—')}\n")
-        lines.append("| 评估点 | 量表 | repeat | 总分 | 程度 | scored_file |")
-        lines.append("|--------|------|--------|------|------|-------------|")
+        lines.append("| 评估点 | 量表 | repeat | LLM自报总分 | LLM条目和 | 复核总分 | 覆盖条目数 | 程度 | scored_file |")
+        lines.append("|--------|------|--------|-------------|-----------|----------|------------|------|-------------|")
         for evaluation in result.get("evaluations", []):
             label = evaluation.get("trigger_label", "—")
             for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
@@ -1992,29 +2238,20 @@ def render_repeat_detail_markdown(results: list[dict[str, Any]]) -> list[str]:
                     if scored_file:
                         scored_file = to_display_path(Path(scored_file))
                     lines.append(
-                        "| {label} | {scale} | r{repeat:02d} | {total} | {severity} | `{file}` |".format(
+                        "| {label} | {scale} | r{repeat:02d} | {reported} | {llm_sum} | {reviewed} | {overrides} | {severity} | `{file}` |".format(
                             label=label,
                             scale=scale_name,
                             repeat=int(row.get("repeat", 0) or 0),
-                            total=format_number(row.get("total_score")),
+                            reported=format_number(row.get("reported_total_score")),
+                            llm_sum=format_number(row.get("llm_item_sum_total")),
+                            reviewed=format_number(row.get("reviewed_total_score")),
+                            overrides=int(row.get("answer_override_count", 0) or 0),
                             severity=row.get("severity", "—"),
                             file=scored_file or "—",
                         )
                     )
         lines.append("")
     return lines
-
-
-def render_score_list(values: Any) -> str:
-    if not isinstance(values, list):
-        return "—"
-    return ",".join(str(value) for value in values) if values else "—"
-
-
-def render_votes(votes: Any) -> str:
-    if not isinstance(votes, dict) or not votes:
-        return "—"
-    return ", ".join(f"{score}:{count}" for score, count in sorted(votes.items()))
 
 
 def render_repeat_group_severity_matrix_markdown(matrix_payload: dict, group_values: list[str]) -> list[str]:
@@ -2035,190 +2272,227 @@ def render_repeat_group_severity_matrix_markdown(matrix_payload: dict, group_val
     return lines
 
 
-def render_status(value: Any) -> str:
-    status = str(value or "")
-    return {
-        "stable": "稳定",
-        "resolved": "已定稿",
-        "unresolved": "未定稿",
-    }.get(status, status or "—")
+def format_interval(interval: Any) -> str:
+    if not isinstance(interval, dict):
+        return "—"
+    lower = interval.get("lower")
+    upper = interval.get("upper")
+    if lower is None or upper is None:
+        return "—"
+    return "[{}, {}]".format(format_number(lower, 2), format_number(upper, 2))
 
 
-def render_stability_analysis_markdown(analysis: dict[str, Any]) -> list[str]:
-    if not isinstance(analysis, dict):
-        return []
-    if not analysis.get("enabled") and not analysis.get("unstable_items"):
-        return []
-
-    lines = []
-    unstable_items = analysis.get("unstable_items", [])
-    if not isinstance(unstable_items, list):
-        unstable_items = []
-    adjusted_totals = analysis.get("adjusted_totals", [])
-    if not isinstance(adjusted_totals, list):
-        adjusted_totals = []
-    rerun_records = analysis.get("rerun_records", [])
-    if not isinstance(rerun_records, list):
-        rerun_records = []
-
-    lines.append("## 条目稳定性与补跑\n")
-    lines.append(
-        "- 判定规则：同一条目初始重复分数极差 `>= {}` 视为不稳定。".format(
-            analysis.get("range_threshold", "—")
+def format_category_distribution(scale_payload: dict[str, Any]) -> str:
+    counts = scale_payload.get("category_counts", {})
+    proportions = scale_payload.get("category_proportions", {})
+    if not isinstance(counts, dict) or not counts:
+        return "—"
+    return "; ".join(
+        "{}: {}/{} ({:.1%})".format(
+            category,
+            count,
+            scale_payload.get("expected_repeats", 0),
+            float(proportions.get(category, 0.0) or 0.0),
         )
+        for category, count in counts.items()
     )
-    lines.append(f"- 最大补跑轮数：{analysis.get('max_extra_repeat', '—')}")
-    lines.append(f"- 不稳定条目数：{len(unstable_items)}")
-    lines.append(f"- 已记录补跑任务数：{len(rerun_records)}")
+
+
+def render_fixed_repeat_statistics_markdown(results: list[dict[str, Any]]) -> list[str]:
+    lines = ["## 固定完整重复统计\n"]
+    lines.append("| 条件 | 评估点 | 量表 | 状态 | 有效/K | 均值 | 样本SD | MAD | 95% CI | 中位数 | IQR | 截尾均值 | 众数程度 | 置信度 | 不确定性 | 翻转率 |")
+    lines.append("|------|--------|------|------|--------|------|--------|-----|--------|--------|-----|----------|----------|--------|----------|--------|")
+    for result in results:
+        for evaluation in result.get("evaluations", []) or []:
+            for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
+                lines.append(
+                    "| {condition} | {label} | {scale} | {status} | {valid}/{expected} | {mean} | {sd} | {mad} | {ci} | {median} | {iqr} | {trimmed} | {severity} | {confidence} | {uncertainty} | {flip} |".format(
+                        condition=result.get("condition_name", "—"),
+                        label=evaluation.get("trigger_label", "—"),
+                        scale=scale_name,
+                        status=scale_payload.get("aggregation_status", "—"),
+                        valid=scale_payload.get("valid_repeats", 0),
+                        expected=scale_payload.get("expected_repeats", 0),
+                        mean=format_number(scale_payload.get("mean"), 2),
+                        sd=format_number(scale_payload.get("sample_sd"), 2),
+                        mad=format_number(scale_payload.get("mean_absolute_deviation"), 2),
+                        ci=format_interval(scale_payload.get("ci95")),
+                        median=format_number(scale_payload.get("median"), 2),
+                        iqr=format_number(scale_payload.get("iqr"), 2),
+                        trimmed=format_number(scale_payload.get("trimmed_mean_drop_one_each"), 2),
+                        severity=scale_payload.get("severity", "—"),
+                        confidence=format_number(scale_payload.get("modal_confidence"), 3),
+                        uncertainty=format_number(scale_payload.get("category_uncertainty"), 3),
+                        flip=format_number(scale_payload.get("category_pairwise_flip_rate"), 3),
+                    )
+                )
     lines.append("")
+    lines.append("### 严重程度类别分布\n")
+    lines.append("| 条件 | 评估点 | 量表 | 类别分布 | 是否翻转 |")
+    lines.append("|------|--------|------|----------|----------|")
+    for result in results:
+        for evaluation in result.get("evaluations", []) or []:
+            for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        result.get("condition_name", "—"),
+                        evaluation.get("trigger_label", "—"),
+                        scale_name,
+                        format_category_distribution(scale_payload),
+                        "是" if scale_payload.get("any_category_flip") else "否",
+                    )
+                )
+    lines.append("")
+    return lines
 
-    scale_counts = analysis.get("scale_counts", {})
-    if isinstance(scale_counts, dict):
-        lines.append("### 概览\n")
-        lines.append("| 量表 | 不稳定条目 | 已定稿 | 未定稿 |")
-        lines.append("|------|------------|--------|--------|")
-        for scale_name in SCALES:
-            item = scale_counts.get(scale_name, {}) if isinstance(scale_counts.get(scale_name, {}), dict) else {}
+
+def render_sensitivity_markdown(payload: dict[str, Any]) -> list[str]:
+    lines = ["## 敏感性分析\n"]
+    method_labels = {
+        "median_total": "总分中位数",
+        "trimmed_mean": "去除一个最高/最低总分后的均值",
+        "r01": "首轮 r01",
+    }
+    for method_name, label in method_labels.items():
+        method = payload.get(method_name, {}) if isinstance(payload, dict) else {}
+        lines.append(f"### {label}\n")
+        lines.append("| 条件 | 评估点 | 量表 | 敏感性总分 | 相对首次Δ |")
+        lines.append("|------|--------|------|------------|-----------|")
+        for result in method.get("conditions", []) or []:
+            for evaluation in result.get("evaluations", []) or []:
+                for scale_name, scale_payload in (evaluation.get("scales", {}) or {}).items():
+                    lines.append(
+                        "| {} | {} | {} | {} | {} |".format(
+                            result.get("condition_name", "—"),
+                            evaluation.get("trigger_label", "—"),
+                            scale_name,
+                            format_number(scale_payload.get("total_score"), 2),
+                            format_delta(scale_payload.get("delta_from_baseline")),
+                        )
+                    )
+        lines.append("")
+        lines.extend(
+            render_final_delta_markdown(
+                f"{label}：按 Variant 的最终变化",
+                method.get("variant_final_delta", {}),
+                VARIANTS,
+            )
+        )
+        lines.extend(
+            render_final_delta_markdown(
+                f"{label}：按 Group 的最终变化",
+                method.get("group_final_delta", {}),
+                method.get("group_values", GROUPS),
+            )
+        )
+    return lines
+
+
+def render_reliability_markdown(payload: dict[str, Any]) -> list[str]:
+    lines = ["## 批次重复测量可靠性\n"]
+    lines.append("ICC 按量表和评估点分别计算；condition/persona 是测量目标，repeat 是重复测量。\n")
+    lines.append("| 量表 | 评估点 | 目标数 | K | ICC(1,1) | ICC(1,K) | 不可计算原因 | 排除目标 |")
+    lines.append("|------|--------|--------|---|----------|----------|--------------|----------|")
+    by_scale = payload.get("by_scale", {}) if isinstance(payload, dict) else {}
+    for scale_name in SCALES:
+        for label, item in (by_scale.get(scale_name, {}) or {}).items():
             lines.append(
-                "| {scale} | {unstable} | {resolved} | {unresolved} |".format(
-                    scale=scale_name,
-                    unstable=item.get("unstable_item_count", 0),
-                    resolved=item.get("resolved_count", 0),
-                    unresolved=item.get("unresolved_count", 0),
+                "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    scale_name,
+                    label,
+                    item.get("target_count", 0),
+                    item.get("repeat_count", 0),
+                    format_number(item.get("icc_1_1"), 3),
+                    format_number(item.get("icc_1_k"), 3),
+                    item.get("reason", "") or "—",
+                    ", ".join(item.get("excluded_targets", []) or []) or "—",
                 )
             )
-        lines.append("")
+    lines.append("")
+    return lines
 
-    if unstable_items:
-        lines.append("### 不稳定条目明细\n")
-        lines.append("| 条件 | 评估点 | 量表 | 条目 | 初始分数 | 补跑分数 | 投票 | 最终分 | 状态 | 备注 |")
-        lines.append("|------|--------|------|------|----------|----------|------|--------|------|------|")
-        for row in unstable_items:
-            lines.append(
-                "| {condition} | {label} | {scale} | {item_id} | {initial} | {extra} | {votes} | {majority} | {status} | {note} |".format(
-                    condition=row.get("condition_name", "—"),
-                    label=row.get("trigger_label", "—"),
-                    scale=row.get("scale", "—"),
-                    item_id=row.get("item_id", "—"),
-                    initial=render_score_list(row.get("initial_scores")),
-                    extra=render_score_list(row.get("extra_scores")),
-                    votes=render_votes(row.get("votes")),
-                    majority=format_number(row.get("majority_score")),
-                    status=render_status(row.get("status")),
-                    note=row.get("resolution_note", "") or "—",
-                )
+
+def render_snapshot_integrity_markdown(results: list[dict[str, Any]]) -> list[str]:
+    integrity_rows = [
+        (result, evaluation)
+        for result in results
+        for evaluation in result.get("evaluations", []) or []
+        if evaluation.get("historical_snapshot_integrity")
+    ]
+    if not integrity_rows:
+        return []
+    lines = [
+        "## 历史快照完整性\n",
+        "| 条件 | 评估点 | 完整性 | Bundle 已校验 | 使用最终 storage 兼容 |",
+        "|------|--------|--------|----------------|-------------------------|",
+    ]
+    for result, evaluation in integrity_rows:
+        lines.append(
+            "| {} | {} | {} | {} | {} |".format(
+                result.get("condition_name", "—"),
+                evaluation.get("trigger_label", "—"),
+                evaluation.get("historical_snapshot_integrity", "—"),
+                "是" if evaluation.get("snapshot_bundle_verified") is True else "否",
+                "是" if evaluation.get("legacy_final_storage_used") else "否",
             )
-        lines.append("")
-
-    if adjusted_totals:
-        lines.append("### 评分复核后总分\n")
-        lines.append("| 条件 | 评估点 | 量表 | 条目数 | 复核总分 | 复核程度 | 未定稿条目 | 低分定稿条目 |")
-        lines.append("|------|--------|------|--------|----------|----------|------------|--------------|")
-        for row in adjusted_totals:
-            unresolved = row.get("unresolved_item_ids", [])
-            unresolved_text = ",".join(str(item) for item in unresolved) if isinstance(unresolved, list) and unresolved else "—"
-            tie_break_items = row.get("tie_break_item_ids", [])
-            tie_break_text = ",".join(str(item) for item in tie_break_items) if isinstance(tie_break_items, list) and tie_break_items else "—"
-            lines.append(
-                "| {condition} | {label} | {scale} | {count}/{expected} | {total} | {severity} | {unresolved} | {tie_break} |".format(
-                    condition=row.get("condition_name", "—"),
-                    label=row.get("trigger_label", "—"),
-                    scale=row.get("scale", "—"),
-                    count=row.get("scored_item_count", 0),
-                    expected=row.get("expected_item_count", 0),
-                    total=format_number(row.get("adjusted_total")),
-                    severity=row.get("adjusted_severity", "—"),
-                    unresolved=unresolved_text,
-                    tie_break=tie_break_text,
-                )
-            )
-        lines.append("")
-
-    if rerun_records:
-        lines.append("### 补跑记录\n")
-        lines.append("| 条件 | 评估点 | repeat | 条目 | metadata |")
-        lines.append("|------|--------|--------|------|----------|")
-        for record in rerun_records:
-            output_file = record.get("metadata_file", "")
-            display_file = to_display_path(Path(output_file)) if output_file else "—"
-            scale_items = record.get("scale_item_ids", {})
-            lines.append(
-                "| {condition} | {label} | r{repeat:02d} | `{items}` | `{file}` |".format(
-                    condition=record.get("condition_name", "—"),
-                    label=record.get("trigger_label", "—"),
-                    repeat=int(record.get("repeat", 0) or 0),
-                    items=json.dumps(scale_items, ensure_ascii=False, sort_keys=True),
-                    file=display_file,
-                )
-            )
-        lines.append("")
-
+        )
+    lines.append("")
     return lines
 
 
 def render_markdown_report(payload: dict[str, Any]) -> str:
     results = payload.get("conditions", [])
     warnings = payload.get("warnings", [])
-    lines = []
-    lines.append(f"# 存档重复量表评估汇总：{payload['batch_name']}\n")
-    lines.append(f"生成时间：{payload['generated_at']}\n")
-    lines.append("> 本汇总只统计 PHQ-9 / BDI-II；主分数为评分复核后的条目最终分之和，重复均值保留在附录。\n")
-    lines.append("## 汇总范围\n")
-    lines.append(f"- 条件数：{len(results)}")
-    lines.append(f"- 重复次数：{payload.get('repeat', '—')}")
-    lines.append(f"- 原始报告：`{payload.get('source_original_summary', '')}`")
-    lines.append(f"- 评估点：{', '.join(payload['trigger_labels']) if payload.get('trigger_labels') else '—'}")
+    completion = payload.get("completion", {}) if isinstance(payload.get("completion"), dict) else {}
+    ready_for_final = completion.get("ready_for_final_report", True)
+    lines = [
+        f"# 存档重复量表评估汇总：{payload['batch_name']}\n",
+        f"生成时间：{payload['generated_at']}\n",
+        (
+            "> 状态：完整。所有 condition × 评估点 × 量表均已取得固定 K 次有效复核总分。\n"
+            if ready_for_final
+            else "> **状态：未完成。此文件仅用于续跑诊断，不是最终报告；请使用相同 `--name` 重新运行。**\n"
+        ),
+        "> 本汇总只统计 PHQ-9 / BDI-II。每次以 LLM 条目分为底稿，用患者明确且无歧义的 0–3 分回答覆盖冲突条目；主分数是固定 K 次复核后完整量表总分的均值。重复测量不是独立患者样本。\n",
+        "## 汇总范围\n",
+        f"- 完成状态：`{completion.get('status', 'unknown')}`",
+        f"- 完整量表目标：{completion.get('complete_scale_targets', '—')} / {completion.get('total_scale_targets', '—')}",
+        f"- 方法版本：`{payload.get('aggregation_method_version', '—')}`",
+        f"- 条件数：{len(results)}",
+        f"- 固定完整重复次数 K：{payload.get('repeat', '—')}",
+        f"- 原始报告：`{payload.get('source_original_summary', '')}`",
+        f"- 评估点：{', '.join(payload['trigger_labels']) if payload.get('trigger_labels') else '—'}",
+    ]
     if warnings:
         lines.append("- 警告：")
-        for warning in warnings:
-            lines.append(f"  - {warning}")
+        lines.extend(f"  - {warning}" for warning in warnings)
     lines.append("")
-
-    lines.append("## 各条件量表变化过程\n")
+    lines.extend(render_snapshot_integrity_markdown(results))
+    lines.extend(render_fixed_repeat_statistics_markdown(results))
+    lines.append("## 主结果：各条件量表变化过程\n")
     for result in results:
         lines.extend(render_condition_trajectory_markdown(result))
-
-    lines.extend(
-        render_dimension_trajectory_markdown(
-            "按 Variant 的评估轨迹对比",
-            payload["variant_trajectory"],
-            VARIANTS,
-            payload["trigger_labels"],
-        )
-    )
-    lines.extend(
-        render_dimension_trajectory_markdown(
-            "按 Group 的评估轨迹对比",
-            payload["group_trajectory"],
-            payload.get("group_values", GROUPS),
-            payload["trigger_labels"],
-        )
-    )
-    lines.extend(
-        render_dimension_trajectory_markdown(
-            "按 Severity 的评估轨迹对比",
-            payload["severity_trajectory"],
-            SEVERITIES,
-            payload["trigger_labels"],
-        )
-    )
-    lines.extend(render_final_delta_markdown("按 Variant 的最终变化对比", payload["variant_final_delta"], VARIANTS))
-    lines.extend(render_final_delta_markdown("按 Group 的最终变化对比", payload["group_final_delta"], payload.get("group_values", GROUPS)))
-    lines.extend(render_final_delta_markdown("按 Severity 的最终变化对比", payload["severity_final_delta"], SEVERITIES))
-    lines.extend(render_repeat_group_severity_matrix_markdown(
-        payload["group_severity_final_delta_matrix"],
-        payload.get("group_values", GROUPS),
-    ))
+    lines.extend(render_dimension_trajectory_markdown("按 Variant 的主结果轨迹", payload["variant_trajectory"], VARIANTS, payload["trigger_labels"]))
+    lines.extend(render_dimension_trajectory_markdown("按 Group 的主结果轨迹", payload["group_trajectory"], payload.get("group_values", GROUPS), payload["trigger_labels"]))
+    lines.extend(render_dimension_trajectory_markdown("按 Severity 的主结果轨迹", payload["severity_trajectory"], SEVERITIES, payload["trigger_labels"]))
+    lines.extend(render_final_delta_markdown("按 Variant 的主结果最终变化", payload["variant_final_delta"], VARIANTS))
+    lines.extend(render_final_delta_markdown("按 Group 的主结果最终变化", payload["group_final_delta"], payload.get("group_values", GROUPS)))
+    lines.extend(render_final_delta_markdown("按 Severity 的主结果最终变化", payload["severity_final_delta"], SEVERITIES))
+    lines.extend(render_repeat_group_severity_matrix_markdown(payload["group_severity_final_delta_matrix"], payload.get("group_values", GROUPS)))
+    lines.extend(render_sensitivity_markdown(payload.get("sensitivity_analysis", {})))
+    lines.extend(render_reliability_markdown(payload.get("reliability_analysis", {})))
     lines.extend(render_scale_score_validation_markdown(payload["scale_score_validation"]))
-    lines.extend(render_stability_analysis_markdown(payload.get("stability_analysis", {})))
     lines.extend(render_repeat_detail_markdown(results))
     lines.extend(render_original_diff_markdown(payload["original_diff"]))
     return "\n".join(lines)
 
 
 def write_report_outputs(cfg: RuntimeConfig, payload: dict[str, Any]) -> tuple[Path, Path]:
-    json_path = reports_dir(cfg) / f"{cfg.name}_summary.json"
-    md_path = reports_dir(cfg) / f"{cfg.name}_summary.md"
+    completion = payload.get("completion", {}) if isinstance(payload.get("completion"), dict) else {}
+    ready_for_final = completion.get("ready_for_final_report", True)
+    report_suffix = "summary" if ready_for_final else "incomplete"
+    json_path = reports_dir(cfg) / f"{cfg.name}_{report_suffix}.json"
+    md_path = reports_dir(cfg) / f"{cfg.name}_{report_suffix}.md"
     if cfg.dry_run:
         print(f"[DRY-RUN] write summary json: {json_path}")
         print(f"[DRY-RUN] write summary md:   {md_path}")
@@ -2229,6 +2503,18 @@ def write_report_outputs(cfg: RuntimeConfig, payload: dict[str, Any]) -> tuple[P
     print(f"[WRITE] {json_path}")
     print(f"[WRITE] {md_path}")
     return json_path, md_path
+
+
+def require_complete_report(cfg: RuntimeConfig, payload: dict[str, Any], md_path: Path) -> None:
+    completion = payload.get("completion", {}) or {}
+    if cfg.dry_run or completion.get("ready_for_final_report", False):
+        return
+    incomplete_count = len(completion.get("incomplete_scale_targets", []) or [])
+    raise RuntimeError(
+        f"重复评估尚未完整（{incomplete_count} 个量表目标缺少有效 K 次结果）。\n"
+        f"已写入续跑诊断报告: {md_path}\n"
+        "请使用相同 --name 重新运行；默认会复用完整 answered/scored 并只补缺失阶段。"
+    )
 
 
 def main() -> None:
@@ -2252,28 +2538,12 @@ def main() -> None:
                         error=item.get("error", ""),
                     )
                 )
-        if task_results and all(item.get("status") == "error" for item in task_results):
-            details = "\n\n".join(warnings[:3])
-            raise RuntimeError(
-                "所有重复评估 answer worker 都失败，停止生成空报告。"
-                + (f"\n\n前几个错误:\n{details}" if details else "")
-            )
-        stability_results = run_stability_reruns(cfg, original_summary)
-        for item in stability_results:
-            if item.get("status") == "error":
-                warnings.append(
-                    "stability {condition} {label} r{repeat:02d}: {error}".format(
-                        condition=item.get("condition_name", "—"),
-                        label=item.get("label", "—"),
-                        repeat=int(item.get("repeat", 0) or 0),
-                        error=item.get("error", ""),
-                    )
-                )
     else:
         print("[INFO] report-only: 跳过 worker 调用，只汇总已有重复结果")
 
     payload = build_summary_payload(cfg, original_summary, warnings)
     _json_path, md_path = write_report_outputs(cfg, payload)
+    require_complete_report(cfg, payload, md_path)
     print(f"\n[Done] 存档重复评估报告: {md_path}")
 
 

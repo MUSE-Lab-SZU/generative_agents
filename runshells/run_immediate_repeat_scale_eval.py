@@ -4,7 +4,7 @@
 Typical usage:
     python3 runshells/run_immediate_repeat_scale_eval.py \
       --run-name batch-0707-Counsel-KBD2-G1-SEV-0707-2011 \
-      --repeat 3 --max-parallel 3
+      --repeat 10 --max-parallel 3
 
 The script prepares a synthetic staged_eval/NOW job from the latest available
 checkpoint state, refreshes its runtime config from current storage memory, and
@@ -60,8 +60,8 @@ ORIGINAL_SUMMARY = ""
 # 输出批次名；留空时自动生成 immediate-repeat-<condition>-<MMdd-HHmm>。
 NAME = ""
 
-# 每个评估点重复次数。
-REPEAT = 3
+# 每个评估点固定执行的完整 PHQ-9 / BDI-II 重复次数。
+REPEAT = 10
 
 # 逗号分隔 labels；"auto" 表示已完成 staged_eval + NOW。
 LABELS = "auto"
@@ -83,15 +83,6 @@ DRY_RUN = False
 
 # 是否只汇总已有 repeat 输出。
 REPORT_ONLY = False
-
-# 是否启用条目稳定性补跑。
-STABILITY_RERUN = True
-
-# 不稳定条目最多补跑轮数。
-MAX_EXTRA_REPEAT = 4
-
-# 条目分数极差阈值。
-STABILITY_RANGE_THRESHOLD = 1
 
 # 是否把目标患者动态抑郁状态重置为初始 depression_config 状态后复评。
 RESET_TARGET_DEPRESSION_STATE = False
@@ -133,9 +124,6 @@ class ImmediateConfig:
     force: bool
     dry_run: bool
     report_only: bool
-    stability_rerun: bool
-    max_extra_repeat: int
-    stability_range_threshold: int
     original_summary: Path | None
     reset_target_depression_state: bool
     output_group: str
@@ -150,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--condition", default=CONDITION, help="condition 名；留空时从 batch_state 或 run_name 反查")
     parser.add_argument("--original-summary", default=ORIGINAL_SUMMARY, help="原始 *_summary.json；留空时交给 archived repeat 脚本自动处理")
     parser.add_argument("--name", default=NAME, help="输出批次名；默认 immediate-repeat-<condition>-<MMdd-HHmm>")
-    parser.add_argument("--repeat", type=int, default=REPEAT, help="每个评估点重复次数")
+    parser.add_argument("--repeat", type=int, default=REPEAT, help="每个评估点固定完整重复次数，默认 10")
     parser.add_argument("--labels", default=LABELS, help="逗号分隔 labels；默认 auto=已完成 staged_eval + NOW")
     parser.add_argument("--now-label", default=NOW_LABEL, help="即时评估 label，默认 NOW")
     parser.add_argument("--include-now", action=argparse.BooleanOptionalAction, default=INCLUDE_NOW, help="auto labels 中是否加入 NOW")
@@ -158,9 +146,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action=argparse.BooleanOptionalAction, default=FORCE, help="覆盖已有 repeat 输出")
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=DRY_RUN, help="只打印计划，不写入、不调用 worker")
     parser.add_argument("--report-only", action=argparse.BooleanOptionalAction, default=REPORT_ONLY, help="只汇总已有 repeat 输出")
-    parser.add_argument("--stability-rerun", action=argparse.BooleanOptionalAction, default=STABILITY_RERUN, help="启用条目稳定性补跑")
-    parser.add_argument("--max-extra-repeat", type=int, default=MAX_EXTRA_REPEAT, help="不稳定条目最多补跑轮数")
-    parser.add_argument("--stability-range-threshold", type=int, default=STABILITY_RANGE_THRESHOLD, help="条目分数极差阈值")
     parser.add_argument("--reset-target-depression-state", action=argparse.BooleanOptionalAction, default=RESET_TARGET_DEPRESSION_STATE, help="沿用 archived repeat 的抑郁状态重置选项")
     parser.add_argument("--output-group", default=OUTPUT_GROUP, help="沿用 archived repeat 的输出 group 重标记选项")
     parser.add_argument("--use-vllm-models", action=argparse.BooleanOptionalAction, default=USE_VLLM_MODELS, help="把即时复评 runtime_config 的 think LLM / embedding 改为 vLLM")
@@ -262,9 +247,6 @@ def resolve_runtime_config(args: argparse.Namespace) -> ImmediateConfig:
         force=bool(args.force),
         dry_run=bool(args.dry_run),
         report_only=bool(args.report_only),
-        stability_rerun=bool(args.stability_rerun),
-        max_extra_repeat=max(0, int(args.max_extra_repeat or 0)),
-        stability_range_threshold=max(1, int(args.stability_range_threshold or 1)),
         original_summary=original_summary,
         reset_target_depression_state=bool(args.reset_target_depression_state),
         output_group=str(args.output_group or "").strip(),
@@ -751,10 +733,6 @@ def build_archived_repeat_cmd(cfg: ImmediateConfig, labels: list[str], original_
         cfg.output_name,
         "--max-parallel",
         str(cfg.max_parallel),
-        "--max-extra-repeat",
-        str(cfg.max_extra_repeat),
-        "--stability-range-threshold",
-        str(cfg.stability_range_threshold),
     ]
     if original_summary:
         cmd.extend(["--original-summary", str(original_summary)])
@@ -764,8 +742,6 @@ def build_archived_repeat_cmd(cfg: ImmediateConfig, labels: list[str], original_
         cmd.append("--dry-run")
     if cfg.report_only:
         cmd.append("--report-only")
-    if not cfg.stability_rerun:
-        cmd.append("--no-stability-rerun")
     if cfg.reset_target_depression_state:
         cmd.append("--reset-target-depression-state")
     if cfg.output_group:
@@ -795,7 +771,7 @@ def validate_archived_repeat_script(cfg: ImmediateConfig) -> None:
     except Exception as exc:
         raise RuntimeError(f"无法读取 archived repeat 脚本: {ARCHIVED_REPEAT_SCRIPT} ({exc})") from exc
 
-    required_markers = ["worker_failure_detail"]
+    required_markers = ["worker_failure_detail", "fixed_complete_scale_reviewed_v2"]
     if cfg.use_vllm_models:
         required_markers.extend(
             [

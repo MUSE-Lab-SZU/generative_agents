@@ -1,12 +1,234 @@
 """generative_agents.model.llm_model"""
 
-import time
+import json
 import re
+import time
+from urllib.parse import urlsplit, urlunsplit
+
 import requests
 
 
 DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
 DEFAULT_LLM_RETRY = 10
+ERROR_LOG_TEXT_LIMIT = 500
+ERROR_CAUSE_CHAIN_LIMIT = 3
+
+
+_SENSITIVE_LOG_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;}]+"),
+    re.compile(r"(?i)((?:api[_-]?key|x-api-key)\s*[:=]\s*)[^\s,;}]+"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+)
+
+
+def _safe_exception_text(value, limit=ERROR_LOG_TEXT_LIMIT):
+    """Return a redacted, single-line diagnostic string without raising."""
+    try:
+        text = str(value)
+    except Exception:
+        try:
+            text = repr(value)
+        except Exception:
+            text = "<unprintable>"
+    text = " ".join(text.replace("\x00", "\\x00").split())
+    for pattern in _SENSITIVE_LOG_PATTERNS:
+        text = pattern.sub(lambda match: match.group(1) + "<redacted>", text)
+    if len(text) > limit:
+        text = text[:limit] + "...<truncated>"
+    return text
+
+
+def sanitize_endpoint_for_log(base_url):
+    """Remove credentials, query parameters, and fragments from a logged URL."""
+    raw_url = _safe_exception_text(base_url, limit=ERROR_LOG_TEXT_LIMIT)
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlsplit(raw_url)
+        if not parsed.scheme or not parsed.netloc:
+            return raw_url.split("?", 1)[0].split("#", 1)[0]
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = "[{}]".format(hostname)
+        netloc = hostname
+        if parsed.port is not None:
+            netloc = "{}:{}".format(netloc, parsed.port)
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except Exception:
+        without_query = raw_url.split("?", 1)[0].split("#", 1)[0]
+        return re.sub(r"(?<=//)[^/@\s]+@", "<redacted>@", without_query)
+
+
+def _safe_attr(obj, name, default=None):
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _exception_message(exc):
+    message = _safe_exception_text(exc)
+    if message:
+        return message
+    return _safe_exception_text(repr(exc)) or type(exc).__name__
+
+
+def safe_exception_message_for_log(exc):
+    """Expose the bounded/redacted exception message used by diagnostic logs."""
+    return _exception_message(exc)
+
+
+def _exception_cause_chain(exc, limit=ERROR_CAUSE_CHAIN_LIMIT):
+    chain, seen = [], {id(exc)}
+    current = exc
+    while len(chain) < limit:
+        cause = _safe_attr(current, "__cause__")
+        if cause is None and not bool(_safe_attr(current, "__suppress_context__", False)):
+            cause = _safe_attr(current, "__context__")
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        chain.append(
+            {
+                "type": type(cause).__name__,
+                "message": _exception_message(cause),
+            }
+        )
+        current = cause
+    return chain
+
+
+def _exception_http_metadata(exc):
+    status_code = _safe_attr(exc, "status_code")
+    request_id = _safe_attr(exc, "request_id")
+    response = _safe_attr(exc, "response")
+    if status_code is None and response is not None:
+        status_code = _safe_attr(response, "status_code")
+    if not request_id and response is not None:
+        headers = _safe_attr(response, "headers")
+        if headers is not None:
+            try:
+                request_id = headers.get("x-request-id") or headers.get("request-id")
+            except Exception:
+                request_id = None
+    try:
+        normalized_status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        normalized_status = _safe_exception_text(status_code)
+    return normalized_status, _safe_exception_text(request_id)
+
+
+def classify_call_exception(exc, stage="request"):
+    """Classify a client-side failure without importing a provider SDK."""
+    if stage in {"callback", "response_normalization", "output_parse"}:
+        return "output_parse_or_validation"
+
+    status_code, _request_id = _exception_http_metadata(exc)
+    if status_code == 429:
+        return "rate_limit_or_concurrency"
+    if status_code in {401, 403}:
+        return "authentication"
+    if status_code in {408, 504}:
+        return "timeout"
+    if isinstance(status_code, int) and 500 <= status_code <= 599:
+        return "server_error"
+    if isinstance(status_code, int) and 400 <= status_code <= 499:
+        return "client_error"
+
+    chain = [{"type": type(exc).__name__, "message": _exception_message(exc)}]
+    chain.extend(_exception_cause_chain(exc))
+    searchable = " ".join(
+        "{} {}".format(item.get("type", ""), item.get("message", ""))
+        for item in chain
+    ).lower()
+    if any(token in searchable for token in ("rate limit", "ratelimit", "too many requests", "concurrency")):
+        return "rate_limit_or_concurrency"
+    if any(token in searchable for token in ("timeout", "timed out", "deadline exceeded")):
+        return "timeout"
+    if any(
+        token in searchable
+        for token in (
+            "connection",
+            "connecterror",
+            "dns",
+            "name resolution",
+            "network is unreachable",
+            "broken pipe",
+        )
+    ):
+        return "connection"
+    return "unexpected"
+
+
+def format_call_error_details(
+    exc,
+    *,
+    caller,
+    stage,
+    provider,
+    model,
+    base_url,
+    attempt,
+    total_attempts,
+    retrying,
+    elapsed_ms=None,
+):
+    """Format safe structured error details for stdout/stderr logs."""
+    try:
+        status_code, request_id = _exception_http_metadata(exc)
+        details = {
+            "caller": _safe_exception_text(caller),
+            "stage": _safe_exception_text(stage),
+            "provider": _safe_exception_text(provider),
+            "model": _safe_exception_text(model),
+            "endpoint": sanitize_endpoint_for_log(base_url),
+            "attempt": int(attempt),
+            "total_attempts": int(total_attempts),
+            "retrying": bool(retrying),
+            "category": classify_call_exception(exc, stage=stage),
+            "exception_type": type(exc).__name__,
+            "message": _exception_message(exc),
+            "exception_repr": _safe_exception_text(repr(exc)),
+            "cause_chain": _exception_cause_chain(exc),
+        }
+        if elapsed_ms is not None:
+            details["elapsed_ms"] = max(0, int(round(float(elapsed_ms))))
+        if status_code is not None:
+            details["status_code"] = status_code
+        if request_id:
+            details["request_id"] = request_id
+        return json.dumps(details, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception as format_exc:
+        fallback = {
+            "caller": _safe_exception_text(caller),
+            "stage": _safe_exception_text(stage),
+            "category": "unexpected",
+            "exception_type": type(exc).__name__,
+            "message": _exception_message(exc),
+            "format_error": _exception_message(format_exc),
+        }
+        return json.dumps(fallback, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _ollama_error_response_summary(response):
+    """Return a bounded error-only response summary without logging request data."""
+    try:
+        payload = response.json()
+    except Exception:
+        return _safe_exception_text(_safe_attr(response, "text", ""), limit=300)
+    if isinstance(payload, dict):
+        selected = {
+            key: payload.get(key)
+            for key in ("error", "message", "detail")
+            if key in payload
+        }
+        if selected:
+            return _safe_exception_text(
+                json.dumps(selected, ensure_ascii=False, default=str),
+                limit=300,
+            )
+        return "body_keys={}".format(sorted(str(key) for key in payload.keys()))
+    return "body_type={}".format(type(payload).__name__)
 
 
 def resolve_ollama_timeout_seconds(config, default=DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS):
@@ -42,6 +264,7 @@ def strip_qwen_think_tags(text):
 
 class LLMModel:
     def __init__(self, config):
+        self._provider = config.get("provider", "")
         self._api_key = config["api_key"]
         self._base_url = config["base_url"]
         self._model = config["model"]
@@ -70,18 +293,42 @@ class LLMModel:
         retry = self._default_retry if retry is None else retry
         response, self._meta_responses = None, []
         self._summary.setdefault(caller, [0, 0, 0])
-        for _ in range(retry):
+        for attempt in range(1, retry + 1):
+            started_at = time.monotonic()
+            stage = "request"
             try:
-                meta_response = self._completion(prompt, **kwargs).strip()
+                meta_response = self._completion(prompt, **kwargs)
+                stage = "response_normalization"
+                meta_response = meta_response.strip()
                 self._meta_responses.append(meta_response)
                 self._summary["total"][0] += 1
                 self._summary[caller][0] += 1
                 if callback:
+                    stage = "callback"
                     response = callback(meta_response)
                 else:
                     response = meta_response
             except Exception as e:
-                print(f"LLMModel.completion() caused an error: {e}")
+                elapsed_ms = (time.monotonic() - started_at) * 1000
+                details = format_call_error_details(
+                    e,
+                    caller=caller,
+                    stage=stage,
+                    provider=self._provider,
+                    model=self._model,
+                    base_url=self._base_url,
+                    attempt=attempt,
+                    total_attempts=retry,
+                    retrying=attempt < retry,
+                    elapsed_ms=elapsed_ms,
+                )
+                print(
+                    "LLMModel.completion() caused an error: {} | [LLM_CALL_ERROR] {}".format(
+                        safe_exception_message_for_log(e),
+                        details,
+                    ),
+                    flush=True,
+                )
                 time.sleep(5)
                 response = None
                 continue
@@ -163,12 +410,34 @@ class OllamaLLMModel(LLMModel):
             print(
                 "[OLLAMA_TIMEOUT] model={} url={} timeout={}s error={}".format(
                     self._model,
-                    request_url,
+                    sanitize_endpoint_for_log(request_url),
                     self._request_timeout_seconds,
-                    exc,
+                    safe_exception_message_for_log(exc),
                 )
             )
             raise
+        status_code = _safe_attr(response, "status_code")
+        try:
+            is_http_error = int(status_code) >= 400
+        except (TypeError, ValueError):
+            is_http_error = False
+        if is_http_error:
+            print(
+                "[OLLAMA_HTTP_ERROR] {}".format(
+                    json.dumps(
+                        {
+                            "model": _safe_exception_text(self._model),
+                            "endpoint": sanitize_endpoint_for_log(request_url),
+                            "status_code": int(status_code),
+                            "response_summary": _ollama_error_response_summary(response),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ),
+                flush=True,
+            )
         return response.json()
 
     def _completion(self, prompt, temperature=0.5):

@@ -9,7 +9,11 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import Settings
 
 from modules import utils
-from modules.model.llm_model import resolve_ollama_timeout_seconds
+from modules.model.llm_model import (
+    format_call_error_details,
+    resolve_ollama_timeout_seconds,
+    safe_exception_message_for_log,
+)
 
 
 STORAGE_RETRY_MAX = 3
@@ -19,6 +23,11 @@ STORAGE_RETRY_SLEEP_SECONDS = 5
 class LlamaIndex:
     def __init__(self, embedding_config, path=None):
         self._config = {"max_nodes": 0}
+        self._embedding_log_context = {
+            "provider": str(embedding_config.get("provider", "") or ""),
+            "model": str(embedding_config.get("model", "") or ""),
+            "base_url": str(embedding_config.get("base_url", "") or ""),
+        }
         if embedding_config["provider"] == "hugging_face":
             from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
@@ -64,11 +73,34 @@ class LlamaIndex:
     def _run_with_retry(self, op_name, callback, error_formatter):
         last_error = None
         for retry_count in range(1, STORAGE_RETRY_MAX + 1):
+            started_at = time.monotonic()
             try:
                 return callback()
             except Exception as e:
                 last_error = e
-                print(error_formatter(retry_count, e))
+                context = getattr(self, "_embedding_log_context", {}) or {}
+                details = format_call_error_details(
+                    e,
+                    caller="embedding.{}".format(op_name),
+                    stage="request",
+                    provider=context.get("provider", ""),
+                    model=context.get("model", ""),
+                    base_url=context.get("base_url", ""),
+                    attempt=retry_count,
+                    total_attempts=STORAGE_RETRY_MAX,
+                    retrying=retry_count < STORAGE_RETRY_MAX,
+                    elapsed_ms=(time.monotonic() - started_at) * 1000,
+                )
+                print(
+                    "{} | [EMBEDDING_CALL_ERROR] {}".format(
+                        error_formatter(
+                            retry_count,
+                            safe_exception_message_for_log(e),
+                        ),
+                        details,
+                    ),
+                    flush=True,
+                )
                 if retry_count >= STORAGE_RETRY_MAX:
                     raise
                 time.sleep(STORAGE_RETRY_SLEEP_SECONDS)
@@ -151,6 +183,7 @@ class LlamaIndex:
         node_ids=None,
         retriever_creator=None,
     ):
+        started_at = time.monotonic()
         try:
             retriever_creator = retriever_creator or VectorIndexRetriever
             return retriever_creator(
@@ -160,7 +193,26 @@ class LlamaIndex:
                 node_ids=node_ids,
             ).retrieve(text)
         except Exception as e:
-            # print(f"LlamaIndex.retrieve() caused an error: {e}")
+            context = getattr(self, "_embedding_log_context", {}) or {}
+            details = format_call_error_details(
+                e,
+                caller="embedding.retrieve",
+                stage="request",
+                provider=context.get("provider", ""),
+                model=context.get("model", ""),
+                base_url=context.get("base_url", ""),
+                attempt=1,
+                total_attempts=1,
+                retrying=False,
+                elapsed_ms=(time.monotonic() - started_at) * 1000,
+            )
+            print(
+                "LlamaIndex.retrieve() caused an error: {} | [EMBEDDING_CALL_ERROR] {}".format(
+                    safe_exception_message_for_log(e),
+                    details,
+                ),
+                flush=True,
+            )
             return []
 
     def query(

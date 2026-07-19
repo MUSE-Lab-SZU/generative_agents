@@ -154,6 +154,7 @@ GROUP_OVERLAY_FILES = {
     "g5": GROUP_OVERLAY_DIR / "g5_negative_resident_chat.json",
     "g6": GROUP_OVERLAY_DIR / "g6_supportive_counseling.json",
     "g7": GROUP_OVERLAY_DIR / "g7_memory_removed.json",
+    "g9": GROUP_OVERLAY_DIR / "g9_positive_resident_chat.json",
 }
 
 SEVERITY_SHORT_NAMES = {
@@ -162,7 +163,7 @@ SEVERITY_SHORT_NAMES = {
     "severe": "SEV",
 }
 SEVERITIES = ["mild", "moderate", "severe"]
-GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7"]
+GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7", "g9"]
 WILDCARD_TOKENS = {"*", "ALL"}
 VARIANT_SELECTOR_ALIASES = dict(KABUDA_VARIANT_SELECTOR_ALIASES)
 GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
@@ -1681,7 +1682,15 @@ def append_post_entry(evaluations: list[dict], run_dir: Path) -> None:
 
 def apply_trajectory_deltas(evaluations: list[dict]) -> None:
     for scale_name in SCALES:
-        baseline = None
+        baseline = next(
+            (
+                float(evaluation.get("scales", {}).get(scale_name, {}).get("total_score"))
+                for evaluation in evaluations
+                if str(evaluation.get("trigger_label", "") or "").strip().upper() == "T0"
+                and evaluation.get("scales", {}).get(scale_name, {}).get("total_score") is not None
+            ),
+            None,
+        )
         previous = None
         for evaluation in evaluations:
             scale_payload = evaluation["scales"].setdefault(scale_name, {})
@@ -1690,13 +1699,11 @@ def apply_trajectory_deltas(evaluations: list[dict]) -> None:
                 scale_payload["delta_from_previous"] = None
                 scale_payload["delta_from_baseline"] = None
                 continue
-            if baseline is None:
-                baseline = float(total_score)
             if previous is None:
                 delta_from_previous = 0.0
             else:
                 delta_from_previous = float(total_score) - previous
-            delta_from_baseline = float(total_score) - baseline
+            delta_from_baseline = float(total_score) - baseline if baseline is not None else None
             scale_payload["delta_from_previous"] = delta_from_previous
             scale_payload["delta_from_baseline"] = delta_from_baseline
             previous = float(total_score)
@@ -1730,7 +1737,13 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
                     "completed_session_count": int(metadata.get("completed_session_count", 0) or 0),
                     "sim_time": str(metadata.get("sim_time", "") or ""),
                     "snapshot_name": str(metadata.get("snapshot_name", "") or ""),
-                    "source": "staged_eval",
+                    "source": (
+                        "staged_eval_snapshot"
+                        if metadata.get("artifact_kind") == "repeat_eval_snapshot"
+                        and metadata.get("evaluation_executed") is False
+                        else "staged_eval"
+                    ),
+                    "evaluation_executed": metadata.get("evaluation_executed", True),
                     "metadata_path": str(metadata_path),
                     "scales": scales_payload,
                 }

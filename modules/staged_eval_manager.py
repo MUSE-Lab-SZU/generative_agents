@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List
 
@@ -22,6 +25,9 @@ SCALE_QUESTION_FILES = {
     "PHQ-9": "PHQ-9-v2.jsonl",
     "BDI-II": "BDI-II-v2.jsonl",
 }
+SNAPSHOT_BUNDLE_SCHEMA_VERSION = 1
+SNAPSHOT_STORAGE_DIRNAME = "snapshot_storage"
+SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
 
 
 class StagedEvalManager:
@@ -67,6 +73,8 @@ class StagedEvalManager:
                 snapshot_name="",
             )
         except Exception as exc:
+            if self._capture_only():
+                raise
             self._log("warning", f"[STAGED_EVAL] T0 failed: {exc}")
             return None
 
@@ -178,6 +186,20 @@ class StagedEvalManager:
         worker_cfg = self._worker_cfg()
         scale_question_files = self._resolve_scale_question_files()
 
+        snapshot_bundle = None
+        storage_source_root = os.path.join(self.checkpoints_folder, "storage")
+        if self._capture_only():
+            self._cleanup_capture_only_eval_artifacts(trigger_dir)
+            snapshot_bundle, storage_source_root = self._capture_snapshot_bundle(
+                trigger_label=trigger_label,
+                trigger_dir=trigger_dir,
+                runtime_config=runtime_config,
+                conversation=conversation,
+                step_no=step_no,
+                sim_time=sim_time,
+                snapshot_name=snapshot_name,
+            )
+
         job_payload = self._build_worker_job_payload(
             trigger_label=trigger_label,
             completed_session_count=completed_session_count,
@@ -191,6 +213,8 @@ class StagedEvalManager:
             worker_result_path=worker_paths["result"],
             scale_question_files=scale_question_files,
             worker_cfg=worker_cfg,
+            storage_source_root=storage_source_root,
+            snapshot_bundle=snapshot_bundle,
         )
         self._write_json(worker_paths["job"], job_payload)
         metadata = self._build_trigger_queue_metadata(
@@ -204,6 +228,40 @@ class StagedEvalManager:
             worker_cfg=worker_cfg,
             extra_metadata=extra_metadata,
         )
+        if self._capture_only():
+            metadata.update(
+                {
+                    "status": "ok",
+                    "execution_mode": "capture_only",
+                    "artifact_kind": "repeat_eval_snapshot",
+                    "evaluation_executed": False,
+                    "worker_mode": "capture_only",
+                    "worker_status": "not_started",
+                    "worker_script": "",
+                    "worker_log_file": "",
+                    "worker_result_file": "",
+                    "snapshot_bundle": copy.deepcopy(snapshot_bundle or {}),
+                    "scales": {},
+                }
+            )
+            if trigger_label == "T0":
+                metadata["snapshot_phase"] = "after_initial_injection_before_first_think"
+            self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
+            self._step_trigger_enqueued = True
+            self._mark_trigger_done(metadata, trigger_dir)
+            self._persist_state()
+            self._log(
+                "info",
+                "[STAGED_EVAL_CAPTURE] trigger={} target={} completed_sessions={} step={} sim_time={}".format(
+                    trigger_label,
+                    target_agent,
+                    completed_session_count,
+                    step_no,
+                    sim_time,
+                ),
+            )
+            return metadata
+
         self._write_json(os.path.join(trigger_dir, "metadata.json"), metadata)
         self._enqueue_job_record(
             trigger_label=trigger_label,
@@ -391,6 +449,8 @@ class StagedEvalManager:
                 snapshot_name=snapshot_name,
             )
         except Exception as exc:
+            if self._capture_only():
+                raise
             self._log("warning", f"[STAGED_EVAL] {trigger_label} failed: {exc}")
             return None
 
@@ -448,6 +508,8 @@ class StagedEvalManager:
                 },
             )
         except Exception as exc:
+            if self._capture_only():
+                raise
             self._log("warning", f"[STAGED_EVAL] {trigger_label} failed: {exc}")
             return None
 
@@ -496,6 +558,8 @@ class StagedEvalManager:
                 },
             )
         except Exception as exc:
+            if self._capture_only():
+                raise
             self._log("warning", f"[STAGED_EVAL] T4 failed: {exc}")
             return None
 
@@ -522,6 +586,15 @@ class StagedEvalManager:
 
     def _enabled(self) -> bool:
         return bool(self._cfg().get("enabled", False))
+
+    def _execution_mode(self) -> str:
+        mode = str(self._cfg().get("execution_mode", "evaluate") or "evaluate").strip().lower()
+        if mode not in {"evaluate", "capture_only"}:
+            raise ValueError("unsupported staged_eval.execution_mode: {}".format(mode))
+        return mode
+
+    def _capture_only(self) -> bool:
+        return self._execution_mode() == "capture_only"
 
     def _cfg(self) -> Dict[str, Any]:
         cfg = self.config.get("staged_eval", {}) or {}
@@ -593,8 +666,10 @@ class StagedEvalManager:
         worker_result_path: str,
         scale_question_files: Dict[str, str],
         worker_cfg: Dict[str, Any],
+        storage_source_root: str,
+        snapshot_bundle: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
-        return {
+        payload = {
             "run_name": self.run_name,
             "trigger_label": trigger_label,
             "completed_session_count": int(completed_session_count),
@@ -608,10 +683,120 @@ class StagedEvalManager:
             "conversation": copy.deepcopy(conversation or {}),
             "trigger_dir": trigger_dir,
             "worker_result_path": worker_result_path,
-            "storage_source_root": os.path.join(self.checkpoints_folder, "storage"),
+            "storage_source_root": str(storage_source_root or ""),
             "tmp_root_parent": os.path.join(self.output_dir, "_tmp"),
             "cleanup_tmp_storage": bool(worker_cfg.get("cleanup_tmp_storage", True)),
         }
+        if isinstance(snapshot_bundle, dict) and snapshot_bundle:
+            payload["snapshot_bundle"] = copy.deepcopy(snapshot_bundle)
+        return payload
+
+    @staticmethod
+    def _canonical_json_sha256(payload: Any) -> str:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _storage_file_manifest(self, storage_root: str) -> tuple[List[Dict[str, Any]], int]:
+        files: List[Dict[str, Any]] = []
+        total_size = 0
+        for current_root, dirnames, filenames in os.walk(storage_root):
+            dirnames.sort()
+            filenames.sort()
+            for filename in filenames:
+                path = os.path.join(current_root, filename)
+                relative_path = os.path.relpath(path, storage_root).replace(os.sep, "/")
+                size = os.path.getsize(path)
+                files.append(
+                    {
+                        "path": relative_path,
+                        "size": int(size),
+                        "sha256": self._file_sha256(path),
+                    }
+                )
+                total_size += int(size)
+        return files, total_size
+
+    def _capture_snapshot_bundle(
+        self,
+        trigger_label: str,
+        trigger_dir: str,
+        runtime_config: Dict[str, Any],
+        conversation: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+    ) -> tuple[Dict[str, Any], str]:
+        source_storage = os.path.join(self.checkpoints_folder, "storage")
+        if not os.path.isdir(source_storage):
+            raise FileNotFoundError("staged_eval capture source storage not found: {}".format(source_storage))
+
+        snapshot_storage = os.path.join(trigger_dir, SNAPSHOT_STORAGE_DIRNAME)
+        manifest_path = os.path.join(trigger_dir, SNAPSHOT_MANIFEST_FILENAME)
+        temp_storage = tempfile.mkdtemp(prefix=".snapshot_storage-", dir=trigger_dir)
+        try:
+            shutil.copytree(source_storage, temp_storage, dirs_exist_ok=True)
+            files, total_size = self._storage_file_manifest(temp_storage)
+            manifest = {
+                "schema_version": SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+                "artifact_kind": "repeat_eval_snapshot",
+                "storage_scope": "full",
+                "trigger_label": str(trigger_label or ""),
+                "step_no": int(step_no),
+                "sim_time": str(sim_time or ""),
+                "snapshot_name": str(snapshot_name or ""),
+                "runtime_config_sha256": self._canonical_json_sha256(runtime_config),
+                "conversation_sha256": self._canonical_json_sha256(conversation or {}),
+                "file_count": len(files),
+                "total_size": int(total_size),
+                "files": files,
+            }
+            if os.path.exists(snapshot_storage):
+                shutil.rmtree(snapshot_storage)
+            os.replace(temp_storage, snapshot_storage)
+            temp_storage = ""
+            self._write_json_atomic(manifest_path, manifest)
+        except Exception:
+            if temp_storage and os.path.isdir(temp_storage):
+                shutil.rmtree(temp_storage, ignore_errors=True)
+            raise
+
+        bundle = {
+            "schema_version": SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+            "storage_scope": "full",
+            "storage_relpath": SNAPSHOT_STORAGE_DIRNAME,
+            "manifest_relpath": SNAPSHOT_MANIFEST_FILENAME,
+            "runtime_config_sha256": manifest["runtime_config_sha256"],
+            "conversation_sha256": manifest["conversation_sha256"],
+        }
+        return bundle, snapshot_storage
+
+    def _cleanup_capture_only_eval_artifacts(self, trigger_dir: str) -> None:
+        for filename in os.listdir(trigger_dir):
+            path = os.path.join(trigger_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            is_worker_artifact = filename in {"worker.log", "worker_result.json"}
+            is_scale_artifact = filename.endswith(
+                ("_answered.jsonl", "_trace.json", "_scored.json", "_item_scored.json")
+            )
+            if is_worker_artifact or is_scale_artifact:
+                os.unlink(path)
 
     def _resolve_worker_script_path(self, worker_script: str) -> str:
         path = str(worker_script or "").strip()
@@ -1150,6 +1335,20 @@ class StagedEvalManager:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _write_json_atomic(self, path: str, payload: Any) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".{}-".format(os.path.basename(path)), dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def _log(self, level: str, message: str) -> None:
         logger = self.logger

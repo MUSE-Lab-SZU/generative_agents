@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-07-08
+> 更新时间：2026-07-19
 
 ## 关键测试结果速查
 
@@ -28,6 +28,13 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-19：统一增强 LLM、Ollama、embedding 与重复量表评分 worker 的失败诊断：错误日志新增调用方、阶段、模型、脱敏 endpoint、重试次数、耗时、异常分类、HTTP 状态/request ID 和有限 cause chain，区分限流/并发、鉴权、超时、连接、服务端及输出解析错误；日志会移除 URL 凭据、查询参数、API key、Authorization 和提示词/回答正文，同时保持原有重试、failsafe、最终抛错或空检索结果语义，并新增对应回归测试。
+- 2026-07-19：新增仅管理 Qwen chat 的多卡张量并行脚本 `runshells/vllm_chat_tp.sh`，可在不影响既有 embedding 服务的情况下执行 `start/stop/restart/status/logs/print-config`，支持 GPU、并行度、显存利用率、上下文长度等环境变量覆盖，并提供逐卡显存预检、PID 归属校验、端口冲突检测、API 健康检查和启动超时诊断；`docs/RUNBOOK.md`同步补充部署示例与显存说明。
+- 2026-07-19：修正批量评估轨迹的基线语义：`delta_from_baseline`只使用具有有效量表分数的 T0，T0 仅快照而未评分时不再把后续首个评估点误当基线；同时将“批量仿真→重复复评”脚本的日期、KBD、居民聊天组和严重程度提取为统一参数并据此生成 condition、任务名和日志名，减少切换实验组合时的漏改风险。
+- 2026-07-18：新增严格的分阶段评估时间点快照：`staged_eval.execution_mode`默认改为`capture_only`，在 T0、session 等触发点冻结当时的完整本地 storage、runtime config 与对话上下文并生成带 SHA-256、文件数和大小校验的 snapshot bundle，不再在仿真过程中启动量表 worker；存档重复复评会校验 bundle 路径、清单、内容摘要及文件集合，拒绝损坏快照、外置记忆读取和默认复用最终 storage，旧存档仅可通过`--allow-legacy-final-storage`显式降级并在 JSON/Markdown 报告中标记为未验证，同时批量汇总会区分“仅快照”与“已执行评估”。
+- 2026-07-18：重构存档与即时重复量表复评：对每个 agent×评估点固定执行 K 次完整 PHQ-9 / BDI-II（默认 K=10），仅在 K 次结果齐全时生成主结果；每次评估区分“评分 LLM 自报总分”“LLM 条目分之和”和“患者明确且无歧义的 0-3 分回答覆盖冲突条目后的复核总分”，主分采用 K 次复核总分均值。评分 JSON 会严格拒绝非整数、重复、缺失、错序或错号条目；报告继续提供样本 SD、t 分布 95% CI、类别分布/翻转、首轮与中位数等敏感性分析以及 ICC(1,1)/ICC(1,K)，不恢复不稳定条目自适应补跑及投票重构主分逻辑。
+- 2026-07-16：新增 G9 积极居民聊天组：复用 G3 的随机居民聊天调度，新增非治疗性、低施压的积极支持前缀并限定只注入居民侧；批量实验 condition、流水线示例、项目文档与回归测试同步支持 `G9`，用于和 G3 中性聊天、G5 负面支持进行话语效价对照。
+- 2026-07-13：增强存档重复量表复评的断点续跑能力：`runshells/run_archived_repeat_scale_eval.py`默认启用`--resume-partial`，同一`--name`重跑时会校验并复用完整的 answered/scored，只补跑缺失或损坏阶段；损坏的 job/metadata 不会被误判为完成。只要任一 condition×评估点×量表缺少固定 K 次有效结果，就只写`*_incomplete.json/.md`诊断文件并以非零状态退出，不生成正式`*_summary.json/.md`。
 - 2026-07-12：优化强制医患对话的判断LLM提示词：改为围绕当前阶段唯一缺口进行“承接后最小推进”，明确防重复探索、阶段适配与约18个医生轮次的收束节奏；`advice`统一为包含当前缺口、承接、动作、提问意图和避免重复项的单行结构，并使终止判断与回复策略保持一致。
 - 2026-07-12：修正并强化居民聊天干预：`ResidentChatScheduler`默认将居民侧设为`prompt_target=doctor`，G3/G5组显式指定该目标并新增回归测试，确保中性社交和负面支持提示词只注入被选中居民；同时收紧中性聊天的安慰/实际帮助边界，规范负面支持的伤害强度、篇幅及快速收束方式。
 - 2026-07-12：`runshells/run_batch_then_repeat_eval.sh`支持通过`--repeat-count`和`--max-parallel`运行多轮独立的“批量仿真→重复量表复评”流水线；每轮自动使用`-01`、`-02`等独立名称、summary和日志，并提供进度、失败轮次汇总及中断时的子进程清理。
@@ -266,7 +273,7 @@ data/config.json
 | `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
 | `replay.py`   | 回放 Web 服务入口（Flask）                                        |
 | `runshells/`  | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
-| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5）                           |
+| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9）                  |
 | `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
 | `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
 | `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |

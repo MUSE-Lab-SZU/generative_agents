@@ -8,7 +8,8 @@
 #   bash runshells/run_batch_then_repeat_eval.sh --repeat-count 6 --max-parallel 2
 #
 # 说明:
-#   每轮先运行仿真实验；仿真成功后，再运行 archived repeat scale eval。
+#   外层 --repeat-count 表示独立仿真轮数；每轮仿真成功后，再对同一快照
+#   固定执行 EVAL_REPEAT 次完整 PHQ-9 / BDI-II 复评。
 #   每轮的存档、报告和日志均以 -01、-02 … 后缀区分。
 # ============================================================
 
@@ -21,25 +22,31 @@ cd "$PROJECT_DIR"
 # ↓↓↓ 实验参数在此修改 ↓↓↓
 # ============================================================
 
-SIM_NAME="batch-0710"
-SIM_CONDITION="Counsel-KBD2-G3-SEV"
+EXP_DATE="0718"
+GROUP="G9"
+KBD="KBD6"
+SEVERITY="SEV"
+
+SIM_NAME="batch-${EXP_DATE}"
+SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
 SIM_MAX_PARALLEL=1
-SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:11434}"
-SIM_LOG="results/batch-0710-KBD2-G3-SEV_run.log"
+SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1}"
+SIM_LOG="results/batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
-EVAL_CONDITION="Counsel-KBD2-G3-SEV"
+EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
 EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20,POST"
-EVAL_REPEAT=3
-EVAL_NAME="repeat-KBD2-G3-SEV-0710"
+# 同一 agent × 时间点 × 量表的固定完整复评次数（不是独立患者样本数）
+EVAL_REPEAT=10
+EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
 EVAL_MAX_PARALLEL=3
-EVAL_LOG="results/repeat-KBD2-G3-SEV-0710.log"
+EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 
 # ============================================================
 # ↑↑↑ 实验参数在此修改 ↑↑↑
 # ============================================================
 
-REPEAT_COUNT=6
+REPEAT_COUNT=2
 MAX_PARALLEL_REPEATS=""
 
 usage() {
