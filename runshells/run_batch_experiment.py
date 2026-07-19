@@ -595,14 +595,49 @@ def latest_checkpoint_activity_mtime(run_name: str) -> float | None:
     return latest_mtime
 
 
-def build_simulation_cmd(run_name: str, cfg: RuntimeConfig, *, resume: bool, runtime_config_path: Path | None = None) -> list[str]:
+def latest_snapshot_step_for_run(run_name: str) -> int:
+    snapshot_name = latest_snapshot_name_for_run(run_name)
+    if not snapshot_name:
+        return 0
+    snapshot_path = checkpoint_dir_for_run(run_name) / snapshot_name
+    payload = load_optional_json_file(snapshot_path)
+    if payload is None:
+        raise ValueError(f"最新 checkpoint 快照不是有效 JSON: {snapshot_path}")
+    step_value = payload.get("step", 0)
+    if isinstance(step_value, bool):
+        raise ValueError(f"最新 checkpoint 快照的 step 无效: {snapshot_path}")
+    try:
+        step_no = int(step_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"最新 checkpoint 快照的 step 无效: {snapshot_path}") from exc
+    if step_no < 0:
+        raise ValueError(f"最新 checkpoint 快照的 step 不能为负数: {snapshot_path}")
+    return step_no
+
+
+def simulation_steps_for_attempt(run_name: str, cfg: RuntimeConfig, *, resume: bool) -> int:
+    target_step = max(0, int(cfg.step))
+    if not resume:
+        return target_step
+    completed_step = latest_snapshot_step_for_run(run_name)
+    return max(0, target_step - completed_step)
+
+
+def build_simulation_cmd(
+    run_name: str,
+    cfg: RuntimeConfig,
+    *,
+    resume: bool,
+    step_count: int,
+    runtime_config_path: Path | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         str(START_SCRIPT),
         "--name",
         run_name,
         "--step",
-        str(cfg.step),
+        str(step_count),
         "--stride",
         str(cfg.stride),
         "--verbose",
@@ -652,7 +687,21 @@ def run_simulation_with_recovery(
             context=f"启动仿真子进程 {run_name}",
             dry_run=cfg.dry_run,
         )
-        cmd = build_simulation_cmd(run_name, cfg, resume=resume_next, runtime_config_path=runtime_config_path)
+        step_count = simulation_steps_for_attempt(run_name, cfg, resume=resume_next)
+        if resume_next and step_count == 0:
+            completed_step = latest_snapshot_step_for_run(run_name)
+            print(
+                f"[SKIP] {run_name} 已到达目标总步数："
+                f"checkpoint_step={completed_step}, target_step={cfg.step}"
+            )
+            return
+        cmd = build_simulation_cmd(
+            run_name,
+            cfg,
+            resume=resume_next,
+            step_count=step_count,
+            runtime_config_path=runtime_config_path,
+        )
         print(f"[RUN] {' '.join(cmd)}")
         stats.attempt_count += 1
         if resume_next:

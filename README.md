@@ -28,6 +28,8 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-19：新增稀疏 checkpoint 安全恢复流水线：通过精确 batch state 定位原 run，从最新通过 runtime/storage bundle、SHA-256、文件集合和 trace sidecar 校验的 staged-eval 时间点回退，恢复前检查活跃进程、LLM/embedding 服务与必需密钥，并将较新 live 产物备份到 `results/recovery_backups/`；批量续跑现按目标总步数扣除已完成步数，达标时直接跳过，且可用新脚本 dry-run、并行恢复多个重复实验，再衔接原 summary 后处理和支持断点续跑的存档重复量表复评。
+- 2026-07-19：补强实验运行可观测性与本机服务默认配置：`depression_dynamic` 内部 LLM 正常调用会在 debug 日志中记录完整 prompt/response，便于追溯动态主诉链路。
 - 2026-07-19：统一增强 LLM、Ollama、embedding 与重复量表评分 worker 的失败诊断：错误日志新增调用方、阶段、模型、脱敏 endpoint、重试次数、耗时、异常分类、HTTP 状态/request ID 和有限 cause chain，区分限流/并发、鉴权、超时、连接、服务端及输出解析错误；日志会移除 URL 凭据、查询参数、API key、Authorization 和提示词/回答正文，同时保持原有重试、failsafe、最终抛错或空检索结果语义，并新增对应回归测试。
 - 2026-07-19：新增仅管理 Qwen chat 的多卡张量并行脚本 `runshells/vllm_chat_tp.sh`，可在不影响既有 embedding 服务的情况下执行 `start/stop/restart/status/logs/print-config`，支持 GPU、并行度、显存利用率、上下文长度等环境变量覆盖，并提供逐卡显存预检、PID 归属校验、端口冲突检测、API 健康检查和启动超时诊断；`docs/RUNBOOK.md`同步补充部署示例与显存说明。
 - 2026-07-19：修正批量评估轨迹的基线语义：`delta_from_baseline`只使用具有有效量表分数的 T0，T0 仅快照而未评分时不再把后续首个评估点误当基线；同时将“批量仿真→重复复评”脚本的日期、KBD、居民聊天组和严重程度提取为统一参数并据此生成 condition、任务名和日志名，减少切换实验组合时的漏改风险。
