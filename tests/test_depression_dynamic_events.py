@@ -747,8 +747,23 @@ class _FakeDepressionDynamic:
 
 
 class _FakeLlm:
+    def __init__(self):
+        self.calls = []
+
     def is_available(self):
         return True
+
+    def completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return "完整 LLM 响应"
+
+
+class _FakeLogger:
+    def __init__(self):
+        self.debugs = []
+
+    def debug(self, msg):
+        self.debugs.append(msg)
 
 
 def _agent_with_fake_dynamic():
@@ -765,6 +780,22 @@ def _agent_with_fake_dynamic():
     agent._dynamic_location = lambda: "家"
     agent._dynamic_time_of_day = lambda: "night"
     return agent
+
+
+def test_agent_depression_llm_completion_logs_full_prompt_and_response():
+    agent = _agent_with_fake_dynamic()
+    agent.think_config = {"llm": {"retry": 2, "temperature": 0.3}}
+    agent.logger = _FakeLogger()
+
+    output = agent._depression_llm_completion("完整动态抑郁 prompt")
+
+    assert output == "完整 LLM 响应"
+    assert agent._llm.calls[0]["caller"] == "depression_dynamic"
+    assert agent._llm.calls[0]["prompt"] == "完整动态抑郁 prompt"
+    assert len(agent.logger.debugs) == 1
+    assert "卡布达.depression_dynamic" in agent.logger.debugs[0]
+    assert "完整动态抑郁 prompt" in agent.logger.debugs[0]
+    assert "完整 LLM 响应" in agent.logger.debugs[0]
 
 
 def test_agent_reset_initializes_depression_graph_window():
