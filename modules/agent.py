@@ -3510,10 +3510,23 @@ class Agent:
         if not self.llm_available():
             return ""
         llm_cfg = self.think_config.get("llm", {}) if isinstance(self.think_config.get("llm", {}), dict) else {}
-        return self._llm.completion(
+        output = self._llm.completion(
             prompt=prompt,
             retry=int(llm_cfg.get("retry", 3) or 3),
             failsafe="",
             caller="depression_dynamic",
             temperature=float(llm_cfg.get("temperature", 0.5) or 0.5),
         ) or ""
+        self._log_depression_llm_call(prompt, output)
+        return output
+
+    def _log_depression_llm_call(self, prompt, response):
+        """记录动态抑郁模块内部 LLM 调用的完整 prompt 和 response。"""
+        if not self.logger or not hasattr(self.logger, "debug"):
+            return
+        title = "{}.depression_dynamic".format(self.name)
+        msg = {
+            "<PROMPT>": "\n" + str(prompt or "") + "\n",
+            "response": str(response or ""),
+        }
+        self.logger.debug(utils.block_msg(title, msg))
