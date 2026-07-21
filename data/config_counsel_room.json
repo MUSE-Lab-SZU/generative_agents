@@ -8,7 +8,8 @@
         "api_key": "EMPTY",
         "retry": 3,
         "request_timeout_seconds": 300
-      }
+      },
+      "lite_non_consult": true
     },
     "associate": {
       "embedding": {

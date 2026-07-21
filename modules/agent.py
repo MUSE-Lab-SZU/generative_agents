@@ -36,6 +36,9 @@ class Agent:
         self.reflection_policy = self._resolve_reflection_policy(
             self.think_config.get("reflection_policy", {})
         )
+        # lite 非会诊步：开启后，无 intervention lock 的步跳过 percept + 自发对话（保留
+        # schedule 重建与周期反思）。咨询室模式用，村庄模式默认 False 不受影响。
+        self._lite_non_consult_enabled = bool(self.think_config.get("lite_non_consult", False))
         self.chat_iter = config["chat_iter"]
         global_chat_history = config.get("chat_history", {}) or {}
         local_chat_history = (config.get("_raw", {}) or {}).get("chat_history", {})
@@ -504,8 +507,14 @@ class Agent:
                 start=utils.get_timer().daily_time(plan["start"]),
             )
         if self.is_awake():
-            self.percept()
-            self.make_plan(agents)
+            # lite 非会诊步：无 intervention lock 时跳过 percept + make_plan（自发对话），
+            # 保留周期反思（抑郁在两次会诊间演化的唯一通道）。会诊步有 lock → full think。
+            _lock = self.status.get("intervention", {}).get("lock", {})
+            has_lock = bool(_lock.get("enabled"))
+            lite = self._lite_non_consult_enabled and not has_lock
+            if not lite:
+                self.percept()
+                self.make_plan(agents)
             periodic_result = self._maybe_reflect_periodic()
             if not bool((periodic_result or {}).get("triggered", False)):
                 self.reflect(trigger_source="legacy_poignancy")

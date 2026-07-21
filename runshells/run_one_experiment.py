@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -193,6 +194,36 @@ def run_cmd(cmd: list[str], *, dry_run: bool, timeout: Optional[int] = None) -> 
     subprocess.run(cmd, cwd=BASE_DIR, check=True, timeout=timeout)
 
 
+def run_cmd_with_retry(
+    cmd: list[str],
+    *,
+    dry_run: bool,
+    timeout: Optional[int] = None,
+    max_attempts: int = 3,
+    backoff_seconds: int = 10,
+) -> None:
+    """对瞬时失败（如评分 LLM 的 API 抖动）最多重试 max_attempts 次，每次线性退避。
+
+    专用于 post-scale 的 answers/score worker（LLM 子进程）——偶发 API 失败不应让
+    整个 batch 崩掉。非 LLM 步骤（compress/merge 等）仍用 run_cmd。
+    """
+    last_exc: Optional[BaseException] = None
+    label = os.path.basename(str(cmd[1])) if len(cmd) > 1 else "command"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            run_cmd(cmd, dry_run=dry_run, timeout=timeout)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            wait = backoff_seconds * attempt
+            print(f"[RETRY] {label} 第 {attempt}/{max_attempts} 次失败，{wait}s 后重试 | {exc}")
+            if not dry_run:
+                time.sleep(wait)
+    raise RuntimeError(f"{label} 重试 {max_attempts} 次仍失败: {last_exc}")
+
+
 def detect_assets_root(name: str) -> str:
     """从 checkpoint 的首个 simulate-*.json 推断回放所需的 assets 子目录。
 
@@ -330,7 +361,7 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
         answers_path = scales_dir / f"{scale_name}_post_answered.jsonl"
         scored_path = scales_dir / f"{scale_name}_post_scored.json"
 
-        run_cmd(
+        run_cmd_with_retry(
             [
                 WORKER_PYTHON,
                 str(SCALE_WORKER_SCRIPT),
@@ -344,7 +375,7 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
             timeout=POST_EVAL_TIMEOUT_SECONDS,
         )
 
-        run_cmd(
+        run_cmd_with_retry(
             [
                 WORKER_PYTHON,
                 str(SCORE_WORKER_SCRIPT),
@@ -377,7 +408,7 @@ def run_post_30q(name: str, agent_name: str, *, dry_run: bool) -> None:
     answers_path = scales_dir / "30Q_post_answered.jsonl"
     scored_path = scales_dir / "30Q_post_scored.json"
 
-    run_cmd(
+    run_cmd_with_retry(
         [
             WORKER_PYTHON,
             str(SCALE_WORKER_SCRIPT),
@@ -391,7 +422,7 @@ def run_post_30q(name: str, agent_name: str, *, dry_run: bool) -> None:
         timeout=1800,
     )
 
-    run_cmd(
+    run_cmd_with_retry(
         [
             WORKER_PYTHON,
             str(SCORE_WORKER_SCRIPT),
