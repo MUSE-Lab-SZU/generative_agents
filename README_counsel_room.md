@@ -213,13 +213,14 @@ done
 
 | 变体 | agent 人设来源 | 空间模板 |
 |------|----------------|----------|
-| **kbd1** | 咨询室手工版 `agents/卡布达/agent.json` | 已内含（诊室锁定） |
-| **kbd2-9** | 村庄 `agents/卡布达N/agent.json`（persona） | **叠加**咨询室的空间约束 |
+| **kbd1** | 咨询室专用 `agents/卡布达/agent.json`（手工版） | 已内含（诊室锁定） |
+| **kbd2-9** | 咨询室专用 `agents/卡布达N/agent.json`（2026-07-22 起） | 已内含（诊室锁定） |
 
 要点：
-- **零新增资产文件**：kbd2-9 不复制文件，靠「村庄 persona + 咨询室空间模板」叠加。
+- **kbd1-9 均为咨询室专用文件**：kbd2-9 的文件由「村庄 persona + 咨询室空间模板 + 无村庄地点的 daily_plan」生成后固化（见下方修订说明），运行时直读、不做叠加。
 - 抑郁配置**始终来自村庄三件套**（`depression_config_mild/moderate/severe.json`），与变体解耦。
 - 记忆注入按变体切换：kbd1→`memory_injections.json`，kbdN→`memory_injections_kabudaN.json`。
+- **修订（2026-07-22）**：kbd2-9 原靠运行时叠加生成（村庄 persona + 空间模板），因村庄 `daily_plan` 泄漏（生成「今天下午在杂货店」类现在式村庄事件）改为固化文件；改某个变体的咨询室 persona 直接编辑对应文件，村庄源文件改动不再自动传导。新变体若无咨询室文件，运行时仍兜底叠加（daily_plan 用模板干净版）。
 
 ---
 
@@ -304,7 +305,7 @@ results/
 
 1. **咨询室入口唯一**：用 `run_batch_experiment.py --counsel-room`。`run_one_experiment.py` 没有 `--counsel-room`，跑不出咨询室。
 2. **overlay 最小化**：新增咨询室差异优先加到 `data/config_counsel_room.json`，不要复制整个 `config.json`。能继承的（forced_llm、CBT、sparse、反思节奏）一律不动。
-3. **变体零拷贝**：新患者变体放村庄 `agents/卡布达N/`，咨询室自动叠加空间模板，不要在 `counsel_room/` 下建副本。
+3. **变体双资产**：新患者变体需两处放置——村庄 `agents/卡布达N/`（persona + 抑郁三件套，村庄实验用）+ 咨询室 `counsel_room/agents/卡布达N/agent.json`（咨询室实验直读，daily_plan 等不得含村庄地点）。缺咨询室文件时运行时兜底叠加（daily_plan 用模板干净版），但正式实验应先建文件。
 4. **跑前必做**：(a) 确认 vLLM 18000/18001 在线；(b) `set -a && source .env && set +a` 注入 DeepSeek key；(c) `--dry-run` 过一遍。
 5. **长跑用 nohup**：后台 + `disown`，PPID 归 1，断开 SSH 不死。
 6. **崩溃先看状态机**：`batch_state/<batch>/<cond>.json` 的 `status` 字段（`failed_after_checkpoint` = 可续跑；`failed` = 无 checkpoint，从头）。
@@ -324,7 +325,8 @@ results/
 |------|------|
 | [data/config_counsel_room.json](data/config_counsel_room.json) | 咨询室 overlay（patients + lite_non_consult） |
 | [frontend/static/assets/counsel_room/maze.json](frontend/static/assets/counsel_room/maze.json) | 6×7 诊室地图 |
-| [frontend/static/assets/counsel_room/agents/卡布达/agent.json](frontend/static/assets/counsel_room/agents/卡布达/agent.json) | 患者诊室配置（kbd1 直接用、kbd2-9 取空间模板） |
+| [frontend/static/assets/counsel_room/agents/卡布达/agent.json](frontend/static/assets/counsel_room/agents/卡布达/agent.json) | 患者诊室配置 kbd1（兼作新变体兜底的空间/daily_plan 模板） |
+| [frontend/static/assets/counsel_room/agents/卡布达2-9/agent.json](frontend/static/assets/counsel_room/agents/) | 患者诊室配置 kbd2-9（2026-07-22 起直读） |
 | [frontend/static/assets/counsel_room/agents/蜻蜓队长/agent.json](frontend/static/assets/counsel_room/agents/蜻蜓队长/agent.json) | 医生诊室配置 |
 | [runshells/run_batch_experiment.py](runshells/run_batch_experiment.py) | 批量入口（`--counsel-room`、条件选择器、base+overlay 合并） |
 | [runshells/run_one_experiment.py](runshells/run_one_experiment.py) | 单次入口（无 `--counsel-room`） |

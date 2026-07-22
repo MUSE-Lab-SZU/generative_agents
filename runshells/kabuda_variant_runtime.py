@@ -169,8 +169,9 @@ def prepare_kabuda_variant_runtime(
     )
     source_depression_path = village_agent_dir / SEVERITY_CONFIG_NAMES[severity]
 
-    # 咨询室的 kbd1 使用专用角色配置；kbd2..9 复用村庄人设并叠加
-    # 咨询室的坐标、空间树与当前场景。严重度配置始终来自村庄变体目录。
+    # 咨询室的 kbd1-9 均使用专用角色配置（counsel_room/agents/{name}/agent.json）；
+    # 无专用文件的新变体兜底复用村庄人设并叠加咨询室的坐标、空间树、当前场景
+    # 与 daily_plan。严重度配置始终来自村庄变体目录。
     counsel_spatial_template: Path | None = None
     if agent_source_subdir == "counsel_room":
         counsel_agent_path = (
@@ -219,6 +220,11 @@ def prepare_kabuda_variant_runtime(
         for field in ("spatial", "coord", "currently"):
             if field in template:
                 agent_payload[field] = copy.deepcopy(template[field])
+        # 兜底：未来新变体若无咨询室专用 agent.json，村庄 daily_plan 含村庄地点
+        # （会经 base_desc 注入 schedule prompt 生成现在式村庄事件），覆盖为模板的干净版本。
+        override_plan = template.get("scratch", {}).get("daily_plan")
+        if override_plan and isinstance(agent_payload.get("scratch"), dict):
+            agent_payload["scratch"]["daily_plan"] = override_plan
     depression_payload = normalize_runtime_agent_name(
         load_json_file(source_depression_path),
         source_name=source_agent_name,
