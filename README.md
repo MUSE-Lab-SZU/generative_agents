@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-07-19
+> 更新时间：2026-07-22
 
 ## 关键测试结果速查
 
@@ -28,6 +28,9 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-07-22：新增咨询室轻量仿真模式：`runshells/run_batch_experiment.py --counsel-room` 会加载 6×7 咨询室地图和“卡布达＋蜻蜓队长”双角色最小配置，支持 `Counsel-G4-MILD` 与 `Counsel-KBD2-G4-MOD`/`Counsel-ALL-G4-ALL` 等 KBD1–9 × 三种严重度选择器；变体保留原有人设和抑郁配置，同时叠加咨询室空间状态，非会诊步可跳过感知及自发对话以降低开销、会诊锁定期间仍走完整流程。批量汇总会按单一 G4 维度输出，`compress.py` 和单次流水线可从存档自动识别地图与角色花名册；目前回放前端仍仅有村庄底图模板。操作指南见 [`README_counsel_room.md`](README_counsel_room.md)。
+- 2026-07-22：新增 `kbd_repeat` 归档重复量表报告工具：它会严格校验固定 K 次完整复评、聚合字段及重复编号，从重复量表 summary JSON 生成轨迹、终点变化、最佳改善/反弹和测量可靠性图，并输出 PNG/SVG/PDF、统计明细 CSV、条目统计、Markdown 报告、图表索引和批次清单。工具支持按 KBD、组别、外层重复筛选或跨 KBD 对照，提供仅折线、演示和附录图模式、CI/SD 误差条、原始重复点及可选外层均值/CI；时间点配对仅在报告显式声明时使用配对区间估计。
+- 2026-07-22：增强实验后处理与恢复韧性：`run_one_experiment.py` 的治疗后量表回答与评分子进程失败时会最多重试 3 次并线性退避，压缩阶段会传入自动识别的资源目录；稀疏 checkpoint 恢复脚本新增 `--repeat-index` 以只处理指定外层重复，并在复评失败时保留退出码、写入明确错误日志和失败汇总。
 - 2026-07-19：新增稀疏 checkpoint 安全恢复流水线：通过精确 batch state 定位原 run，从最新通过 runtime/storage bundle、SHA-256、文件集合和 trace sidecar 校验的 staged-eval 时间点回退，恢复前检查活跃进程、LLM/embedding 服务与必需密钥，并将较新 live 产物备份到 `results/recovery_backups/`；批量续跑现按目标总步数扣除已完成步数，达标时直接跳过，且可用新脚本 dry-run、并行恢复多个重复实验，再衔接原 summary 后处理和支持断点续跑的存档重复量表复评。
 - 2026-07-19：补强实验运行可观测性与本机服务默认配置：`depression_dynamic` 内部 LLM 正常调用会在 debug 日志中记录完整 prompt/response，便于追溯动态主诉链路。
 - 2026-07-19：统一增强 LLM、Ollama、embedding 与重复量表评分 worker 的失败诊断：错误日志新增调用方、阶段、模型、脱敏 endpoint、重试次数、耗时、异常分类、HTTP 状态/request ID 和有限 cause chain，区分限流/并发、鉴权、超时、连接、服务端及输出解析错误；日志会移除 URL 凭据、查询参数、API key、Authorization 和提示词/回答正文，同时保持原有重试、failsafe、最终抛错或空检索结果语义，并新增对应回归测试。

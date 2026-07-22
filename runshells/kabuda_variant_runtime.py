@@ -154,6 +154,8 @@ def prepare_kabuda_variant_runtime(
     resolved_variant = resolve_variant(variant)
     if severity not in SEVERITY_CONFIG_NAMES:
         raise ValueError(f"unknown severity: {severity}")
+    if agent_source_subdir not in {"village", "counsel_room"}:
+        raise ValueError(f"unknown agent source subdir: {agent_source_subdir}")
 
     source_agent_name = VARIANT_SOURCE_AGENT_NAMES[resolved_variant]
     village_agent_dir = (
@@ -167,11 +169,8 @@ def prepare_kabuda_variant_runtime(
     )
     source_depression_path = village_agent_dir / SEVERITY_CONFIG_NAMES[severity]
 
-    # agent.json 来源：
-    # - 村庄模式（默认）：直接取村庄变体。
-    # - 咨询室模式：若 counsel_room/agents/{name}/agent.json 存在（kbd1 手工版）则直接用；
-    #   否则（kbd2..9）取村庄变体 persona，并叠加咨询室空间模板——spatial/coord/currently
-    #   取自 counsel_room/agents/{runtime_agent_name}/agent.json。抑郁配置始终取村庄按严重度三件套。
+    # 咨询室的 kbd1 使用专用角色配置；kbd2..9 复用村庄人设并叠加
+    # 咨询室的坐标、空间树与当前场景。严重度配置始终来自村庄变体目录。
     counsel_spatial_template: Path | None = None
     if agent_source_subdir == "counsel_room":
         counsel_agent_path = (
@@ -203,7 +202,6 @@ def prepare_kabuda_variant_runtime(
     else:
         source_agent_path = village_agent_dir / "agent.json"
         source_agent_dir = village_agent_dir
-
     if not source_agent_path.is_file():
         raise FileNotFoundError(source_agent_path)
     if not source_depression_path.is_file():

@@ -157,8 +157,6 @@ GROUP_OVERLAY_FILES = {
     "g9": GROUP_OVERLAY_DIR / "g9_positive_resident_chat.json",
 }
 
-# 咨询室模式（--counsel-room）：独立于 group 矩阵，只跑卡布达+蜻蜓队长、6×7 地图、
-# 用 data/config_counsel_room.json 作为最小 overlay 与 config.json 合并
 COUNSEL_ROOM_OVERLAY = BASE_DIR / "data" / "config_counsel_room.json"
 COUNSEL_ROOM_AGENTS = ["卡布达", "蜻蜓队长"]
 
@@ -200,18 +198,19 @@ ALL_CONDITIONS = [
     for severity in SEVERITIES
 ]
 
+
 def _make_counsel_condition(variant: str, severity: str) -> BatchCondition:
-    """构造咨询室条件。kbd1 沿用旧名 Counsel-G4-{SEV}（向后兼容）；
-    其余变体用 Counsel-{SHORT}-G4-{SEV}。"""
+    """构造咨询室条件；kbd1 保留旧的三段式名称。"""
     if variant == "kbd1":
         name = f"Counsel-G4-{SEVERITY_SHORT_NAMES[severity]}"
     else:
-        name = f"Counsel-{VARIANT_SHORT_NAMES[variant]}-G4-{SEVERITY_SHORT_NAMES[severity]}"
+        name = (
+            f"Counsel-{VARIANT_SHORT_NAMES[variant]}-G4-"
+            f"{SEVERITY_SHORT_NAMES[severity]}"
+        )
     return BatchCondition(name=name, variant=variant, group="g4", severity=severity)
 
 
-# 咨询室默认条件集：kbd1 × 3 severity（不传 --condition 时跑这些）。
-# 其他变体（kbd2..9）通过 4-token 选择器按需构造，见 resolve_counsel_room_conditions。
 COUNSEL_ROOM_CONDITIONS = [
     _make_counsel_condition("kbd1", severity) for severity in SEVERITIES
 ]
@@ -280,7 +279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--counsel-room",
         action="store_true",
-        help="咨询室模式：6×7 地图、卡布达+蜻蜓队长、data/config_counsel_room.json 作为最小 overlay",
+        help="咨询室模式：6×7 地图、卡布达+蜻蜓队长、使用咨询室最小配置覆盖层",
     )
     return parser.parse_args()
 
@@ -364,16 +363,10 @@ def resolve_conditions(condition_names: str | list[str] | None) -> list[BatchCon
     return conditions
 
 
-def resolve_counsel_room_conditions(condition_names: str | list[str] | None) -> list[BatchCondition]:
-    """咨询室模式条件解析：独立于 group 选择器，支持 kbd1-9 变体。
-
-    选择器（不传 = 默认 kbd1 × 3）：
-      Counsel-G4-MILD / Counsel-G4-MOD / Counsel-G4-SEV / Counsel-G4-ALL   → kbd1
-      Counsel-KBD2-G4-MILD / Counsel-KBD2-G4-MOD / Counsel-KBD2-G4-ALL     → 指定变体
-      Counsel-ALL-G4-MILD                                                   → 全 9 变体 × 该严重度
-      Counsel-ALL-G4-ALL                                                    → 全 9 变体 × 3 严重度（27）
-      ALL / *                                                               → 默认 kbd1 × 3
-    """
+def resolve_counsel_room_conditions(
+    condition_names: str | list[str] | None,
+) -> list[BatchCondition]:
+    """解析咨询室条件，支持 kbd1..9 × mild/moderate/severe。"""
     if not condition_names:
         return list(COUNSEL_ROOM_CONDITIONS)
 
@@ -381,46 +374,58 @@ def resolve_counsel_room_conditions(condition_names: str | list[str] | None) -> 
     chosen: list[BatchCondition] = []
     seen_names: set[str] = set()
     for selector in selectors:
-        norm = str(selector or "").strip()
-        up = norm.upper()
-        if up in {"ALL", "*"}:
-            for cond in COUNSEL_ROOM_CONDITIONS:
-                if cond.name not in seen_names:
-                    chosen.append(cond)
-                    seen_names.add(cond.name)
-            continue
-
-        tokens = [t.strip().upper() for t in norm.split("-")]
-        if len(tokens) == 3 and tokens[0] == "COUNSEL" and tokens[1] == "G4":
-            var_tok, sev_tok = "KBD1", tokens[2]
-        elif len(tokens) == 4 and tokens[0] == "COUNSEL" and tokens[2] == "G4":
-            var_tok, sev_tok = tokens[1], tokens[3]
+        normalized = str(selector or "").strip()
+        upper = normalized.upper()
+        if upper in WILDCARD_TOKENS:
+            candidates = COUNSEL_ROOM_CONDITIONS
         else:
-            raise ValueError(
-                f"咨询室条件格式无法识别: {norm}（示例：Counsel-G4-MILD、"
-                f"Counsel-KBD2-G4-MOD、Counsel-ALL-G4-ALL）"
-            )
+            tokens = [token.strip().upper() for token in normalized.split("-")]
+            if len(tokens) == 3 and tokens[0] == "COUNSEL" and tokens[1] == "G4":
+                variant_token, severity_token = "KBD1", tokens[2]
+            elif len(tokens) == 4 and tokens[0] == "COUNSEL" and tokens[2] == "G4":
+                variant_token, severity_token = tokens[1], tokens[3]
+            else:
+                raise ValueError(
+                    f"咨询室条件格式无法识别: {normalized}（示例：Counsel-G4-MILD、"
+                    "Counsel-KBD2-G4-MOD、Counsel-ALL-G4-ALL）"
+                )
 
-        try:
-            var_keys = None if var_tok in WILDCARD_TOKENS else [VARIANT_SELECTOR_ALIASES[var_tok]]
-            sev_keys = None if sev_tok in WILDCARD_TOKENS else [SEVERITY_SELECTOR_ALIASES[sev_tok]]
-        except KeyError as exc:
-            raise ValueError(f"咨询室条件含未知 token: {norm}（{exc}）") from exc
+            try:
+                variants = (
+                    VARIANTS
+                    if variant_token in WILDCARD_TOKENS
+                    else [VARIANT_SELECTOR_ALIASES[variant_token]]
+                )
+                severities = (
+                    SEVERITIES
+                    if severity_token in WILDCARD_TOKENS
+                    else [SEVERITY_SELECTOR_ALIASES[severity_token]]
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"咨询室条件含未知 token: {normalized}（{exc}）"
+                ) from exc
+            candidates = [
+                _make_counsel_condition(variant, severity)
+                for variant in variants
+                for severity in severities
+            ]
 
-        for v in (VARIANTS if var_keys is None else var_keys):
-            for s in (SEVERITIES if sev_keys is None else sev_keys):
-                cond = _make_counsel_condition(v, s)
-                if cond.name not in seen_names:
-                    chosen.append(cond)
-                    seen_names.add(cond.name)
+        for condition in candidates:
+            if condition.name in seen_names:
+                continue
+            chosen.append(condition)
+            seen_names.add(condition.name)
 
     if not chosen:
         raise ValueError(f"咨询室模式下未找到条件: {condition_names}")
     return chosen
 
 
-def resolve_conditions_for_mode(cfg: RuntimeConfig, selector: str | list[str] | None) -> list[BatchCondition]:
-    """按当前模式（咨询室/普通）选择对应的条件解析器。"""
+def resolve_conditions_for_mode(
+    cfg: RuntimeConfig,
+    selector: str | list[str] | None,
+) -> list[BatchCondition]:
     if cfg.counsel_room:
         return resolve_counsel_room_conditions(selector)
     return resolve_conditions(selector)
@@ -433,6 +438,10 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         raise ValueError("SUMMARY_ONLY=True 时必须提供 RUN_NAME 或 --name，对应已有批量实验基础名。")
     if not base_name:
         base_name = generate_batch_name()
+
+    condition_selector = args.condition
+    if condition_selector is None and args.resume_condition:
+        condition_selector = [args.resume_condition]
 
     return RuntimeConfig(
         name=base_name,
@@ -455,9 +464,9 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         resume_condition=str(args.resume_condition or "").strip() or None,
         skip_completed=bool(args.skip_completed),
         conditions=(
-            resolve_counsel_room_conditions(args.condition)
+            resolve_counsel_room_conditions(condition_selector)
             if args.counsel_room
-            else resolve_conditions(args.condition)
+            else resolve_conditions(condition_selector)
         ),
         counsel_room=bool(args.counsel_room),
     )
@@ -491,6 +500,7 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  log:          {cfg.log_file or '(空)'}")
     print(f"  评估角色:     {cfg.agent}")
     print(f"  仅做汇总:     {cfg.summary_only}")
+    print(f"  咨询室模式:   {cfg.counsel_room}")
     print(f"  条件数:       {len(cfg.conditions)}")
     print(f"  跑 merge:     {cfg.run_merge}")
     print(f"  跑治疗后量表: {cfg.run_post_scale}")
@@ -498,7 +508,6 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  跑记忆可视化: {cfg.run_agent_memory_vis}")
     print(f"  跑外置审计:   {cfg.run_external_memory_audit}")
     print(f"  并行度:       {cfg.max_parallel}")
-    print(f"  咨询室模式:   {cfg.counsel_room}")
     print("  Embedding URLs: " + ", ".join(cfg.embedding_base_urls))
     print(f"  续跑批次:     {cfg.resume_batch}")
     print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
@@ -930,33 +939,26 @@ def build_condition_runtime_config_payload(
     *,
     embedding_base_url: str | None = None,
 ) -> dict[str, Any]:
+    template = load_json_file(runtime_config_template_path())
     if cfg.counsel_room:
-        template = load_json_file(runtime_config_template_path())
         overlay = load_json_file(COUNSEL_ROOM_OVERLAY)
-        merged = deep_merge_dict(template, overlay)
-        variant_runtime = prepare_kabuda_variant_runtime(
-            base_dir=BASE_DIR,
-            variant=condition.variant,
-            severity=condition.severity,
-            output_dir=batch_runtime_persona_dir(cfg, condition),
-            dry_run=cfg.dry_run,
-            agent_source_subdir="counsel_room",
-        )
         assets_root = "assets/counsel_room"
         agent_roster = COUNSEL_ROOM_AGENTS
+        agent_source_subdir = "counsel_room"
     else:
-        template = load_json_file(runtime_config_template_path())
         overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
-        merged = deep_merge_dict(template, overlay)
-        variant_runtime = prepare_kabuda_variant_runtime(
-            base_dir=BASE_DIR,
-            variant=condition.variant,
-            severity=condition.severity,
-            output_dir=batch_runtime_persona_dir(cfg, condition),
-            dry_run=cfg.dry_run,
-        )
         assets_root = "assets/village"
         agent_roster = PERSONAS
+        agent_source_subdir = "village"
+    merged = deep_merge_dict(template, overlay)
+    variant_runtime = prepare_kabuda_variant_runtime(
+        base_dir=BASE_DIR,
+        variant=condition.variant,
+        severity=condition.severity,
+        output_dir=batch_runtime_persona_dir(cfg, condition),
+        dry_run=cfg.dry_run,
+        agent_source_subdir=agent_source_subdir,
+    )
     payload: dict[str, Any] = {
         "stride": cfg.stride,
         "time": {"start": cfg.start},
@@ -1392,6 +1394,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             "verbose": cfg.verbose,
             "log_file": cfg.log_file,
             "scale_agent": cfg.agent,
+            "mode": "counsel_room" if cfg.counsel_room else "village",
             "group_overlay_file": (
                 COUNSEL_ROOM_OVERLAY.name
                 if cfg.counsel_room
@@ -1493,7 +1496,9 @@ def should_resume_condition(cfg: RuntimeConfig, condition: BatchCondition, state
     if cfg.resume_batch:
         return str(state.get("status", "") or "") in RESUMEABLE_CONDITION_STATUSES
     if cfg.resume_condition:
-        resume_targets = {item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)}
+        resume_targets = {
+            item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)
+        }
         return condition.name in resume_targets
     return False
 
@@ -2017,13 +2022,17 @@ def aggregate_final_deltas(results: list[dict], *, dimension_key: str, dimension
     return payload
 
 
-def build_group_severity_matrix(results: list[dict]) -> dict:
+def report_group_values(cfg: RuntimeConfig) -> list[str]:
+    return ["g4"] if cfg.counsel_room else list(GROUPS)
+
+
+def build_group_severity_matrix(results: list[dict], group_values: list[str]) -> dict:
     payload = {}
     for scale_name in SCALES:
         scale_payload = {}
         for severity in SEVERITIES:
             row = {}
-            for group in GROUPS:
+            for group in group_values:
                 values = []
                 for result in results:
                     if result.get("severity") != severity or result.get("group") != group:
@@ -2038,6 +2047,7 @@ def build_group_severity_matrix(results: list[dict]) -> dict:
 
 
 def build_summary_payload(cfg: RuntimeConfig, results: list[dict], warnings: list[str]) -> dict:
+    group_values = report_group_values(cfg)
     return {
         "batch_name": cfg.name,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2045,13 +2055,14 @@ def build_summary_payload(cfg: RuntimeConfig, results: list[dict], warnings: lis
         "conditions": results,
         "warnings": warnings,
         "trigger_labels": ordered_trigger_labels(results),
+        "group_values": group_values,
         "variant_trajectory": aggregate_dimension_trajectory(results, dimension_key="variant", dimension_values=VARIANTS),
-        "group_trajectory": aggregate_dimension_trajectory(results, dimension_key="group", dimension_values=GROUPS),
+        "group_trajectory": aggregate_dimension_trajectory(results, dimension_key="group", dimension_values=group_values),
         "severity_trajectory": aggregate_dimension_trajectory(results, dimension_key="severity", dimension_values=SEVERITIES),
         "variant_final_delta": aggregate_final_deltas(results, dimension_key="variant", dimension_values=VARIANTS),
-        "group_final_delta": aggregate_final_deltas(results, dimension_key="group", dimension_values=GROUPS),
+        "group_final_delta": aggregate_final_deltas(results, dimension_key="group", dimension_values=group_values),
         "severity_final_delta": aggregate_final_deltas(results, dimension_key="severity", dimension_values=SEVERITIES),
-        "group_severity_final_delta_matrix": build_group_severity_matrix(results),
+        "group_severity_final_delta_matrix": build_group_severity_matrix(results, group_values),
         "scale_score_validation": build_scale_score_validation(results),
     }
 
@@ -2116,18 +2127,21 @@ def render_final_delta_markdown(title: str, delta_payload: dict, dimension_value
     return lines
 
 
-def render_group_severity_matrix_markdown(matrix_payload: dict) -> list[str]:
+def render_group_severity_matrix_markdown(
+    matrix_payload: dict,
+    group_values: list[str],
+) -> list[str]:
     lines = []
     lines.append("## Group × Severity 最终变化矩阵\n")
     for scale_name in SCALES:
         lines.append(f"### {scale_name}\n")
-        header = "| severity \\ group | " + " | ".join(GROUPS) + " |"
-        sep = "|--------------------|" + "|".join(["----"] * len(GROUPS)) + "|"
+        header = "| severity \\ group | " + " | ".join(group_values) + " |"
+        sep = "|--------------------|" + "|".join(["----"] * len(group_values)) + "|"
         lines.append(header)
         lines.append(sep)
         for severity in SEVERITIES:
             row = matrix_payload.get(scale_name, {}).get(severity, {})
-            rendered = [format_delta(row.get(group)) for group in GROUPS]
+            rendered = [format_delta(row.get(group)) for group in group_values]
             lines.append(f"| {severity} | " + " | ".join(rendered) + " |")
         lines.append("")
     return lines
@@ -2206,6 +2220,7 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
         return None
 
     payload = build_summary_payload(cfg, results, warnings)
+    group_values = payload["group_values"]
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     stem = summary_output_stem(cfg)
     json_path = REPORTS_DIR / f"{stem}_summary.json"
@@ -2241,7 +2256,7 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
         render_dimension_trajectory_markdown(
             "按 Group 的评估轨迹对比",
             payload["group_trajectory"],
-            GROUPS,
+            group_values,
             payload["trigger_labels"],
         )
     )
@@ -2254,9 +2269,14 @@ def export_batch_summary(cfg: RuntimeConfig) -> tuple[Path, Path] | None:
         )
     )
     lines.extend(render_final_delta_markdown("按 Variant 的最终变化对比", payload["variant_final_delta"], VARIANTS))
-    lines.extend(render_final_delta_markdown("按 Group 的最终变化对比", payload["group_final_delta"], GROUPS))
+    lines.extend(render_final_delta_markdown("按 Group 的最终变化对比", payload["group_final_delta"], group_values))
     lines.extend(render_final_delta_markdown("按 Severity 的最终变化对比", payload["severity_final_delta"], SEVERITIES))
-    lines.extend(render_group_severity_matrix_markdown(payload["group_severity_final_delta_matrix"]))
+    lines.extend(
+        render_group_severity_matrix_markdown(
+            payload["group_severity_final_delta_matrix"],
+            group_values,
+        )
+    )
     lines.extend(render_scale_score_validation_markdown(payload["scale_score_validation"]))
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
@@ -2270,7 +2290,9 @@ def prepare_conditions_for_execution(cfg: RuntimeConfig) -> tuple[list[BatchCond
     notes: list[str] = []
     resume_targets = set()
     if cfg.resume_condition:
-        resume_targets = {item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)}
+        resume_targets = {
+            item.name for item in resolve_conditions_for_mode(cfg, cfg.resume_condition)
+        }
 
     for condition in cfg.conditions:
         state = read_condition_state(cfg, condition)

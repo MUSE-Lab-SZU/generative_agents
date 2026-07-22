@@ -202,56 +202,51 @@ def run_cmd_with_retry(
     max_attempts: int = 3,
     backoff_seconds: int = 10,
 ) -> None:
-    """对瞬时失败（如评分 LLM 的 API 抖动）最多重试 max_attempts 次，每次线性退避。
-
-    专用于 post-scale 的 answers/score worker（LLM 子进程）——偶发 API 失败不应让
-    整个 batch 崩掉。非 LLM 步骤（compress/merge 等）仍用 run_cmd。
-    """
+    """为量表回答/评分子进程提供有限次数的线性退避重试。"""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     last_exc: Optional[BaseException] = None
     label = os.path.basename(str(cmd[1])) if len(cmd) > 1 else "command"
     for attempt in range(1, max_attempts + 1):
         try:
             run_cmd(cmd, dry_run=dry_run, timeout=timeout)
             return
-        except Exception as exc:
+        except (subprocess.SubprocessError, OSError) as exc:
             last_exc = exc
             if attempt >= max_attempts:
                 break
-            wait = backoff_seconds * attempt
-            print(f"[RETRY] {label} 第 {attempt}/{max_attempts} 次失败，{wait}s 后重试 | {exc}")
+            wait_seconds = backoff_seconds * attempt
+            print(
+                f"[RETRY] {label} 第 {attempt}/{max_attempts} 次失败，"
+                f"{wait_seconds}s 后重试 | {exc}"
+            )
             if not dry_run:
-                time.sleep(wait)
+                time.sleep(wait_seconds)
     raise RuntimeError(f"{label} 重试 {max_attempts} 次仍失败: {last_exc}")
 
 
 def detect_assets_root(name: str) -> str:
-    """从 checkpoint 的首个 simulate-*.json 推断回放所需的 assets 子目录。
-
-    存档里嵌入了运行时配置，``maze.path`` 含 ``counsel_room`` 即咨询室（6×7），
-    否则按村庄（50×50）处理。读不到任何存档时安全回退到 ``village``。
-    用于给 compress.py 显式传递 ``--assets-root``。
-    """
+    """从首个存档的 maze.path 推断 compress.py 所需资源目录。"""
     checkpoint_dir = CHECKPOINTS_ROOT / name
     if not checkpoint_dir.is_dir():
         return "village"
     try:
-        names = sorted(
-            p for p in checkpoint_dir.iterdir()
-            if p.name.startswith("simulate-") and p.name.endswith(".json")
+        snapshots = sorted(
+            path
+            for path in checkpoint_dir.iterdir()
+            if path.name.startswith("simulate-") and path.name.endswith(".json")
         )
     except OSError:
         return "village"
-    for path in names:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return "village"
-        maze_field = data.get("maze")
-        maze_path = ""
-        if isinstance(maze_field, dict):
-            maze_path = str(maze_field.get("path", "") or "")
-        return "counsel_room" if "counsel_room" in maze_path else "village"
-    return "village"
+    if not snapshots:
+        return "village"
+    try:
+        data = json.loads(snapshots[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "village"
+    maze = data.get("maze")
+    maze_path = str(maze.get("path", "") or "") if isinstance(maze, dict) else ""
+    return "counsel_room" if "counsel_room" in maze_path else "village"
 
 
 def ensure_checkpoint_state(name: str, *, resume: bool, dry_run: bool) -> None:
@@ -525,7 +520,14 @@ def main() -> None:
     if cfg.run_compress:
         assets_root = detect_assets_root(cfg.name)
         run_cmd(
-            [sys.executable, str(COMPRESS_SCRIPT), "--name", cfg.name, "--assets-root", assets_root],
+            [
+                sys.executable,
+                str(COMPRESS_SCRIPT),
+                "--name",
+                cfg.name,
+                "--assets-root",
+                assets_root,
+            ],
             dry_run=cfg.dry_run,
             timeout=1800,
         )

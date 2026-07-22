@@ -2,6 +2,7 @@
 *.md
 !README.md
 !readme.md
+!/README_counsel_room.md
 !BDI-II评估提示词.md
 !PHQ-9评估提示词.md
 !SDS评估提示词.md

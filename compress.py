@@ -5,17 +5,9 @@ from datetime import datetime, timedelta
 
 from modules.maze import Maze
 
-file_markdown = "simulation.md"
-file_movement = "movement.json"
 
-frames_per_step = 60  # 每个step包含的帧数
-
-# 村庄模式的角色花名册兜底值（与 start.personas 保持一致）。
-# 仅在存档目录里没有任何 simulate-*.json 时作为最后兜底使用——正常回放时
+# 村庄模式的角色花名册兜底值（与 start.personas 保持一致）。正常回放时，
 # 角色花名册由 _resolve_run_context 从存档动态读取。
-# 注意：不能写成 ``from start import personas``——start.py 在模块顶层调用了
-# parse_args()，导入即会消费 sys.argv，导致本脚本新增的 --assets-root 参数被
-# start 的 parser 误判为「unrecognized arguments」。
 _DEFAULT_VILLAGE_PERSONAS = [
     "卡布达",
     "金龟次郎",
@@ -27,28 +19,23 @@ _DEFAULT_VILLAGE_PERSONAS = [
 
 
 def _assets_base(assets_root):
-    """根据 assets 子目录名（village / counsel_room）返回完整资源根路径。"""
+    """根据 assets 子目录名返回完整资源根路径。"""
     return f"frontend/static/assets/{assets_root}"
 
 
 def _resolve_run_context(checkpoints_folder, assets_root_override=None):
-    """确定回放所需的 assets_root 与角色花名册。
+    """从存档确定资源根目录和角色花名册。
 
-    assets_root 优先级：显式参数 > 从首个 simulate-*.json 自动检测 > 默认 village。
-    角色花名册始终取自存档的 ``agents`` 字段（咨询室仅 卡布达 + 蜻蜓队长，村庄为
-    全部 6 人）——它与 assets_root 天然耦合，故不单独设参数；存档缺失时回退到
-    _DEFAULT_VILLAGE_PERSONAS。
-
-    自动检测依据：每个存档里都嵌入了运行时配置，其中 ``maze.path`` 对咨询室
-    运行为 ``assets/counsel_room/maze.json``、对村庄运行为 ``assets/village/maze.json``。
+    assets_root 优先级：显式参数 > 首个 simulate-*.json 的 maze.path > village。
+    角色花名册优先读取存档 agents，存档缺失时回退到村庄默认角色。
     """
     assets_root = assets_root_override
     roster = None
-
     try:
         names = sorted(
-            n for n in os.listdir(checkpoints_folder)
-            if n.startswith("simulate-") and n.endswith(".json")
+            name
+            for name in os.listdir(checkpoints_folder)
+            if name.startswith("simulate-") and name.endswith(".json")
         )
     except OSError:
         names = []
@@ -56,18 +43,18 @@ def _resolve_run_context(checkpoints_folder, assets_root_override=None):
     if names:
         try:
             with open(os.path.join(checkpoints_folder, names[0]), "r", encoding="utf-8") as f:
-                snap = json.load(f)
+                snapshot = json.load(f)
         except (OSError, ValueError):
-            snap = {}
+            snapshot = {}
 
         if assets_root is None:
-            maze_field = snap.get("maze")
+            maze_field = snapshot.get("maze")
             maze_path = ""
             if isinstance(maze_field, dict):
                 maze_path = str(maze_field.get("path", "") or "")
             assets_root = "counsel_room" if "counsel_room" in maze_path else "village"
 
-        agents = snap.get("agents")
+        agents = snapshot.get("agents")
         if isinstance(agents, dict) and agents:
             roster = list(agents.keys())
 
@@ -76,6 +63,11 @@ def _resolve_run_context(checkpoints_folder, assets_root_override=None):
     if roster is None:
         roster = list(_DEFAULT_VILLAGE_PERSONAS)
     return assets_root, roster
+
+file_markdown = "simulation.md"
+file_movement = "movement.json"
+
+frames_per_step = 60  # 每个step包含的帧数
 
 
 # 从存档文件中读取stride
@@ -436,10 +428,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--name", type=str, default="", help="the name of the simulation")
 parser.add_argument(
     "--assets-root",
-    type=str,
+    choices=("village", "counsel_room"),
     default=None,
-    help="assets 子目录名（village 或 counsel_room）；默认从存档自动检测。"
-         "角色花名册始终从存档自动读取，与 assets_root 耦合，无需单独指定。",
+    help="assets 子目录；默认从存档 maze.path 自动检测。",
 )
 args = parser.parse_args()
 
@@ -458,6 +449,5 @@ if __name__ == "__main__":
 
     assets_root, roster = _resolve_run_context(checkpoints_folder, args.assets_root)
     print(f"[compress] assets_root={assets_root} roster={roster}")
-
     generate_report(checkpoints_folder, compressed_folder, file_markdown, assets_root, roster)
     generate_movement(checkpoints_folder, compressed_folder, file_movement, assets_root)

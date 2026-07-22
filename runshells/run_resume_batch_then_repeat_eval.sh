@@ -4,6 +4,7 @@
 #
 # 运行前请先启动并确认 Qwen/BGE 服务；本脚本只检查，不自动启动服务。
 # 每个重复通过 batch_state 精确锁定原 run_name，并继续使用原 summary/复评名称。
+# 默认村庄模式；咨询室模式加 --counsel-room（自动使用 G4 并透传模式参数）。
 # ============================================================
 
 set -euo pipefail
@@ -15,10 +16,11 @@ cd "$PROJECT_DIR"
 # ↓↓↓ 恢复实验参数在此修改 ↓↓↓
 # ============================================================
 
-EXP_DATE="0718"
-GROUP="G1"
-KBD="KBD2"
-SEVERITY="SEV"
+EXP_DATE="${EXP_DATE:-0718}"
+GROUP="${GROUP:-G9}"
+KBD="${KBD:-KBD6}"
+SEVERITY="${SEVERITY:-SEV}"
+COUNSEL_ROOM=false
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
@@ -38,6 +40,8 @@ EVAL_MAX_PARALLEL=3
 EVAL_LOG="results/resume-repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 
 REPEAT_COUNT=2
+# 留空时处理 01 至 REPEAT_COUNT；设置为正整数时只处理该重复编号。
+REPEAT_INDEX=""
 MAX_PARALLEL_REPEATS=""
 
 # ============================================================
@@ -53,13 +57,18 @@ usage() {
 
 参数:
   -n, --repeat-count N  恢复 batch-日期-01 至 batch-日期-N，默认使用脚本顶部配置
-  -j, --max-parallel N  同时恢复的独立实验数，默认等于 repeat-count
+  -r, --repeat-index N  只恢复 batch-日期-N；设置后不遍历 repeat-count 范围
+  -j, --max-parallel N  同时恢复的独立实验数，默认等于本次选中的重复数
+      --counsel-room    使用咨询室模式（固定 G4，并透传给批量实验脚本）
       --dry-run         完整校验并显示恢复锚点/命令，不移动文件、不启动任务
   -h, --help            显示帮助
 
 示例:
   bash runshells/run_resume_batch_then_repeat_eval.sh --dry-run
   bash runshells/run_resume_batch_then_repeat_eval.sh -n 2 -j 1
+  bash runshells/run_resume_batch_then_repeat_eval.sh --repeat-index 2 --dry-run
+  bash runshells/run_resume_batch_then_repeat_eval.sh --repeat-index 2
+  bash runshells/run_resume_batch_then_repeat_eval.sh --counsel-room -n 2 -j 2
 EOF
 }
 
@@ -70,10 +79,19 @@ while [[ $# -gt 0 ]]; do
       REPEAT_COUNT="$2"
       shift 2
       ;;
+    -r|--repeat-index)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要一个整数。" >&2; exit 2; }
+      REPEAT_INDEX="$2"
+      shift 2
+      ;;
     -j|--max-parallel)
       [[ $# -ge 2 ]] || { echo "错误: $1 需要一个整数。" >&2; exit 2; }
       MAX_PARALLEL_REPEATS="$2"
       shift 2
+      ;;
+    --counsel-room)
+      COUNSEL_ROOM=true
+      shift
       ;;
     --dry-run)
       DRY_RUN=true
@@ -91,14 +109,33 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$COUNSEL_ROOM" == true ]]; then
+  GROUP="G4"
+  SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
+  EVAL_CONDITION="$SIM_CONDITION"
+  SIM_LOG="results/resume-batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
+  EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
+  EVAL_LOG="results/resume-repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
+fi
+
 [[ "$REPEAT_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --repeat-count 必须是正整数。" >&2; exit 2; }
+if [[ -n "$REPEAT_INDEX" ]]; then
+  [[ "$REPEAT_INDEX" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --repeat-index 必须是正整数。" >&2; exit 2; }
+  SELECTED_REPEAT_START="$REPEAT_INDEX"
+  SELECTED_REPEAT_END="$REPEAT_INDEX"
+  SELECTED_REPEAT_COUNT=1
+else
+  SELECTED_REPEAT_START=1
+  SELECTED_REPEAT_END="$REPEAT_COUNT"
+  SELECTED_REPEAT_COUNT="$REPEAT_COUNT"
+fi
 [[ "$SIM_TARGET_STEP" =~ ^[1-9][0-9]*$ ]] || { echo "错误: SIM_TARGET_STEP 必须是正整数。" >&2; exit 2; }
 if [[ -z "$MAX_PARALLEL_REPEATS" ]]; then
-  MAX_PARALLEL_REPEATS="$REPEAT_COUNT"
+  MAX_PARALLEL_REPEATS="$SELECTED_REPEAT_COUNT"
 fi
 [[ "$MAX_PARALLEL_REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --max-parallel 必须是正整数。" >&2; exit 2; }
-if (( MAX_PARALLEL_REPEATS > REPEAT_COUNT )); then
-  MAX_PARALLEL_REPEATS="$REPEAT_COUNT"
+if (( MAX_PARALLEL_REPEATS > SELECTED_REPEAT_COUNT )); then
+  MAX_PARALLEL_REPEATS="$SELECTED_REPEAT_COUNT"
 fi
 if [[ "$SIM_CONDITION" != "$EVAL_CONDITION" ]]; then
   echo "错误: SIM_CONDITION 与 EVAL_CONDITION 必须相同。" >&2
@@ -207,6 +244,9 @@ run_one_repeat() {
       --max-parallel "$SIM_MAX_PARALLEL"
       --log "$SIM_CHECKPOINT_LOG"
     )
+    if [[ "$COUNSEL_ROOM" == true ]]; then
+      batch_cmd+=(--counsel-room)
+    fi
     if [[ "$DRY_RUN" == true ]]; then
       batch_cmd+=(--dry-run)
       print_command env "BATCH_EMBEDDING_BASE_URLS=$SIM_EMBEDDING_BASE_URLS" "${batch_cmd[@]}"
@@ -253,8 +293,15 @@ run_one_repeat() {
     echo " 复评名称: $run_eval_name"
     echo " 原始 summary: $run_summary"
   } >> "$run_eval_log"
-  "${eval_cmd[@]}" >> "$run_eval_log" 2>&1
-  echo "重复复评完成 $(date '+%F %T')" >> "$run_eval_log"
+  local eval_exit_code
+  if "${eval_cmd[@]}" >> "$run_eval_log" 2>&1; then
+    echo "重复复评完成 $(date '+%F %T')" >> "$run_eval_log"
+  else
+    eval_exit_code=$?
+    echo "错误: 重复复评失败 exit_code=${eval_exit_code} $(date '+%F %T')" \
+      | tee -a "$run_eval_log" >&2
+    return "$eval_exit_code"
+  fi
 }
 
 render_progress() {
@@ -279,7 +326,12 @@ echo "=========================================="
 echo " 稀疏 checkpoint 安全恢复流水线"
 echo "=========================================="
 echo " 条件:          $SIM_CONDITION"
-echo " 重复存档:      ${SIM_NAME}-01 至 ${SIM_NAME}-$(printf '%02d' "$REPEAT_COUNT")"
+echo " 模式:          $([[ "$COUNSEL_ROOM" == true ]] && echo 咨询室 || echo 村庄)"
+if [[ -n "$REPEAT_INDEX" ]]; then
+  echo " 重复存档:      ${SIM_NAME}-$(printf '%02d' "$REPEAT_INDEX")（仅此编号）"
+else
+  echo " 重复存档:      ${SIM_NAME}-01 至 ${SIM_NAME}-$(printf '%02d' "$REPEAT_COUNT")"
+fi
 echo " 目标总步数:    $SIM_TARGET_STEP"
 echo " 外层并行数:    $MAX_PARALLEL_REPEATS"
 echo " 量表复评次数:  $EVAL_REPEAT"
@@ -290,7 +342,7 @@ STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/resume-batch-repeat-status.XXXXXX")
 declare -A PID_TO_REPEAT=()
 declare -a FAILED_REPEATS=()
 started_at=$(date +%s)
-next_repeat=1
+next_repeat="$SELECTED_REPEAT_START"
 completed=0
 
 cleanup_children() {
@@ -314,9 +366,9 @@ start_repeat() {
   PID_TO_REPEAT[$!]="$repeat_index"
 }
 
-render_progress "$completed" "$REPEAT_COUNT" "$started_at"
-while (( completed < REPEAT_COUNT )); do
-  while (( next_repeat <= REPEAT_COUNT && ${#PID_TO_REPEAT[@]} < MAX_PARALLEL_REPEATS )); do
+render_progress "$completed" "$SELECTED_REPEAT_COUNT" "$started_at"
+while (( completed < SELECTED_REPEAT_COUNT )); do
+  while (( next_repeat <= SELECTED_REPEAT_END && ${#PID_TO_REPEAT[@]} < MAX_PARALLEL_REPEATS )); do
     start_repeat "$next_repeat"
     ((next_repeat += 1))
   done
@@ -332,9 +384,9 @@ while (( completed < REPEAT_COUNT )); do
     fi
     unset 'PID_TO_REPEAT[$pid]'
     ((completed += 1))
-    render_progress "$completed" "$REPEAT_COUNT" "$started_at"
+    render_progress "$completed" "$SELECTED_REPEAT_COUNT" "$started_at"
   done
-  (( completed < REPEAT_COUNT )) && sleep 1
+  (( completed < SELECTED_REPEAT_COUNT )) && sleep 1
 done
 echo ""
 rm -rf "$STATUS_DIR"
