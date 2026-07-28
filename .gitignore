@@ -42,3 +42,4 @@ results/
 
 # App.py adhoc outputs (large, regenerable)
 customization/depression_scale_agent/questions/adhoc/
+results/*
