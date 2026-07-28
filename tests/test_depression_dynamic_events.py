@@ -312,12 +312,25 @@ def test_initialize_graph_window_uses_llm_full_stage_without_committing_turn():
                 },
                 ensure_ascii=False,
             )
+        if payload["mode"] == "branch_repair":
+            return json.dumps(
+                {
+                    "children": [
+                        {
+                            "id": "stage_c",
+                            "label": "补充承认日常停滞",
+                            "summary": "补足候选窗口，转向承认失业后日常安排持续停滞。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "stage": {
-                        "id": "stage_b",
-                        "label": "开始承认失业后的疲惫",
-                        "summary": "从单纯自责延伸到承认失业后持续疲惫和日常停滞。",
+                        "id": payload["candidate_seed"]["id"],
+                        "label": payload["candidate_seed"]["label"],
+                        "summary": payload["candidate_seed"]["summary"],
                         "narrative_focus": ["疲惫", "日常停滞", "自责后的耗竭"],
                 }
             },
@@ -331,16 +344,16 @@ def test_initialize_graph_window_uses_llm_full_stage_without_committing_turn():
     )
 
     assert state["graph"]["planned_graph"] == ["stage_a"]
-    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == ["stage_a", "stage_b"]
+    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == ["stage_a", "stage_b", "stage_c"]
     assert state["interaction_count"] == 0
     assert state["graph"]["stage_history"] == []
     assert state["graph"]["stage_index"] == 0
     assert state["current_stage"]["id"] == "stage_a"
     assert engine.graph_manager.stage_catalog["stage_b"]["source"] == "llm"
-    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b", "stage_c"]
 
     restored = DepressionSimulationEngine.from_dict(engine.to_dict())
-    assert restored.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert restored.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b", "stage_c"]
     assert restored.graph_manager.stage_catalog["stage_b"]["source"] == "llm"
 
 
@@ -410,12 +423,25 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
                 },
                 ensure_ascii=False,
             )
+        if payload["mode"] == "branch_repair":
+            return json.dumps(
+                {
+                    "children": [
+                        {
+                            "id": "stage_d",
+                            "label": "阶段 D",
+                            "summary": "补足候选窗口的运行态生成阶段。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "stage": {
-                        "id": "stage_b",
-                        "label": "阶段 B",
-                        "summary": "运行态生成的阶段。",
+                        "id": payload["candidate_seed"]["id"],
+                        "label": payload["candidate_seed"]["label"],
+                        "summary": payload["candidate_seed"]["summary"],
                         "next_candidates": ["stage_c"],
                 }
             },
@@ -428,8 +454,9 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
         roadmap_completion_func=completion,
     )
 
-    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b", "stage_d"]
     assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == []
+    assert engine.graph_manager.stage_catalog["stage_d"]["next_candidates"] == []
     assert "stage_c" not in engine.graph_manager.stage_catalog
 
 
@@ -444,9 +471,26 @@ def test_graph_window_rejects_planner_reused_existing_stage_id():
         }
     )
     engine = DepressionSimulationEngine(config)
+    repair_payloads = []
+    repair_prompts = []
 
     def completion(prompt):
         payload = _planner_payload(prompt)
+        if payload["mode"] == "branch_repair":
+            repair_payloads.append(payload)
+            repair_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "children": [
+                        {
+                            "id": "stage_d",
+                            "label": "补充阶段 D",
+                            "summary": "补足被拒绝分支后形成的另一条合法自我认识走向。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         if payload["mode"] == "branch_seed":
             return json.dumps(
                 {
@@ -482,8 +526,14 @@ def test_graph_window_rejects_planner_reused_existing_stage_id():
         roadmap_completion_func=completion,
     )
 
-    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_c"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_c", "stage_d"]
     assert engine.graph_manager.stage_catalog["stage_b"]["label"] == "已有阶段 B"
+    assert repair_payloads[0]["needed_count"] == 1
+    assert repair_payloads[0]["rejected_branch_candidates"][0]["id"] == "stage_b"
+    assert repair_payloads[0]["accepted_branch_candidates"][0]["id"] == "stage_c"
+    assert "之前被拒绝使用的子分支" in repair_prompts[0]
+    assert "已经录用的子分支" in repair_prompts[0]
+    assert "还需要生成的合法子分支数量：1" in repair_prompts[0]
 
 
 def test_advance_to_visited_stage_is_downgraded_and_pruned():
@@ -530,11 +580,18 @@ def test_initialize_graph_window_skips_planner_when_current_stage_has_candidates
             "summary": "已有配置分支。",
         }
     )
-    config["complaint_graph"]["stages"][0]["next_candidates"] = ["stage_b"]
+    config["complaint_graph"]["stages"].append(
+        {
+            "id": "stage_c",
+            "label": "阶段 C",
+            "summary": "已有配置分支。",
+        }
+    )
+    config["complaint_graph"]["stages"][0]["next_candidates"] = ["stage_b", "stage_c"]
     engine = DepressionSimulationEngine(config)
 
     def completion(_prompt):
-        raise AssertionError("planner should not be called when next_candidates already exist")
+        raise AssertionError("planner should not be called when the candidate window is full")
 
     state = engine.initialize_graph_window(
         location="家",
@@ -543,8 +600,8 @@ def test_initialize_graph_window_skips_planner_when_current_stage_has_candidates
     )
 
     assert state["graph"]["planned_graph"] == ["stage_a"]
-    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == ["stage_a", "stage_b"]
-    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert [stage["id"] for stage in state["graph"]["current_graph_window"]] == ["stage_a", "stage_b", "stage_c"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b", "stage_c"]
 
 
 def test_initialize_graph_window_maintains_window_size_future_nodes():
@@ -755,6 +812,8 @@ def test_commit_advance_then_expands_new_current_stage_future_window():
     children_by_parent = {
         "stage_a": [
             {"id": "stage_b", "label": "阶段 B", "summary": "推进后的当前节点。"},
+            {"id": "stage_x", "label": "阶段 X", "summary": "A 后的第二条候选分支。"},
+            {"id": "stage_y", "label": "阶段 Y", "summary": "A 后的第三条候选分支。"},
         ],
         "stage_b": [
             {"id": "stage_c", "label": "阶段 C", "summary": "B 后的第一段。"},
@@ -765,6 +824,16 @@ def test_commit_advance_then_expands_new_current_stage_future_window():
 
     def completion(prompt):
         payload = _planner_payload(prompt)
+        if payload.get("task") == "transition_decision":
+            return json.dumps(
+                {
+                    "matched_current_stage": True,
+                    "action": "advance",
+                    "target_stage_id": "stage_b",
+                    "reason": "测试推进到 B。",
+                },
+                ensure_ascii=False,
+            )
         parent_id = payload["current_stage"]["id"]
         if payload["mode"] == "branch_seed":
             return json.dumps({"children": children_by_parent[parent_id]}, ensure_ascii=False)
@@ -792,7 +861,7 @@ def test_commit_advance_then_expands_new_current_stage_future_window():
         "stage_d",
         "stage_e",
     ]
-    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b", "stage_x", "stage_y"]
     assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == ["stage_c", "stage_d", "stage_e"]
     assert state["graph"]["last_evaluation"]["action"] == "advance"
 

@@ -841,7 +841,7 @@ class ComplaintGraphManager:
             return False
         if self._coerce_bool(stage.get("is_terminal_stage", False)):
             return False
-        return not self._candidate_ids_for_stage(stage, self.window_size)
+        return len(self._candidate_ids_for_stage(stage, self.window_size)) < self.window_size
 
     def _infer_branch_plan(
         self,
@@ -852,6 +852,13 @@ class ComplaintGraphManager:
         llm_cfg: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """两阶段生成当前节点的候选子分支。"""
+        existing_candidates = self._accepted_branch_summaries(
+            self._candidate_ids_for_stage(parent_stage, self.window_size)
+        )
+        needed_count = max(0, self.window_size - len(existing_candidates))
+        if needed_count <= 0:
+            return []
+
         seed_payload = self._call_graph_planner(
             completion_func=completion_func,
             mode="branch_seed",
@@ -860,9 +867,42 @@ class ComplaintGraphManager:
             conversation_content=conversation_content,
             llm_cfg=llm_cfg,
         )
-        seeds = self._normalize_branch_seeds(seed_payload)
+        seeds, rejected = self._normalize_branch_seed_result(
+            seed_payload,
+            accepted_seed_ids=set(),
+            limit=needed_count,
+        )
+        repair_attempt = 0
+        max_repair_attempts = self._bounded_int(
+            self.planner.get("max_branch_repair_attempts"),
+            self.window_size + 2,
+            1,
+            16,
+        )
+        while len(seeds) < needed_count and repair_attempt < max_repair_attempts:
+            repair_attempt += 1
+            repair_payload = self._call_graph_branch_repair(
+                completion_func=completion_func,
+                parent_stage=parent_stage,
+                session_context=session_context,
+                conversation_content=conversation_content,
+                llm_cfg=llm_cfg,
+                accepted_branches=existing_candidates + self._seed_branch_summaries(seeds),
+                rejected_branches=rejected,
+                needed_count=needed_count - len(seeds),
+            )
+            supplement, supplement_rejected = self._normalize_branch_seed_result(
+                repair_payload,
+                accepted_seed_ids={str(seed.get("id", "") or "").strip() for seed in seeds},
+                limit=needed_count - len(seeds),
+            )
+            rejected.extend(supplement_rejected)
+            if not supplement:
+                continue
+            seeds.extend(supplement)
+
         stages: List[Dict[str, Any]] = []
-        for seed in seeds[: self.window_size]:
+        for seed in seeds[:needed_count]:
             detail_payload = self._call_graph_planner(
                 completion_func=completion_func,
                 mode="branch_detail",
@@ -874,6 +914,34 @@ class ComplaintGraphManager:
             )
             stages.append(self._normalize_branch_detail(detail_payload, seed))
         return stages
+
+    def _call_graph_branch_repair(
+        self,
+        completion_func: Callable[[str], str],
+        parent_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        accepted_branches: List[Dict[str, Any]],
+        rejected_branches: List[Dict[str, Any]],
+        needed_count: int,
+    ) -> Dict[str, Any]:
+        """调用补分支 prompt，为被拒绝分支留下明确上下文。"""
+        prompt = self._build_graph_repair_prompt(
+            parent_stage=parent_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            llm_cfg=llm_cfg,
+            accepted_branches=accepted_branches,
+            rejected_branches=rejected_branches,
+            needed_count=needed_count,
+        )
+        try:
+            raw = str(completion_func(prompt) or "")
+        except Exception:
+            raw = ""
+        parsed = self._parse_json_object(raw)
+        return parsed if isinstance(parsed, dict) else {}
 
     def _call_graph_planner(
         self,
@@ -903,8 +971,18 @@ class ComplaintGraphManager:
 
     def _normalize_branch_seeds(self, payload: Any) -> List[Dict[str, Any]]:
         """清洗第一阶段返回的简略子节点。"""
+        seeds, _rejected = self._normalize_branch_seed_result(payload)
+        return seeds
+
+    def _normalize_branch_seed_result(
+        self,
+        payload: Any,
+        accepted_seed_ids: Optional[set] = None,
+        limit: Optional[int] = None,
+    ) -> tuple:
+        """清洗简略子节点，并返回被拒绝的候选，供补分支 prompt 使用。"""
         if not isinstance(payload, dict):
-            return []
+            return [], []
         raw_items = (
             payload.get("children")
             or payload.get("branches")
@@ -914,15 +992,30 @@ class ComplaintGraphManager:
             or []
         )
         seeds: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
         seen = {str(item or "").strip() for item in self.stage_catalog.keys() if str(item or "").strip()}
         seen.add(self.get_current_stage_id())
+        for item in accepted_seed_ids or set():
+            text = str(item or "").strip()
+            if text:
+                seen.add(text)
+        max_count = self._bounded_int(limit, self.window_size, 0, self.window_size)
         for item in self._to_list(raw_items):
             if not isinstance(item, dict):
+                rejected.append({"id": "", "label": "", "summary": "", "reason": "not_an_object"})
                 continue
             label = str(item.get("label", item.get("name", "")) or "").strip()
             summary = str(item.get("summary", item.get("description", label)) or label).strip()
             stage_id = (str(item.get("id", "") or "").strip() or self._make_stage_id(label or summary))[:80]
             if not stage_id or stage_id in seen:
+                rejected.append(
+                    {
+                        "id": stage_id,
+                        "label": (label or stage_id)[:80],
+                        "summary": self._clip_text(summary or label or stage_id, limit=220),
+                        "reason": "duplicate_or_existing_stage_id" if stage_id else "empty_stage_id",
+                    }
+                )
                 continue
             seen.add(stage_id)
             seeds.append(
@@ -932,9 +1025,9 @@ class ComplaintGraphManager:
                     "summary": self._clip_text(summary or label or stage_id, limit=220),
                 }
             )
-            if len(seeds) >= self.window_size:
+            if len(seeds) >= max_count:
                 break
-        return seeds
+        return seeds, rejected
 
     def _normalize_branch_detail(self, payload: Any, seed: Dict[str, Any]) -> Dict[str, Any]:
         """清洗第二阶段返回的完整子节点，失败时用 seed 补默认字段。"""
@@ -954,11 +1047,16 @@ class ComplaintGraphManager:
                         break
         merged = copy.deepcopy(seed if isinstance(seed, dict) else {})
         merged.update(detail)
+        seed_id = str((seed if isinstance(seed, dict) else {}).get("id", "") or "").strip()
+        if seed_id:
+            merged["id"] = seed_id
         return self._sanitize_stage(merged, source="llm")
 
     def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
         """写入子节点并更新父节点 next_candidates。"""
-        child_ids: List[str] = []
+        parent_key = str(parent_id or "").strip()
+        parent_stage = self.stage_catalog.get(parent_key, {})
+        child_ids: List[str] = self._candidate_ids_for_stage(parent_stage, self.window_size)
         existing_ids = {str(item or "").strip() for item in self.stage_catalog.keys() if str(item or "").strip()}
         for stage in child_stages:
             normalized = self._sanitize_stage(stage, source=str(stage.get("source", "llm") or "llm"))
@@ -974,6 +1072,37 @@ class ComplaintGraphManager:
         self._apply_branch_candidates(parent_id, child_ids)
         self._prune_unknown_next_candidates(child_ids + [str(parent_id or "").strip()])
         return child_ids
+
+    def _accepted_branch_summaries(self, branch_ids: List[str]) -> List[Dict[str, Any]]:
+        """把已录用候选压缩成补分支 prompt 需要的摘要。"""
+        results: List[Dict[str, Any]] = []
+        for branch_id in branch_ids:
+            stage = self.stage_catalog.get(str(branch_id or "").strip(), {})
+            if not isinstance(stage, dict):
+                continue
+            results.append(
+                {
+                    "id": str(stage.get("id", "") or "")[:80],
+                    "label": str(stage.get("label", "") or "")[:80],
+                    "summary": self._clip_text(stage.get("summary", ""), limit=220),
+                }
+            )
+        return results
+
+    def _seed_branch_summaries(self, seeds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把本轮已通过校验的 seed 压缩成补分支 prompt 需要的摘要。"""
+        results: List[Dict[str, Any]] = []
+        for seed in seeds:
+            if not isinstance(seed, dict):
+                continue
+            results.append(
+                {
+                    "id": str(seed.get("id", "") or "")[:80],
+                    "label": str(seed.get("label", "") or "")[:80],
+                    "summary": self._clip_text(seed.get("summary", ""), limit=220),
+                }
+            )
+        return results
 
     def _build_graph_prompt(
         self,
@@ -992,6 +1121,10 @@ class ComplaintGraphManager:
             "current_stage": copy.deepcopy(parent_stage),
             "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
             "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
+            "needed_count": max(
+                0,
+                self.window_size - len(self._candidate_ids_for_stage(parent_stage, self.window_size)),
+            ),
             "window_size": int(self.window_size),
             "candidate_seed": copy.deepcopy(candidate_seed if isinstance(candidate_seed, dict) else {}),
             "session_context": session_context,
@@ -1001,6 +1134,48 @@ class ComplaintGraphManager:
         return render_prompt(
             "depression/graph_planner",
             {"payload_json": payload_json},
+        )
+
+    def _build_graph_repair_prompt(
+        self,
+        parent_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        accepted_branches: List[Dict[str, Any]],
+        rejected_branches: List[Dict[str, Any]],
+        needed_count: int,
+    ) -> str:
+        """构造候选分支补齐 prompt。"""
+        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
+        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        payload = {
+            "mode": "branch_repair",
+            "current_stage": copy.deepcopy(parent_stage),
+            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
+            "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
+            "accepted_branch_candidates": copy.deepcopy(accepted_branches),
+            "rejected_branch_candidates": copy.deepcopy(rejected_branches),
+            "needed_count": max(0, int(needed_count)),
+            "window_size": int(self.window_size),
+            "session_context": session_context,
+            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
+        }
+        repair_context = (
+            "之前被拒绝使用的子分支：{}\n"
+            "已经录用的子分支：{}\n"
+            "还需要生成的合法子分支数量：{}"
+        ).format(
+            json.dumps(rejected_branches, ensure_ascii=False),
+            json.dumps(accepted_branches, ensure_ascii=False),
+            max(0, int(needed_count)),
+        )
+        return render_prompt(
+            "depression/graph_branch_repair",
+            {
+                "payload_json": json.dumps(payload, ensure_ascii=False),
+                "repair_context": repair_context,
+            },
         )
 
     def _normalize_graph_path(self, value: Any, current_stage_id: str) -> List[str]:
