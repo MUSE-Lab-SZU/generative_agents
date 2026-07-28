@@ -4,6 +4,7 @@ from string import Template
 
 from modules import utils
 from modules.depression import DepressionSimulationEngine
+from modules.depression.state_machine import ComplaintGraphManager
 
 try:
     import pytest
@@ -430,6 +431,93 @@ def test_unknown_llm_next_candidates_are_pruned_from_runtime_graph():
     assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_b"]
     assert engine.graph_manager.stage_catalog["stage_b"]["next_candidates"] == []
     assert "stage_c" not in engine.graph_manager.stage_catalog
+
+
+def test_graph_window_rejects_planner_reused_existing_stage_id():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_graph"]["planner"]["llm_enabled"] = True
+    config["complaint_graph"]["stages"].append(
+        {
+            "id": "stage_b",
+            "label": "已有阶段 B",
+            "summary": "这是已经存在的节点，不能被规划器当成新节点复用。",
+        }
+    )
+    engine = DepressionSimulationEngine(config)
+
+    def completion(prompt):
+        payload = _planner_payload(prompt)
+        if payload["mode"] == "branch_seed":
+            return json.dumps(
+                {
+                    "children": [
+                        {
+                            "id": "stage_b",
+                            "label": "错误复用阶段 B",
+                            "summary": "这个节点 ID 已经存在，应被程序端拒绝。",
+                        },
+                        {
+                            "id": "stage_c",
+                            "label": "新阶段 C",
+                            "summary": "这是合法的新分支。",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "stage": {
+                    "id": payload["candidate_seed"]["id"],
+                    "label": payload["candidate_seed"]["label"],
+                    "summary": payload["candidate_seed"]["summary"],
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    engine.initialize_graph_window(
+        location="家",
+        time_of_day="morning",
+        roadmap_completion_func=completion,
+    )
+
+    assert engine.graph_manager.stage_catalog["stage_a"]["next_candidates"] == ["stage_c"]
+    assert engine.graph_manager.stage_catalog["stage_b"]["label"] == "已有阶段 B"
+
+
+def test_advance_to_visited_stage_is_downgraded_and_pruned():
+    manager = ComplaintGraphManager(
+        {
+            "complaint_graph": {
+                "initial_stage_id": "stage_0",
+                "planner": {"llm_enabled": False, "window_size": 3},
+                "stages": [
+                    {"id": "stage_0", "label": "阶段 0"},
+                    {"id": "stage_1", "label": "阶段 1"},
+                    {"id": "stage_2", "label": "阶段 2", "next_candidates": ["stage_1"]},
+                ],
+            }
+        }
+    )
+    manager.planned_graph = ["stage_0", "stage_1", "stage_2"]
+    manager.stage_index = 2
+
+    snapshot = manager.commit_turn(
+        {
+            "action": "advance",
+            "matched": True,
+            "match_reason": "坏状态里的候选回指已访问节点",
+            "next_graph": ["stage_2", "stage_1"],
+            "session_context": {},
+            "conversation_excerpt": "继续推进",
+        }
+    )
+
+    assert snapshot["last_evaluation"]["action"] == "hold"
+    assert snapshot["stage_index"] == 2
+    assert snapshot["current_stage_id"] == "stage_2"
+    assert manager.stage_catalog["stage_2"]["next_candidates"] == []
 
 
 def test_initialize_graph_window_skips_planner_when_current_stage_has_candidates():

@@ -610,6 +610,18 @@ class ComplaintGraphManager:
             start_id = next(iter(self.stage_catalog.keys()))
         return self._normalize_graph_ids([start_id])
 
+    def _visited_stage_ids(self) -> set:
+        """返回当前已走过的路径节点，用于禁止候选分支回指旧节点。"""
+        if not isinstance(self.planned_graph, list) or not self.planned_graph:
+            return set()
+        max_idx = min(max(0, int(self.stage_index)), len(self.planned_graph) - 1)
+        visited = set()
+        for item in self.planned_graph[: max_idx + 1]:
+            stage_id = str(item or "").strip()
+            if stage_id and stage_id in self.stage_catalog:
+                visited.add(stage_id)
+        return visited
+
     def _candidate_ids_for_stage(self, stage: Dict[str, Any], count: int) -> List[str]:
         """清洗并截断单个节点的 next_candidates。"""
         if not isinstance(stage, dict):
@@ -618,11 +630,13 @@ class ComplaintGraphManager:
         limit = max(0, int(count))
         results: List[str] = []
         seen = {stage_id}
+        visited = self._visited_stage_ids()
         for candidate in self._to_list(stage.get("next_candidates", [])):
             candidate_id = str(candidate or "").strip()
             if (
                 not candidate_id
                 or candidate_id in seen
+                or candidate_id in visited
                 or candidate_id not in self.stage_catalog
             ):
                 continue
@@ -639,9 +653,10 @@ class ComplaintGraphManager:
             return
         normalized: List[str] = []
         seen = {parent_key}
+        visited = self._visited_stage_ids()
         for child_id in child_ids:
             key = str(child_id or "").strip()
-            if not key or key in seen or key not in self.stage_catalog:
+            if not key or key in seen or key in visited or key not in self.stage_catalog:
                 continue
             seen.add(key)
             normalized.append(key[:80])
@@ -899,19 +914,20 @@ class ComplaintGraphManager:
             or []
         )
         seeds: List[Dict[str, Any]] = []
-        seen = {self.get_current_stage_id()}
+        seen = {str(item or "").strip() for item in self.stage_catalog.keys() if str(item or "").strip()}
+        seen.add(self.get_current_stage_id())
         for item in self._to_list(raw_items):
             if not isinstance(item, dict):
                 continue
             label = str(item.get("label", item.get("name", "")) or "").strip()
             summary = str(item.get("summary", item.get("description", label)) or label).strip()
-            stage_id = str(item.get("id", "") or "").strip() or self._make_stage_id(label or summary)
+            stage_id = (str(item.get("id", "") or "").strip() or self._make_stage_id(label or summary))[:80]
             if not stage_id or stage_id in seen:
                 continue
             seen.add(stage_id)
             seeds.append(
                 {
-                    "id": stage_id[:80],
+                    "id": stage_id,
                     "label": (label or stage_id)[:80],
                     "summary": self._clip_text(summary or label or stage_id, limit=220),
                 }
@@ -943,13 +959,15 @@ class ComplaintGraphManager:
     def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
         """写入子节点并更新父节点 next_candidates。"""
         child_ids: List[str] = []
+        existing_ids = {str(item or "").strip() for item in self.stage_catalog.keys() if str(item or "").strip()}
         for stage in child_stages:
             normalized = self._sanitize_stage(stage, source=str(stage.get("source", "llm") or "llm"))
             stage_id = str(normalized.get("id", "") or "").strip()
-            if not stage_id or stage_id == parent_id or stage_id in child_ids:
+            if not stage_id or stage_id == parent_id or stage_id in existing_ids or stage_id in child_ids:
                 continue
             normalized["next_candidates"] = []
             self.stage_catalog[stage_id] = normalized
+            existing_ids.add(stage_id)
             child_ids.append(stage_id)
             if len(child_ids) >= self.window_size:
                 break
