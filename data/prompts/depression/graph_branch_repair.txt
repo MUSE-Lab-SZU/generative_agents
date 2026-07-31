@@ -19,7 +19,7 @@ ${repair_context}
 
 约束：
 1. children 数量必须等于 needed_count；如果确实无法生成这么多，也要尽可能多生成。
-2. 不要复用 payload.stages 中已有的 id。
+2. 不要复用 payload.known_stage_ids 中已有的 id。
 3. 不要复用补分支上下文里“之前被拒绝使用的子分支”的 id。
 4. 不要复用补分支上下文里“已经录用的子分支”的 id。
 5. 所有 children 都必须是 current_stage 的直接子分支，不要写成线性剧情链。

@@ -1104,6 +1104,79 @@ class ComplaintGraphManager:
             )
         return results
 
+    def _stage_summary_for_prompt(self, stage: Dict[str, Any]) -> Dict[str, Any]:
+        """返回用于 prompt 去重和语义参照的紧凑节点摘要。"""
+        payload = stage if isinstance(stage, dict) else {}
+        return {
+            "id": str(payload.get("id", "") or "")[:80],
+            "label": str(payload.get("label", "") or "")[:80],
+            "summary": self._clip_text(payload.get("summary", ""), limit=220),
+        }
+
+    def _prompt_known_stage_ids(self) -> List[str]:
+        """返回 prompt 所需的已占用 ID；程序端仍负责最终唯一性校验。"""
+        limit = self._bounded_int(
+            self.planner.get("prompt_known_stage_id_limit"), 512, 50, 5000
+        )
+        ids = [str(stage_id or "").strip()[:80] for stage_id in self.stage_catalog]
+        return [stage_id for stage_id in ids if stage_id][:limit]
+
+    def _build_prompt_graph_snapshot(
+        self,
+        parent_stage: Dict[str, Any],
+        mode: str,
+    ) -> Dict[str, Any]:
+        """构造有界的主诉图 prompt 视图，不改变运行态 catalog。
+
+        完整 ``stage_catalog`` 是程序的权威图索引，不能为了缩短 prompt 而删减。
+        LLM 只需看到当前节点、直接子节点、近期路径和少量语义参照；所有已
+        占用 ID 则以短字符串索引传递，用于降低重复生成的概率。
+        """
+        cfg = self.planner if isinstance(self.planner, dict) else {}
+        path_limit = self._bounded_int(cfg.get("prompt_recent_path_limit"), 4, 1, 12)
+        guard_limit = self._bounded_int(cfg.get("prompt_semantic_guard_limit"), 20, 0, 80)
+        current_id = str(parent_stage.get("id", "") or "").strip()
+        child_ids = self._candidate_ids_for_stage(parent_stage, self.window_size)
+
+        # planned_graph 可能包含前瞻节点；仅取已经走到 current 的实际路径。
+        path_ids = self._normalize_graph_ids(
+            self.planned_graph[: min(max(0, int(self.stage_index)) + 1, len(self.planned_graph))]
+        )
+        recent_path = [
+            self._stage_summary_for_prompt(self.stage_catalog[stage_id])
+            for stage_id in path_ids[-path_limit:]
+            if stage_id in self.stage_catalog
+        ]
+        existing_children = [
+            copy.deepcopy(self.stage_catalog[stage_id])
+            for stage_id in child_ids
+            if stage_id in self.stage_catalog
+        ]
+
+        # 优先使用近期新增节点作为语义防重参照；当前节点、路径和直接子节点
+        # 已通过其他字段完整表达，无须重复。
+        excluded_ids = {current_id, *child_ids, *path_ids}
+        semantic_guard: List[Dict[str, Any]] = []
+        for stage in reversed(list(self.stage_catalog.values())):
+            if len(semantic_guard) >= guard_limit:
+                break
+            stage_id = str(stage.get("id", "") or "").strip()
+            if not stage_id or stage_id in excluded_ids:
+                continue
+            semantic_guard.append(self._stage_summary_for_prompt(stage))
+
+        return {
+            "snapshot_version": 1,
+            "mode": str(mode or "branch_seed"),
+            "current_stage": copy.deepcopy(parent_stage),
+            "local_graph": {
+                "recent_path": recent_path,
+                "existing_children": existing_children,
+                "semantic_guard": semantic_guard,
+            },
+            "known_stage_ids": self._prompt_known_stage_ids(),
+        }
+
     def _build_graph_prompt(
         self,
         mode: str,
@@ -1116,10 +1189,8 @@ class ComplaintGraphManager:
         """构造分支规划器 prompt。"""
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        payload = {
-            "mode": str(mode or "branch_seed"),
-            "current_stage": copy.deepcopy(parent_stage),
-            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
+        payload = self._build_prompt_graph_snapshot(parent_stage, mode)
+        payload.update({
             "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
             "needed_count": max(
                 0,
@@ -1129,7 +1200,7 @@ class ComplaintGraphManager:
             "candidate_seed": copy.deepcopy(candidate_seed if isinstance(candidate_seed, dict) else {}),
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-        }
+        })
         payload_json = json.dumps(payload, ensure_ascii=False)
         return render_prompt(
             "depression/graph_planner",
@@ -1149,10 +1220,8 @@ class ComplaintGraphManager:
         """构造候选分支补齐 prompt。"""
         cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
         text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        payload = {
-            "mode": "branch_repair",
-            "current_stage": copy.deepcopy(parent_stage),
-            "stages": [copy.deepcopy(item) for item in self.stage_catalog.values()],
+        payload = self._build_prompt_graph_snapshot(parent_stage, "branch_repair")
+        payload.update({
             "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
             "accepted_branch_candidates": copy.deepcopy(accepted_branches),
             "rejected_branch_candidates": copy.deepcopy(rejected_branches),
@@ -1160,14 +1229,14 @@ class ComplaintGraphManager:
             "window_size": int(self.window_size),
             "session_context": session_context,
             "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-        }
+        })
         repair_context = (
-            "之前被拒绝使用的子分支：{}\n"
-            "已经录用的子分支：{}\n"
+            "之前被拒绝使用的子分支数量：{}\n"
+            "已经录用的子分支数量：{}\n"
             "还需要生成的合法子分支数量：{}"
         ).format(
-            json.dumps(rejected_branches, ensure_ascii=False),
-            json.dumps(accepted_branches, ensure_ascii=False),
+            len(rejected_branches),
+            len(accepted_branches),
             max(0, int(needed_count)),
         )
         return render_prompt(

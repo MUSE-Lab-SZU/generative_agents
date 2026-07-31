@@ -50,7 +50,7 @@ mode = "branch_detail" 时，补全 candidate_seed 指定的单个子节点：
 1. 不要输出病情等级或严重程度。
 2. 所有 children 都必须是 current_stage 的直接子分支，不要写成一条线性剧情链；每个 child 都必须回答“患者在 current_stage 基础上进一步认识到了自己什么”。
 3. children 数量应等于 needed_count；如果没有 needed_count，则最多等于 window_size；如果确实只能规划更少分支，可以少于目标数量，程序会继续补分支。
-4. 不要复用 stages 中已有的 id，除非 payload 明确要求补全 candidate_seed。
+4. 不要复用 known_stage_ids 中已有的 id，除非 payload 明确要求补全 candidate_seed。local_graph 只提供局部语义参照，不是完整主诉图。
 5. 新节点必须是当前节点的自然延续，不要写成突然康复或跨越式好转，也不要只是简单的形容词叠加。
 6. 每个分支应代表不同的自我认识走向，例如从泛泛自责进一步认识到“我把失业等同于整个人失败”、从低落进一步认识到“我已经在日常功能上躲开很多事”、从关系疏离进一步认识到“我害怕被看见真实状态”、或从轻微好转进一步认识到“我遭遇到的事情似乎没有那么糟糕”。
 7. branch_detail 阶段只能补全 candidate_seed 这一个节点，不要额外生成其他节点。

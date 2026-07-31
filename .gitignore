@@ -32,6 +32,14 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Simulation runtime outputs
+results/checkpoints/
+results/compressed/
+
+docs/*
+!docs/主诉图_catalog与分支Prompt字段说明.md
+tests/
+
 # Experiment outputs and large artifacts
 results/
 *.pdf

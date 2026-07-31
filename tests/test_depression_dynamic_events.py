@@ -93,6 +93,64 @@ def _planner_payload(prompt):
     return json.loads(str(prompt).rsplit("输入：", 1)[-1])
 
 
+def test_branch_prompt_uses_bounded_catalog_snapshot_instead_of_full_stages():
+    config = _single_stage_empty_candidates_config()
+    config["complaint_graph"]["planner"].update(
+        {
+            "prompt_recent_path_limit": 2,
+            "prompt_semantic_guard_limit": 2,
+            "prompt_known_stage_id_limit": 100,
+        }
+    )
+    config["complaint_graph"]["stages"].extend(
+        {
+            "id": "stage_{}".format(index),
+            "label": "历史阶段 {}".format(index),
+            "summary": "用于验证 prompt 快照不会携带完整 catalog 的历史节点。",
+        }
+        for index in range(1, 8)
+    )
+    manager = ComplaintGraphManager(config)
+
+    payload = _planner_payload(
+        manager._build_graph_prompt(
+            mode="branch_seed",
+            parent_stage=manager.get_current_stage(),
+            session_context={},
+            conversation_content="测试对话",
+            llm_cfg={},
+        )
+    )
+    detail_payload = _planner_payload(
+        manager._build_graph_prompt(
+            mode="branch_detail",
+            parent_stage=manager.get_current_stage(),
+            session_context={},
+            conversation_content="测试对话",
+            llm_cfg={},
+            candidate_seed={"id": "new_stage", "label": "新节点", "summary": "测试"},
+        )
+    )
+    repair_payload = _planner_payload(
+        manager._build_graph_repair_prompt(
+            parent_stage=manager.get_current_stage(),
+            session_context={},
+            conversation_content="测试对话",
+            llm_cfg={},
+            accepted_branches=[],
+            rejected_branches=[],
+            needed_count=2,
+        )
+    )
+
+    for prompt_payload in (payload, detail_payload, repair_payload):
+        assert "stages" not in prompt_payload
+        assert set(prompt_payload["known_stage_ids"]) == set(manager.stage_catalog)
+    assert payload["current_stage"]["id"] == "stage_a"
+    assert len(payload["local_graph"]["semantic_guard"]) == 2
+    assert all(set(item) == {"id", "label", "summary"} for item in payload["local_graph"]["semantic_guard"])
+
+
 def test_generate_chat_template_keeps_persona_description_single_source():
     template = Template(Path("data/prompts/generate_chat.txt").read_text(encoding="utf-8"))
     common = {
