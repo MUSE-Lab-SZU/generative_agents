@@ -49,9 +49,9 @@ Thumbs.db
 results/checkpoints/
 results/compressed/
 
-docs/
+docs/*
+!docs/主诉图_catalog与分支Prompt字段说明.md
 tests/
 
 results/
 results/*
-
