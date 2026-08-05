@@ -51,3 +51,6 @@ results/
 # App.py adhoc outputs (large, regenerable)
 customization/depression_scale_agent/questions/adhoc/
 results/*
+
+customization/expert_checkpoint_chat/sessions
+customization/expert_checkpoint_chat/records
