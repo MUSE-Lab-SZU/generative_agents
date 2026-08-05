@@ -13,7 +13,15 @@ from .agent import Agent
 class Game:
     """管理模拟世界中的地图、角色、对话和全局运行状态"""
 
-    def __init__(self, name, static_root, config, conversation, logger=None):
+    def __init__(
+        self,
+        name,
+        static_root,
+        config,
+        conversation,
+        logger=None,
+        storage_root=None,
+    ):
         """根据配置初始化游戏世界、地图和所有 Agent"""
         self.name = name
         self.static_root = static_root
@@ -27,7 +35,12 @@ class Game:
             agent_base = config["agent_base"]
         else:
             agent_base = {}
-        storage_root = os.path.join(f"results/checkpoints/{name}", "storage")
+        # `storage_root` 让只读回放、评估等调用方可以把联想记忆放入隔离目录。
+        # 未传参时严格保持原模拟流程的既有目录约定。
+        storage_root = storage_root or os.path.join(
+            f"results/checkpoints/{name}", "storage"
+        )
+        storage_root = os.path.abspath(storage_root)
         if not os.path.isdir(storage_root):
             os.makedirs(storage_root)
             
@@ -94,11 +107,21 @@ class Game:
             self.logger.info("\n{}\n{}\n".format(utils.split_line(title), agent))
 
 
-def create_game(name, static_root, config, conversation, logger=None):
+def create_game(name, static_root, config, conversation, logger=None, storage_root=None):
     """Create the game"""
 
     utils.set_timer(**config.get("time", {}))
-    GenerativeAgentsMap.set(GenerativeAgentsKey.GAME, Game(name, static_root, config, conversation, logger=logger))
+    GenerativeAgentsMap.set(
+        GenerativeAgentsKey.GAME,
+        Game(
+            name,
+            static_root,
+            config,
+            conversation,
+            logger=logger,
+            storage_root=storage_root,
+        ),
+    )
     return GenerativeAgentsMap.get(GenerativeAgentsKey.GAME)
 
 

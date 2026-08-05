@@ -55,3 +55,6 @@ tests/
 
 results/
 results/*
+
+customization/expert_checkpoint_chat/sessions
+customization/expert_checkpoint_chat/records
