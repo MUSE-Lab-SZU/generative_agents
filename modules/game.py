@@ -21,7 +21,6 @@ class Game:
         logger=None,
         storage_root=None,
     ):
-        """根据配置初始化游戏世界、地图和所有 Agent"""
         self.name = name
         self.static_root = static_root
         self.record_iterval = config.get("record_iterval", 30)
@@ -35,17 +34,13 @@ class Game:
         else:
             agent_base = {}
         storage_root_override = str(config.get("storage_root_override", "") or "").strip()
-        if storage_root_override:
+        if storage_root is not None:
+            storage_root = os.path.abspath(os.fspath(storage_root))
+        elif storage_root_override:
             storage_root = os.path.abspath(storage_root_override)
         else:
-            # `storage_root` 让只读回放、评估等调用方可以把联想记忆放入隔离目录。
-            # 未传参时严格保持原模拟流程的既有目录约定。
-            storage_root = storage_root or os.path.join(
-                f"results/checkpoints/{name}", "storage"
-            )
-            storage_root = os.path.abspath(storage_root)
-        if not os.path.isdir(storage_root):
-            os.makedirs(storage_root)
+            storage_root = os.path.join(f"results/checkpoints/{name}", "storage")
+        os.makedirs(storage_root, exist_ok=True)
         global_dynamic_cfg = copy.deepcopy(
             ((config.get("intervention", {}) or {}).get("depression_dynamic", {}) or {})
         )

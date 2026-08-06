@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-抑郁症治疗遍历实验自动化脚本。
+Legacy G1/G2 抑郁症治疗遍历实验自动化脚本。
+
+该入口为历史实验复现保留：它会备份并替换共享的 data/config.json
+与卡布达 depression_config.json。新建单次实验请使用
+runshells/run_one_experiment.py，新建批量实验请使用
+runshells/run_batch_then_repeat_eval.sh 或 runshells/run_batch_experiment.py。
+
+注意：这里的“Legacy 入口”不等于已弃用
+intervention.cbt_controller_mode=legacy；后者仍是受支持且会使用的配置。
 
 第一阶段遍历 2(group) × 3(severity) = 6 个实验条件，
 每个条件依次：替换配置 → 运行模拟 → 合并记录 → 收集数据 → 前后量表 → compress → 可视化。
@@ -24,6 +32,8 @@ import sys
 import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
+
+from cbt_experiment_config import deep_merge_dict as _deep_merge_dict
 
 # ─── 项目根目录 ───────────────────────────────────────────────
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -177,13 +187,9 @@ def load_json_file(path: str) -> dict:
 
 
 def deep_merge_dict(base: dict, overlay: dict) -> dict:
-    merged = json.loads(json.dumps(base, ensure_ascii=False))
-    for key, value in (overlay or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    """Compatibility wrapper for the frozen legacy experiment entry point."""
+
+    return _deep_merge_dict(base, overlay)
 
 
 
@@ -431,20 +437,6 @@ def run_external_memory_audit(trial_name: str, agent_name: str = "卡布达", dr
 # 数据收集
 # ═══════════════════════════════════════════════════════════════
 
-def _analyze_session_eval(judge_file: str, trial_name: str) -> None:
-    """解析 judge_conversation.json，提取并打印 session_eval 摘要。"""
-    scores, session_ends = _extract_session_eval_scores(judge_file)
-
-    if scores:
-        avg = sum(scores) / len(scores)
-        print(f"  [SESSION-EVAL] {trial_name}: {len(scores)} 次评估")
-        print(f"    efficacy_score: 平均={avg:.1f}, 最低={min(scores)}, 最高={max(scores)}")
-        print(f"    session_end 次数: {session_ends}")
-        print(f"    分数序列: {scores}")
-    else:
-        print(f"  [SESSION-EVAL] {trial_name}: 未找到 efficacy_score 数据")
-
-
 def collect_trial_data(
     run_name: str,
     group: str,
@@ -621,26 +613,15 @@ def _count_conversation_turns(conv: dict | list) -> dict:
         return result
 
     if isinstance(conv, dict):
-        for ts, convs in conv.items():
+        for convs in conv.values():
             result["sessions"] += 1
             for c in convs:
-                for k, v in c.items():
+                for v in c.values():
                     if isinstance(v, list):
                         result["turns"] += len(v)
                     else:
                         result["turns"] += 1
     return result
-
-
-def _load_expert_scores(score_file: str) -> dict:
-    """从专家评分文件加载评分结果。"""
-    if not os.path.exists(score_file):
-        return {}
-    try:
-        with open(score_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
 
 
 def generate_report(dry_run: bool = False) -> None:
@@ -679,11 +660,6 @@ def generate_report(dry_run: bool = False) -> None:
         if with_ts:
             return [os.path.join(EXPERIMENT_DATA_ROOT, d) for d in with_ts]
         return [os.path.join(EXPERIMENT_DATA_ROOT, trial_name)]
-
-    def _find_single_trial_dir(trial_name: str) -> Optional[str]:
-        """找到最新匹配的试验目录（兼容旧逻辑）。"""
-        dirs = _find_trial_dirs(trial_name)
-        return dirs[-1] if dirs else None
 
     # 按条件名收集数据，支持多轮
     condition_data = {}  # key = trial_name, value = list of round dicts
@@ -1788,26 +1764,6 @@ def _score_single_scale(answers_path: str, scoring_prompt_path: str, output_path
     except Exception as e:
         print(f"    [ERROR] score worker 失败: {e}")
         return None
-
-
-def _build_session_timeline(scores: list, session_ends: int) -> str:
-    """生成 session_eval 时间线的 Markdown 文本。"""
-    if not scores:
-        return "> 无 session_eval 数据"
-
-    lines = []
-    for i, s in enumerate(scores):
-        if i == 0:
-            trend = "—"
-        elif s > scores[i - 1]:
-            trend = "↑"
-        elif s < scores[i - 1]:
-            trend = "↓"
-        else:
-            trend = "→"
-        lines.append(f"  {i+1} | {s} | {trend}")
-
-    return "\n".join(lines)
 
 
 def _resolve_last_snapshot(cp_name: str) -> Optional[str]:

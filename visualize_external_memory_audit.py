@@ -14,8 +14,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-import os
 import re
 import statistics
 import sys
@@ -23,7 +21,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -434,7 +432,11 @@ def _memory_level(item: Dict[str, Any]) -> str:
     return str(item.get("level", "") or "").upper()
 
 
-def _build_relations(memories: List[Dict[str, Any]], map_data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _build_relations(
+    memories: List[Dict[str, Any]],
+    map_data: Dict[str, Any],
+    retrieve_data: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     node_to_remote = map_data.get("node_to_remote", {}) or {}
     remote_to_nodes = defaultdict(list)
     for node_id, rel in node_to_remote.items():
@@ -450,12 +452,27 @@ def _build_relations(memories: List[Dict[str, Any]], map_data: Dict[str, Any]) -
         if rid:
             memory_by_remote[rid] = item
 
+    details = retrieve_data.get("details", {}) if isinstance(retrieve_data, dict) else {}
+    if not isinstance(details, dict):
+        details = {}
+    short_term_recent = details.get("short_term_recent", [])
+    if not isinstance(short_term_recent, list):
+        short_term_recent = []
+    short_term_by_remote: Dict[str, Dict[str, Any]] = {}
+    for item in short_term_recent:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("remote_id", "") or "").strip()
+        if rid:
+            short_term_by_remote[rid] = item
+
     rows: List[Dict[str, Any]] = []
     for node_id, rel in node_to_remote.items():
         if not isinstance(rel, dict):
             continue
         remote_id = str(rel.get("remote_id", "") or "").strip()
         mem = memory_by_remote.get(remote_id, {})
+        short_term = short_term_by_remote.get(remote_id, {})
         conflict = len(remote_to_nodes.get(remote_id, [])) > 1
         if conflict:
             status = "conflict"
@@ -471,8 +488,15 @@ def _build_relations(memories: List[Dict[str, Any]], map_data: Dict[str, Any]) -
                 "create_time": str(rel.get("create_time", "") or ""),
                 "memory_level": _memory_level(mem) if mem else "",
                 "memory_timestamp": str(mem.get("timestamp", "") or ""),
+                "memory_content": str(mem.get("content", "") or ""),
+                "short_term_timestamp": str(short_term.get("ts", "") or ""),
+                "short_term_content": str(short_term.get("content", "") or ""),
                 "is_locked": bool(mem.get("is_locked")) if mem else False,
                 "is_milestone": bool(mem.get("is_milestone")) if mem else False,
+                "embed_mock_at_write": _memory_embed_mock_at_write(mem) if mem else False,
+                "ingest_mode": _memory_ingest_mode(mem) if mem else "",
+                "fallback_reason": _memory_fallback_reason(mem) if mem else "",
+                "write_path_status": _memory_write_path_status(mem) if mem else "",
                 "relation_status": status,
             }
         )
@@ -481,6 +505,7 @@ def _build_relations(memories: List[Dict[str, Any]], map_data: Dict[str, Any]) -
     for remote_id, mem in memory_by_remote.items():
         if remote_id in map_remote_ids:
             continue
+        short_term = short_term_by_remote.get(remote_id, {})
         rows.append(
             {
                 "node_id": "",
@@ -489,8 +514,15 @@ def _build_relations(memories: List[Dict[str, Any]], map_data: Dict[str, Any]) -
                 "create_time": "",
                 "memory_level": _memory_level(mem),
                 "memory_timestamp": str(mem.get("timestamp", "") or ""),
+                "memory_content": str(mem.get("content", "") or ""),
+                "short_term_timestamp": str(short_term.get("ts", "") or ""),
+                "short_term_content": str(short_term.get("content", "") or ""),
                 "is_locked": bool(mem.get("is_locked")),
                 "is_milestone": bool(mem.get("is_milestone")),
+                "embed_mock_at_write": _memory_embed_mock_at_write(mem),
+                "ingest_mode": _memory_ingest_mode(mem),
+                "fallback_reason": _memory_fallback_reason(mem),
+                "write_path_status": _memory_write_path_status(mem),
                 "relation_status": "remote_only",
             }
         )
@@ -601,6 +633,49 @@ def _mws_stats(memories: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _memory_ingest_mode(item: Dict[str, Any]) -> str:
+    return str(item.get("ingest_mode", "") or "").strip()
+
+
+def _memory_fallback_reason(item: Dict[str, Any]) -> str:
+    return str(item.get("fallback_reason", "") or "").strip()
+
+
+def _memory_embed_mock_at_write(item: Dict[str, Any]) -> bool:
+    return bool(item.get("embed_mock_at_write", False))
+
+
+def _memory_write_path_status(item: Dict[str, Any]) -> str:
+    ingest_mode = _memory_ingest_mode(item)
+    embed_mock_at_write = _memory_embed_mock_at_write(item)
+    if ingest_mode == "raw_fallback" and embed_mock_at_write:
+        return "raw_fallback+mock_write"
+    if ingest_mode == "raw_fallback":
+        return "raw_fallback"
+    if embed_mock_at_write:
+        return "mock_write"
+    return "normal"
+
+
+def _write_path_summary(memories: List[Dict[str, Any]]) -> Dict[str, Any]:
+    status_counter: Counter[str] = Counter()
+    fallback_reasons: List[str] = []
+    for item in memories:
+        if not isinstance(item, dict):
+            continue
+        status_counter[_memory_write_path_status(item)] += 1
+        reason = _memory_fallback_reason(item)
+        if reason:
+            fallback_reasons.append(reason)
+    unique_reasons = sorted(set(fallback_reasons))
+    return {
+        "embed_mock_at_write_count": sum(1 for item in memories if _memory_embed_mock_at_write(item)),
+        "raw_fallback_memory_count": sum(1 for item in memories if _memory_ingest_mode(item) == "raw_fallback"),
+        "write_path_status_counts": dict(status_counter),
+        "fallback_reason_samples": unique_reasons[:5],
+    }
+
+
 def _consistency_with_stats(
     memories: List[Dict[str, Any]],
     milestones: List[Dict[str, Any]],
@@ -655,6 +730,7 @@ def _consistency_with_stats(
     service_milestones = _safe_int(chroma.get("milestones", 0))
     service_locked = _safe_int(chroma.get("locked", 0))
     service_raw_fallback = _safe_int(chroma.get("raw_fallback", 0))
+    service_embed_mock_at_write = _safe_int(chroma.get("embed_mock_at_write", 0))
     service_pg_milestones = _safe_int(postgres.get("l4_milestones", 0))
     ranked_count = len(ranked_memories)
     embed_mock = bool(flags.get("embed_mock", False))
@@ -666,6 +742,12 @@ def _consistency_with_stats(
         warnings.append(
             "chroma.raw_fallback={}，说明有一部分长期记忆是在分析链路异常时以 raw_fallback 方式写入。".format(
                 service_raw_fallback
+            )
+        )
+    if service_embed_mock_at_write > 0:
+        warnings.append(
+            "chroma.embed_mock_at_write={}，说明库里存在写入当下 embedding 已退到 MOCK 的零向量记录；这类旧数据容易表现为‘明明在库里但就是召不回来’。".format(
+                service_embed_mock_at_write
             )
         )
     if service_l2 > ranked_count:
@@ -695,6 +777,7 @@ def _consistency_with_stats(
             "chroma_milestones": service_milestones,
             "chroma_locked": service_locked,
             "chroma_raw_fallback": service_raw_fallback,
+            "chroma_embed_mock_at_write": service_embed_mock_at_write,
             "postgres_l4_milestones": service_pg_milestones,
             "embed_mock": embed_mock,
         },
@@ -721,6 +804,16 @@ def _stats_dashboard(
         flags = {}
     if not isinstance(chroma, dict):
         chroma = {}
+    write_path_summary = _write_path_summary(memories)
+    service_raw_fallback = _safe_int(chroma.get("raw_fallback", 0))
+    observed_raw_fallback = _safe_int(write_path_summary.get("raw_fallback_memory_count", 0))
+    metadata_gap_warnings: List[str] = []
+    if service_raw_fallback > 0 and observed_raw_fallback == 0 and total > 0:
+        metadata_gap_warnings.append(
+            "stats.chroma.raw_fallback={}，但本次 /api/memories 明细里没有任何 ingest_mode=raw_fallback；Node/Remote 关系视图当前无法逐条定位这些 raw_fallback，说明服务端 list_memories 返回未透出逐条 ingest metadata。".format(
+                service_raw_fallback
+            )
+        )
     return {
         "memory_total": total,
         "L1_count": level_counter.get("L1", 0),
@@ -731,7 +824,13 @@ def _stats_dashboard(
         "relation_audit": relation_audit,
         "mws": _mws_stats(memories),
         "embed_mock": bool(flags.get("embed_mock", False)),
-        "raw_fallback_count": _safe_int(chroma.get("raw_fallback", 0)),
+        "raw_fallback_count": service_raw_fallback,
+        "service_embed_mock_at_write_count": _safe_int(chroma.get("embed_mock_at_write", 0)),
+        "embed_mock_at_write_count": _safe_int(write_path_summary.get("embed_mock_at_write_count", 0)),
+        "raw_fallback_memory_count": observed_raw_fallback,
+        "write_path_status_counts": write_path_summary.get("write_path_status_counts", {}),
+        "fallback_reason_samples": write_path_summary.get("fallback_reason_samples", []),
+        "metadata_gap_warnings": metadata_gap_warnings,
         "consistency_with_stats": consistency_with_stats,
     }
 
@@ -835,6 +934,17 @@ def _build_html(report: Dict[str, Any]) -> str:
     health = report.get("health", {})
     timeline = report.get("timeline_replay", [])
 
+    metadata_gap_warnings = stats.get("metadata_gap_warnings", []) if isinstance(stats, dict) else []
+    if not isinstance(metadata_gap_warnings, list):
+        metadata_gap_warnings = []
+    relation_warning_html = ""
+    if metadata_gap_warnings:
+        relation_warning_html = "".join(
+            f'<div class="warn">{_html_escape(item)}</div>'
+            for item in metadata_gap_warnings
+            if str(item or "").strip()
+        )
+
     relation_rows = "".join(
         "<tr>"
         f"<td>{_html_escape(r.get('relation_status', ''))}</td>"
@@ -844,6 +954,13 @@ def _build_html(report: Dict[str, Any]) -> str:
         f"<td>{_html_escape(r.get('create_time', ''))}</td>"
         f"<td>{_html_escape(r.get('memory_level', ''))}</td>"
         f"<td>{_html_escape(r.get('memory_timestamp', ''))}</td>"
+        f"<td>{_html_escape(r.get('memory_content', ''))}</td>"
+        f"<td>{_html_escape(r.get('short_term_timestamp', ''))}</td>"
+        f"<td>{_html_escape(r.get('short_term_content', ''))}</td>"
+        f"<td>{_html_escape(r.get('write_path_status', ''))}</td>"
+        f"<td>{_html_escape(r.get('embed_mock_at_write', ''))}</td>"
+        f"<td>{_html_escape(r.get('ingest_mode', ''))}</td>"
+        f"<td>{_html_escape(r.get('fallback_reason', ''))}</td>"
         "</tr>"
         for r in relations
     )
@@ -899,6 +1016,7 @@ def _build_html(report: Dict[str, Any]) -> str:
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }}
     .kv {{ line-height: 1.8; white-space: pre-wrap; word-break: break-all; }}
     .mono {{ font-family: Consolas, "Courier New", monospace; }}
+    .warn {{ margin: 0 0 10px 0; padding: 10px 12px; border-radius: 8px; border: 1px solid #f59e0b; background: #fffbeb; color: #92400e; line-height: 1.6; }}
   </style>
 </head>
 <body>
@@ -925,8 +1043,9 @@ def _build_html(report: Dict[str, Any]) -> str:
 
     <div class="card">
       <h2>Node/Remote 关系视图</h2>
+      {relation_warning_html}
       <table>
-        <thead><tr><th>status</th><th>node_id</th><th>remote_id</th><th>node_type</th><th>create_time</th><th>level</th><th>memory_ts</th></tr></thead>
+        <thead><tr><th>status</th><th>node_id</th><th>remote_id</th><th>node_type</th><th>create_time</th><th>level</th><th>memory_ts</th><th>memory_content</th><th>short_term_ts</th><th>short_term_content</th><th>write_path_status</th><th>embed_mock_at_write</th><th>ingest_mode</th><th>fallback_reason</th></tr></thead>
         <tbody>{relation_rows}</tbody>
       </table>
     </div>
@@ -972,6 +1091,7 @@ def _build_user_stats_markdown(report: Dict[str, Any]) -> str:
     meta = report.get("meta", {}) if isinstance(report, dict) else {}
     user_stats = report.get("user_stats", {}) if isinstance(report, dict) else {}
     consistency = report.get("consistency_with_stats", {}) if isinstance(report, dict) else {}
+    stats_dashboard = report.get("stats_dashboard", {}) if isinstance(report, dict) else {}
     errors = report.get("errors", {}) if isinstance(report, dict) else {}
 
     chroma = user_stats.get("chroma", {}) if isinstance(user_stats, dict) else {}
@@ -1002,6 +1122,8 @@ def _build_user_stats_markdown(report: Dict[str, Any]) -> str:
         service_counts = {}
     if not isinstance(observed_counts, dict):
         observed_counts = {}
+    if not isinstance(stats_dashboard, dict):
+        stats_dashboard = {}
 
     def _mark(flag: Any) -> str:
         return "一致" if bool(flag) else "不一致"
@@ -1038,6 +1160,9 @@ def _build_user_stats_markdown(report: Dict[str, Any]) -> str:
             "- `chroma.milestones`: **{}**，表示 metadata 中 `is_milestone=true` 的长期记忆条数。".format(_safe_int(chroma.get("milestones", 0))),
             "- `chroma.locked`: **{}**，表示 metadata 中 `is_locked=true` 的长期记忆条数。".format(_safe_int(chroma.get("locked", 0))),
             "- `chroma.raw_fallback`: **{}**，如果大于 0，说明有一段时间分析链路不健康，长期记忆以 raw_fallback 方式落盘。".format(_safe_int(chroma.get("raw_fallback", 0))),
+            "- `chroma.embed_mock_at_write`: **{}**，v2.1.3 起表示写入当下 embedding 退到 MOCK 的长期记忆条数；它是定位\"老数据明明在库里，但就是召不回来\"的重要信号。".format(
+                _safe_int(chroma.get("embed_mock_at_write", 0))
+            ),
             "",
             "## PostgreSQL 侧统计",
             "- `postgres.l3_emotion_log`: **{}**，对应 L3 情绪日志表条数。".format(_safe_int(postgres.get("l3_emotion_log", 0))),
@@ -1062,6 +1187,25 @@ def _build_user_stats_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend(
         [
+            "",
+            "## 单条写入退化观察（基于 `/api/memories` metadata）",
+            "- `embed_mock_at_write=true` 条数：**{}**。这表示这些记忆写入当下 BGE 不可达，向量被写成零向量；它和 `flags.embed_mock` 的区别是：前者是历史逐条事实，后者是当前服务状态。".format(
+                _safe_int(stats_dashboard.get("embed_mock_at_write_count", 0))
+            ),
+            "- `ingest_mode=raw_fallback` 条数：**{}**。这些记忆写入时 LLM 分析链路异常，因此只有原文降级写入，不会自然进入 L2/L3/L4。".format(
+                _safe_int(stats_dashboard.get("raw_fallback_memory_count", 0))
+            ),
+            "- `write_path_status` 分布：`{}`。".format(
+                json.dumps(stats_dashboard.get("write_path_status_counts", {}), ensure_ascii=False)
+            ),
+            "- `fallback_reason` 样例：`{}`。".format(
+                json.dumps(stats_dashboard.get("fallback_reason_samples", []), ensure_ascii=False)
+            ),
+            *[
+                "- 元数据缺口提示：{}".format(item)
+                for item in (stats_dashboard.get("metadata_gap_warnings", []) if isinstance(stats_dashboard, dict) else [])
+                if str(item or "").strip()
+            ],
             "",
             "## 与本次审计结果对照",
             "- 长期记忆总数：服务端 **{}** / 当前 list_memories **{}** / {}".format(
@@ -1149,7 +1293,7 @@ def _build_report(target: AgentTarget) -> Dict[str, Any]:
         user_stats = {}
 
     map_data = _load_map(target.map_path)
-    relations, relation_audit = _build_relations(memories=memories, map_data=map_data)
+    relations, relation_audit = _build_relations(memories=memories, map_data=map_data, retrieve_data=retrieve_data)
     layer_summary = _layer_summary(memories=memories, milestones=milestones, retrieve_data=retrieve_data)
     consistency_with_stats = _consistency_with_stats(
         memories=memories,

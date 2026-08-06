@@ -15,9 +15,49 @@ import os
 import traceback
 from string import Template
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Mapping, Optional, List
 
 from modules import utils
+from modules.complaint_graph_trace import (
+    capture_runtime_chat_trace,
+    capture_runtime_reflection_trace,
+    unavailable_trace,
+    update_session_chat_summary,
+    update_session_reflection_summary,
+)
+from modules.cbt_minimal_controller import (
+    MINIMAL_STAGE_ADAPTER_VERSION,
+    MINIMAL_PROGRESS_DEFAULT,
+    PATIENT_STATE_DEFAULT,
+    PROGRESSIVE_D_CONTROLLER_VERSION,
+    PROGRESSIVE_D_PATIENT_STATE_DEFAULT,
+    STAGE_ADAPTER_ACTIONS,
+    compact_patient_state_text,
+    compact_progressive_d_patient_state_text,
+    compact_prior_progress_text,
+    compact_progressive_d_subgoal_progress_text,
+    compact_route_text,
+    copy_soft_step_back_default,
+    eligible_soft_step_back_targets,
+    generate_session_end,
+    initialize_subgoal_progress_state,
+    load_prompt_template,
+    load_stage_subgoal_map,
+    load_strategy_map,
+    load_term_glossary,
+    merge_progressive_d_batch_progress,
+    normalize_minimal_judge_output,
+    normalize_minimal_session_eval,
+    normalize_patient_state,
+    normalize_progressive_d_control_eval,
+    normalize_progressive_d_patient_state,
+    progressive_d_completion_audit,
+    recent_dialogue,
+    route_strategies,
+    safe_judge_fallback,
+    split_utterances,
+    tagged_dialogue,
+)
 from modules.memory_injection_manager import MemoryInjectionManager
 from modules.intervention_consult_record import (
     ConsultRecordError,
@@ -93,6 +133,12 @@ class InterventionManager:
         self._environment_llm_key = ""
         self._think_llm = None
         self._think_llm_key = ""
+        self._cbt_strategy_map_cache: Optional[Dict[str, Any]] = None
+        self._cbt_strategy_map_cache_path = ""
+        self._cbt_term_glossary_cache: Optional[Dict[str, Any]] = None
+        self._cbt_term_glossary_cache_path = ""
+        self._cbt_stage_subgoals_cache: Optional[Dict[str, Any]] = None
+        self._cbt_stage_subgoals_cache_path = ""
         self._consult_history_indexes: Dict[str, Any] = {}
 
         # 全局运行时状态（随 config 落盘）
@@ -393,22 +439,23 @@ class InterventionManager:
                 )
             )
         else:
-            # 医患会话后尝试抽取医生作业，并交给环境模型生成任务结果记忆
-            self._log_highlight(
-                "ORDER_EXTRACT_START speaker={} other={} chats={}".format(
-                    getattr(speaker, "name", ""),
-                    getattr(other, "name", ""),
-                    len(chats or []),
+            if closed_meeting_id and closed_meeting_kind == "doctor_consult":
+                # 正式医患会诊后抽取医生作业，并交给环境模型生成任务结果记忆
+                self._log_highlight(
+                    "ORDER_EXTRACT_START speaker={} other={} chats={}".format(
+                        getattr(speaker, "name", ""),
+                        getattr(other, "name", ""),
+                        len(chats or []),
+                    )
                 )
-            )
-            self._extract_and_queue_orders(
-                speaker=speaker,
-                other=other,
-                chats=chats,
-                meeting_id=closed_meeting_id,
-                meeting_kind=closed_meeting_kind or "doctor_consult",
-                start_time=start_time,
-            )
+                self._extract_and_queue_orders(
+                    speaker=speaker,
+                    other=other,
+                    chats=chats,
+                    meeting_id=closed_meeting_id,
+                    meeting_kind=closed_meeting_kind,
+                    start_time=start_time,
+                )
 
             self._handle_consult_history_after_chat(
                 speaker=speaker,
@@ -466,42 +513,224 @@ class InterventionManager:
                             )
                         )
                     else:
-                        session_eval_payload = self.evaluate_session_after_chat(
-                            doctor=doctor_for_session,
-                            patient=patient_for_session,
-                            chats=chats or [],
-                            summary=str(summary or ""),
-                            meeting_id=meeting_id_for_session,
-                            start_time=start_time,
+                        pair_key_for_session = build_pair_key(
+                            doctor_for_session.name,
+                            patient_for_session.name,
                         )
-                        if isinstance(session_eval_payload, dict):
+                        minimal_duplicate = self._is_minimal_meeting_processed(
+                            pair_key_for_session,
+                            meeting_id_for_session,
+                        )
+                        if minimal_duplicate:
                             current_session = self._resolve_session_prompt_current_session(
                                 doctor_for_session.name,
                                 patient_for_session.name,
                             )
-                            pair_key_for_session = build_pair_key(doctor_for_session.name, patient_for_session.name)
-                            reason_text = str(session_eval_payload.get("reason", "") or "")
-                            self._store_session_eval_reason(
-                                pair_key=pair_key_for_session,
-                                current_session=current_session,
-                                meeting_id=meeting_id_for_session,
-                                reason=reason_text,
+                            audit = {
+                                "applied": True,
+                                "pair_key": pair_key_for_session,
+                                "session_before": current_session,
+                                "action": "skip_duplicate_meeting",
+                                "current_session": current_session,
+                                "completed": bool(
+                                    self.session_prompt_injection.resolve_current_session(
+                                        doctor_for_session.name,
+                                        patient_for_session.name,
+                                    ).get("completed", False)
+                                ),
+                            }
+                        else:
+                            minimal_mode = self.get_cbt_controller_mode() == "minimal"
+                            progressive_d_mode = bool(
+                                minimal_mode
+                                and self._is_progressive_d_configured()
                             )
-                            self.append_dialog_judge_trace_eval(
+                            session_eval_payload = None
+                            if progressive_d_mode:
+                                self._log_highlight(
+                                    "[PROGRESSIVE_D_SESSION_EVAL_SKIPPED] meeting_id={}".format(
+                                        meeting_id_for_session
+                                    )
+                                )
+                            else:
+                                try:
+                                    session_eval_payload = self.evaluate_session_after_chat(
+                                        doctor=doctor_for_session,
+                                        patient=patient_for_session,
+                                        chats=chats or [],
+                                        meeting_id=meeting_id_for_session,
+                                    )
+                                except Exception as exc:
+                                    if not minimal_mode:
+                                        raise
+                                    self._log_highlight(
+                                        "[MINIMAL_SESSION_EVAL_FAIL_CLOSED] meeting_id={} error={}".format(
+                                            meeting_id_for_session,
+                                            str(exc),
+                                        )
+                                    )
+                            subgoal_record = None
+                            if progressive_d_mode:
+                                try:
+                                    subgoal_record = self.evaluate_progressive_d_control_after_chat(
+                                        doctor=doctor_for_session,
+                                        patient=patient_for_session,
+                                        chats=chats or [],
+                                        meeting_id=meeting_id_for_session,
+                                    )
+                                except Exception as exc:
+                                    self._log_highlight(
+                                        "[PROGRESSIVE_D_CONTROL_ISOLATED_ERROR] meeting_id={} error={}".format(
+                                            meeting_id_for_session,
+                                            str(exc),
+                                        )
+                                    )
+                            if progressive_d_mode:
+                                current_session = self._resolve_session_prompt_current_session(
+                                    doctor_for_session.name,
+                                    patient_for_session.name,
+                                )
+                                expected_version = str(
+                                    self.get_progressive_d_runtime_policy().get(
+                                        "controller_version",
+                                        MINIMAL_STAGE_ADAPTER_VERSION,
+                                    )
+                                    or MINIMAL_STAGE_ADAPTER_VERSION
+                                )
+                                latest_record = (
+                                    subgoal_record
+                                    if isinstance(subgoal_record, dict)
+                                    else {}
+                                )
+                                record_fresh = bool(
+                                    str(
+                                        latest_record.get(
+                                            "meeting_id",
+                                            "",
+                                        )
+                                        or ""
+                                    )
+                                    == meeting_id_for_session
+                                    and str(
+                                        latest_record.get(
+                                            "legacy_session",
+                                            "",
+                                        )
+                                        or ""
+                                    )
+                                    == current_session
+                                    and str(
+                                        latest_record.get(
+                                            "cbt_controller_version",
+                                            "",
+                                        )
+                                        or ""
+                                    )
+                                    == expected_version
+                                )
+                                transition_adapter = (
+                                    latest_record.get(
+                                        "transition_adapter",
+                                        {},
+                                    )
+                                    if record_fresh
+                                    else {}
+                                )
+                                if not isinstance(
+                                    transition_adapter,
+                                    dict,
+                                ):
+                                    transition_adapter = {}
+                                if not transition_adapter:
+                                    transition_adapter = {
+                                        "recommended_action": "",
+                                        "effective_action": "hold",
+                                        "session_end": False,
+                                        "reason": (
+                                            "stage_adapter_missing"
+                                            if record_fresh
+                                            else "stage_adapter_record_stale"
+                                        ),
+                                    }
+                                session_eval_end = bool(
+                                    transition_adapter.get(
+                                        "session_end",
+                                        False,
+                                    )
+                                )
+                                self.append_dialog_judge_trace_eval(
+                                    meeting_id=meeting_id_for_session,
+                                    pair_key=pair_key_for_session,
+                                    step_time=self._resolve_trace_step_time(),
+                                    normalized_eval_payload={
+                                        "control_source": (
+                                            "batch_control_adapter"
+                                            if self._is_progressive_d_v3_configured()
+                                            else "subgoal_adapter"
+                                        ),
+                                        "session_end": session_eval_end,
+                                        "stage_transition_adapter": copy.deepcopy(
+                                            transition_adapter
+                                        ),
+                                    },
+                                )
+                            elif isinstance(session_eval_payload, dict):
+                                current_session = self._resolve_session_prompt_current_session(
+                                    doctor_for_session.name,
+                                    patient_for_session.name,
+                                )
+                                reason_text = str(session_eval_payload.get("reason", "") or "")
+                                self._store_session_eval_reason(
+                                    pair_key=pair_key_for_session,
+                                    current_session=current_session,
+                                    meeting_id=meeting_id_for_session,
+                                    reason=reason_text,
+                                )
+                                if minimal_mode:
+                                    self._store_minimal_session_eval_result(
+                                        pair_key=pair_key_for_session,
+                                        meeting_id=meeting_id_for_session,
+                                        payload=session_eval_payload,
+                                    )
+                                self.append_dialog_judge_trace_eval(
+                                    meeting_id=meeting_id_for_session,
+                                    pair_key=pair_key_for_session,
+                                    step_time=self._resolve_trace_step_time(),
+                                    normalized_eval_payload=session_eval_payload,
+                                )
+                                session_eval_end = bool(
+                                    session_eval_payload.get("session_end", False)
+                                )
+                            if minimal_mode and session_eval_end is None:
+                                session_eval_end = False
+                            audit = self.session_prompt_injection.on_chat_finished(
+                                doctor_name=doctor_for_session.name,
+                                patient_name=patient_for_session.name,
+                                chats=chats or [],
                                 meeting_id=meeting_id_for_session,
-                                pair_key=pair_key_for_session,
-                                step_time=self._resolve_trace_step_time(),
-                                normalized_eval_payload=session_eval_payload,
+                                now_str=self._fmt_dt(start_time),
+                                session_eval_end=session_eval_end,
                             )
-                            session_eval_end = bool(session_eval_payload.get("session_end", False))
-                        audit = self.session_prompt_injection.on_chat_finished(
-                            doctor_name=doctor_for_session.name,
-                            patient_name=patient_for_session.name,
-                            chats=chats or [],
-                            meeting_id=meeting_id_for_session,
-                            now_str=self._fmt_dt(start_time),
-                            session_eval_end=session_eval_end,
-                        )
+                            if minimal_mode:
+                                self._mark_controller_meeting_processed(
+                                    pair_key_for_session,
+                                    meeting_id_for_session,
+                                )
+                            if (
+                                minimal_mode and progressive_d_mode
+                            ):
+                                try:
+                                    self._progressive_d_progress_state_for_pair(
+                                        pair_key_for_session,
+                                        str(audit.get("current_session", "") or ""),
+                                    )
+                                except Exception as exc:
+                                    self._log_highlight(
+                                        "[SUBGOAL_PROGRESS_SYNC_ERROR] meeting_id={} error={}".format(
+                                            meeting_id_for_session,
+                                            str(exc),
+                                        )
+                                    )
                     if session_eval_end is not None:
                         self._log_highlight(
                             "[SESSION_PROMPT_EVAL_END] meeting_id={} session_eval_end={} action={}".format(
@@ -617,6 +846,12 @@ class InterventionManager:
         doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
         if not doctor or not patient:
             return
+        if closed_meeting_id and closed_meeting_kind != "resident_chat":
+            self.append_dialog_judge_trace_reflection(
+                doctor=doctor,
+                patient=patient,
+                meeting_id=closed_meeting_id,
+            )
 
         now_step = int(self.config.get("step", 0) or 0)
         runtime_snapshot = self._get_patient_depression_runtime_snapshot(patient)
@@ -1364,16 +1599,1260 @@ class InterventionManager:
         )
         return policy
 
+    def get_cbt_controller_mode(self) -> str:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        mode = str(intervention_cfg.get("cbt_controller_mode", "legacy") or "legacy").strip().lower()
+        return mode if mode in ("legacy", "minimal") else "legacy"
+
+    def _minimal_progress_state(self, pair_key: str) -> Dict[str, Any]:
+        self._ensure_session_eval_state_schema()
+        state = self.state.setdefault("session_eval_state", {})
+        pairs = state.setdefault("minimal_by_pair", {})
+        item = pairs.setdefault(str(pair_key or ""), copy.deepcopy(MINIMAL_PROGRESS_DEFAULT))
+        if not isinstance(item, dict):
+            item = copy.deepcopy(MINIMAL_PROGRESS_DEFAULT)
+            pairs[str(pair_key or "")] = item
+        for key, value in MINIMAL_PROGRESS_DEFAULT.items():
+            if key not in item:
+                item[key] = copy.deepcopy(value)
+        if not isinstance(item.get("latest_patient_state"), dict):
+            item["latest_patient_state"] = {}
+        item["tracker_meeting_id"] = str(item.get("tracker_meeting_id", "") or "")
+        if not isinstance(item.get("high_risk_seen"), bool):
+            item["high_risk_seen"] = False
+        item.pop("last_patient_evidence", None)
+        return item
+
+    def _minimal_state_for_meeting(
+        self,
+        pair_key: str,
+        meeting_id: str,
+    ) -> Dict[str, Any]:
+        progress_state = self._minimal_progress_state(pair_key)
+        target = str(meeting_id or "").strip()
+        current = str(progress_state.get("tracker_meeting_id", "") or "").strip()
+        if not target or current != target:
+            progress_state["latest_patient_state"] = copy.deepcopy(PATIENT_STATE_DEFAULT)
+            progress_state["tracker_meeting_id"] = target
+            progress_state["high_risk_seen"] = False
+        elif not progress_state.get("latest_patient_state"):
+            progress_state["latest_patient_state"] = copy.deepcopy(PATIENT_STATE_DEFAULT)
+        return progress_state
+
+    def _progressive_d_tracker_state(self, pair_key: str) -> Dict[str, Any]:
+        self._ensure_progressive_d_state_schema()
+        state = self.state.setdefault("progressive_d_tracker_state", {})
+        pairs = state.setdefault("by_pair", {})
+        pair = str(pair_key or "")
+        item = pairs.setdefault(
+            pair,
+            {
+                "latest_patient_state": copy.deepcopy(
+                    PROGRESSIVE_D_PATIENT_STATE_DEFAULT
+                ),
+                "tracker_meeting_id": "",
+                "high_risk_seen": False,
+            },
+        )
+        if not isinstance(item, dict):
+            item = {
+                "latest_patient_state": copy.deepcopy(
+                    PROGRESSIVE_D_PATIENT_STATE_DEFAULT
+                ),
+                "tracker_meeting_id": "",
+                "high_risk_seen": False,
+            }
+            pairs[pair] = item
+        latest = item.get("latest_patient_state")
+        if not isinstance(latest, dict):
+            item["latest_patient_state"] = copy.deepcopy(
+                PROGRESSIVE_D_PATIENT_STATE_DEFAULT
+            )
+        else:
+            item["latest_patient_state"] = normalize_progressive_d_patient_state(
+                latest
+            )
+        item["tracker_meeting_id"] = str(
+            item.get("tracker_meeting_id", "") or ""
+        )
+        item["high_risk_seen"] = bool(item.get("high_risk_seen", False))
+        item.pop("tracker_valid", None)
+        return item
+
+    def _progressive_d_state_for_meeting(
+        self,
+        pair_key: str,
+        meeting_id: str,
+    ) -> Dict[str, Any]:
+        state = self._progressive_d_tracker_state(pair_key)
+        target = str(meeting_id or "").strip()
+        current = str(state.get("tracker_meeting_id", "") or "").strip()
+        if target and current != target:
+            state["tracker_meeting_id"] = target
+            state["high_risk_seen"] = False
+        return state
+
+    def _progressive_d_risk_check_state(
+        self,
+        pair_key: str,
+    ) -> Dict[str, Any]:
+        self._ensure_progressive_d_state_schema()
+        state = self.state.setdefault("risk_check_state_by_pair", {})
+        pair = str(pair_key or "")
+        item = state.setdefault(
+            pair,
+            {
+                "last_risk_level": "none",
+                "episode": 0,
+                "check_pending": False,
+                "checked": False,
+                "awaiting_patient_response": False,
+            },
+        )
+        if not isinstance(item, dict):
+            item = {}
+            state[pair] = item
+        item["last_risk_level"] = str(
+            item.get("last_risk_level", "none") or "none"
+        )
+        try:
+            item["episode"] = max(0, int(item.get("episode", 0) or 0))
+        except (TypeError, ValueError):
+            item["episode"] = 0
+        for field in (
+            "check_pending",
+            "checked",
+            "awaiting_patient_response",
+        ):
+            item[field] = bool(item.get(field, False))
+        return item
+
+    def _update_progressive_d_risk_check_after_patient(
+        self,
+        pair_key: str,
+        risk_level: str,
+    ) -> Dict[str, Any]:
+        item = self._progressive_d_risk_check_state(pair_key)
+        current = str(risk_level or "none").strip().lower()
+        previous = str(item.get("last_risk_level", "none") or "none")
+        if current == "none":
+            item.update(
+                {
+                    "last_risk_level": "none",
+                    "check_pending": False,
+                    "checked": False,
+                    "awaiting_patient_response": False,
+                }
+            )
+            return item
+        if current == "high":
+            if previous != "high":
+                item["episode"] = int(item.get("episode", 0) or 0) + 1
+            item.update(
+                {
+                    "last_risk_level": "high",
+                    "check_pending": True,
+                    "checked": False,
+                    "awaiting_patient_response": False,
+                }
+            )
+            return item
+        if previous == "none":
+            item["episode"] = int(item.get("episode", 0) or 0) + 1
+            item["check_pending"] = True
+            item["checked"] = False
+        if bool(item.get("awaiting_patient_response", False)):
+            item["awaiting_patient_response"] = False
+            item["check_pending"] = False
+            item["checked"] = True
+        item["last_risk_level"] = "possible"
+        return item
+
+    def _mark_progressive_d_safety_check_requested(
+        self,
+        pair_key: str,
+    ) -> None:
+        item = self._progressive_d_risk_check_state(pair_key)
+        item["awaiting_patient_response"] = True
+        item["check_pending"] = False
+
+    def _is_minimal_meeting_processed(self, pair_key: str, meeting_id: str) -> bool:
+        if self.get_cbt_controller_mode() != "minimal":
+            return False
+        return self._is_controller_meeting_processed(
+            pair_key,
+            meeting_id,
+        )
+
+    def _minimal_state_tracker_policy(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw = intervention_cfg.get("state_tracker", {}) or {}
+        if self._is_progressive_d_v3_configured():
+            progressive_d_policy = self.get_progressive_d_runtime_policy()
+            return {
+                "enabled": bool(progressive_d_policy.get("enabled", False)),
+                "prompt_file": str(
+                    progressive_d_policy.get("state_tracker_prompt_file", "")
+                    or "data/prompts/intervention/state_tracker_progressive_d.txt"
+                ).strip(),
+                "retry": int(progressive_d_policy.get("state_tracker_retry", 2) or 2),
+                "recent_utterances": int(
+                    progressive_d_policy.get("state_tracker_recent_utterances", 8)
+                    or 8
+                ),
+            }
+        default_prompt = (
+            "data/prompts/intervention/state_tracker_progressive_d.txt"
+            if self._is_progressive_d_v3_configured()
+            else "data/prompts/intervention/state_tracker.txt"
+        )
+        configured_prompt_key = (
+            "progressive_d_prompt_file"
+            if self._is_progressive_d_v3_configured()
+            else "prompt_file"
+        )
+        return {
+            "enabled": self._safe_bool(raw.get("enabled", True), True),
+            "prompt_file": str(
+                raw.get(configured_prompt_key, default_prompt)
+                or default_prompt
+            ).strip(),
+            "retry": max(1, self._safe_int(raw.get("retry", 2), 2)),
+            "recent_utterances": max(1, self._safe_int(raw.get("recent_utterances", 8), 8)),
+        }
+
+    def _minimal_strategy_map(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        router_cfg = intervention_cfg.get("strategy_router", {}) or {}
+        path = str(
+            router_cfg.get("strategy_map_file", "data/intervention/cbt_strategy_map.json")
+            or "data/intervention/cbt_strategy_map.json"
+        ).strip()
+        if self._cbt_strategy_map_cache is None or self._cbt_strategy_map_cache_path != path:
+            self._cbt_strategy_map_cache = load_strategy_map(path)
+            self._cbt_strategy_map_cache_path = path
+        return self._cbt_strategy_map_cache
+
+    def get_progressive_d_runtime_policy(self) -> Dict[str, Any]:
+        """Return the native D policy, with a strict fallback for old D configs."""
+
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw = intervention_cfg.get("progressive_d")
+        native = isinstance(raw, dict)
+        if native:
+            state_tracker = raw.get("state_tracker", {}) or {}
+            judge = raw.get("judge", {}) or {}
+            control_eval = raw.get("control_eval", {}) or {}
+            transitions = raw.get("transitions", {}) or {}
+            if not isinstance(state_tracker, dict):
+                state_tracker = {}
+            if not isinstance(judge, dict):
+                judge = {}
+            if not isinstance(control_eval, dict):
+                control_eval = {}
+            if not isinstance(transitions, dict):
+                transitions = {}
+            enabled = bool(
+                self.get_cbt_controller_mode() == "minimal"
+                and self._safe_bool(raw.get("enabled", False), False)
+            )
+            route = str(
+                control_eval.get("route", "forced_llm") or "forced_llm"
+            ).strip().lower()
+            if route not in {"forced_llm", "think_llm"}:
+                route = "forced_llm"
+            raw_actions = transitions.get(
+                "allowed_actions",
+                ["stay", "side_step", "soft_step_back", "hold"],
+            )
+            allowed_actions = []
+            if isinstance(raw_actions, list):
+                for value in raw_actions:
+                    action = str(value or "").strip().lower()
+                    if action in STAGE_ADAPTER_ACTIONS and action not in allowed_actions:
+                        allowed_actions.append(action)
+            raw_predecessors = transitions.get("soft_step_back_predecessors", {}) or {}
+            predecessors = (
+                copy.deepcopy(raw_predecessors)
+                if isinstance(raw_predecessors, dict)
+                else {}
+            )
+            return {
+                "enabled": enabled,
+                "source": "progressive_d",
+                "controller_version": str(
+                    raw.get("controller_version", "") or ""
+                ).strip(),
+                "state_tracker_prompt_file": str(
+                    state_tracker.get(
+                        "prompt_file",
+                        "data/prompts/intervention/state_tracker_progressive_d.txt",
+                    )
+                    or "data/prompts/intervention/state_tracker_progressive_d.txt"
+                ).strip(),
+                "state_tracker_retry": max(
+                    1,
+                    self._safe_int(state_tracker.get("retry", 2), 2),
+                ),
+                "state_tracker_recent_utterances": max(
+                    1,
+                    self._safe_int(state_tracker.get("recent_utterances", 8), 8),
+                ),
+                "judge_prompt_file": str(
+                    judge.get(
+                        "prompt_file",
+                        "data/prompts/intervention/dialog_judge_progressive_d.txt",
+                    )
+                    or "data/prompts/intervention/dialog_judge_progressive_d.txt"
+                ).strip(),
+                "judge_retry": max(1, self._safe_int(judge.get("retry", 2), 2)),
+                "control_route": route,
+                "control_prompt_file": str(
+                    control_eval.get(
+                        "prompt_file",
+                        "data/prompts/intervention/control_eval_progressive_d.txt",
+                    )
+                    or "data/prompts/intervention/control_eval_progressive_d.txt"
+                ).strip(),
+                "stage_subgoals_file": str(
+                    control_eval.get(
+                        "stage_subgoals_file",
+                        "data/intervention/cbt_stage_subgoals.json",
+                    )
+                    or "data/intervention/cbt_stage_subgoals.json"
+                ).strip(),
+                "control_retry": max(
+                    1,
+                    self._safe_int(control_eval.get("retry", 2), 2),
+                ),
+                "allowed_actions": allowed_actions,
+                "soft_step_back_predecessors": predecessors,
+            }
+
+        shadow = intervention_cfg.get("subgoal_shadow", {}) or {}
+        progress = intervention_cfg.get("subgoal_progress_for_judge", {}) or {}
+        limited = intervention_cfg.get("limited_subgoal_transitions", {}) or {}
+        adapter = intervention_cfg.get("legacy_stage_transition_adapter", {}) or {}
+        if not isinstance(shadow, dict):
+            shadow = {}
+        if not isinstance(progress, dict):
+            progress = {}
+        if not isinstance(limited, dict):
+            limited = {}
+        if not isinstance(adapter, dict):
+            adapter = {}
+        version = str(intervention_cfg.get("cbt_controller_version", "") or "").strip()
+        adapter_version = str(adapter.get("controller_version", "") or "").strip()
+        enabled = bool(
+            self.get_cbt_controller_mode() == "minimal"
+            and self._safe_bool(intervention_cfg.get("subgoal_shadow_enabled", False), False)
+            and self._safe_bool(progress.get("enabled", False), False)
+            and self._safe_bool(limited.get("enabled", False), False)
+            and self._safe_bool(adapter.get("enabled", False), False)
+            and version == PROGRESSIVE_D_CONTROLLER_VERSION
+            and adapter_version == PROGRESSIVE_D_CONTROLLER_VERSION
+        )
+        return {
+            "enabled": enabled,
+            "source": "legacy_progressive_d_config",
+            "controller_version": adapter_version,
+            "state_tracker_prompt_file": str(
+                (intervention_cfg.get("state_tracker", {}) or {}).get(
+                    "progressive_d_prompt_file",
+                    "data/prompts/intervention/state_tracker_progressive_d.txt",
+                )
+                or "data/prompts/intervention/state_tracker_progressive_d.txt"
+            ).strip(),
+            "state_tracker_retry": max(
+                1,
+                self._safe_int(
+                    (intervention_cfg.get("state_tracker", {}) or {}).get("retry", 2),
+                    2,
+                ),
+            ),
+            "state_tracker_recent_utterances": max(
+                1,
+                self._safe_int(
+                    (intervention_cfg.get("state_tracker", {}) or {}).get(
+                        "recent_utterances",
+                        8,
+                    ),
+                    8,
+                ),
+            ),
+            "judge_prompt_file": str(
+                (intervention_cfg.get("dialog_judge", {}) or {}).get(
+                    "progressive_d_prompt_file",
+                    "data/prompts/intervention/dialog_judge_progressive_d.txt",
+                )
+                or "data/prompts/intervention/dialog_judge_progressive_d.txt"
+            ).strip(),
+            "judge_retry": max(
+                1,
+                self._safe_int(
+                    (intervention_cfg.get("dialog_judge", {}) or {}).get("retry", 2),
+                    2,
+                ),
+            ),
+            "control_route": str(shadow.get("route", "forced_llm") or "forced_llm").strip().lower(),
+            "control_prompt_file": str(
+                shadow.get(
+                    "progressive_d_prompt_file",
+                    "data/prompts/intervention/control_eval_progressive_d.txt",
+                )
+                or "data/prompts/intervention/control_eval_progressive_d.txt"
+            ).strip(),
+            "stage_subgoals_file": str(
+                shadow.get(
+                    "stage_subgoals_file",
+                    "data/intervention/cbt_stage_subgoals.json",
+                )
+                or "data/intervention/cbt_stage_subgoals.json"
+            ).strip(),
+            "control_retry": max(1, self._safe_int(shadow.get("retry", 2), 2)),
+            "allowed_actions": copy.deepcopy(
+                adapter.get("allowed_actions", list(STAGE_ADAPTER_ACTIONS))
+            ),
+            "soft_step_back_predecessors": copy.deepcopy(
+                adapter.get("soft_step_back_predecessors", {}) or {}
+            ),
+        }
+
+    def _minimal_term_glossary(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        router_cfg = intervention_cfg.get("strategy_router", {}) or {}
+        path = str(
+            router_cfg.get(
+                "term_glossary_file",
+                "data/intervention/cbt_term_glossary.json",
+            )
+            or "data/intervention/cbt_term_glossary.json"
+        ).strip()
+        if (
+            self._cbt_term_glossary_cache is None
+            or self._cbt_term_glossary_cache_path != path
+        ):
+            self._cbt_term_glossary_cache = load_term_glossary(
+                path,
+                self._minimal_strategy_map(),
+            )
+            self._cbt_term_glossary_cache_path = path
+        return self._cbt_term_glossary_cache
+
+
+    def _is_progressive_d_configured(self) -> bool:
+        return bool(self.get_progressive_d_runtime_policy().get("enabled", False))
+
+    def _is_progressive_d_v3_configured(self) -> bool:
+        policy = self.get_progressive_d_runtime_policy()
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        configured_version = str(intervention_cfg.get("cbt_controller_version", "") or "").strip()
+        policy_version = str(policy.get("controller_version", "") or "").strip()
+        return bool(
+            policy.get("enabled", False)
+            and configured_version == PROGRESSIVE_D_CONTROLLER_VERSION
+            and policy_version == PROGRESSIVE_D_CONTROLLER_VERSION
+        )
+
+    def _minimal_stage_subgoals(self, path: str) -> Dict[str, Any]:
+        path_text = str(path or "").strip()
+        if (
+            self._cbt_stage_subgoals_cache is None
+            or self._cbt_stage_subgoals_cache_path != path_text
+        ):
+            self._cbt_stage_subgoals_cache = load_stage_subgoal_map(path_text)
+            self._cbt_stage_subgoals_cache_path = path_text
+        return self._cbt_stage_subgoals_cache
+
+
+    def _progressive_d_progress_state_for_pair(
+        self,
+        pair_key: str,
+        current_session: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        policy = self.get_progressive_d_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            raise ValueError("Progressive D is disabled")
+        stage_map = self._minimal_stage_subgoals(
+            str(policy.get("stage_subgoals_file", "") or "")
+        )
+        stage_item = stage_map.get(str(current_session or ""))
+        if not isinstance(stage_item, dict):
+            raise ValueError(
+                f"no static subgoal mapping for fixed outline: {current_session}"
+            )
+        self._ensure_subgoal_progress_state_schema()
+        pairs = self.state.setdefault("subgoal_progress_by_pair", {})
+        pair_key_text = str(pair_key or "")
+        current = initialize_subgoal_progress_state(
+            str(current_session or ""),
+            stage_item,
+            pairs.get(pair_key_text),
+            preserve_active=True,
+            include_side_step=True,
+            include_stage_adapter=True,
+            include_evidence_turn_id=False,
+            include_batch_control=True,
+            controller_version=str(
+                policy.get("controller_version", PROGRESSIVE_D_CONTROLLER_VERSION)
+                or PROGRESSIVE_D_CONTROLLER_VERSION
+            ),
+        )
+        soft_step_back = current.get("soft_step_back", {})
+        if isinstance(soft_step_back, dict) and soft_step_back.get("active", False):
+            eligible_targets = eligible_soft_step_back_targets(
+                stage_map=stage_map,
+                legacy_order=list(
+                    self.session_prompt_injection.injection_cfg.get("order", [])
+                    or []
+                ),
+                current_session=str(current_session or ""),
+                current_macro_stage=str(stage_item.get("macro_stage", "") or ""),
+                active_subgoal_id=str(
+                    soft_step_back.get("return_to_subgoal_id", "") or ""
+                ),
+                configured_predecessors=policy.get(
+                    "soft_step_back_predecessors",
+                    {},
+                ),
+            )
+            if str(soft_step_back.get("target_subgoal_id", "") or "") not in eligible_targets:
+                current["soft_step_back"] = copy_soft_step_back_default()
+        pairs[pair_key_text] = current
+        return current, stage_item
+
+
+    def _apply_progressive_d_control_result(
+        self,
+        pair_key: str,
+        meeting_id: str,
+        legacy_session: str,
+        payload: Dict[str, Any],
+        evaluator_valid: bool = True,
+    ) -> Dict[str, Any]:
+        """Merge one D batch and derive the calibrated graded completion audit."""
+
+        result: Dict[str, Any] = {
+            "recommended_action": str(
+                payload.get("recommended_action", "") or ""
+            ),
+            "effective_action": "hold",
+            "session_end": False,
+            "reason": "",
+            "session_prompt_complete": False,
+            "completion_reason": "not_ready",
+            "completion_score": 0.0,
+            "completion_threshold": 0.0,
+            "meetings_in_current_prompt": 0,
+        }
+        tracker = self._progressive_d_tracker_state(pair_key)
+        meeting_id_text = str(meeting_id or "").strip()
+        if (
+            not meeting_id_text
+            or str(tracker.get("tracker_meeting_id", "") or "")
+            != meeting_id_text
+        ):
+            result["reason"] = "meeting_state_stale"
+            return result
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        stage_policy = self.get_progressive_d_runtime_policy()
+        expected_version = str(
+            intervention_cfg.get("cbt_controller_version", "") or ""
+        )
+        actual_version = str(
+            stage_policy.get("controller_version", "") or ""
+        )
+        if (
+            expected_version != PROGRESSIVE_D_CONTROLLER_VERSION
+            or actual_version != expected_version
+        ):
+            result["reason"] = "controller_version_mismatch"
+            return result
+
+        progress_state, stage_item = self._progressive_d_progress_state_for_pair(
+            pair_key,
+            legacy_session,
+        )
+        processed = progress_state.get("meeting_ids_in_current_prompt", [])
+        if isinstance(processed, list) and meeting_id_text in processed:
+            result["reason"] = "duplicate_meeting"
+            return result
+        candidate = copy.deepcopy(progress_state)
+        if evaluator_valid:
+            try:
+                merge_progressive_d_batch_progress(
+                    candidate,
+                    stage_item,
+                    payload.get("subgoals", []),
+                    meeting_id_text,
+                )
+            except Exception as exc:
+                result["reason"] = "batch_merge_invalid:{}".format(str(exc))
+                return result
+        else:
+            meeting_ids = candidate.setdefault(
+                "meeting_ids_in_current_prompt",
+                [],
+            )
+            if not isinstance(meeting_ids, list):
+                meeting_ids = []
+                candidate["meeting_ids_in_current_prompt"] = meeting_ids
+            meeting_ids.append(meeting_id_text)
+            candidate["meetings_in_current_prompt"] = len(meeting_ids)
+
+        audit = progressive_d_completion_audit(
+            candidate,
+            high_risk_seen=bool(tracker.get("high_risk_seen", False)),
+        )
+        result.update(copy.deepcopy(audit))
+        prompt_state = (
+            self.session_prompt_injection.resolve_current_session(
+                *str(pair_key or "").split("::", 1)
+            )
+            if "::" in str(pair_key or "")
+            else {}
+        )
+        order = list(
+            self.session_prompt_injection.injection_cfg.get("order", [])
+            or []
+        )
+        current = str(
+            prompt_state.get("current_session", legacy_session) or ""
+        )
+        try:
+            current_index = int(prompt_state.get("current_index", 0) or 0)
+        except (TypeError, ValueError):
+            current_index = -1
+        if (
+            current != str(legacy_session or "")
+            or current not in order
+            or current_index < 0
+            or current_index >= len(order)
+            or order[current_index] != current
+        ):
+            result["reason"] = "legacy_state_invalid"
+            return result
+
+        action = str(payload.get("recommended_action", "") or "")
+        if not evaluator_valid:
+            result["effective_action"] = "hold"
+            result["reason"] = "control_evaluator_invalid"
+            result["session_prompt_complete"] = False
+            result["completion_reason"] = "blocked_by_hold"
+        elif action == "hold":
+            result["effective_action"] = "hold"
+            result["reason"] = "recommended_hold"
+            result["session_prompt_complete"] = False
+            result["completion_reason"] = "blocked_by_hold"
+        elif action == "side_step":
+            side_step = candidate.get("side_step")
+            if not isinstance(side_step, dict):
+                side_step = {}
+                candidate["side_step"] = side_step
+            if side_step.get("active", False):
+                result["reason"] = "side_step_already_active"
+            elif not str(payload.get("reason", "") or "").strip():
+                result["reason"] = "side_step_reason_empty"
+            else:
+                side_step.update(
+                    {
+                        "active": True,
+                        "reason": str(payload.get("reason", "") or "").strip(),
+                        "return_to_subgoal_id": str(
+                            candidate.get("active_subgoal_id", "") or ""
+                        ),
+                        "started_meeting_id": meeting_id_text,
+                    }
+                )
+                result["effective_action"] = "side_step"
+                result["reason"] = "side_step_activated"
+            result["session_prompt_complete"] = False
+            result["completion_reason"] = (
+                "blocked_by_side_step"
+                if result["effective_action"] == "side_step"
+                else "blocked_by_hold"
+            )
+        elif action == "soft_step_back":
+            target = str(payload.get("target_subgoal_id", "") or "")
+            stage_map = self._minimal_stage_subgoals(
+                str(
+                    self.get_progressive_d_runtime_policy().get(
+                        "stage_subgoals_file",
+                        "",
+                    )
+                    or ""
+                )
+            )
+            eligible = eligible_soft_step_back_targets(
+                stage_map=stage_map,
+                legacy_order=order,
+                current_session=current,
+                current_macro_stage=str(
+                    stage_item.get("macro_stage", "") or ""
+                ),
+                active_subgoal_id=str(
+                    candidate.get("active_subgoal_id", "") or ""
+                ),
+                configured_predecessors=stage_policy.get(
+                    "soft_step_back_predecessors",
+                    {},
+                ),
+            )
+            if target not in eligible:
+                result["reason"] = "soft_step_back_target_not_allowed"
+            else:
+                candidate["soft_step_back"] = {
+                    "active": True,
+                    "target_subgoal_id": target,
+                    "return_to_subgoal_id": str(
+                        candidate.get("active_subgoal_id", "") or ""
+                    ),
+                    "reason": str(payload.get("reason", "") or "").strip(),
+                }
+                result["effective_action"] = "soft_step_back"
+                result["reason"] = "soft_step_back_activated"
+            result["session_prompt_complete"] = False
+            result["completion_reason"] = (
+                "blocked_by_soft_step_back"
+                if result["effective_action"] == "soft_step_back"
+                else "blocked_by_hold"
+            )
+        elif bool(audit.get("session_prompt_complete", False)):
+            result["effective_action"] = "advance_stage"
+            result["session_end"] = True
+            result["reason"] = str(
+                audit.get("completion_reason", "") or "score_threshold"
+            )
+        elif action == "stay":
+            result["effective_action"] = "stay"
+            result["reason"] = str(
+                audit.get("completion_reason", "") or "not_ready"
+            )
+        else:
+            result["effective_action"] = "hold"
+            result["reason"] = "recommended_hold"
+            result["session_prompt_complete"] = False
+            result["completion_reason"] = "blocked_by_hold"
+
+        self.state.setdefault("subgoal_progress_by_pair", {})[
+            str(pair_key or "")
+        ] = candidate
+        return result
+
+    def _compact_subgoal_progress_for_judge(
+        self,
+        pair_key: str,
+        current_session: str,
+    ) -> str:
+        progress_state, stage_item = self._progressive_d_progress_state_for_pair(
+            pair_key,
+            current_session,
+        )
+        glossary = self._minimal_term_glossary()
+        return compact_progressive_d_subgoal_progress_text(
+            stage_item,
+            progress_state,
+            glossary.get("macro_stages", {}),
+        )
+
+    def _compact_prior_control_progress_for_judge(
+        self,
+        pair_key: str,
+        current_session: str,
+        progress_state: Mapping[str, Any],
+    ) -> str:
+        """Expose only the final controller decision to Progressive D Judge."""
+
+        if not self._is_progressive_d_configured():
+            return compact_prior_progress_text(progress_state)
+
+        state = self.state.get(
+            (
+                "progressive_d_control_state"
+                if self._is_progressive_d_v3_configured()
+                else "subgoal_shadow_state"
+            ),
+            {},
+        )
+        latest_by_pair = (
+            state.get("latest_by_pair", {})
+            if isinstance(state, Mapping)
+            else {}
+        )
+        record = (
+            latest_by_pair.get(str(pair_key or ""), {})
+            if isinstance(latest_by_pair, Mapping)
+            else {}
+        )
+        if not isinstance(record, Mapping):
+            record = {}
+        adapter = record.get("transition_adapter", {})
+        if not isinstance(adapter, Mapping):
+            adapter = {}
+        current_text = str(current_session or "").strip() or "未知"
+        if not record or not adapter:
+            return (
+                "尚无上次会后最终控制结论；"
+                "当前固定会谈提纲={}，继续围绕当前提纲推进。"
+            ).format(current_text)
+
+        expected_version = str(
+            self.get_progressive_d_runtime_policy().get(
+                "controller_version",
+                MINIMAL_STAGE_ADAPTER_VERSION,
+            )
+            or MINIMAL_STAGE_ADAPTER_VERSION
+        ).strip()
+        record_version = str(
+            record.get("cbt_controller_version", "") or ""
+        ).strip()
+        if not record_version or record_version != expected_version:
+            return (
+                "上次会后控制结论版本不匹配，暂缓采用；"
+                "当前固定会谈提纲={}，继续围绕当前提纲推进。"
+            ).format(current_text)
+
+        effective_action = str(
+            adapter.get("effective_action", "") or ""
+        ).strip()
+        reason = str(adapter.get("reason", "") or "").strip()
+        previous_session = str(
+            record.get("legacy_session", "") or ""
+        ).strip()
+        action_labels = self._minimal_term_glossary().get("actions", {})
+        action_label = (
+            str(action_labels.get(effective_action, "") or "").strip()
+            if isinstance(action_labels, Mapping)
+            else ""
+        )
+        if not effective_action or effective_action == "hold":
+            return (
+                "上次最终控制结论=暂缓并继续当前固定会谈提纲；"
+                "当前固定会谈提纲={}；"
+                "控制器说明={}"
+            ).format(current_text, reason or "尚无可执行的会后推进结论")
+        if effective_action == "advance_stage":
+            return (
+                "上次最终控制结论=当前固定会谈提纲已完成，并严格相邻推进；"
+                "上一固定会谈提纲={}；当前固定会谈提纲={}；"
+                "控制器说明={}"
+            ).format(
+                previous_session or "未知",
+                current_text,
+                reason or "全部推进条件已通过",
+            )
+        return (
+            "上次最终控制结论={}；"
+            "当前固定会谈提纲={}，继续围绕当前提纲推进；"
+            "控制器说明={}"
+        ).format(
+            action_label or effective_action,
+            current_text,
+            reason or "无",
+        )
+
+    def update_patient_state_after_utterance(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        patient_utterance: str,
+        forced: bool,
+        turn_no: int,
+    ) -> Dict[str, Any]:
+        progressive_d_v3 = self._is_progressive_d_v3_configured()
+        fallback = copy.deepcopy(
+            PROGRESSIVE_D_PATIENT_STATE_DEFAULT
+            if progressive_d_v3
+            else PATIENT_STATE_DEFAULT
+        )
+        if self.get_cbt_controller_mode() != "minimal" or not self.enabled or not bool(forced):
+            return fallback
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        if not doctor or not patient:
+            return fallback
+        if str(getattr(speaker, "name", "") or "") != str(getattr(patient, "name", "") or ""):
+            return fallback
+        meeting_id, pair_key, _ = self._resolve_trace_session_context(doctor, patient)
+        progress_state = (
+            self._progressive_d_state_for_meeting(pair_key, meeting_id)
+            if progressive_d_v3
+            else self._minimal_state_for_meeting(pair_key, meeting_id)
+        )
+        policy = self._minimal_state_tracker_policy()
+        if not bool(policy.get("enabled", True)):
+            if not progressive_d_v3:
+                progress_state["latest_patient_state"] = copy.deepcopy(fallback)
+            return fallback
+
+        patient_utterances, _ = split_utterances(chats or [], patient.name)
+        prompt_text = ""
+        raw: Any = {}
+        error = ""
+        try:
+            if progressive_d_v3:
+                patient_state_text = self._get_progressive_d_patient_state_text(
+                    patient
+                )
+                if not patient_state_text:
+                    raise ValueError("Progressive D patient internal state is empty")
+                prompt_text = load_prompt_template(
+                    str(policy.get("prompt_file", "") or ""),
+                    {"PATIENT_INTERNAL_STATE": patient_state_text},
+                    required_placeholders=("PATIENT_INTERNAL_STATE",),
+                )
+            else:
+                prompt_text = load_prompt_template(
+                    str(policy.get("prompt_file", "") or ""),
+                    {
+                        "CURRENT_PATIENT_REPLY": str(patient_utterance or ""),
+                        "RECENT_DIALOGUE": recent_dialogue(
+                            chats or [],
+                            int(policy.get("recent_utterances", 8) or 8),
+                        ),
+                    },
+                    required_placeholders=("CURRENT_PATIENT_REPLY", "RECENT_DIALOGUE"),
+                )
+            raw = self._call_think_llm_json(
+                prompt_text=prompt_text,
+                retry=int(policy.get("retry", 2) or 2),
+                doctor_agent=doctor,
+                caller="cbt_state_tracker",
+            )
+            normalized = (
+                normalize_progressive_d_patient_state(raw)
+                if progressive_d_v3
+                else normalize_patient_state(raw, patient_utterances)
+            )
+        except Exception as exc:
+            prior = progress_state.get("latest_patient_state", {})
+            normalized = (
+                normalize_progressive_d_patient_state(prior)
+                if progressive_d_v3 and isinstance(prior, dict)
+                else fallback
+            )
+            error = str(exc)
+
+        progress_state["latest_patient_state"] = copy.deepcopy(normalized)
+        if progressive_d_v3:
+            self._update_progressive_d_risk_check_after_patient(
+                pair_key,
+                str(normalized.get("risk_level", "none") or "none"),
+            )
+        if str(normalized.get("risk_level", "") or "") == "high":
+            progress_state["high_risk_seen"] = True
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="state_tracker_llm",
+            prompt_text=prompt_text,
+            output={
+                "raw_output": (
+                    normalize_progressive_d_patient_state(raw)
+                    if progressive_d_v3
+                    else copy.deepcopy(raw)
+                ),
+                "normalized_output": copy.deepcopy(normalized),
+            },
+            turn_no=int(turn_no or -1),
+            meta={
+                "source": (
+                    "progressive_d_state_tracker"
+                    if progressive_d_v3 and not error
+                    else (
+                        "progressive_d_state_tracker_error"
+                        if progressive_d_v3
+                        else (
+                            "state_tracker"
+                            if not error
+                            else "state_tracker_error"
+                        )
+                    )
+                ),
+                "route": "think_llm",
+                "caller": "cbt_state_tracker",
+                "error": error,
+            },
+        )
+        return normalized
+
+    def evaluate_progressive_d_control_after_chat(
+        self,
+        doctor: Any,
+        patient: Any,
+        chats: Any,
+        meeting_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Batch-evaluate all current subgoals for Progressive D v3."""
+
+        if not self._is_progressive_d_v3_configured():
+            return None
+        policy = self.get_progressive_d_runtime_policy()
+        if not bool(policy.get("enabled", False)):
+            return None
+        pair_key = build_pair_key(
+            str(getattr(doctor, "name", "") or ""),
+            str(getattr(patient, "name", "") or ""),
+        )
+        current_session = self._resolve_session_prompt_current_session(
+            str(getattr(doctor, "name", "") or ""),
+            str(getattr(patient, "name", "") or ""),
+        )
+        prompt_text = ""
+        raw: Any = {}
+        normalized: Optional[Dict[str, Any]] = None
+        error = ""
+        stage_item: Dict[str, Any] = {}
+        macro_stage = ""
+        soft_targets: List[str] = []
+        try:
+            stage_map = self._minimal_stage_subgoals(
+                str(policy.get("stage_subgoals_file", "") or "")
+            )
+            configured = stage_map.get(current_session)
+            if not isinstance(configured, dict):
+                raise ValueError(
+                    f"no static subgoal mapping for fixed outline: {current_session}"
+                )
+            stage_item = configured
+            macro_stage = str(stage_item.get("macro_stage", "") or "")
+            progress_state, _ = self._progressive_d_progress_state_for_pair(
+                pair_key,
+                current_session,
+            )
+            stage_policy = self.get_progressive_d_runtime_policy()
+            soft_targets = eligible_soft_step_back_targets(
+                stage_map=stage_map,
+                legacy_order=list(
+                    self.session_prompt_injection.injection_cfg.get(
+                        "order",
+                        [],
+                    )
+                    or []
+                ),
+                current_session=current_session,
+                current_macro_stage=macro_stage,
+                active_subgoal_id=str(
+                    progress_state.get("active_subgoal_id", "") or ""
+                ),
+                configured_predecessors=stage_policy.get(
+                    "soft_step_back_predecessors",
+                    {},
+                ),
+            )
+            configured_subgoals = [
+                {
+                    "子目标ID": str(item.get("id", "") or ""),
+                    "目标": str(item.get("goal", "") or ""),
+                    "完成线索": str(
+                        item.get("completion_hint", "") or ""
+                    ),
+                }
+                for item in stage_item.get("subgoals", [])
+                if isinstance(item, Mapping)
+            ]
+            prompt_text = load_prompt_template(
+                str(policy.get("control_prompt_file", "") or ""),
+                {
+                    "DOCTOR": str(getattr(doctor, "name", "") or ""),
+                    "PATIENT": str(getattr(patient, "name", "") or ""),
+                    "FIXED_OUTLINE_ID": current_session,
+                    "MACRO_STAGE": macro_stage,
+                    "SUBGOAL_CONFIG": json.dumps(
+                        configured_subgoals,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    "PRIOR_PROGRESS": compact_progressive_d_subgoal_progress_text(
+                        stage_item,
+                        progress_state,
+                        self._minimal_term_glossary().get(
+                            "macro_stages",
+                            {},
+                        ),
+                    ),
+                    "MEETING_NUMBER": str(
+                        int(
+                            progress_state.get(
+                                "meetings_in_current_prompt",
+                                0,
+                            )
+                            or 0
+                        )
+                        + 1
+                    ),
+                    "CURRENT_SESSION_PROMPT": str(
+                        self.get_session_prompt_for_judge(
+                            speaker=doctor,
+                            other=patient,
+                            forced=True,
+                        )
+                        or ""
+                    ),
+                    "DIALOGUE_HISTORY": to_conversation_text(chats or []),
+                    "SOFT_STEP_BACK_TARGETS": (
+                        "、".join(soft_targets) or "无"
+                    ),
+                },
+                required_placeholders=(
+                    "DOCTOR",
+                    "PATIENT",
+                    "FIXED_OUTLINE_ID",
+                    "MACRO_STAGE",
+                    "SUBGOAL_CONFIG",
+                    "PRIOR_PROGRESS",
+                    "MEETING_NUMBER",
+                    "CURRENT_SESSION_PROMPT",
+                    "DIALOGUE_HISTORY",
+                    "SOFT_STEP_BACK_TARGETS",
+                ),
+            )
+            if str(policy.get("control_route", "forced_llm") or "") == "think_llm":
+                raw = self._call_think_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("control_retry", 2) or 2),
+                    doctor_agent=doctor,
+                    caller="cbt_progressive_d_control_eval",
+                )
+            else:
+                raw = self._call_forced_llm_json(
+                    prompt_text,
+                    retry=int(policy.get("control_retry", 2) or 2),
+                    caller="cbt_progressive_d_control_eval",
+                )
+            normalized = normalize_progressive_d_control_eval(
+                raw,
+                configured_subgoal_ids=[
+                    str(item.get("id", "") or "")
+                    for item in stage_item.get("subgoals", [])
+                    if isinstance(item, Mapping)
+                ],
+                allowed_soft_targets=soft_targets,
+            )
+        except Exception as exc:
+            error = str(exc)
+
+        adapter = self._apply_progressive_d_control_result(
+            pair_key=pair_key,
+            meeting_id=str(meeting_id or ""),
+            legacy_session=current_session,
+            payload=normalized or {},
+            evaluator_valid=isinstance(normalized, dict) and not bool(error),
+        )
+        record = {
+            "meeting_id": str(meeting_id or ""),
+            "legacy_session": current_session,
+            "macro_stage": macro_stage,
+            "subgoals": copy.deepcopy(
+                (normalized or {}).get("subgoals", [])
+            ),
+            "recommended_action": str(
+                (normalized or {}).get("recommended_action", "") or ""
+            ),
+            "target_subgoal_id": str(
+                (normalized or {}).get("target_subgoal_id", "") or ""
+            ),
+            "reason": str((normalized or {}).get("reason", "") or ""),
+            "valid": isinstance(normalized, dict) and not bool(error),
+            "error": error,
+            "transition_adapter": copy.deepcopy(adapter),
+            "cbt_controller_version": PROGRESSIVE_D_CONTROLLER_VERSION,
+            "updated_at": self._fmt_dt(self._now()),
+        }
+        self._ensure_progressive_d_state_schema()
+        control = self.state.setdefault("progressive_d_control_state", {})
+        control.setdefault("latest_by_pair", {})[pair_key] = copy.deepcopy(
+            record
+        )
+        history = control.setdefault("history_by_pair", {}).setdefault(
+            pair_key,
+            [],
+        )
+        if isinstance(history, list):
+            history.append(copy.deepcopy(record))
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="control_eval_llm",
+            prompt_text=prompt_text,
+            output={
+                "normalized_output": copy.deepcopy(normalized),
+                "legacy_session": current_session,
+                "macro_stage": macro_stage,
+                "transition_adapter": copy.deepcopy(adapter),
+            },
+            turn_no=-1,
+            meeting_id=str(meeting_id or ""),
+            pair_key=pair_key,
+            meta={
+                "source": (
+                    "progressive_d_control_eval"
+                    if not error
+                    else "progressive_d_control_eval_error"
+                ),
+                "route": str(policy.get("control_route", "") or ""),
+                "error": error,
+                "controller_version": PROGRESSIVE_D_CONTROLLER_VERSION,
+            },
+        )
+        return copy.deepcopy(record)
+
+
+    def build_doctor_reply_guidance(self, judge: Any) -> str:
+        if self.get_cbt_controller_mode() != "minimal" or not isinstance(judge, dict):
+            return str((judge or {}).get("advice", "") or "") if isinstance(judge, dict) else ""
+        glossary = self._minimal_term_glossary()
+        primary = self._doctor_guidance_term(
+            str(judge.get("primary_strategy", "") or ""),
+            glossary.get("primary_strategies", {}),
+        )
+        micro = self._doctor_guidance_term(
+            str(judge.get("micro_skill", "") or ""),
+            glossary.get("micro_skills", {}),
+        )
+        guidance = (
+            "主要策略：{}\n微技能：{}\n本轮目标：{}"
+        ).format(
+            primary,
+            micro,
+            str(judge.get("turn_goal", "") or ""),
+        ).strip()
+        if self._is_progressive_d_v3_configured():
+            internal = str(
+                judge.get("_patient_internal_state", "") or ""
+            ).strip()
+            if internal:
+                guidance += (
+                    "\n已知患者材料：{}\n回应边界：围绕一个明确材料缺口推进；"
+                    "不要重复泛问感受、身体感觉或已经核对过的安全问题。"
+                ).format(internal)
+        return guidance
+
+    @staticmethod
+    def _doctor_guidance_term(term_id: str, terms: Any) -> str:
+        item = terms.get(term_id, {}) if isinstance(terms, Mapping) else {}
+        if not isinstance(item, Mapping):
+            return str(term_id or "")
+        label = str(item.get("label", "") or "").strip()
+        instruction = str(item.get("instruction", "") or "").strip()
+        if label and instruction:
+            return "{}。执行要点：{}".format(label, instruction)
+        return label or str(term_id or "")
+
     def get_dialog_judge_runtime_policy(self) -> Dict[str, Any]:
         default_policy = {
             "enabled": False,
             "prompt_file": "data/prompts/intervention/dialog_judge.txt",
+            "legacy_prompt_file": "data/prompts/intervention/dialog_judge_legacy.txt",
+            "progressive_d_prompt_file": "data/prompts/intervention/dialog_judge_progressive_d.txt",
             "retry": 2,
             "force_forced_llm": True,
             "patient_state_prompt_file": "data/prompts/intervention/dialog_judge_patient_state_summary.txt",
             "patient_state_summary_retry": 2,
             "source": "defaults",
         }
+        if self.get_cbt_controller_mode() == "legacy":
+            default_policy["prompt_file"] = default_policy["legacy_prompt_file"]
         intervention_cfg = self.config.get("intervention", {}) or {}
         raw_cfg = intervention_cfg.get("dialog_judge", {}) or {}
         if not isinstance(raw_cfg, dict):
@@ -1394,6 +2873,15 @@ class InterventionManager:
         policy["enabled"] = self._safe_bool(raw_cfg.get("enabled", False), False)
         prompt_file = str(raw_cfg.get("prompt_file", default_policy["prompt_file"]) or "").strip()
         policy["prompt_file"] = prompt_file or default_policy["prompt_file"]
+        configured_legacy_prompt_file = str(raw_cfg.get("legacy_prompt_file", "") or "").strip()
+        legacy_prompt_file = configured_legacy_prompt_file or default_policy["legacy_prompt_file"]
+        policy["legacy_prompt_file"] = legacy_prompt_file or default_policy["legacy_prompt_file"]
+        if self.get_cbt_controller_mode() == "legacy":
+            policy["prompt_file"] = (
+                policy["legacy_prompt_file"]
+                if configured_legacy_prompt_file
+                else policy["prompt_file"]
+            )
         retry = self._safe_int(raw_cfg.get("retry", default_policy["retry"]), default_policy["retry"])
         policy["retry"] = retry if retry >= 1 else default_policy["retry"]
         policy["force_forced_llm"] = self._safe_bool(
@@ -1411,6 +2899,24 @@ class InterventionManager:
         policy["patient_state_summary_retry"] = (
             patient_state_summary_retry if patient_state_summary_retry >= 1 else default_policy["patient_state_summary_retry"]
         )
+        if self._is_progressive_d_v3_configured():
+            progressive_d_policy = self.get_progressive_d_runtime_policy()
+            policy["subgoal_progress_enabled"] = bool(
+                progressive_d_policy.get("enabled", False)
+            )
+            policy["prompt_file"] = str(
+                progressive_d_policy.get(
+                    "judge_prompt_file",
+                    default_policy["progressive_d_prompt_file"],
+                )
+                or default_policy["progressive_d_prompt_file"]
+            )
+            policy["retry"] = int(
+                progressive_d_policy.get("judge_retry", policy["retry"])
+                or policy["retry"]
+            )
+        else:
+            policy["subgoal_progress_enabled"] = False
         self._log_highlight(
             "[DIALOG_JUDGE_POLICY] source={} enabled={} retry={} force_forced_llm={} prompt_file={} patient_state_prompt_file={} patient_state_summary_retry={}".format(
                 policy["source"],
@@ -1429,10 +2935,13 @@ class InterventionManager:
             "enabled": False,
             "route": "forced_llm",
             "prompt_file": "data/prompts/intervention/session_eval.txt",
+            "legacy_prompt_file": "data/prompts/intervention/session_eval_legacy.txt",
             "retry": 2,
             "history_recent_n": 3,
             "source": "defaults",
         }
+        if self.get_cbt_controller_mode() == "legacy":
+            default_policy["prompt_file"] = default_policy["legacy_prompt_file"]
         intervention_cfg = self.config.get("intervention", {}) or {}
         raw_cfg = intervention_cfg.get("session_eval", {}) or {}
         if not isinstance(raw_cfg, dict):
@@ -1455,6 +2964,15 @@ class InterventionManager:
         policy["route"] = route
         prompt_file = str(raw_cfg.get("prompt_file", default_policy["prompt_file"]) or "").strip()
         policy["prompt_file"] = prompt_file or default_policy["prompt_file"]
+        configured_legacy_prompt_file = str(raw_cfg.get("legacy_prompt_file", "") or "").strip()
+        legacy_prompt_file = configured_legacy_prompt_file or default_policy["legacy_prompt_file"]
+        policy["legacy_prompt_file"] = legacy_prompt_file or default_policy["legacy_prompt_file"]
+        if self.get_cbt_controller_mode() == "legacy":
+            policy["prompt_file"] = (
+                policy["legacy_prompt_file"]
+                if configured_legacy_prompt_file
+                else policy["prompt_file"]
+            )
         retry = self._safe_int(raw_cfg.get("retry", default_policy["retry"]), default_policy["retry"])
         policy["retry"] = retry if retry >= 1 else default_policy["retry"]
         history_recent_n = self._safe_int(
@@ -1524,13 +3042,19 @@ class InterventionManager:
         doctor: Any,
         patient: Any,
         chats: Any,
-        summary: str,
         meeting_id: str,
-        start_time: Any,
     ) -> Optional[Dict[str, Any]]:
         policy = self.get_session_eval_runtime_policy()
         if not bool(policy.get("enabled", False)):
             return None
+        if self.get_cbt_controller_mode() == "minimal":
+            return self._evaluate_minimal_session_after_chat(
+                doctor=doctor,
+                patient=patient,
+                chats=chats,
+                meeting_id=meeting_id,
+                policy=policy,
+            )
 
         pair_key = build_pair_key(getattr(doctor, "name", ""), getattr(patient, "name", ""))
         current_session = ""
@@ -1553,7 +3077,6 @@ class InterventionManager:
         session_usage_log = self._build_session_usage_log(
             pair_key=pair_key,
             current_session=current_session,
-            history_items=history_items,
         )
         fallback_levels = 0
         for item in history_items:
@@ -1665,6 +3188,107 @@ class InterventionManager:
             )
             return fallback
 
+    def _evaluate_minimal_session_after_chat(
+        self,
+        doctor: Any,
+        patient: Any,
+        chats: Any,
+        meeting_id: str,
+        policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        pair_key = build_pair_key(getattr(doctor, "name", ""), getattr(patient, "name", ""))
+        progress_state = self._minimal_state_for_meeting(pair_key, meeting_id)
+        current_session_prompt = self.get_session_prompt_for_judge(
+            speaker=doctor,
+            other=patient,
+            forced=True,
+        )
+        prompt_text = ""
+        raw: Any = {}
+        error = ""
+        dialogue_text, _ = tagged_dialogue(
+            chats or [],
+            str(getattr(patient, "name", "") or ""),
+        )
+        try:
+            prompt_text = load_prompt_template(
+                str(policy.get("prompt_file", "") or ""),
+                {
+                    "DOCTOR": str(getattr(doctor, "name", "") or ""),
+                    "PATIENT": str(getattr(patient, "name", "") or ""),
+                    "CURRENT_SESSION_PROMPT": str(current_session_prompt or ""),
+                    "PRIOR_PROGRESS": compact_prior_progress_text(progress_state),
+                    "DIALOGUE_HISTORY": dialogue_text,
+                },
+                required_placeholders=(
+                    "DOCTOR",
+                    "PATIENT",
+                    "CURRENT_SESSION_PROMPT",
+                    "PRIOR_PROGRESS",
+                    "DIALOGUE_HISTORY",
+                ),
+            )
+            if str(policy.get("route", "forced_llm") or "forced_llm").strip().lower() == "think_llm":
+                raw = self._call_think_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("retry", 2) or 2),
+                    doctor_agent=doctor,
+                    caller="cbt_minimal_session_eval",
+                )
+            else:
+                raw = self._call_forced_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("retry", 2) or 2),
+                    caller="cbt_minimal_session_eval",
+                )
+            normalized = normalize_minimal_session_eval(raw)
+        except Exception as exc:
+            error = str(exc)
+            normalized = normalize_minimal_session_eval({})
+            normalized["reason"] = "session_eval_error:{}".format(error)
+
+        latest_patient_state = progress_state.get("latest_patient_state", {})
+        risk_level = (
+            latest_patient_state.get("risk_level", "possible")
+            if isinstance(latest_patient_state, dict)
+            else "possible"
+        )
+        result = copy.deepcopy(normalized)
+        adapter = generate_session_end(
+            session_eval=normalized,
+            chats=chats or [],
+            patient_name=str(getattr(patient, "name", "") or ""),
+            risk_level=str(risk_level or "possible"),
+            high_risk_seen=bool(
+                progress_state.get("high_risk_seen", False)
+            ),
+        )
+        result.update(copy.deepcopy(adapter))
+        prompt_adapter_output = {
+            "session_end_adapter": copy.deepcopy(adapter)
+        }
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="session_eval_llm",
+            prompt_text=prompt_text,
+            output={
+                "raw_output": copy.deepcopy(raw),
+                "normalized_output": copy.deepcopy(normalized),
+                **prompt_adapter_output,
+            },
+            turn_no=-1,
+            meeting_id=str(meeting_id or ""),
+            pair_key=str(pair_key or ""),
+            meta={
+                "source": "minimal_session_eval" if not error else "minimal_session_eval_error",
+                "route": str(policy.get("route", "forced_llm") or ""),
+                "error": error,
+                "controller_version": "",
+            },
+        )
+        return result
+
     def judge_forced_dialog_before_doctor_speak(
         self,
         speaker: Any,
@@ -1710,6 +3334,17 @@ class InterventionManager:
             pair_key=pair_key,
             current_session=current_session,
         )
+        if self.get_cbt_controller_mode() == "minimal":
+            return self._judge_forced_dialog_minimal(
+                doctor=doctor,
+                patient=patient,
+                chats=chats,
+                turn_no=turn_no,
+                session_prompt_text=session_prompt_text,
+                pair_key=pair_key,
+                current_session=current_session,
+                policy=policy,
+            )
         if not bool(policy.get("force_forced_llm", True)):
             self._log_highlight(
                 "[DIALOG_JUDGE_FALLBACK] turn={} reason=force_forced_llm_disabled".format(
@@ -1789,115 +3424,232 @@ class InterventionManager:
             )
             return default_output
 
-    def get_depr_short_term_runtime_policy(self) -> Dict[str, Any]:
-        default_retry = 2
-        default_force_forced_llm = True
-        policy = {
-            "retry": default_retry,
-            "force_forced_llm": default_force_forced_llm,
-            "source": "defaults",
-            "notes": [],
-        }
-
-        intervention_cfg = self.config.get("intervention", {}) or {}
-        forced_llm = intervention_cfg.get("forced_llm", {}) or {}
-        if not isinstance(forced_llm, dict):
-            policy["notes"].append("forced_llm_not_dict")
-            self._log_highlight(
-                "[DEPR_SHORT_TERM_POLICY] source=defaults reason=forced_llm_not_dict retry={} force_forced_llm={}".format(
-                    policy["retry"],
-                    policy["force_forced_llm"],
+    def _judge_forced_dialog_minimal(
+        self,
+        doctor: Any,
+        patient: Any,
+        chats: Any,
+        turn_no: int,
+        session_prompt_text: str,
+        pair_key: str,
+        current_session: str,
+        policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        meeting_id, _, _ = self._resolve_trace_session_context(doctor, patient)
+        progressive_d_v3 = self._is_progressive_d_v3_configured()
+        progress_state = (
+            self._progressive_d_state_for_meeting(pair_key, meeting_id)
+            if progressive_d_v3
+            else self._minimal_state_for_meeting(pair_key, meeting_id)
+        )
+        patient_state = progress_state.get("latest_patient_state", {})
+        if not isinstance(patient_state, dict) or not patient_state:
+            patient_state = copy.deepcopy(
+                PROGRESSIVE_D_PATIENT_STATE_DEFAULT
+                if progressive_d_v3
+                else PATIENT_STATE_DEFAULT
+            )
+        prompt_text = ""
+        raw: Any = {}
+        error = ""
+        side_step_active = False
+        route_session = current_session
+        if bool(policy.get("subgoal_progress_enabled", False)):
+            try:
+                subgoal_state, _ = self._progressive_d_progress_state_for_pair(
+                    pair_key,
+                    current_session,
                 )
-            )
-            return policy
-
-        keys_present = (
-            "depr_short_term_retry" in forced_llm
-            or "depr_short_term_force_forced_llm" in forced_llm
-        )
-        if keys_present:
-            policy["source"] = "forced_llm_config"
-
-        raw_retry = forced_llm.get("depr_short_term_retry", default_retry)
-        retry = self._safe_int(raw_retry, default_retry)
-        if retry < 1:
-            policy["notes"].append("retry_lt_1_fallback")
-            retry = default_retry
-        policy["retry"] = retry
-
-        raw_force = forced_llm.get(
-            "depr_short_term_force_forced_llm",
-            default_force_forced_llm,
-        )
-        policy["force_forced_llm"] = self._safe_bool(
-            raw_force,
-            default_force_forced_llm,
-        )
-
-        self._log_highlight(
-            "[DEPR_SHORT_TERM_POLICY] source={} retry={} force_forced_llm={} notes={}".format(
-                policy.get("source", "defaults"),
-                policy.get("retry", default_retry),
-                policy.get("force_forced_llm", default_force_forced_llm),
-                "|".join(policy.get("notes", [])) or "none",
-            )
-        )
-        return policy
-
-    def get_depr_current_event_runtime_policy(self) -> Dict[str, Any]:
-        default_retry = 2
-        default_force_forced_llm = False
-        policy = {
-            "retry": default_retry,
-            "force_forced_llm": default_force_forced_llm,
-            "source": "defaults",
-            "notes": [],
-        }
-
-        intervention_cfg = self.config.get("intervention", {}) or {}
-        forced_llm = intervention_cfg.get("forced_llm", {}) or {}
-        if not isinstance(forced_llm, dict):
-            policy["notes"].append("forced_llm_not_dict")
-            self._log_highlight(
-                "[DEPR_CURRENT_EVENT_POLICY] source=defaults reason=forced_llm_not_dict retry={} force_forced_llm={}".format(
-                    policy["retry"],
-                    policy["force_forced_llm"],
+                side_step = subgoal_state.get("side_step", {})
+                side_step_active = bool(
+                    isinstance(side_step, dict)
+                    and side_step.get("active", False)
                 )
+                soft_step_back = subgoal_state.get(
+                    "soft_step_back",
+                    {},
+                )
+                if (
+                    isinstance(soft_step_back, dict)
+                    and soft_step_back.get("active", False)
+                    and not side_step_active
+                ):
+                    target_id = str(
+                        soft_step_back.get("target_subgoal_id", "") or ""
+                    )
+                    stage_map = self._minimal_stage_subgoals(
+                        str(
+                            self.get_progressive_d_runtime_policy().get(
+                                "stage_subgoals_file",
+                                "",
+                            )
+                            or ""
+                        )
+                    )
+                    for session_id, stage_item in stage_map.items():
+                        configured = (
+                            stage_item.get("subgoals", [])
+                            if isinstance(stage_item, dict)
+                            else []
+                        )
+                        if any(
+                            isinstance(item, dict)
+                            and str(item.get("id", "") or "") == target_id
+                            for item in configured
+                        ):
+                            route_session = str(session_id or current_session)
+                            break
+            except Exception as exc:
+                error = str(exc)
+        try:
+            routed_patient_state = copy.deepcopy(patient_state)
+            monitored_possible = False
+            if progressive_d_v3:
+                risk_check = self._progressive_d_risk_check_state(pair_key)
+                if bool(progress_state.get("high_risk_seen", False)):
+                    routed_patient_state["risk_level"] = "high"
+                else:
+                    monitored_possible = bool(
+                        str(
+                            patient_state.get("risk_level", "") or ""
+                        ) == "possible"
+                        and risk_check.get("checked", False)
+                        and not risk_check.get("check_pending", False)
+                    )
+                    if monitored_possible:
+                        routed_patient_state["risk_level"] = "none"
+            route = route_strategies(
+                current_session=route_session,
+                patient_state=routed_patient_state,
+                strategy_map=self._minimal_strategy_map(),
+                side_step_active=side_step_active,
             )
-            return policy
-
-        keys_present = (
-            "depr_current_event_retry" in forced_llm
-            or "depr_current_event_force_forced_llm" in forced_llm
+            if monitored_possible:
+                route["applied_rule"] = "risk_possible_monitored"
+                route["explanation"] = (
+                    "本次可能风险已经完成一次安全核对，继续当前 CBT 主线并保持监测。"
+                )
+            if route_session != current_session:
+                route["applied_rule"] = "soft_step_back_target"
+                route["explanation"] = (
+                    "soft step-back temporarily reuses configured predecessor "
+                    f"strategies from {route_session}"
+                )
+        except Exception as exc:
+            error = str(exc)
+            route = {
+                "allowed_primary_strategies": ["support_stabilize"],
+                "allowed_micro_skills": ["validation", "focused_question"],
+                "applied_rule": "config_error_fallback",
+                "explanation": error,
+            }
+        latest_patient_reply = self._extract_latest_patient_utterance(
+            chats or [], patient.name
         )
-        if keys_present:
-            policy["source"] = "forced_llm_config"
-
-        raw_retry = forced_llm.get("depr_current_event_retry", default_retry)
-        retry = self._safe_int(raw_retry, default_retry)
-        if retry < 1:
-            policy["notes"].append("retry_lt_1_fallback")
-            retry = default_retry
-        policy["retry"] = retry
-
-        raw_force = forced_llm.get(
-            "depr_current_event_force_forced_llm",
-            default_force_forced_llm,
-        )
-        policy["force_forced_llm"] = self._safe_bool(
-            raw_force,
-            default_force_forced_llm,
-        )
-
-        self._log_highlight(
-            "[DEPR_CURRENT_EVENT_POLICY] source={} retry={} force_forced_llm={} notes={}".format(
-                policy.get("source", "defaults"),
-                policy.get("retry", default_retry),
-                policy.get("force_forced_llm", default_force_forced_llm),
-                "|".join(policy.get("notes", [])) or "none",
+        subgoal_progress_text = ""
+        if bool(policy.get("subgoal_progress_enabled", False)):
+            try:
+                subgoal_progress_text = self._compact_subgoal_progress_for_judge(
+                    pair_key,
+                    current_session,
+                )
+            except Exception as exc:
+                error = "{}; {}".format(error, str(exc)).strip("; ")
+                subgoal_progress_text = ""
+        try:
+            required_placeholders = [
+                "CURRENT_SESSION_PROMPT",
+                "DIALOGUE_HISTORY",
+                "PATIENT_STATE",
+                "CANDIDATE_STRATEGIES",
+            ]
+            if progressive_d_v3:
+                required_placeholders.append("TURN_NO")
+            else:
+                required_placeholders.extend(
+                    ["LATEST_PATIENT_REPLY", "PRIOR_PROGRESS"]
+                )
+            if bool(policy.get("subgoal_progress_enabled", False)):
+                required_placeholders.append("SUBGOAL_PROGRESS")
+            if progressive_d_v3:
+                required_placeholders.append("PATIENT_INTERNAL_STATE")
+            prompt_text = load_prompt_template(
+                str(policy.get("prompt_file", "") or ""),
+                {
+                    "CURRENT_SESSION_PROMPT": str(session_prompt_text or ""),
+                    "SUBGOAL_PROGRESS": str(subgoal_progress_text or ""),
+                    "LATEST_PATIENT_REPLY": str(latest_patient_reply or ""),
+                    "DIALOGUE_HISTORY": (
+                        to_conversation_text(chats or [])
+                        if progressive_d_v3
+                        else recent_dialogue(chats or [], 8)
+                    ),
+                    "PRIOR_PROGRESS": (
+                        ""
+                        if progressive_d_v3
+                        else self._compact_prior_control_progress_for_judge(
+                            pair_key,
+                            current_session,
+                            progress_state,
+                        )
+                    ),
+                    "PATIENT_STATE": (
+                        compact_progressive_d_patient_state_text(patient_state)
+                        if progressive_d_v3
+                        else compact_patient_state_text(patient_state)
+                    ),
+                    "PATIENT_INTERNAL_STATE": (
+                        self._compact_progressive_d_patient_internal_state(
+                            patient
+                        )
+                        if progressive_d_v3
+                        else ""
+                    ),
+                    "CANDIDATE_STRATEGIES": compact_route_text(
+                        route,
+                        self._minimal_term_glossary(),
+                    ),
+                    "TURN_NO": str(int(turn_no or 1)),
+                },
+                required_placeholders=required_placeholders,
             )
+            raw = self._call_forced_llm_json(
+                prompt_text,
+                retry=int(policy.get("retry", 2) or 2),
+                caller="cbt_minimal_dialog_judge",
+            )
+            normalized = normalize_minimal_judge_output(raw, route)
+        except Exception as exc:
+            error = "{}; {}".format(error, str(exc)).strip("; ")
+            normalized = safe_judge_fallback(
+                route.get("allowed_primary_strategies", []),
+                route.get("allowed_micro_skills", []),
+            )
+        output = copy.deepcopy(normalized)
+        output["valid"] = True
+        if progressive_d_v3:
+            output["_patient_internal_state"] = (
+                self._compact_progressive_d_patient_internal_state(patient)
+            )
+            if str(normalized.get("primary_strategy", "") or "") == "safety_check":
+                self._mark_progressive_d_safety_check_requested(pair_key)
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="judge_llm",
+            prompt_text=prompt_text,
+            output={
+                "raw_output": copy.deepcopy(raw),
+                "normalized_output": copy.deepcopy(normalized),
+                "router": copy.deepcopy(route),
+            },
+            turn_no=int(turn_no or -1),
+            meta={
+                "source": "minimal_dialog_judge" if not error else "minimal_dialog_judge_fallback",
+                "error": error,
+            },
         )
-        return policy
+        return output
 
     def should_route_forced_llm(self, speaker: Any, other: Any, forced: bool = False) -> bool:
         speaker_name = getattr(speaker, "name", "")
@@ -2175,6 +3927,58 @@ class InterventionManager:
             return str(prompt_text[start_idx:end_idx].strip() or "")
         return str(prompt_text[start_idx:].strip() or "")
 
+    def _get_progressive_d_patient_state_text(
+        self,
+        patient_agent: Any,
+    ) -> str:
+        """Select only the three patient-internal sections used by D."""
+
+        raw = self._get_patient_dynamic_state_raw_text(patient_agent)
+        if not raw:
+            return ""
+        wanted = {
+            "=== 当前主诉节点层 ===",
+            "=== 会话上下文层 ===",
+            "=== 瞬时情绪与表达指导层 ===",
+        }
+        lines: List[str] = []
+        active = False
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("===") and stripped.endswith("==="):
+                active = stripped in wanted
+            if active:
+                lines.append(line)
+        return "\n".join(lines).strip()
+
+    def _compact_progressive_d_patient_internal_state(
+        self,
+        patient_agent: Any,
+    ) -> str:
+        """Project auditable labelled facts without another LLM call."""
+
+        raw = self._get_progressive_d_patient_state_text(patient_agent)
+        if not raw:
+            return "患者内部状态暂不可用；请只根据当前固定会谈提纲与已有对话推进。"
+        labels = (
+            "节点概述：",
+            "核心信念：",
+            "当前最容易围绕这些问题组织表达：",
+            "这轮说话姿态：",
+            "当前瞬时情绪标签：",
+            "情绪强度：",
+            "暴露程度：",
+            "防御水平：",
+        )
+        selected: List[str] = []
+        for line in raw.splitlines():
+            text = line.strip().lstrip("- ").strip()
+            if any(text.startswith(label) for label in labels):
+                selected.append(text)
+        if not selected:
+            return "患者内部状态已有记录，但缺少可压缩的结构化标签。"
+        return "；".join(selected)
+
     def _strip_text_code_fence(self, text: str) -> str:
         raw = str(text or "").strip()
         if not raw:
@@ -2413,6 +4217,70 @@ class InterventionManager:
             )
         )
 
+    def _store_minimal_session_eval_result(
+        self,
+        pair_key: str,
+        meeting_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        progress_state = self._minimal_progress_state(pair_key)
+        progress_state["last_progress"] = str(payload.get("progress", "none") or "none")
+        progress_state["last_evidence_turn_id"] = str(
+            payload.get("evidence_turn_id", "") or ""
+        )
+        progress_state["last_blocking_factor"] = str(
+            payload.get("blocking_factor", "") or ""
+        )
+        progress_state["last_reason"] = str(payload.get("reason", "") or "")
+        progress_state["meeting_id"] = str(meeting_id or "")
+
+        state = self.state.setdefault("session_eval_state", {})
+        latest = state.setdefault("latest_reason_by_pair", {}).get(str(pair_key or ""))
+        if isinstance(latest, dict):
+            latest["session_end"] = bool(payload.get("session_end", False))
+            latest["progress"] = progress_state["last_progress"]
+            latest["evidence_turn_id"] = progress_state[
+                "last_evidence_turn_id"
+            ]
+            latest["blocking_factor"] = progress_state["last_blocking_factor"]
+            if payload.get("cbt_controller_version"):
+                latest["cbt_controller_version"] = str(
+                    payload.get("cbt_controller_version", "") or ""
+                )
+            if isinstance(payload.get("stage_transition_adapter"), dict):
+                latest["stage_transition_adapter"] = copy.deepcopy(
+                    payload.get("stage_transition_adapter", {})
+                )
+        history = state.setdefault("history_by_pair", {}).get(str(pair_key or ""), [])
+        if isinstance(history, list) and history:
+            last_item = history[-1]
+            if (
+                isinstance(last_item, dict)
+                and str(last_item.get("meeting_id", "") or "") == str(meeting_id or "")
+            ):
+                last_item.update(
+                    {
+                        "session_end": bool(payload.get("session_end", False)),
+                        "progress": progress_state["last_progress"],
+                        "evidence_turn_id": progress_state[
+                            "last_evidence_turn_id"
+                        ],
+                        "blocking_factor": progress_state["last_blocking_factor"],
+                    }
+                )
+                if payload.get("cbt_controller_version"):
+                    last_item["cbt_controller_version"] = str(
+                        payload.get("cbt_controller_version", "") or ""
+                    )
+                if isinstance(
+                    payload.get("stage_transition_adapter"),
+                    dict,
+                ):
+                    last_item["stage_transition_adapter"] = copy.deepcopy(
+                        payload.get("stage_transition_adapter", {})
+                    )
+
+
     def _get_session_eval_reason_for_judge(self, pair_key: str, current_session: str) -> str:
         self._ensure_session_eval_state_schema()
         current_session_text = str(current_session or "").strip() or "unknown"
@@ -2586,7 +4454,6 @@ class InterventionManager:
         self,
         pair_key: str,
         current_session: str,
-        history_items: List[Dict[str, Any]],
     ) -> str:
         self._ensure_session_eval_state_schema()
         state = self.state.setdefault("session_eval_state", {})
@@ -2662,16 +4529,46 @@ class InterventionManager:
         session_item = self._ensure_trace_session(sessions, meeting_id, pair_key, step_time)
         turns = session_item.setdefault("turns", [])
         patient_text = self._extract_latest_patient_utterance(chats or [], patient.name)
-        turns.append(
-            {
-                "patient": str(patient_text or ""),
-                "judge": {
-                    "doctor_turn_judge_cache": copy.deepcopy(
-                        doctor_turn_judge_cache if isinstance(doctor_turn_judge_cache, dict) else {}
+        try:
+            complaint_graph_trace = capture_runtime_chat_trace(
+                patient,
+                str(patient_text or ""),
+            )
+        except Exception as exc:
+            complaint_graph_trace = unavailable_trace(
+                "runtime_capture_error:{}".format(str(exc)),
+                {"mode": "runtime_capture"},
+            )
+        turn_item = {
+            "patient": str(patient_text or ""),
+            "judge": {
+                "doctor_turn_judge_cache": copy.deepcopy(
+                    doctor_turn_judge_cache if isinstance(doctor_turn_judge_cache, dict) else {}
+                )
+            },
+            "doctor": str(doctor_utterance or ""),
+            "complaint_graph": complaint_graph_trace,
+        }
+        turns.append(turn_item)
+        update_session_chat_summary(
+            session_item,
+            complaint_graph_trace,
+        )
+        self._log_highlight(
+            "[DIALOG_JUDGE_COMPLAINT_GRAPH] meeting_id={} turn_no={} status={} action={} changed={} reason={}".format(
+                str(meeting_id or ""),
+                (doctor_turn_judge_cache or {}).get("turn_no", -1),
+                str(complaint_graph_trace.get("status", "") or ""),
+                str(
+                    (complaint_graph_trace.get("transition", {}) or {}).get(
+                        "action",
+                        "",
                     )
-                },
-                "doctor": str(doctor_utterance or ""),
-            }
+                    or ""
+                ),
+                bool(complaint_graph_trace.get("changed", False)),
+                str(complaint_graph_trace.get("reason", "") or ""),
+            )
         )
         self._log_highlight(
             "[DIALOG_JUDGE_TRACE_APPEND] meeting_id={} pair_key={} valid={} terminate={} advice_len={} patient_len={} doctor_len={}".format(
@@ -2682,6 +4579,55 @@ class InterventionManager:
                 len(str((doctor_turn_judge_cache or {}).get("advice", "") or "")),
                 len(str(patient_text or "")),
                 len(str(doctor_utterance or "")),
+            )
+        )
+
+    def append_dialog_judge_trace_reflection(
+        self,
+        doctor: Any,
+        patient: Any,
+        meeting_id: str,
+    ) -> None:
+        self._ensure_dialog_judge_trace_state_schema()
+        pair_key = build_pair_key(
+            str(getattr(doctor, "name", "") or ""),
+            str(getattr(patient, "name", "") or ""),
+        )
+        try:
+            complaint_graph_trace = capture_runtime_reflection_trace(
+                patient,
+                str(meeting_id or ""),
+            )
+        except Exception as exc:
+            complaint_graph_trace = unavailable_trace(
+                "runtime_capture_error:{}".format(str(exc)),
+                {"mode": "runtime_capture"},
+            )
+        state = self.state.setdefault("dialog_judge_trace_state", {})
+        sessions = state.setdefault("sessions", [])
+        session_item = self._ensure_trace_session(
+            sessions,
+            str(meeting_id or ""),
+            pair_key,
+            self._resolve_trace_step_time(),
+        )
+        update_session_reflection_summary(
+            session_item,
+            complaint_graph_trace,
+        )
+        self._log_highlight(
+            "[DIALOG_JUDGE_COMPLAINT_GRAPH_REFLECTION] meeting_id={} status={} action={} changed={} reason={}".format(
+                str(meeting_id or ""),
+                str(complaint_graph_trace.get("status", "") or ""),
+                str(
+                    (complaint_graph_trace.get("transition", {}) or {}).get(
+                        "action",
+                        "",
+                    )
+                    or ""
+                ),
+                bool(complaint_graph_trace.get("changed", False)),
+                str(complaint_graph_trace.get("reason", "") or ""),
             )
         )
 
@@ -2827,7 +4773,10 @@ class InterventionManager:
             "doctor": 0,
             "consult_history": 0,
             "judge_llm": 0,
+            "state_tracker_llm": 0,
             "session_eval_llm": 0,
+            "subgoal_shadow_eval_llm": 0,
+            "control_eval_llm": 0,
             "order_extract_llm": 0,
             "environment_model_llm": 0,
             "unknown": 0,
@@ -2900,7 +4849,21 @@ class InterventionManager:
                 "- doctor_count: `{}`".format(counts["doctor"]),
                 "- consult_history_count: `{}`".format(counts["consult_history"]),
                 "- judge_count: `{}`".format(counts["judge_llm"]),
+                "- state_tracker_count: `{}`".format(counts["state_tracker_llm"]),
                 "- session_eval_count: `{}`".format(counts["session_eval_llm"]),
+                "- subgoal_eval_count: `{}`".format(
+                    counts["subgoal_shadow_eval_llm"]
+                ),
+                "- control_eval_count: `{}`".format(
+                    (
+                        counts["control_eval_llm"]
+                        if counts["control_eval_llm"]
+                        else (
+                            counts["session_eval_llm"]
+                            + counts["subgoal_shadow_eval_llm"]
+                        )
+                    )
+                ),
                 "- order_extract_count: `{}`".format(counts["order_extract_llm"]),
                 "- environment_model_count: `{}`".format(counts["environment_model_llm"]),
                 "- unknown_count: `{}`".format(counts["unknown"]),
@@ -3050,6 +5013,10 @@ class InterventionManager:
         meeting_kind: str = "doctor_consult",
         start_time: Any = None,
     ) -> None:
+        meeting_id_text = str(meeting_id or "").strip()
+        meeting_kind_text = str(meeting_kind or "").strip()
+        if not meeting_id_text or meeting_kind_text != "doctor_consult":
+            return
         if not self.order_extract.get("enabled", True):
             return
         env_policy = self.get_environment_model_runtime_policy()
@@ -3065,11 +5032,19 @@ class InterventionManager:
         if not conversation.strip():
             return
 
+        if isinstance(start_time, datetime.datetime):
+            order_now = start_time
+        else:
+            order_now = self._parse_dt(str(start_time or ""))
+        if order_now is None:
+            order_now = utils.get_timer().get_date()
+        order_now_text = self._fmt_dt(order_now)
+
         result = doctor.completion(
             "extract_doctor_order",
             doctor.name,
             patient.name,
-            self._fmt_dt(self._now()),
+            order_now_text,
             conversation,
             prompt_file=str(self.order_extract.get("prompt_file", "") or "").strip(),
             _forced_prompt_trace={
@@ -3077,7 +5052,7 @@ class InterventionManager:
                 "other": patient,
                 "role": "order_extract_llm",
                 "source": "order_extract",
-                "meeting_id": str(meeting_id or ""),
+                "meeting_id": meeting_id_text,
                 "pair_key": build_pair_key(doctor.name, patient.name),
                 "meta": {
                     "stage": "extract_doctor_order",
@@ -3103,7 +5078,7 @@ class InterventionManager:
                 continue
 
             task_id = "order_{}_{}_{}".format(
-                self._fmt_dt(self._now()).replace(":", "").replace("-", ""),
+                order_now_text.replace(":", "").replace("-", ""),
                 patient.name,
                 len(accepted_tasks) + 1,
             )
@@ -3138,9 +5113,9 @@ class InterventionManager:
             doctor=doctor,
             patient=patient,
             tasks=accepted_tasks,
-            meeting_id=meeting_id,
-            meeting_kind=meeting_kind,
-            start_time=start_time,
+            meeting_id=meeting_id_text,
+            meeting_kind=meeting_kind_text,
+            start_time=order_now,
             env_policy=env_policy,
         )
 
@@ -3201,8 +5176,6 @@ class InterventionManager:
         doctor: Any,
         patient: Any,
         tasks: List[Dict[str, Any]],
-        meeting_id: str,
-        meeting_kind: str,
         task_batch_id: str,
         agents_map: Dict[str, Any],
         env_policy: Dict[str, Any],
@@ -3365,7 +5338,6 @@ class InterventionManager:
         meeting_id: str,
         meeting_kind: str,
         env_policy: Dict[str, Any],
-        now: Any,
     ) -> tuple:
         patient_name = str(getattr(patient, "name", "") or "")
         doctor_name = str(getattr(doctor, "name", "") or "")
@@ -3657,8 +5629,6 @@ class InterventionManager:
             doctor=doctor,
             patient=patient,
             tasks=tasks,
-            meeting_id=meeting_id,
-            meeting_kind=meeting_kind,
             task_batch_id=task_batch_id,
             agents_map=agents_map,
             env_policy=env_policy,
@@ -3750,7 +5720,6 @@ class InterventionManager:
             meeting_id=meeting_id,
             meeting_kind=meeting_kind,
             env_policy=env_policy,
-            now=start_time,
         )
         if not payloads:
             self._log_highlight(
@@ -3847,12 +5816,6 @@ class InterventionManager:
         if not isinstance(meeting, dict):
             return False
         return str(getattr(speaker, "name", "") or "") == str(meeting.get("doctor", "") or "")
-
-    def get_meeting_kind(self, speaker: Any, other: Any, forced: bool = False) -> str:
-        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
-        if not isinstance(meeting, dict):
-            return ""
-        return str(meeting.get("meeting_kind", "") or "")
 
     def get_meeting_prompt_file(self, speaker: Any, other: Any, forced: bool = False) -> str:
         meeting = self.resolve_meeting_context(speaker, other, forced=forced)
@@ -4080,6 +6043,7 @@ class InterventionManager:
         if not isinstance(resident_chat_state.get("completed_counts_by_patient"), dict):
             resident_chat_state["completed_counts_by_patient"] = {}
         self._ensure_completed_meeting_state_schema()
+        self._ensure_controller_processed_meeting_state_schema()
         environment_task_state = self.state.get("environment_task_state", {})
         if not isinstance(environment_task_state, dict):
             environment_task_state = {}
@@ -4099,6 +6063,9 @@ class InterventionManager:
         self._ensure_consult_record_state_schema()
         self._ensure_dialog_judge_trace_state_schema()
         self._ensure_session_eval_state_schema()
+        self._ensure_subgoal_shadow_state_schema()
+        self._ensure_subgoal_progress_state_schema()
+        self._ensure_progressive_d_state_schema()
         self._ensure_forced_prompt_trace_state_schema()
 
     def _ensure_step_flags_state_schema(self) -> None:
@@ -4162,6 +6129,88 @@ class InterventionManager:
             state["meeting_ids_by_pair"] = {}
         if not isinstance(state.get("records_by_meeting_id"), dict):
             state["records_by_meeting_id"] = {}
+
+    def _ensure_controller_processed_meeting_state_schema(self) -> None:
+        state = self.state.setdefault(
+            "controller_processed_meeting_state",
+            {},
+        )
+        if not isinstance(state, dict):
+            state = {}
+            self.state["controller_processed_meeting_state"] = state
+        meeting_ids_by_pair = state.get("meeting_ids_by_pair")
+        if not isinstance(meeting_ids_by_pair, dict):
+            meeting_ids_by_pair = {}
+            state["meeting_ids_by_pair"] = meeting_ids_by_pair
+        if bool(state.get("legacy_history_migrated", False)):
+            return
+
+        for source_name in ("session_eval_state", "subgoal_shadow_state"):
+            source = self.state.get(source_name, {})
+            history_by_pair = (
+                source.get("history_by_pair", {})
+                if isinstance(source, dict)
+                else {}
+            )
+            if not isinstance(history_by_pair, dict):
+                continue
+            for pair_key, history in history_by_pair.items():
+                if not isinstance(history, list):
+                    continue
+                ids = meeting_ids_by_pair.setdefault(str(pair_key or ""), [])
+                if not isinstance(ids, list):
+                    ids = []
+                    meeting_ids_by_pair[str(pair_key or "")] = ids
+                for item in history:
+                    if not isinstance(item, dict):
+                        continue
+                    meeting_id = str(item.get("meeting_id", "") or "").strip()
+                    if meeting_id and meeting_id not in ids:
+                        ids.append(meeting_id)
+        state["legacy_history_migrated"] = True
+
+    def _is_controller_meeting_processed(
+        self,
+        pair_key: str,
+        meeting_id: str,
+    ) -> bool:
+        target = str(meeting_id or "").strip()
+        if not target:
+            return False
+        self._ensure_controller_processed_meeting_state_schema()
+        state = self.state.setdefault(
+            "controller_processed_meeting_state",
+            {},
+        )
+        ids = state.setdefault("meeting_ids_by_pair", {}).get(
+            str(pair_key or ""),
+            [],
+        )
+        return isinstance(ids, list) and target in ids
+
+    def _mark_controller_meeting_processed(
+        self,
+        pair_key: str,
+        meeting_id: str,
+    ) -> None:
+        target = str(meeting_id or "").strip()
+        pair = str(pair_key or "").strip()
+        if not pair or not target:
+            return
+        self._ensure_controller_processed_meeting_state_schema()
+        state = self.state.setdefault(
+            "controller_processed_meeting_state",
+            {},
+        )
+        ids = state.setdefault("meeting_ids_by_pair", {}).setdefault(
+            pair,
+            [],
+        )
+        if not isinstance(ids, list):
+            ids = []
+            state["meeting_ids_by_pair"][pair] = ids
+        if target not in ids:
+            ids.append(target)
 
     def _mark_completed_meeting(
         self,
@@ -4250,6 +6299,65 @@ class InterventionManager:
             state["latest_reason_by_pair"] = {}
         if not isinstance(state.get("history_by_pair"), dict):
             state["history_by_pair"] = {}
+        if (
+            self.get_cbt_controller_mode() == "minimal"
+            and not isinstance(state.get("minimal_by_pair"), dict)
+        ):
+            state["minimal_by_pair"] = {}
+        self._drop_legacy_patient_evidence_fields(state)
+
+    def _ensure_subgoal_shadow_state_schema(self) -> None:
+        state = self.state.get("subgoal_shadow_state")
+        if not isinstance(state, dict):
+            return
+        if not isinstance(state.get("latest_by_pair"), dict):
+            state["latest_by_pair"] = {}
+        if not isinstance(state.get("history_by_pair"), dict):
+            state["history_by_pair"] = {}
+        self._drop_legacy_patient_evidence_fields(state)
+
+    def _ensure_subgoal_progress_state_schema(self) -> None:
+        enabled = bool(self.get_progressive_d_runtime_policy().get("enabled", False))
+        if not enabled:
+            return
+        if not isinstance(self.state.get("subgoal_progress_by_pair"), dict):
+            self.state["subgoal_progress_by_pair"] = {}
+        self._drop_legacy_patient_evidence_fields(
+            self.state["subgoal_progress_by_pair"]
+        )
+
+    def _ensure_progressive_d_state_schema(self) -> None:
+        if not self._is_progressive_d_v3_configured():
+            return
+        tracker = self.state.setdefault("progressive_d_tracker_state", {})
+        if not isinstance(tracker, dict):
+            tracker = {}
+            self.state["progressive_d_tracker_state"] = tracker
+        if not isinstance(tracker.get("by_pair"), dict):
+            tracker["by_pair"] = {}
+        risk = self.state.setdefault("risk_check_state_by_pair", {})
+        if not isinstance(risk, dict):
+            self.state["risk_check_state_by_pair"] = {}
+        control = self.state.setdefault("progressive_d_control_state", {})
+        if not isinstance(control, dict):
+            control = {}
+            self.state["progressive_d_control_state"] = control
+        if not isinstance(control.get("latest_by_pair"), dict):
+            control["latest_by_pair"] = {}
+        if not isinstance(control.get("history_by_pair"), dict):
+            control["history_by_pair"] = {}
+
+    @classmethod
+    def _drop_legacy_patient_evidence_fields(cls, value: Any) -> None:
+        """Remove deprecated evaluator quotes before a resumed state is saved."""
+
+        if isinstance(value, dict):
+            value.pop("patient_evidence", None)
+            for child in value.values():
+                cls._drop_legacy_patient_evidence_fields(child)
+        elif isinstance(value, list):
+            for child in value:
+                cls._drop_legacy_patient_evidence_fields(child)
 
     def _ensure_forced_prompt_trace_state_schema(self) -> None:
         state = self.state.setdefault("forced_prompt_trace_state", {})
@@ -5429,20 +7537,6 @@ class InterventionManager:
         self._save_consult_history_manifest(agent, pair_key, manifest)
         return {"status": "success", "reason": write_reason, "record_id": record_id}
 
-    def _load_consult_history_records_by_ids(
-        self,
-        agent: Any,
-        pair_key: str,
-        record_ids: List[str],
-    ) -> List[Dict[str, Any]]:
-        manifest = self._load_consult_history_manifest(agent, pair_key)
-        records: List[Dict[str, Any]] = []
-        for record_id in record_ids or []:
-            loaded = self._load_consult_history_record_by_id(agent, pair_key, str(record_id or "").strip(), manifest=manifest)
-            if isinstance(loaded, dict):
-                records.append(loaded)
-        return records
-
     def _load_prompt_txt_or_raise(self, path: str) -> str:
         file_path = str(path or "").strip()
         if not file_path:
@@ -5667,26 +7761,6 @@ class InterventionManager:
             "gate_output": copy.deepcopy(normalized if isinstance(normalized, dict) else {}),
         }
 
-    def _consult_history_gate(
-        self,
-        speaker: Any,
-        other: Any,
-        chats: Any,
-        latest_utterance: str,
-        policy: Dict[str, Any],
-        pair_key: str,
-    ) -> Dict[str, Any]:
-        trace = self._consult_history_gate_with_trace(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            latest_utterance=latest_utterance,
-            policy=policy,
-            pair_key=pair_key,
-        )
-        gate_output = trace.get("gate_output", {}) if isinstance(trace, dict) else {}
-        return copy.deepcopy(gate_output if isinstance(gate_output, dict) else {})
-
     def _retrieve_consult_history_candidates(
         self,
         agent: Any,
@@ -5829,27 +7903,6 @@ class InterventionManager:
             "memory_block": memory_block,
         }
 
-    def _summarize_consult_history_hits(
-        self,
-        speaker: Any,
-        other: Any,
-        chats: Any,
-        pair_key: str,
-        query: str,
-        hits: List[Dict[str, Any]],
-        policy: Dict[str, Any],
-    ) -> str:
-        trace = self._summarize_consult_history_hits_with_trace(
-            speaker=speaker,
-            other=other,
-            chats=chats,
-            pair_key=pair_key,
-            query=query,
-            hits=hits,
-            policy=policy,
-        )
-        return str(trace.get("memory_block", "") or "") if isinstance(trace, dict) else ""
-
     def _build_consult_history_trace_context(
         self,
         speaker: Any,
@@ -5857,9 +7910,7 @@ class InterventionManager:
         chats: Any,
         forced: bool = False,
         turn_no: int = 1,
-        is_initiator: bool = False,
     ) -> Dict[str, Any]:
-        del is_initiator
         trace_context: Dict[str, Any] = {
             "evaluated": False,
             "memory_block": "",
@@ -5944,13 +7995,13 @@ class InterventionManager:
         turn_no: int = 1,
         is_initiator: bool = False,
     ) -> str:
+        del is_initiator
         trace_context = self._build_consult_history_trace_context(
             speaker=speaker,
             other=other,
             chats=chats,
             forced=forced,
             turn_no=turn_no,
-            is_initiator=is_initiator,
         )
         return str(trace_context.get("memory_block", "") or "") if isinstance(trace_context, dict) else ""
 
@@ -6091,78 +8142,6 @@ class InterventionManager:
             return record
         return None
 
-    def _build_depr_summary_with_consult_fallback(
-        self,
-        speaker: Any,
-        other: Any,
-        chat_summary: str,
-        meeting_id: str,
-    ) -> str:
-        fallback_summary = str(chat_summary or "")
-        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
-        if not doctor or not patient:
-            return fallback_summary
-
-        doctor_name = str(getattr(doctor, "name", "") or "")
-        patient_name = str(getattr(patient, "name", "") or "")
-        pair_key = build_pair_key(doctor_name, patient_name)
-        step = int(self.config.get("step", 0) or 0)
-
-        try:
-            if not self._consult_record_enabled():
-                raise RuntimeError("consult_record_disabled")
-
-            record = self._get_latest_consult_record_by_pair(pair_key)
-            if not isinstance(record, dict) or not record:
-                raise RuntimeError("latest_consult_record_missing")
-
-            flat = flatten_record_for_injection(record)
-            if not isinstance(flat, dict):
-                raise RuntimeError("flatten_record_invalid")
-
-            evidence_parts: List[str] = []
-            current_session = str(record.get("current_session", "") or "").strip()
-            record_id = str(record.get("record_id", "") or "").strip()
-            if record_id:
-                evidence_parts.append(f"record_id={record_id}")
-            if current_session:
-                evidence_parts.append(f"current_session={current_session}")
-
-            for key in [
-                "s_expr",
-                "s_focus",
-                "s_impact",
-                "o_obs",
-                "o_source",
-                "o_resp",
-                "a_formulation",
-                "a_outcome",
-                "a_understanding",
-            ]:
-                value = str(flat.get(key, "") or "").strip()
-                if value:
-                    evidence_parts.append(f"{key}={value}")
-
-            consult_summary = "\n".join(evidence_parts).strip()
-            if not consult_summary:
-                raise RuntimeError("flatten_record_empty")
-            return consult_summary
-        except Exception as err:
-            self._log_consult(
-                "ERROR trigger=InterventionManager.after_chat->depr_short_term_summary "
-                "doctor={} patient={} meeting_id={} pair_key={} step={} "
-                "fallback=fallback_to_chat_summary reason={} traceback={}".format(
-                    doctor_name,
-                    patient_name,
-                    str(meeting_id or ""),
-                    pair_key,
-                    step,
-                    str(err),
-                    traceback.format_exc().replace("\n", "\\n"),
-                )
-            )
-            return fallback_summary
-
     def _next_consult_record_id(self) -> str:
         self._ensure_consult_record_state_schema()
         state = self.state.setdefault("consult_record_state", {})
@@ -6170,13 +8149,6 @@ class InterventionManager:
         seq = len(records) + 1
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         return "rec_{}_{}".format(ts, str(seq).zfill(3))
-
-    def _join_prompt_blocks(self, base_block: str, ext_block: str) -> str:
-        base = str(base_block or "").strip()
-        ext = str(ext_block or "").strip()
-        if base and ext:
-            return base + "\n\n" + ext
-        return base or ext
 
     def _log_consult(self, message: str) -> None:
         self._log("[CONSULT_RECORD] {}".format(message))

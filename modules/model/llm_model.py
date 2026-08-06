@@ -337,7 +337,9 @@ class LLMModel:
         pos = 2 if response is None else 1
         self._summary["total"][pos] += 1
         self._summary[caller][pos] += 1
-        return response or failsafe
+        if response is None or response == "":
+            return failsafe
+        return response
 
     def _completion(self, prompt, **kwargs):
         raise NotImplementedError(

@@ -1,0 +1,252 @@
+{
+  "session1": {
+    "macro_stage": "M1_ENGAGE_ASSESS",
+    "subgoals": [
+      {
+        "id": "alliance_and_cbt_frame",
+        "goal": "建立基本工作联盟，并让患者初步理解 CBT 的协作与当下聚焦框架。",
+        "completion_hint": "患者用自己的表达参与议题协商，或说明其对协作方式的理解与感受。"
+      },
+      {
+        "id": "core_problem_focus",
+        "goal": "从当前材料中协作聚焦一个反复、负荷高且影响功能或关系的核心压力源。",
+        "completion_hint": "患者明确说出本次最值得谈的一个压力源，并将其连接到具体近期情境。"
+      },
+      {
+        "id": "first_cognitive_triangle",
+        "goal": "围绕核心压力源获得第一组情境、情绪与自动思维材料。",
+        "completion_hint": "患者描述一个具体情境、当时情绪，以及一个念头、画面、担忧或最怕后果。"
+      },
+      {
+        "id": "thought_emotion_link",
+        "goal": "帮助患者初步识别想法与情绪之间的联系。",
+        "completion_hint": "患者用自己的话说明或具体示范某个念头出现后情绪如何变化。"
+      }
+    ]
+  },
+  "session2.1": {
+    "macro_stage": "M2_SHARED_FORMULATION",
+    "subgoals": [
+      {
+        "id": "recall_representative_thoughts",
+        "goal": "从既有事件中提取可比较的代表性自动思维。",
+        "completion_hint": "患者确认、修正或补充至少一个来自具体事件的代表性想法。"
+      },
+      {
+        "id": "label_distortion_patterns",
+        "goal": "协作识别代表性想法中的认知扭曲及重复模式。",
+        "completion_hint": "患者将至少一个具体想法与一个扭曲模式匹配，并说明为何贴切。"
+      },
+      {
+        "id": "de_shame_cognitive_habits",
+        "goal": "将重复认知模式理解为可观察的思维习惯，而不是人格事实。",
+        "completion_hint": "患者表达其把标签视为思维习惯、模式或可核对假设，而非对自身的定性。"
+      }
+    ]
+  },
+  "session2.2": {
+    "macro_stage": "M2_SHARED_FORMULATION",
+    "subgoals": [
+      {
+        "id": "detect_recurrent_avoidance",
+        "goal": "识别不同事件中重复出现的回避或防御行为。",
+        "completion_hint": "患者指出至少一个具体回避或防御选择，并识别其在其他情境中的重复性或保护功能。"
+      },
+      {
+        "id": "formulate_conditional_rule",
+        "goal": "从重复行为和担忧中提炼一条暂定的条件规则或中间信念。",
+        "completion_hint": "患者用自己的语言认可、修订或提出一条“如果……那么……”式规则。"
+      },
+      {
+        "id": "link_rule_to_behavior",
+        "goal": "将暂定条件规则连接到患者的具体选择、回避与后果。",
+        "completion_hint": "患者说明该规则如何影响至少一个具体行为，较强证据是连接到多个情境。"
+      }
+    ]
+  },
+  "session2.3": {
+    "macro_stage": "M2_SHARED_FORMULATION",
+    "subgoals": [
+      {
+        "id": "core_belief_hypothesis",
+        "goal": "协作形成一个暂定核心信念假设，而不把它宣布为事实。",
+        "completion_hint": "患者提出、认可或修订一个深层自我意义，并将其视为旧模式或待核对假设。"
+      },
+      {
+        "id": "shared_formulation_chain",
+        "goal": "将核心信念、条件规则、自动思维与行为整合为共享概念化链。",
+        "completion_hint": "患者用自己的话连接链条中的至少两个以上环节，并核对或修正治疗师的总结。"
+      },
+      {
+        "id": "emotional_landing",
+        "goal": "在深层探索后承接情绪，使患者能够安全地保存本次发现。",
+        "completion_hint": "患者表达探索后的感受、当前承受度或对该假设的保留态度，而非仅被动认可。"
+      }
+    ]
+  },
+  "session3.1": {
+    "macro_stage": "M3_TEST_AND_LEARN",
+    "subgoals": [
+      {
+        "id": "select_target_thought",
+        "goal": "选择一个当前高价值的目标负面想法。",
+        "completion_hint": "患者明确说出本次要观察的具体负面想法或近似表达。"
+      },
+      {
+        "id": "map_self_invalidating_loop",
+        "goal": "识别目标想法如何把觉察、例外或尝试重新解释为失败。",
+        "completion_hint": "患者描述这个自我否定循环中的至少一个具体转折或重复过程。"
+      },
+      {
+        "id": "preserve_neutral_data",
+        "goal": "保存中性片段、例外或当前没有反证这一事实，不急于正向解释。",
+        "completion_hint": "患者指出并愿意暂时保留一个中性片段，或明确承认目前很难找到反证。"
+      },
+      {
+        "id": "form_testable_alternative",
+        "goal": "形成一个低强度、可观察且不要求立即相信的替代假设。",
+        "completion_hint": "患者用自己的话接受、修订或提出一个待观察的低强度假设。"
+      }
+    ]
+  },
+  "session3.2": {
+    "macro_stage": "M3_TEST_AND_LEARN",
+    "subgoals": [
+      {
+        "id": "check_experiment_readiness",
+        "goal": "核对患者对行为实验的意愿、负担与失败担忧。",
+        "completion_hint": "患者表达真实意愿、顾虑或修改意见，并说明实验是否会被体验为新的考试。"
+      },
+      {
+        "id": "define_observation_experiment",
+        "goal": "把待检验假设转成低负担、以观察为目的的微型行为实验。",
+        "completion_hint": "患者说明要观察什么，并参与选择一个当前可接受的实验场景或动作。"
+      },
+      {
+        "id": "record_prediction",
+        "goal": "记录实验前最担心的预测及粗粒度担忧。",
+        "completion_hint": "患者说出一个可核对的最坏预测，并表达大致担忧程度。"
+      },
+      {
+        "id": "set_minimum_action",
+        "goal": "共同确定不以触碰或成功为唯一标准的最低动作。",
+        "completion_hint": "患者选择或复述一个足够小、允许停住且当前可接受的最低动作。"
+      },
+      {
+        "id": "implementation_and_failure_protection",
+        "goal": "形成触发或时间地点线索，并加入未执行不等于失败的保护框架。",
+        "completion_hint": "患者能复述何时、何地或由何触发行动，并说明没做到只提供阻抗数据。"
+      }
+    ]
+  },
+  "session3.3-A": {
+    "macro_stage": "M3_TEST_AND_LEARN",
+    "subgoals": [
+      {
+        "id": "verify_execution_status",
+        "goal": "先核对实验真实发生到哪一步。",
+        "completion_hint": "患者具体说明完整执行、部分执行、接近后停住、只是想过或未开始中的实际状态。"
+      },
+      {
+        "id": "compare_prediction_outcome",
+        "goal": "在已执行或部分执行时比较原先预测与实际发生。",
+        "completion_hint": "患者描述实际步骤和关键反应，并指出预测与实际至少一个相同点或差异。"
+      },
+      {
+        "id": "extract_learning",
+        "goal": "从执行数据中提炼有限、不过度正向化的学习点。",
+        "completion_hint": "患者提出、认可或修订一个由实际数据支持的有限学习或假设更新。"
+      },
+      {
+        "id": "locate_barrier",
+        "goal": "在未执行或卡住时定位大致停止点与阻抗。",
+        "completion_hint": "患者描述在哪一步停住、当时出现什么念头或身体反应，而非只说“没做”。"
+      },
+      {
+        "id": "grade_next_task",
+        "goal": "根据阻抗数据共同缩小、替换或重排下一步。",
+        "completion_hint": "患者参与选择并认可一个更小、更可行且不把未执行解释为失败的下一步。"
+      }
+    ]
+  },
+  "session4.1": {
+    "macro_stage": "M4_CONSOLIDATE_END",
+    "subgoals": [
+      {
+        "id": "check_consolidation_readiness",
+        "goal": "核对当前是否适合回顾进展，而不是把回顾变成绩单。",
+        "completion_hint": "患者表达对回顾的准备度、负担或需要先稳定的原因。"
+      },
+      {
+        "id": "identify_micro_difference",
+        "goal": "从真实经历中识别一个很小但具体的差异。",
+        "completion_hint": "患者描述一个可定位到情境或行动的细微差异，不要求将其夸大为改善。"
+      },
+      {
+        "id": "name_reusable_tool",
+        "goal": "从患者经验中提取并命名一个可复用工具。",
+        "completion_hint": "患者用自己可理解、可记忆的方式说出一项工具，最好说明何时使用。"
+      },
+      {
+        "id": "retain_balanced_belief",
+        "goal": "形成一个有真实经验支撑、患者暂时能保留的低强度观点。",
+        "completion_hint": "患者用自己的话接受、修订或提出一个不过度积极的平衡观点。"
+      }
+    ]
+  },
+  "session4.2": {
+    "macro_stage": "M4_CONSOLIDATE_END",
+    "subgoals": [
+      {
+        "id": "normalize_lapse",
+        "goal": "将波动与反复正常化，避免把工具效果变成新的成败考试。",
+        "completion_hint": "患者表达其理解反复或工具未立即见效不等于个人失败。"
+      },
+      {
+        "id": "identify_early_warning",
+        "goal": "识别一个具体且较早的预警信号。",
+        "completion_hint": "患者说出一个可观察的情绪、想法、身体或行为信号。"
+      },
+      {
+        "id": "choose_minimal_response",
+        "goal": "为预警信号选择一个现实可行的极小应对动作。",
+        "completion_hint": "患者选择、修改或复述一个当前可执行的小动作。"
+      },
+      {
+        "id": "add_anti_failure_message",
+        "goal": "为应对计划加入不把未缓解或未完成解释为失败的保护提醒。",
+        "completion_hint": "患者能说出或认可一个与自身担忧相符的保护提醒，并说明其含义。"
+      },
+      {
+        "id": "encode_and_store_plan",
+        "goal": "把预警、动作与保护提醒编码成可调用并可保存的计划。",
+        "completion_hint": "患者复述或实际保存完整计划，并说明放在哪里或何时调用。"
+      }
+    ]
+  },
+  "session4.4": {
+    "macro_stage": "M4_CONSOLIDATE_END",
+    "subgoals": [
+      {
+        "id": "process_ending",
+        "goal": "讨论治疗结束带来的感受与未竟体验。",
+        "completion_hint": "患者用自己的话表达至少一种与结束有关的感受、担忧或期待。"
+      },
+      {
+        "id": "review_transferable_tools",
+        "goal": "回顾患者会继续保留的工具与应对计划。",
+        "completion_hint": "患者说出至少一项自己会保留的工具或计划，并说明何时或如何使用。"
+      },
+      {
+        "id": "negotiate_self_therapist_identity",
+        "goal": "协商而非强加“自己的治疗师”这一自主性身份。",
+        "completion_hint": "患者以实质表达接受、修正或拒绝该身份，并说明自己愿意承担的自我管理方式。"
+      },
+      {
+        "id": "close_relationship",
+        "goal": "在患者参与和状态可承受的前提下完成治疗关系告别。",
+        "completion_hint": "患者参与告别并表达结束时的需要、界限或想保留的内容，而非只被动认可医生宣布。"
+      }
+    ]
+  }
+}

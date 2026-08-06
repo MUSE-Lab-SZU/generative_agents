@@ -2,9 +2,10 @@
 """Prepare a sparse simulation checkpoint for a state-consistent resume.
 
 The live storage may be newer than the latest sparse ``simulate-*.json``.  This
-tool finds the newest staged-eval capture whose runtime snapshot and full
-storage bundle describe the same completed step, validates it, backs up the
-newer live artifacts, and restores that consistent point in place.
+tool finds the newest rolling-resume or staged-eval capture whose runtime
+snapshot and full storage bundle describe the same completed step, validates
+it, backs up the newer live artifacts, and restores that consistent point in
+place.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -26,6 +26,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from artifact_digest import (
+    canonical_json_sha256 as _canonical_json_sha256,
+    file_sha256 as _file_sha256,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_ROOT = BASE_DIR / "results"
@@ -34,6 +39,12 @@ TRACE_STATE_KEYS = (
     "dialog_judge_trace_state",
     "forced_prompt_trace_state",
 )
+REPEAT_EVAL_ARTIFACT_KIND = "repeat_eval_snapshot"
+ROLLING_RESUME_ARTIFACT_KIND = "rolling_resume_checkpoint"
+SUPPORTED_RECOVERY_ARTIFACT_KINDS = {
+    REPEAT_EVAL_ARTIFACT_KIND,
+    ROLLING_RESUME_ARTIFACT_KIND,
+}
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,7 @@ class RecoveryAnchor:
     storage_root: Path
     manifest_path: Path
     manifest: dict[str, Any]
+    artifact_kind: str = REPEAT_EVAL_ARTIFACT_KIND
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -78,21 +90,11 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
 
 def canonical_json_sha256(payload: Any) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _canonical_json_sha256(payload)
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return _file_sha256(path)
 
 
 def resolve_child(root: Path, raw_relpath: Any, field_name: str) -> Path:
@@ -127,8 +129,15 @@ def validate_snapshot_bundle(job_path: Path, job: dict[str, Any]) -> tuple[Path,
     label = str(job.get("trigger_label", "") or "")
     if int(manifest.get("schema_version", 0) or 0) != 1:
         raise ValueError(f"snapshot manifest schema 不匹配: {manifest_path}")
-    if str(manifest.get("artifact_kind", "") or "") != "repeat_eval_snapshot":
+    manifest_artifact_kind = str(manifest.get("artifact_kind", "") or "")
+    if manifest_artifact_kind not in SUPPORTED_RECOVERY_ARTIFACT_KINDS:
         raise ValueError(f"snapshot manifest 类型不匹配: {manifest_path}")
+    job_artifact_kind = str(job.get("artifact_kind", "") or REPEAT_EVAL_ARTIFACT_KIND)
+    bundle_artifact_kind = str(
+        bundle.get("artifact_kind", "") or job_artifact_kind
+    )
+    if manifest_artifact_kind != job_artifact_kind or manifest_artifact_kind != bundle_artifact_kind:
+        raise ValueError(f"snapshot artifact_kind 不一致: {job_path}")
     if str(manifest.get("storage_scope", "") or "") != "full":
         raise ValueError(f"snapshot manifest 不是 full storage: {manifest_path}")
     if str(manifest.get("trigger_label", "") or "") != label:
@@ -198,14 +207,22 @@ def _snapshot_step(snapshot_path: Path) -> int:
         raise ValueError(f"snapshot step 无效: {snapshot_path}") from exc
 
 
-def discover_recovery_anchor(checkpoint_dir: Path) -> RecoveryAnchor:
+def discover_recovery_anchors(checkpoint_dir: Path) -> list[RecoveryAnchor]:
     if not checkpoint_dir.is_dir():
         raise FileNotFoundError(f"checkpoint 不存在: {checkpoint_dir}")
     candidates: list[RecoveryAnchor] = []
     errors: list[str] = []
-    for job_path in sorted((checkpoint_dir / "staged_eval").glob("*/job.json")):
+    job_paths = list(sorted((checkpoint_dir / "staged_eval").glob("*/job.json")))
+    for rolling_name in ("latest", ".previous"):
+        rolling_job = checkpoint_dir / "recovery_checkpoint" / rolling_name / "job.json"
+        if rolling_job.is_file():
+            job_paths.append(rolling_job)
+    for job_path in job_paths:
         try:
             job = load_json(job_path)
+            artifact_kind = str(
+                job.get("artifact_kind", "") or REPEAT_EVAL_ARTIFACT_KIND
+            )
             label = str(job.get("trigger_label", "") or "").strip()
             if not label or label == "T0":
                 continue
@@ -222,10 +239,11 @@ def discover_recovery_anchor(checkpoint_dir: Path) -> RecoveryAnchor:
                 continue
             if str(snapshot_config.get("time", "") or "") != sim_time:
                 continue
-            staged_state = snapshot_config.get("staged_eval_state", {})
-            labels = staged_state.get("triggered_labels", []) if isinstance(staged_state, dict) else []
-            if label not in labels:
-                raise ValueError(f"匹配快照未记录 staged label={label}: {snapshot_path}")
+            if artifact_kind == REPEAT_EVAL_ARTIFACT_KIND:
+                staged_state = snapshot_config.get("staged_eval_state", {})
+                labels = staged_state.get("triggered_labels", []) if isinstance(staged_state, dict) else []
+                if label not in labels:
+                    raise ValueError(f"匹配快照未记录 staged label={label}: {snapshot_path}")
             snapshot_stem = Path(snapshot_name).stem
             for state_key in TRACE_STATE_KEYS:
                 sidecar_path = (
@@ -246,6 +264,7 @@ def discover_recovery_anchor(checkpoint_dir: Path) -> RecoveryAnchor:
                 raise ValueError(f"manifest snapshot 与 job 不匹配: {manifest_path}")
             candidates.append(
                 RecoveryAnchor(
+                    artifact_kind=artifact_kind,
                     label=label,
                     step_no=step_no,
                     sim_time=sim_time,
@@ -264,7 +283,36 @@ def discover_recovery_anchor(checkpoint_dir: Path) -> RecoveryAnchor:
     if not candidates:
         detail = "\n".join(errors[-5:]) if errors else "没有非 T0 的匹配 bundle"
         raise RuntimeError(f"未找到可验证的一致恢复锚点: {checkpoint_dir}\n{detail}")
-    return max(candidates, key=lambda item: (item.step_no, item.snapshot_name, item.label))
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item.step_no,
+            item.snapshot_name,
+            item.artifact_kind == ROLLING_RESUME_ARTIFACT_KIND,
+            item.label,
+        ),
+    )
+
+
+def discover_recovery_anchor(
+    checkpoint_dir: Path,
+    *,
+    snapshot_name: str | None = None,
+) -> RecoveryAnchor:
+    candidates = discover_recovery_anchors(checkpoint_dir)
+    requested = str(snapshot_name or "").strip()
+    if requested:
+        if Path(requested).name != requested or not SNAPSHOT_RE.fullmatch(requested):
+            raise ValueError(f"显式恢复 snapshot 名称无效: {requested}")
+        matches = [item for item in candidates if item.snapshot_name == requested]
+        if not matches:
+            available = ", ".join(item.snapshot_name for item in candidates)
+            raise RuntimeError(
+                f"显式恢复 snapshot 不是可验证的一致锚点: {requested}; "
+                f"available=[{available}]"
+            )
+        return max(matches, key=lambda item: (item.step_no, item.label))
+    return candidates[-1]
 
 
 def resolve_run_from_batch_state(results_root: Path, batch_name: str, condition: str) -> tuple[str, str, Path]:
@@ -386,6 +434,178 @@ def build_staged_index(state: dict[str, Any], run_name: str) -> dict[str, Any]:
     }
 
 
+def _anchor_meeting_ids(checkpoint_dir: Path, anchor: RecoveryAnchor) -> set[str]:
+    sidecar_path = (
+        checkpoint_dir
+        / "trace_state_sidecars"
+        / "forced_prompt_trace_state"
+        / f"{Path(anchor.snapshot_name).stem}.json"
+    )
+    payload = load_json(sidecar_path)
+    sessions = payload.get("sessions", [])
+    if not isinstance(sessions, list):
+        raise ValueError(f"forced trace sidecar sessions 必须是列表: {sidecar_path}")
+    meeting_ids: set[str] = set()
+    for session in sessions:
+        meeting = session.get("meeting", {}) if isinstance(session, dict) else {}
+        if not isinstance(meeting, dict):
+            continue
+        meeting_id = str(meeting.get("meeting_id", "") or "").strip()
+        if meeting_id:
+            meeting_ids.add(meeting_id)
+    return meeting_ids
+
+
+def _filtered_consult_history_manifest(
+    pair_dir: Path,
+    allowed_meeting_ids: set[str],
+) -> tuple[dict[str, Any], list[tuple[str, Path]], dict[str, int]]:
+    manifest_path = pair_dir / "manifest.json"
+    manifest = load_json(manifest_path)
+    records_by_id = manifest.get("records_by_id", {})
+    meeting_to_record = manifest.get("meeting_to_record", {})
+    dedup_keys = manifest.get("dedup_keys", {})
+    write_audit = manifest.get("write_audit", [])
+    if not isinstance(records_by_id, dict) or not isinstance(meeting_to_record, dict):
+        raise ValueError(f"consult_history manifest 映射无效: {manifest_path}")
+    if not isinstance(dedup_keys, dict):
+        dedup_keys = {}
+    if not isinstance(write_audit, list):
+        write_audit = []
+
+    kept_meeting_to_record = {
+        str(meeting_id): str(record_id)
+        for meeting_id, record_id in meeting_to_record.items()
+        if str(meeting_id) in allowed_meeting_ids and str(record_id).strip()
+    }
+    kept_record_ids = set(kept_meeting_to_record.values())
+    kept_records_by_id: dict[str, str] = {}
+    record_sources: list[tuple[str, Path]] = []
+    max_sequence = 0
+    for record_id in sorted(kept_record_ids):
+        relpath = str(records_by_id.get(record_id, "") or "").strip()
+        if not relpath:
+            raise ValueError(
+                f"consult_history meeting 指向缺失记录: {manifest_path}: {record_id}"
+            )
+        source = resolve_child(pair_dir, relpath, "consult_history.records_by_id")
+        record = load_json(source)
+        if str(record.get("meeting_id", "") or "").strip() not in allowed_meeting_ids:
+            raise ValueError(f"consult_history 记录 meeting_id 不匹配: {source}")
+        kept_records_by_id[record_id] = relpath
+        record_sources.append((relpath, source))
+        suffix = str(record_id).rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            max_sequence = max(max_sequence, int(suffix))
+
+    kept_dedup = {
+        str(key): str(record_id)
+        for key, record_id in dedup_keys.items()
+        if str(record_id) in kept_record_ids
+    }
+    kept_audit = [
+        copy.deepcopy(item)
+        for item in write_audit
+        if isinstance(item, dict)
+        and (
+            str(item.get("record_id", "") or "") in kept_record_ids
+            or str(item.get("meeting_id", "") or "") in allowed_meeting_ids
+        )
+    ]
+    filtered = {
+        "records_by_id": kept_records_by_id,
+        "meeting_to_record": kept_meeting_to_record,
+        "dedup_keys": kept_dedup,
+        "write_audit": kept_audit,
+        "record_seq": max_sequence,
+    }
+    stats = {
+        "original_records": len(records_by_id),
+        "kept_records": len(kept_records_by_id),
+        "removed_records": max(0, len(records_by_id) - len(kept_records_by_id)),
+    }
+    return filtered, record_sources, stats
+
+
+def inspect_consult_history_at_anchor(
+    checkpoint_dir: Path,
+    anchor: RecoveryAnchor,
+) -> dict[str, Any]:
+    live_root = checkpoint_dir / "consult_history"
+    if not live_root.is_dir():
+        return {
+            "exists": False,
+            "allowed_meeting_count": 0,
+            "pairs": [],
+            "kept_records": 0,
+            "removed_records": 0,
+        }
+    allowed_meeting_ids = _anchor_meeting_ids(checkpoint_dir, anchor)
+    pairs: list[dict[str, Any]] = []
+    kept = 0
+    removed = 0
+    for pair_dir in sorted(path for path in live_root.iterdir() if path.is_dir()):
+        manifest_path = pair_dir / "manifest.json"
+        if not manifest_path.is_file():
+            if any(pair_dir.iterdir()):
+                raise ValueError(
+                    f"consult_history pair 目录非空但缺少 manifest: {pair_dir}"
+                )
+            continue
+        _manifest, _sources, stats = _filtered_consult_history_manifest(
+            pair_dir,
+            allowed_meeting_ids,
+        )
+        pairs.append({"pair": pair_dir.name, **stats})
+        kept += stats["kept_records"]
+        removed += stats["removed_records"]
+    return {
+        "exists": True,
+        "allowed_meeting_count": len(allowed_meeting_ids),
+        "pairs": pairs,
+        "kept_records": kept,
+        "removed_records": removed,
+    }
+
+
+def _copy_consult_history_at_anchor(
+    checkpoint_dir: Path,
+    anchor: RecoveryAnchor,
+    temp_parent: Path,
+) -> Path | None:
+    live_root = checkpoint_dir / "consult_history"
+    if not live_root.is_dir():
+        return None
+    allowed_meeting_ids = _anchor_meeting_ids(checkpoint_dir, anchor)
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(
+        tempfile.mkdtemp(prefix="consult-history-", dir=str(temp_parent))
+    )
+    try:
+        for pair_dir in sorted(path for path in live_root.iterdir() if path.is_dir()):
+            manifest_path = pair_dir / "manifest.json"
+            if not manifest_path.is_file():
+                if any(pair_dir.iterdir()):
+                    raise ValueError(
+                        f"consult_history pair 目录非空但缺少 manifest: {pair_dir}"
+                    )
+                continue
+            filtered, record_sources, _stats = _filtered_consult_history_manifest(
+                pair_dir,
+                allowed_meeting_ids,
+            )
+            target_pair = temp_root / pair_dir.name
+            for relpath, source in record_sources:
+                target = resolve_child(target_pair, relpath, "consult_history.copy")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            write_json_atomic(target_pair / "manifest.json", filtered)
+        return temp_root
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+
+
 def artifacts_after_anchor(checkpoint_dir: Path, anchor: RecoveryAnchor) -> tuple[list[Path], list[str]]:
     paths: list[Path] = []
     moved_snapshot_stems: list[str] = []
@@ -415,6 +635,16 @@ def artifacts_after_anchor(checkpoint_dir: Path, anchor: RecoveryAnchor) -> tupl
         job = load_json(job_path)
         if int(job.get("step_no", 0) or 0) > anchor.step_no:
             paths.append(trigger_dir)
+    rolling_root = checkpoint_dir / "recovery_checkpoint"
+    rolling_latest_job = rolling_root / "latest" / "job.json"
+    if rolling_latest_job.is_file():
+        try:
+            rolling_job = load_json(rolling_latest_job)
+            rolling_is_newer = int(rolling_job.get("step_no", 0) or 0) > anchor.step_no
+        except Exception:
+            rolling_is_newer = True
+        if rolling_is_newer:
+            paths.append(rolling_root)
     return paths, moved_snapshot_stems
 
 
@@ -447,6 +677,63 @@ def _copy_and_verify_anchor_storage(anchor: RecoveryAnchor, temp_parent: Path) -
         raise
 
 
+def _normalize_related_paths(
+    results_root: Path,
+    raw_paths: list[Path] | None,
+) -> list[Path]:
+    root = results_root.resolve()
+    candidates: list[Path] = []
+    for raw_path in raw_paths or []:
+        path = raw_path.expanduser()
+        if not path.is_absolute():
+            path = results_root / path
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"待隔离路径越出 results 根目录: {raw_path}") from exc
+        if len(relative.parts) < 2:
+            raise ValueError(f"拒绝隔离过宽的 results 路径: {resolved}")
+        if relative.parts[0] in {"recovery_backups", "recovery_locks", ".recovery_tmp"}:
+            raise ValueError(f"拒绝隔离 recovery 管理路径: {resolved}")
+        if resolved.exists():
+            candidates.append(resolved)
+
+    unique = sorted(set(candidates), key=lambda item: (len(item.parts), item.as_posix()))
+    selected: list[Path] = []
+    for candidate in unique:
+        if any(candidate == parent or candidate.is_relative_to(parent) for parent in selected):
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def _related_backup_destination(
+    backup_dir: Path,
+    results_root: Path,
+    source: Path,
+) -> Path:
+    relative = source.resolve().relative_to(results_root.resolve())
+    return backup_dir / "related_artifacts" / relative
+
+
+def _batch_state_update_payload(path: Path, run_name: str) -> dict[str, Any]:
+    payload = load_json(path)
+    state_run_name = str(payload.get("run_name", "") or "").strip()
+    if state_run_name and state_run_name != run_name:
+        raise ValueError(
+            f"batch state run_name 不匹配: expected={run_name} actual={state_run_name}: {path}"
+        )
+    payload["status"] = "failed_after_checkpoint"
+    payload["resume_allowed"] = True
+    payload["error"] = ""
+    payload["forced_llm_rollback_prepared"] = True
+    payload["forced_llm_rollback_prepared_at"] = datetime.now().isoformat(
+        timespec="seconds"
+    )
+    return payload
+
+
 def prepare_checkpoint_resume(
     checkpoint_dir: Path,
     results_root: Path,
@@ -455,8 +742,14 @@ def prepare_checkpoint_resume(
     *,
     dry_run: bool,
     check_health: bool = True,
+    anchor_snapshot_name: str | None = None,
+    batch_state_path: Path | None = None,
+    related_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
-    anchor = discover_recovery_anchor(checkpoint_dir)
+    anchor = discover_recovery_anchor(
+        checkpoint_dir,
+        snapshot_name=anchor_snapshot_name,
+    )
     if target_step <= anchor.step_no:
         raise ValueError(f"目标总步数必须大于恢复锚点: target={target_step}, anchor={anchor.step_no}")
     active = find_active_processes(run_name)
@@ -466,14 +759,40 @@ def prepare_checkpoint_resume(
     if check_health and not dry_run:
         check_runtime_requirements(anchor)
 
+    normalized_related_paths = _normalize_related_paths(results_root, related_paths)
+    checkpoint_resolved = checkpoint_dir.resolve()
+    for related_path in normalized_related_paths:
+        if related_path == checkpoint_resolved or related_path.is_relative_to(
+            checkpoint_resolved
+        ):
+            raise ValueError(
+                f"checkpoint 内部路径必须由恢复器管理，不能作为派生产物隔离: {related_path}"
+            )
+    normalized_state_path: Path | None = None
+    state_update_payload: dict[str, Any] | None = None
+    if batch_state_path is not None:
+        normalized = _normalize_related_paths(results_root, [batch_state_path])
+        if not normalized or normalized[0] != batch_state_path.expanduser().resolve():
+            raise FileNotFoundError(f"batch state 不存在: {batch_state_path}")
+        normalized_state_path = normalized[0]
+        state_update_payload = _batch_state_update_payload(
+            normalized_state_path,
+            run_name,
+        )
+        normalized_related_paths = [
+            path for path in normalized_related_paths if path != normalized_state_path
+        ]
+
     extra_paths, moved_snapshot_stems = artifacts_after_anchor(checkpoint_dir, anchor)
     live_paths = [
         checkpoint_dir / "storage",
         checkpoint_dir / "conversation.json",
         checkpoint_dir / "judge_traces",
         checkpoint_dir / "forced_prompt_traces",
+        checkpoint_dir / "consult_history",
         checkpoint_dir / "staged_eval" / "state.json",
         checkpoint_dir / "staged_eval" / "index.json",
+        *sorted(checkpoint_dir.glob("*.log")),
     ]
     sources: list[Path] = []
     seen: set[Path] = set()
@@ -492,7 +811,9 @@ def prepare_checkpoint_resume(
         "checkpoint_dir": str(checkpoint_dir),
         "target_step": int(target_step),
         "remaining_steps": int(target_step - anchor.step_no),
+        "anchor_selection": "explicit" if anchor_snapshot_name else "latest_consistent",
         "anchor": {
+            "artifact_kind": anchor.artifact_kind,
             "label": anchor.label,
             "step_no": anchor.step_no,
             "sim_time": anchor.sim_time,
@@ -507,6 +828,20 @@ def prepare_checkpoint_resume(
         "backup_dir": str(backup_dir),
         "backed_up_paths": [str(path.relative_to(checkpoint_dir)) for path in sources],
         "moved_post_anchor_snapshot_stems": moved_snapshot_stems,
+        "consult_history": inspect_consult_history_at_anchor(checkpoint_dir, anchor),
+        "batch_state_path": str(normalized_state_path or ""),
+        "batch_state_update": (
+            {
+                "status": "failed_after_checkpoint",
+                "resume_allowed": True,
+            }
+            if normalized_state_path
+            else {}
+        ),
+        "related_artifacts": [
+            str(path.relative_to(results_root.resolve()))
+            for path in normalized_related_paths
+        ],
         "prepared_at": now.isoformat(timespec="seconds"),
     }
     if dry_run:
@@ -514,9 +849,15 @@ def prepare_checkpoint_resume(
 
     temp_parent = results_root / ".recovery_tmp" / run_name
     temp_storage = _copy_and_verify_anchor_storage(anchor, temp_parent)
+    temp_consult_history = _copy_consult_history_at_anchor(
+        checkpoint_dir,
+        anchor,
+        temp_parent,
+    )
     backup_dir.mkdir(parents=True, exist_ok=False)
     moved: list[tuple[Path, Path]] = []
     installed: list[Path] = []
+    batch_state_backup: Path | None = None
     try:
         applying_plan = dict(plan)
         applying_plan["status"] = "applying"
@@ -527,9 +868,24 @@ def prepare_checkpoint_resume(
             shutil.move(str(source), str(destination))
             moved.append((destination, source))
 
+        for source in normalized_related_paths:
+            destination = _related_backup_destination(
+                backup_dir,
+                results_root,
+                source,
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((destination, source))
+
         live_storage = checkpoint_dir / "storage"
         os.replace(temp_storage, live_storage)
         installed.append(live_storage)
+
+        if temp_consult_history is not None:
+            live_consult_history = checkpoint_dir / "consult_history"
+            os.replace(temp_consult_history, live_consult_history)
+            installed.append(live_consult_history)
 
         conversation = anchor.job.get("conversation", {}) or {}
         write_json_atomic(checkpoint_dir / "conversation.json", conversation)
@@ -566,6 +922,12 @@ def prepare_checkpoint_resume(
         (checkpoint_dir / "forced_prompt_traces").mkdir(parents=True, exist_ok=True)
         installed.append(checkpoint_dir / "forced_prompt_traces")
 
+        if normalized_state_path is not None and state_update_payload is not None:
+            batch_state_backup = backup_dir / "batch_state_before.json"
+            shutil.copy2(normalized_state_path, batch_state_backup)
+            write_json_atomic(normalized_state_path, state_update_payload)
+            installed.append(normalized_state_path)
+
         write_json_atomic(backup_dir / "recovery_manifest.json", plan)
         try:
             temp_parent.rmdir()
@@ -584,12 +946,76 @@ def prepare_checkpoint_resume(
                 continue
             original_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(backup_path), str(original_path))
+        if (
+            normalized_state_path is not None
+            and batch_state_backup is not None
+            and batch_state_backup.is_file()
+        ):
+            normalized_state_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(batch_state_backup, normalized_state_path)
         shutil.rmtree(temp_storage, ignore_errors=True)
+        if temp_consult_history is not None:
+            shutil.rmtree(temp_consult_history, ignore_errors=True)
         try:
             temp_parent.rmdir()
             temp_parent.parent.rmdir()
         except OSError:
             pass
+        raise
+
+
+def quarantine_related_artifacts(
+    results_root: Path,
+    run_name: str,
+    paths: list[Path],
+    *,
+    dry_run: bool,
+    reason: str,
+) -> dict[str, Any]:
+    normalized = _normalize_related_paths(results_root, paths)
+    now = datetime.now()
+    recovery_id = now.strftime("%Y%m%d-%H%M%S-%f")
+    backup_dir = results_root / "recovery_backups" / run_name / recovery_id
+    plan = {
+        "schema_version": 1,
+        "status": "dry_run" if dry_run else "prepared",
+        "operation": "quarantine_related_artifacts",
+        "reason": str(reason or "manual"),
+        "run_name": run_name,
+        "backup_dir": str(backup_dir),
+        "related_artifacts": [
+            str(path.relative_to(results_root.resolve())) for path in normalized
+        ],
+        "prepared_at": now.isoformat(timespec="seconds"),
+    }
+    if dry_run or not normalized:
+        if not normalized:
+            plan["status"] = "no_op"
+        return plan
+
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        applying = dict(plan)
+        applying["status"] = "applying"
+        write_json_atomic(backup_dir / "recovery_manifest.json", applying)
+        for source in normalized:
+            destination = _related_backup_destination(
+                backup_dir,
+                results_root,
+                source,
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((destination, source))
+        write_json_atomic(backup_dir / "recovery_manifest.json", plan)
+        return plan
+    except BaseException:
+        for backup_path, original_path in reversed(moved):
+            if not backup_path.exists():
+                continue
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(backup_path), str(original_path))
         raise
 
 
@@ -601,6 +1027,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--condition", help="与 --batch-name 配套，例如 Counsel-KBD6-G9-SEV")
     parser.add_argument("--results-root", default=str(DEFAULT_RESULTS_ROOT), help="results 根目录")
     parser.add_argument("--target-step", type=int, default=120, help="实验目标总步数，默认 120")
+    parser.add_argument(
+        "--anchor-snapshot",
+        help="显式指定已验证恢复 bundle 对应的 simulate-*.json；省略时选最新一致锚点",
+    )
+    parser.add_argument(
+        "--batch-state-path",
+        help="恢复成功后改为 failed_after_checkpoint 的 condition state；旧内容会备份",
+    )
+    parser.add_argument(
+        "--quarantine-path",
+        action="append",
+        default=[],
+        help="随恢复一起安全隔离的 results 内派生产物，可重复",
+    )
+    parser.add_argument(
+        "--quarantine-only",
+        action="store_true",
+        help="只把 --quarantine-path 移入 recovery_backups，不恢复 checkpoint",
+    )
+    parser.add_argument(
+        "--quarantine-reason",
+        default="forced_llm_repair",
+        help="写入 recovery manifest 的隔离原因",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只验证并显示恢复计划，不移动文件")
     return parser.parse_args()
 
@@ -625,6 +1075,50 @@ def main() -> int:
         status, state_path = "", None
 
     checkpoint_dir = results_root / "checkpoints" / run_name
+    def resolve_cli_path(raw: str) -> Path:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path.resolve()
+
+    quarantine_paths = [resolve_cli_path(item) for item in args.quarantine_path]
+    batch_state_path = (
+        resolve_cli_path(args.batch_state_path)
+        if args.batch_state_path
+        else None
+    )
+    if args.quarantine_only:
+        if not quarantine_paths:
+            raise ValueError("--quarantine-only 至少需要一个 --quarantine-path")
+        if args.anchor_snapshot:
+            raise ValueError("--quarantine-only 不能与 --anchor-snapshot 同时使用")
+        if args.dry_run:
+            plan = quarantine_related_artifacts(
+                results_root,
+                run_name,
+                quarantine_paths,
+                dry_run=True,
+                reason=args.quarantine_reason,
+            )
+        else:
+            lock_dir = results_root / "recovery_locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / f"{run_name}.lock"
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError(f"已有恢复进程持有锁: {lock_path}") from exc
+                plan = quarantine_related_artifacts(
+                    results_root,
+                    run_name,
+                    quarantine_paths,
+                    dry_run=False,
+                    reason=args.quarantine_reason,
+                )
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 0
+
     if args.dry_run:
         plan = prepare_checkpoint_resume(
             checkpoint_dir,
@@ -633,6 +1127,9 @@ def main() -> int:
             int(args.target_step),
             dry_run=bool(args.dry_run),
             check_health=True,
+            anchor_snapshot_name=args.anchor_snapshot,
+            batch_state_path=batch_state_path,
+            related_paths=quarantine_paths,
         )
     else:
         lock_dir = results_root / "recovery_locks"
@@ -650,6 +1147,9 @@ def main() -> int:
                 int(args.target_step),
                 dry_run=False,
                 check_health=True,
+                anchor_snapshot_name=args.anchor_snapshot,
+                batch_state_path=batch_state_path,
+                related_paths=quarantine_paths,
             )
     plan["batch_state_status"] = status
     plan["batch_state_path"] = str(state_path) if state_path else ""

@@ -7,6 +7,9 @@
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
+      "prompt_recent_path_limit": 4,
+      "prompt_semantic_guard_limit": 20,
+      "prompt_known_stage_id_limit": 512,
       "min_match_confidence": 0.6,
       "allow_replan": true,
       "max_dialog_history": 16

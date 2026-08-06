@@ -1,0 +1,35 @@
+{
+  "intervention": {
+    "enabled": false,
+    "meeting_queue": {
+      "enabled": false
+    },
+    "resident_chat_scheduler": {
+      "enabled": false
+    },
+    "order_extract": {
+      "enabled": false
+    },
+    "session_prompt_injection": {
+      "enabled": false
+    },
+    "dialog_judge": {
+      "enabled": false
+    },
+    "session_eval": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": false
+    },
+    "depression_dynamic": {
+      "enabled": true
+    },
+    "memory_injection": {
+      "enabled": true
+    },
+    "memory_policy": {
+      "enabled": true
+    }
+  }
+}

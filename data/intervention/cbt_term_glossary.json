@@ -1,0 +1,63 @@
+{
+  "primary_strategies": {
+    "acute_affect_regulation": {"label": "急性情绪调节", "instruction": "先帮助患者降低当下情绪强度，再决定是否继续探索。"},
+    "agenda_focus": {"label": "聚焦本轮议题", "instruction": "与患者共同选定本轮最值得处理的一个具体问题。"},
+    "alliance_repair": {"label": "修复咨访关系", "instruction": "先回应患者的不适、误解或不信任，并重新协商合作方式。"},
+    "alternative_hypothesis": {"label": "形成替代假设", "instruction": "共同提出一个低强度、可观察且不要求患者立即相信的新解释。"},
+    "autonomy_transfer": {"label": "移交自主性", "instruction": "帮助患者把已掌握的方法转化为能够自行选择和使用的工具。"},
+    "balanced_belief_consolidation": {"label": "巩固平衡观点", "instruction": "基于真实经验形成不过度正向、患者暂时能够保留的观点。"},
+    "barrier_analysis": {"label": "分析执行阻碍", "instruction": "定位任务在哪一步卡住，以及当时最主要的内部或外部阻碍。"},
+    "brief_psychoeducation": {"label": "简短心理教育", "instruction": "用简洁语言解释当前最必要的 CBT 概念，并马上联系患者材料。"},
+    "cognitive_distancing": {"label": "拉开认知距离", "instruction": "帮助患者把想法看作心理事件，而不是已经确定的事实。"},
+    "cognitive_triangle_mapping": {"label": "梳理认知三角", "instruction": "引导患者连接具体情境、自动思维以及情绪或身体反应。"},
+    "conditional_rule_elicitation": {"label": "提炼条件规则", "instruction": "从重复担忧和行为中协作提炼一条暂定的“如果……那么……”规则。"},
+    "cross_situation_pattern_mapping": {"label": "梳理跨情境模式", "instruction": "比较多个具体事件，找出反复出现的想法、情绪或应对方式。"},
+    "distortion_labeling": {"label": "识别认知偏差", "instruction": "与患者共同识别思维模式，避免把标签当作对患者的评判。"},
+    "downward_arrow": {"label": "向下箭头探索", "instruction": "沿当前想法逐步询问其更深层含义，同时控制情绪负荷。"},
+    "ending_process": {"label": "处理结束过程", "instruction": "讨论治疗结束带来的感受、担忧和仍未完成的体验。"},
+    "experiment_review": {"label": "回顾行为实验", "instruction": "先核对实际执行，再比较原先预测与真实结果。"},
+    "functional_analysis": {"label": "功能分析", "instruction": "梳理触发、行为和后果，理解当前应对方式短期与长期的作用。"},
+    "graded_experiment_design": {"label": "设计分级实验", "instruction": "把待检验想法转成负担较低、允许部分完成的观察任务。"},
+    "implementation_plan": {"label": "制定执行计划", "instruction": "共同明确最小行动、触发线索以及时间地点。"},
+    "neutral_data_sampling": {"label": "收集中性数据", "instruction": "保存例外和中性片段，不急于把它们解释成积极证明。"},
+    "prediction_capture": {"label": "记录事前预测", "instruction": "在行动前记录患者最担心发生什么以及大致担忧程度。"},
+    "readiness_check": {"label": "核对准备度", "instruction": "询问患者当前意愿、负担和顾虑，并允许调整或暂缓。"},
+    "relapse_prevention_plan": {"label": "制定复发预防计划", "instruction": "识别早期预警信号并匹配一个现实可行的最小应对动作。"},
+    "safety_check": {"label": "安全核对", "instruction": "直接、温和地核对自伤、自杀或其他紧迫风险及可用支持。"},
+    "shared_formulation": {"label": "共同概念化", "instruction": "用患者能够认可的语言连接信念、想法、情绪与行为。"},
+    "skills_review": {"label": "回顾可用技能", "instruction": "从患者真实经历中找出已经使用过且仍可复用的方法。"},
+    "support_stabilize": {"label": "支持与稳定", "instruction": "先接住情绪、降低压力并维持参与，不急于推动高负荷探索。"},
+    "task_grading": {"label": "调整任务难度", "instruction": "根据阻碍把任务缩小、替换或重新排序到可承受程度。"}
+  },
+  "micro_skills": {
+    "choice_scaffolding": {"label": "提供有限选择", "instruction": "给出两三个清晰选项，降低回答和决策负担。"},
+    "focused_question": {"label": "聚焦式提问", "instruction": "一次只追问一个最关键、可具体回答的信息缺口。"},
+    "memory_link": {"label": "连接既有材料", "instruction": "把当前表达与患者先前说过的具体事件或发现连接起来。"},
+    "normalization": {"label": "正常化", "instruction": "说明这种反应可以理解，同时不淡化患者的实际痛苦。"},
+    "one_step_pacing": {"label": "单步推进", "instruction": "本轮只推进一个很小步骤，避免连续追问多个任务。"},
+    "open_question": {"label": "开放式提问", "instruction": "邀请患者用自己的语言描述经验，不预设答案。"},
+    "permission_check": {"label": "征求许可", "instruction": "进入更深或更难的话题前，先确认患者是否愿意继续。"},
+    "psychoeducation": {"label": "概念解释", "instruction": "简短解释一个必要概念，并让解释服务于当前材料。"},
+    "reflection": {"label": "反映", "instruction": "准确复述患者的核心体验或矛盾，帮助其继续展开。"},
+    "reinforcement": {"label": "强化有效尝试", "instruction": "具体指出患者已经做出的努力或有效步骤，避免空泛表扬。"},
+    "scaling": {"label": "粗粒度量化", "instruction": "用低中高或简短量尺帮助患者比较强度，不强求精确数字。"},
+    "socratic_question": {"label": "苏格拉底式提问", "instruction": "用好奇、非对抗的问题帮助患者检查想法和证据。"},
+    "summary": {"label": "小结", "instruction": "简短整理已确认的信息、分歧和下一处最小缺口。"},
+    "teach_back": {"label": "请患者复述", "instruction": "邀请患者用自己的话说明刚形成的理解或计划。"},
+    "validation": {"label": "确认与接纳", "instruction": "明确承认患者体验的合理性和难度，再进入下一步。"}
+  },
+  "macro_stages": {
+    "M1_ENGAGE_ASSESS": "建立关系与评估",
+    "M2_SHARED_FORMULATION": "形成共同理解",
+    "M3_TEST_AND_LEARN": "检验与学习",
+    "M4_CONSOLIDATE_END": "巩固与结束"
+  },
+  "actions": {
+    "stay": "保持当前子目标",
+    "advance_subgoal": "推进到相邻子目标",
+    "side_step": "临时处理旁支问题",
+    "advance_stage": "完成当前固定会谈提纲",
+    "soft_step_back": "软回访前置子目标",
+    "hold": "暂缓更新"
+  }
+}

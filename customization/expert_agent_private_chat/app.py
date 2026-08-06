@@ -1,7 +1,5 @@
 import os
 import sys
-import json
-from dataclasses import dataclass
 
 import gradio as gr
 
@@ -10,37 +8,20 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-from modules.game import create_game  # noqa: E402
-from modules.memory import Event  # noqa: E402
-from modules import utils  # noqa: E402
 from customization.depression_scale_agent.ExpertLLM import ExpertLLM  # noqa: E402
+from customization.snapshot_ui_service import (  # noqa: E402
+    UserStub,
+    create_checkpoint_game,
+    list_agents as _list_agents,
+    list_simulations as _list_simulations,
+    load_config as _load_config,
+    load_conversation as _load_conversation,
+)
 
 
 CHECKPOINTS_ROOT = os.path.join(BASE_DIR, "results", "checkpoints")
 STATIC_ROOT = os.path.join(BASE_DIR, "frontend", "static")
 DEFAULT_USER_NAME = "专家"
-
-
-@dataclass
-class UserStub:
-    name: str
-    tile: object
-
-    def __post_init__(self):
-        address = self.tile.get_address()
-        self._event = Event(
-            self.name,
-            "正在",
-            "聊天",
-            describe=f"{self.name} 正在聊天",
-            address=address,
-        )
-
-    def get_event(self):
-        return self._event
-
-    def get_tile(self):
-        return self.tile
 
 
 class ChatSession:
@@ -50,15 +31,12 @@ class ChatSession:
         if self.config is None:
             raise ValueError(f"找不到存档: {sim_name}")
         self.conversation = load_conversation(sim_name)
-        self.logger = utils.create_io_logger("info")
-        self.game = create_game(
+        self.logger, self.game = create_checkpoint_game(
             sim_name,
             STATIC_ROOT,
             self.config,
             self.conversation,
-            logger=self.logger,
         )
-        self.game.reset_game()
         self.agent_name = ""
         self.agent = None
 
@@ -81,52 +59,27 @@ class ChatSession:
 
 
 def list_simulations():
-    if not os.path.isdir(CHECKPOINTS_ROOT):
-        return []
-    return sorted(
-        d
-        for d in os.listdir(CHECKPOINTS_ROOT)
-        if os.path.isdir(os.path.join(CHECKPOINTS_ROOT, d))
-    )
+    return _list_simulations(CHECKPOINTS_ROOT)
 
 
 def load_latest_config(sim_name):
-    folder = os.path.join(CHECKPOINTS_ROOT, sim_name)
-    if not os.path.isdir(folder):
-        return None
-    files = sorted(
-        f
-        for f in os.listdir(folder)
-        if f.endswith(".json") and f != "conversation.json"
+    return _load_config(
+        CHECKPOINTS_ROOT,
+        sim_name,
+        overwrite_agent_config_paths=True,
     )
-    if not files:
-        return None
-    latest = os.path.join(folder, files[-1])
-    with open(latest, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    if isinstance(config.get("time"), str):
-        config["time"] = {"start": config["time"]}
-    assets_root = os.path.join("assets", "village")
-    for agent_name in config.get("agents", {}):
-        config["agents"][agent_name]["config_path"] = os.path.join(
-            assets_root, "agents", agent_name.replace(" ", "_"), "agent.json"
-        )
-    return config
 
 
 def load_conversation(sim_name):
-    path = os.path.join(CHECKPOINTS_ROOT, sim_name, "conversation.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_conversation(CHECKPOINTS_ROOT, sim_name)
 
 
 def list_agents(sim_name):
-    config = load_latest_config(sim_name)
-    if not config:
-        return []
-    return sorted(config.get("agents", {}).keys())
+    return _list_agents(
+        CHECKPOINTS_ROOT,
+        sim_name,
+        overwrite_agent_config_paths=True,
+    )
 
 
 def ensure_session(sim_name, session):

@@ -1,6 +1,9 @@
 #!/bin/bash
 # ============================================================
-# 抑郁症治疗遍历实验 — 后台运行脚本
+# Legacy G1/G2 抑郁症治疗遍历实验 — 后台运行脚本
+#
+# 仅供历史复现；会备份并替换共享配置。新建批量实验请使用
+# runshells/run_batch_then_repeat_eval.sh 或 runshells/run_batch_experiment.py。
 #
 # 用法:
 #   ./runshells/run_experiment.sh                          # 完整遍历（后台）
@@ -27,7 +30,7 @@ LOG_FILE="$LOG_DIR/experiment_$(date +%Y%m%d_%H%M%S).log"
 
 # ---------- 帮助 ----------
 show_help() {
-    echo "抑郁症治疗遍历实验"
+    echo "Legacy G1/G2 抑郁症治疗遍历实验（仅历史复现）"
     echo ""
     echo "用法: $0 [选项] [-- 传给 run_experiment.py 的参数]"
     echo ""

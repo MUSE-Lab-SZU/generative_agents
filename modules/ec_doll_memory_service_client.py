@@ -2,32 +2,13 @@
 
 from __future__ import annotations
 
-import warnings
-from typing import Any, Dict, List, Optional, TypedDict, Union
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 
 JsonDict = Dict[str, Any]
 JsonList = List[JsonDict]
 JsonData = Union[JsonDict, JsonList]
-
-
-class CognitiveSchema(TypedDict):
-    """`/api/cognitive/schemas` 返回的图式对象（已弃用接口）。"""
-
-    schema_id: str
-    name: str
-    activation_score: float
-    definition: str
-    associated_thoughts: List[str]
-
-
-class CognitiveHistoryItem(TypedDict):
-    """认知接口 history 列表中的单条对话记录（已弃用接口）。"""
-
-    user_input: str
-    ai_response: str
-    active_schemas: List[Any]
 
 
 class ECDollMemoryServiceClient:
@@ -87,39 +68,6 @@ class ECDollMemoryServiceClient:
         if data is None:
             return None
         return {key: value for key, value in data.items() if value is not None}
-
-    @staticmethod
-    def _warn_deprecated(name: str, replacement: str = "") -> None:
-        tip = f"`{name}` 已弃用，不在最新 MEMORY_SERVICE.md 接口清单中。"
-        if replacement:
-            tip += f" 建议改用 `{replacement}`。"
-        warnings.warn(tip, DeprecationWarning, stacklevel=2)
-
-    def get_emotion_timeline(
-        self,
-        limit: int = 50,
-        user_id: Optional[str] = None,
-    ) -> JsonList:
-        """
-        已弃用接口：
-        - 对应旧版路径：`GET /api/v1/visual/emotion_timeline`
-        - 最新文档 `MEMORY_SERVICE.md` 已不再定义该接口
-
-        输入：
-        - `limit`(int): 返回最近情绪点数量。
-        - `user_id`(str|None): 旧接口中的用户 ID 过滤参数。
-
-        输出：
-        - List[dict]：旧接口情绪点数组。常见字段：
-          `timestamp`, `intensity`, `tag`, `related_msg_id`。
-        """
-        self._warn_deprecated("get_emotion_timeline")
-        data = self._request(
-            "GET",
-            "/api/v1/visual/emotion_timeline",
-            params={"limit": limit, "user_id": user_id},
-        )
-        return data if isinstance(data, list) else []
 
     def ingest_memory(
         self,
@@ -415,91 +363,6 @@ class ECDollMemoryServiceClient:
         - 透传服务端返回；常见字段依服务实现而定。
         """
         data = self._request("POST", "/api/embed/recheck")
-        return data if isinstance(data, dict) else {}
-
-    def get_cognitive_schemas(self, user_id: str) -> List[CognitiveSchema]:
-        """
-        已弃用接口：`GET /api/cognitive/schemas`（最新文档不再定义）。
-
-        输入：
-        - `user_id`(str): 用户 ID。
-
-        输出：
-        - List[dict]：认知图式数组。
-        """
-        self._warn_deprecated("get_cognitive_schemas")
-        data = self._request(
-            "GET",
-            "/api/cognitive/schemas",
-            params={"user_id": user_id},
-        )
-        return data if isinstance(data, list) else []
-
-    def run_cognitive_workflow(
-        self,
-        user_id: str,
-        content: str,
-        history: Optional[List[CognitiveHistoryItem]] = None,
-    ) -> JsonDict:
-        """
-        已弃用接口：`POST /api/cognitive/workflow`（最新文档不再定义）。
-
-        输入：
-        - `user_id`(str): 用户 ID。
-        - `content`(str): 当前输入文本。
-        - `history`(list|None): 历史对话记录。
-
-        输出：
-        - dict：常见字段 `inner_monologue`, `active_schemas`, `reflection_result`。
-        """
-        self._warn_deprecated("run_cognitive_workflow")
-        data = self._request(
-            "POST",
-            "/api/cognitive/workflow",
-            json_body={"user_id": user_id, "content": content, "history": history},
-        )
-        return data if isinstance(data, dict) else {}
-
-    def interpret_cognitive(self, user_id: str, content: str) -> JsonDict:
-        """
-        已弃用接口：`POST /api/cognitive/interpret`（最新文档不再定义）。
-
-        输入：
-        - `user_id`(str): 用户 ID。
-        - `content`(str): 当前输入文本。
-
-        输出：
-        - dict：常见字段 `inner_monologue`, `active_schemas`。
-        """
-        self._warn_deprecated("interpret_cognitive")
-        data = self._request(
-            "POST",
-            "/api/cognitive/interpret",
-            json_body={"user_id": user_id, "content": content},
-        )
-        return data if isinstance(data, dict) else {}
-
-    def reflect_cognitive(
-        self,
-        user_id: str,
-        history: List[CognitiveHistoryItem],
-    ) -> JsonDict:
-        """
-        已弃用接口：`POST /api/cognitive/reflect`（最新文档不再定义）。
-
-        输入：
-        - `user_id`(str): 用户 ID。
-        - `history`(list): 历史对话记录。
-
-        输出：
-        - dict：常见字段 `status`, `insights`, `updates`。
-        """
-        self._warn_deprecated("reflect_cognitive")
-        data = self._request(
-            "POST",
-            "/api/cognitive/reflect",
-            json_body={"user_id": user_id, "history": history},
-        )
         return data if isinstance(data, dict) else {}
 
     def health_check(self) -> JsonDict:

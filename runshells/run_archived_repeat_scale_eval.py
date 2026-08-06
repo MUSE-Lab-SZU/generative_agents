@@ -16,19 +16,22 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
-import hashlib
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
-import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from artifact_digest import (
+    canonical_json_sha256 as _canonical_json_sha256,
+    file_sha256 as _file_sha256,
+)
 
 from scipy.stats import t as student_t
 
@@ -63,6 +66,11 @@ from run_batch_experiment import (
     resolve_conditions,
     trigger_sort_key,
     write_json_file,
+)
+from cbt_experiment_config import (
+    MANIFEST_FILENAME,
+    assert_identity_matches,
+    manifest_identity,
 )
 
 
@@ -149,6 +157,7 @@ class RuntimeConfig:
     reset_target_depression_state: bool
     allow_legacy_final_storage: bool
     output_group: str
+    require_controller_manifest: bool = False
 
 
 @dataclass(frozen=True)
@@ -190,6 +199,11 @@ def parse_args() -> argparse.Namespace:
         help="允许旧 staged job 复用最终 storage；结果会被标记为非严格历史快照",
     )
     parser.add_argument("--output-group", default=OUTPUT_GROUP, help="复评输出使用的新 group 标签，例如 G8；留空则沿用原始 condition")
+    parser.add_argument(
+        "--require-controller-manifest",
+        action="store_true",
+        help="要求并校验生成阶段 CBT condition manifest",
+    )
     return parser.parse_args()
 
 
@@ -365,6 +379,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         reset_target_depression_state=bool(args.reset_target_depression_state),
         allow_legacy_final_storage=bool(args.allow_legacy_final_storage),
         output_group=str(args.output_group or "").strip().lower(),
+        require_controller_manifest=bool(args.require_controller_manifest),
     )
 
 
@@ -451,6 +466,7 @@ def print_effective_config(cfg: RuntimeConfig, original_summary: dict[str, Any])
     print(f"  reset depression:{cfg.reset_target_depression_state}")
     print(f"  legacy storage:  {cfg.allow_legacy_final_storage}")
     print(f"  output group:    {cfg.output_group or '(source)'}")
+    print(f"  controller manifest required: {cfg.require_controller_manifest}")
     print("==========================================")
 
 
@@ -469,6 +485,122 @@ def selected_conditions(cfg: RuntimeConfig, original_summary: dict[str, Any]) ->
     if missing:
         raise ValueError(f"原始 summary 中找不到 condition: {', '.join(missing)}")
     return [condition_for_output(cfg, item) for item in source_selected]
+
+
+def generation_manifest_output_path(
+    cfg: RuntimeConfig,
+    condition_name: str,
+) -> Path:
+    return condition_output_dir(cfg, condition_name) / MANIFEST_FILENAME
+
+
+def generation_manifest_for_condition(
+    cfg: RuntimeConfig,
+    condition: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    embedded = condition.get("controller_manifest")
+    manifest: dict[str, Any] | None = (
+        copy.deepcopy(dict(embedded))
+        if isinstance(embedded, Mapping)
+        else None
+    )
+    source_path = str(condition.get("controller_manifest_path", "") or "").strip()
+    if manifest is None and source_path:
+        path = Path(source_path).expanduser()
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        manifest = load_optional_json(path.resolve())
+    required = bool(getattr(cfg, "require_controller_manifest", False))
+    if manifest is None:
+        if required:
+            raise ValueError(
+                "生成阶段 summary 缺少 controller manifest: "
+                + str(condition.get("condition_name", "") or "")
+            )
+        return None
+    if str(manifest.get("artifact_kind", "") or "") != "cbt_experiment_condition":
+        raise ValueError("生成阶段 controller manifest artifact_kind 无效")
+    identity = manifest_identity(manifest)
+    if (
+        not identity["controller_identity"]
+        or identity["mode"] not in {"legacy", "minimal"}
+        or not identity["controller_version"]
+    ):
+        raise ValueError("生成阶段 controller manifest identity 不完整")
+    if condition.get("controller_identity"):
+        assert_identity_matches(
+            condition,
+            manifest,
+            context="repeat eval generation summary",
+        )
+    expected_condition_key = str(condition.get("condition_key", "") or "")
+    if expected_condition_key and (
+        str(manifest.get("condition_key", "") or "") != expected_condition_key
+    ):
+        raise ValueError("repeat eval generation manifest condition key 不匹配")
+    run_name = str(condition.get("run_name", "") or "")
+    if run_name and str(manifest.get("run_name", "") or "") != run_name:
+        raise ValueError("repeat eval generation manifest run_name 不匹配")
+    checkpoint_manifest_path = checkpoints_root(cfg) / run_name / MANIFEST_FILENAME
+    checkpoint_manifest = load_optional_json(checkpoint_manifest_path)
+    if checkpoint_manifest is not None:
+        assert_identity_matches(
+            manifest,
+            checkpoint_manifest,
+            context=f"repeat eval checkpoint manifest {checkpoint_manifest_path}",
+        )
+        if str(checkpoint_manifest.get("condition_key", "") or "") != str(
+            manifest.get("condition_key", "") or ""
+        ):
+            raise ValueError(
+                "repeat eval checkpoint manifest condition key 不匹配"
+            )
+        if str(checkpoint_manifest.get("run_name", "") or "") != run_name:
+            raise ValueError(
+                "repeat eval checkpoint manifest run_name 不匹配"
+            )
+    return manifest
+
+
+def prepare_generation_manifests(
+    cfg: RuntimeConfig,
+    original_summary: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    manifests: dict[str, dict[str, Any]] = {}
+    for condition in selected_conditions(cfg, original_summary):
+        condition_name = str(condition.get("condition_name", "") or "")
+        manifest = generation_manifest_for_condition(cfg, condition)
+        if manifest is None:
+            continue
+        output_path = generation_manifest_output_path(cfg, condition_name)
+        existing = load_optional_json(output_path)
+        if existing is not None:
+            assert_identity_matches(
+                manifest,
+                existing,
+                context=f"repeat eval resume manifest {output_path}",
+            )
+            if str(existing.get("condition_key", "") or "") != str(
+                manifest.get("condition_key", "") or ""
+            ):
+                raise ValueError(
+                    f"repeat eval resume manifest condition key 不匹配: {output_path}"
+                )
+            if str(existing.get("run_name", "") or "") != str(
+                manifest.get("run_name", "") or ""
+            ):
+                raise ValueError(
+                    f"repeat eval resume manifest run_name 不匹配: {output_path}"
+                )
+        if cfg.dry_run:
+            print(
+                f"[DRY-RUN] copy generation manifest: "
+                f"{manifest.get('controller_identity')} -> {output_path}"
+            )
+        else:
+            write_json_file(output_path, manifest)
+        manifests[condition_name] = manifest
+    return manifests
 
 
 def condition_for_output(cfg: RuntimeConfig, condition: dict[str, Any]) -> dict[str, Any]:
@@ -913,24 +1045,11 @@ def condition_evaluation(condition: dict[str, Any], label: str) -> dict[str, Any
 
 
 def canonical_json_sha256(payload: Any) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _canonical_json_sha256(payload)
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    return _file_sha256(path)
 
 
 def resolve_bundle_path(source_dir: Path, raw_relpath: Any, field_name: str) -> Path:
@@ -1036,7 +1155,6 @@ def build_staged_job(
     cfg: RuntimeConfig,
     condition: dict[str, Any],
     label: str,
-    repeat_idx: int,
     output_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_name = str(condition.get("run_name", "") or "").strip()
@@ -1105,7 +1223,6 @@ def build_staged_job(
 def build_post_job(
     cfg: RuntimeConfig,
     condition: dict[str, Any],
-    repeat_idx: int,
     output_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_name = str(condition.get("run_name", "") or "").strip()
@@ -1243,6 +1360,7 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
     checkpoint_dir = checkpoints_root(cfg) / run_name
     if not checkpoint_dir.is_dir():
         raise FileNotFoundError(f"checkpoint not found: {checkpoint_dir}")
+    generation_manifest = generation_manifest_for_condition(cfg, condition)
 
     if task_complete(cfg, task) and not cfg.force:
         print(f"[SKIP] complete: {condition_name} r{task.repeat_idx:02d} {task.label}")
@@ -1259,9 +1377,9 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     if task.label == "POST":
-        job, source_metadata = build_post_job(cfg, condition, task.repeat_idx, output_dir)
+        job, source_metadata = build_post_job(cfg, condition, output_dir)
     else:
-        job, source_metadata = build_staged_job(cfg, condition, task.label, task.repeat_idx, output_dir)
+        job, source_metadata = build_staged_job(cfg, condition, task.label, output_dir)
 
     job_path = output_dir / "job.json"
     active_job, preserve_existing_job = select_resumable_job(cfg, job_path, job)
@@ -1279,6 +1397,26 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
             "source_repeat_mode": "fixed_complete_scale_repeat",
             "evaluation_protocol": evaluation_protocol_metadata(cfg, active_job),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "generation_controller_manifest": (
+                str(generation_manifest_output_path(cfg, condition_name))
+                if generation_manifest is not None
+                else ""
+            ),
+            "controller_identity": (
+                str(generation_manifest.get("controller_identity", "") or "")
+                if generation_manifest is not None
+                else ""
+            ),
+            "controller_version": (
+                str(generation_manifest.get("controller_version", "") or "")
+                if generation_manifest is not None
+                else ""
+            ),
+            "progressive_stage": (
+                generation_manifest.get("progressive_stage")
+                if generation_manifest is not None
+                else None
+            ),
             **repeat_metadata_overrides(cfg, condition),
         }
     )
@@ -1492,7 +1630,7 @@ def summarize_categories(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_scale_repeats(rows: list[dict[str, Any]], scale_name: str) -> dict[str, Any]:
+def summarize_scale_repeats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     expected_repeats = len(rows)
     valid_rows = [row for row in rows if row.get("status") == "ok" and row.get("total_score") is not None]
     scores = [float(row["total_score"]) for row in valid_rows]
@@ -1758,7 +1896,6 @@ def build_condition_result(cfg: RuntimeConfig, condition: dict[str, Any]) -> dic
         scales_payload = {
             scale_name: summarize_scale_repeats(
                 load_repeat_rows(cfg, condition_name, label, scale_name),
-                scale_name,
             )
             for scale_name in SCALES
         }
@@ -2088,6 +2225,21 @@ def build_summary_payload(
             "repeat_unit": "same agent and frozen snapshot; Monte Carlo measurement repeat, not independent patient",
         },
         "source_original_summary": str(cfg.original_summary),
+        "generation_controller_manifests": {
+            str(condition.get("condition_name", "") or ""): {
+                **manifest_identity(manifest),
+                "condition_key": manifest.get("condition_key", ""),
+                "manifest_path": str(
+                    generation_manifest_output_path(
+                        cfg,
+                        str(condition.get("condition_name", "") or ""),
+                    )
+                ),
+            }
+            for condition in selected_conditions(cfg, original_summary)
+            for manifest in [generation_manifest_for_condition(cfg, condition)]
+            if manifest is not None
+        },
         "archive_results_root": str(cfg.archive_results_root),
         "repeat": cfg.repeat,
         "labels": cfg.labels,
@@ -2525,6 +2677,7 @@ def main() -> None:
         raise ValueError(f"original summary must be JSON object: {cfg.original_summary}")
 
     print_effective_config(cfg, original_summary)
+    prepare_generation_manifests(cfg, original_summary)
     warnings: list[str] = []
     if not cfg.report_only:
         task_results = run_tasks(cfg, original_summary)

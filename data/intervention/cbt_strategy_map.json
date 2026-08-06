@@ -1,0 +1,191 @@
+{
+  "session1": {
+    "primary_strategies": [
+      "support_stabilize",
+      "agenda_focus",
+      "cognitive_triangle_mapping",
+      "brief_psychoeducation"
+    ],
+    "micro_skills": [
+      "reflection",
+      "validation",
+      "open_question",
+      "focused_question",
+      "choice_scaffolding",
+      "scaling",
+      "summary",
+      "psychoeducation"
+    ]
+  },
+  "session2.1": {
+    "primary_strategies": [
+      "cross_situation_pattern_mapping",
+      "distortion_labeling",
+      "brief_psychoeducation",
+      "support_stabilize"
+    ],
+    "micro_skills": [
+      "memory_link",
+      "summary",
+      "focused_question",
+      "choice_scaffolding",
+      "socratic_question",
+      "normalization",
+      "teach_back"
+    ]
+  },
+  "session2.2": {
+    "primary_strategies": [
+      "functional_analysis",
+      "cross_situation_pattern_mapping",
+      "conditional_rule_elicitation",
+      "shared_formulation",
+      "support_stabilize"
+    ],
+    "micro_skills": [
+      "memory_link",
+      "summary",
+      "focused_question",
+      "choice_scaffolding",
+      "socratic_question",
+      "permission_check",
+      "teach_back"
+    ]
+  },
+  "session2.3": {
+    "primary_strategies": [
+      "downward_arrow",
+      "shared_formulation",
+      "cognitive_distancing",
+      "support_stabilize",
+      "acute_affect_regulation"
+    ],
+    "micro_skills": [
+      "memory_link",
+      "permission_check",
+      "validation",
+      "focused_question",
+      "socratic_question",
+      "summary",
+      "teach_back",
+      "one_step_pacing"
+    ]
+  },
+  "session3.1": {
+    "primary_strategies": [
+      "functional_analysis",
+      "cognitive_distancing",
+      "neutral_data_sampling",
+      "alternative_hypothesis",
+      "support_stabilize"
+    ],
+    "micro_skills": [
+      "validation",
+      "normalization",
+      "summary",
+      "focused_question",
+      "socratic_question",
+      "choice_scaffolding",
+      "permission_check",
+      "reinforcement"
+    ]
+  },
+  "session3.2": {
+    "primary_strategies": [
+      "readiness_check",
+      "graded_experiment_design",
+      "prediction_capture",
+      "implementation_plan",
+      "task_grading",
+      "cognitive_distancing"
+    ],
+    "micro_skills": [
+      "validation",
+      "focused_question",
+      "scaling",
+      "choice_scaffolding",
+      "permission_check",
+      "summary",
+      "teach_back",
+      "one_step_pacing"
+    ]
+  },
+  "session3.3-A": {
+    "primary_strategies": [
+      "experiment_review",
+      "prediction_capture",
+      "barrier_analysis",
+      "task_grading",
+      "graded_experiment_design",
+      "cognitive_distancing",
+      "support_stabilize"
+    ],
+    "micro_skills": [
+      "focused_question",
+      "validation",
+      "normalization",
+      "summary",
+      "socratic_question",
+      "reinforcement",
+      "choice_scaffolding",
+      "teach_back"
+    ]
+  },
+  "session4.1": {
+    "primary_strategies": [
+      "readiness_check",
+      "skills_review",
+      "neutral_data_sampling",
+      "balanced_belief_consolidation",
+      "support_stabilize"
+    ],
+    "micro_skills": [
+      "validation",
+      "memory_link",
+      "focused_question",
+      "summary",
+      "choice_scaffolding",
+      "reinforcement",
+      "teach_back"
+    ]
+  },
+  "session4.2": {
+    "primary_strategies": [
+      "relapse_prevention_plan",
+      "implementation_plan",
+      "task_grading",
+      "skills_review",
+      "brief_psychoeducation",
+      "safety_check"
+    ],
+    "micro_skills": [
+      "normalization",
+      "memory_link",
+      "focused_question",
+      "choice_scaffolding",
+      "summary",
+      "teach_back",
+      "reinforcement"
+    ]
+  },
+  "session4.4": {
+    "primary_strategies": [
+      "ending_process",
+      "skills_review",
+      "relapse_prevention_plan",
+      "autonomy_transfer",
+      "support_stabilize",
+      "safety_check",
+      "alliance_repair"
+    ],
+    "micro_skills": [
+      "validation",
+      "open_question",
+      "memory_link",
+      "summary",
+      "teach_back",
+      "reinforcement",
+      "permission_check"
+    ]
+  }
+}

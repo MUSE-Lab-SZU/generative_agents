@@ -109,6 +109,36 @@
     }
   },
   "intervention": {
+    "cbt_controller_mode": "legacy",
+    "cbt_controller_version": "minimal_v2_stage_adapter",
+    "progressive_d": {
+      "enabled": false,
+      "controller_version": "progressive_d_v3_1_calibrated_batch_control",
+      "state_tracker": {
+        "prompt_file": "data/prompts/intervention/state_tracker_progressive_d.txt",
+        "retry": 3,
+        "recent_utterances": 8
+      },
+      "judge": {
+        "prompt_file": "data/prompts/intervention/dialog_judge_progressive_d.txt",
+        "retry": 3
+      },
+      "control_eval": {
+        "route": "forced_llm",
+        "prompt_file": "data/prompts/intervention/control_eval_progressive_d.txt",
+        "stage_subgoals_file": "data/intervention/cbt_stage_subgoals.json",
+        "retry": 3
+      },
+      "transitions": {
+        "allowed_actions": [
+          "stay",
+          "side_step",
+          "soft_step_back",
+          "hold"
+        ],
+        "soft_step_back_predecessors": {}
+      }
+    },
     "enabled": true,
     "doctor": "蜻蜓队长",
     "patients": [
@@ -279,25 +309,33 @@
       "api_key_env": "DEEPSEEK_API_KEY",
       "retry": 5,
       "temperature": 0.5,
-      "depr_short_term_retry": 5,
-      "depr_short_term_force_forced_llm": true,
-      "depr_current_event_retry": 5,
-      "depr_current_event_force_forced_llm": true,
       "decide_chat_terminate_retry": 5,
       "decide_chat_terminate_force_forced_llm": true
     },
     "dialog_judge": {
       "enabled": true,
       "prompt_file": "data/prompts/intervention/dialog_judge.txt",
+      "legacy_prompt_file": "data/prompts/intervention/dialog_judge_legacy.txt",
       "retry": 3,
       "force_forced_llm": true,
       "patient_state_prompt_file": "data/prompts/intervention/dialog_judge_patient_state_summary.txt",
       "patient_state_summary_retry": 2
     },
+    "state_tracker": {
+      "enabled": true,
+      "prompt_file": "data/prompts/intervention/state_tracker.txt",
+      "retry": 3,
+      "recent_utterances": 8
+    },
+    "strategy_router": {
+      "strategy_map_file": "data/intervention/cbt_strategy_map.json",
+      "term_glossary_file": "data/intervention/cbt_term_glossary.json"
+    },
     "session_eval": {
       "enabled": true,
       "route": "forced_llm",
       "prompt_file": "data/prompts/intervention/session_eval.txt",
+      "legacy_prompt_file": "data/prompts/intervention/session_eval_legacy.txt",
       "retry": 3,
       "history_recent_n": 3
     },
@@ -416,7 +454,10 @@
     "mode": "consult_sparse",
     "periodic_every_steps": 56,
     "write_final_snapshot": true,
-    "write_on_staged_eval_trigger": true
+    "write_on_staged_eval_trigger": true,
+    "rolling_resume": {
+      "enabled": true
+    }
   },
   "staged_eval": {
     "enabled": true,

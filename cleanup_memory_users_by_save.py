@@ -12,22 +12,27 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
+from memory_user_admin_utils import (
+    as_int as _as_int,
+    build_targets as _build_targets,
+    discover_roles_by_save as _discover_roles_by_save,
+    load_json_file as _load_json_file,
+    print_targets as _print_targets,
+    read_base_user_id as _read_base_user_id,
+    resolve_config_path as _resolve_config_path,
+    write_report as _write_report,
+)
 from modules.ec_doll_memory_service_client import ECDollMemoryServiceClient
 
 # ====== 顶部配置区（按需编辑） ======
-SAVE_NAME = "sim-test-memory-0426"
+SAVE_NAME = "sim-trace-test-0526"
 BASE_URL = "http://localhost:8031"
-EXECUTE_DELETE = False
+EXECUTE_DELETE = True
 # ===================================
 
 CLIENT_TIMEOUT_SECONDS = 30.0
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-CHECKPOINTS_ROOT = PROJECT_ROOT / "results" / "checkpoints"
-AGENTS_ROOT = PROJECT_ROOT / "frontend" / "static" / "assets" / "village" / "agents"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,114 +43,6 @@ def _parse_args() -> argparse.Namespace:
         help="可选。将执行结果写入 JSON 报告文件。",
     )
     return parser.parse_args()
-
-
-def _load_json_file(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as file_obj:
-        data = json.load(file_obj)
-    return data if isinstance(data, dict) else {}
-
-
-def _resolve_config_path(config_path_from_snapshot: str, agent_name: str) -> Path | None:
-    path_text = str(config_path_from_snapshot or "").strip()
-    candidates: List[Path] = []
-    if path_text:
-        raw_path = Path(path_text)
-        if raw_path.is_absolute():
-            candidates.append(raw_path)
-        else:
-            candidates.append(PROJECT_ROOT / raw_path)
-            candidates.append(PROJECT_ROOT / "frontend" / "static" / raw_path)
-    candidates.append(AGENTS_ROOT / str(agent_name).strip() / "agent.json")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _discover_roles_by_save(save_name: str) -> Tuple[List[Dict[str, Any]], str]:
-    roles: List[Dict[str, Any]] = []
-    snapshot_dir = CHECKPOINTS_ROOT / save_name
-    if snapshot_dir.is_dir():
-        snapshot_files = sorted(snapshot_dir.glob("simulate-*.json"))
-        if snapshot_files:
-            latest_snapshot = snapshot_files[-1]
-            try:
-                snapshot_data = _load_json_file(latest_snapshot)
-                agents = snapshot_data.get("agents", {})
-                if isinstance(agents, dict):
-                    for agent_name, meta in agents.items():
-                        if not isinstance(meta, dict):
-                            continue
-                        config_path = _resolve_config_path(
-                            str(meta.get("config_path", "") or ""),
-                            str(agent_name or ""),
-                        )
-                        if config_path is None:
-                            continue
-                        roles.append(
-                            {
-                                "agent_name": str(agent_name),
-                                "config_path": str(config_path),
-                                "source": "snapshot",
-                            }
-                        )
-            except Exception as exc:
-                print("[WARN] 读取存档快照失败：{} error={}".format(latest_snapshot, exc))
-            if roles:
-                return roles, "snapshot"
-
-    for agent_dir in sorted(AGENTS_ROOT.glob("*")):
-        config_path = agent_dir / "agent.json"
-        if not config_path.is_file():
-            continue
-        roles.append(
-            {
-                "agent_name": agent_dir.name,
-                "config_path": str(config_path),
-                "source": "fallback_all_agents",
-            }
-        )
-    return roles, "fallback_all_agents"
-
-
-def _read_base_user_id(config_path: Path) -> str:
-    try:
-        data = _load_json_file(config_path)
-    except Exception:
-        return ""
-    external_memory = data.get("external_memory", {})
-    if not isinstance(external_memory, dict):
-        return ""
-    return str(external_memory.get("user_id", "") or "").strip()
-
-
-def _build_targets(save_name: str) -> Tuple[List[Dict[str, Any]], str]:
-    roles, role_source = _discover_roles_by_save(save_name)
-    targets: List[Dict[str, Any]] = []
-    for role in roles:
-        config_path = Path(str(role.get("config_path", "") or ""))
-        base_user_id = _read_base_user_id(config_path)
-        if not base_user_id:
-            continue
-        scoped_user_id = "{}+{}".format(base_user_id, save_name)
-        targets.append(
-            {
-                "agent_name": str(role.get("agent_name", "") or ""),
-                "base_user_id": base_user_id,
-                "scoped_user_id": scoped_user_id,
-                "config_path": str(config_path),
-                "source": str(role.get("source", role_source) or role_source),
-            }
-        )
-    return targets, role_source
-
-
-def _as_int(value: Any) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return 0
 
 
 def _delete_one(
@@ -234,18 +131,6 @@ def _summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
-def _print_targets(targets: List[Dict[str, Any]]) -> None:
-    print("\n[INFO] 本次目标 user_id 列表（scoped）:")
-    for item in targets:
-        print(
-            "  - agent={} scoped_user_id={} config_path={}".format(
-                item.get("agent_name", ""),
-                item.get("scoped_user_id", ""),
-                item.get("config_path", ""),
-            )
-        )
-
-
 def _confirm_stage_1() -> bool:
     try:
         text = input("\n第一次确认：输入 YES 继续真删流程，否则取消：").strip()
@@ -262,18 +147,6 @@ def _confirm_stage_2(save_name: str) -> bool:
     except EOFError:
         return False
     return text == expected
-
-
-def _write_report(report_file: str, payload: Dict[str, Any]) -> None:
-    if not report_file:
-        return
-    out_path = Path(report_file)
-    if not out_path.is_absolute():
-        out_path = PROJECT_ROOT / out_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as file_obj:
-        json.dump(payload, file_obj, ensure_ascii=False, indent=2)
-    print("[INFO] 报告已写入：{}".format(out_path))
 
 
 def main() -> int:

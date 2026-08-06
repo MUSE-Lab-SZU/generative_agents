@@ -57,6 +57,26 @@ from kabuda_variant_runtime import (
     VARIANTS,
     prepare_kabuda_variant_runtime,
 )
+from cbt_experiment_config import (
+    CONTROLLERS,
+    MANIFEST_FILENAME,
+    PROGRESSIVE_STAGES,
+    apply_controller_override,
+    assert_checkpoint_identity,
+    assert_identity_matches,
+    build_condition_key,
+    build_condition_manifest,
+    controller_identity_label,
+    controller_identity_from_config,
+    deep_merge_dict as merge_cbt_config,
+    normalize_controller_request,
+    validate_resolved_controller_config,
+)
+from scale_protocol import (
+    extract_direct_answer_score,
+    extract_item_scores as extract_protocol_item_scores,
+    render_validation_number,
+)
 
 
 # ============================================================
@@ -136,8 +156,6 @@ GROUP_OVERLAY_DIR = BASE_DIR / "experiments" / "config" / "groups"
 EXPERIMENT_DATA_ROOT = BASE_DIR / "results" / "experiment_data"
 REPORTS_DIR = EXPERIMENT_DATA_ROOT / "reports"
 BATCH_STATE_ROOT = EXPERIMENT_DATA_ROOT / "batch_state"
-PERSISTENT_GLOBAL_CONFIG_BACKUP = BASE_DIR / "experiments" / "config" / "default_config.backup.json"
-
 PERSONAS = [
     "卡布达",
     "金龟次郎",
@@ -238,6 +256,10 @@ class RuntimeConfig:
     resume_condition: str | None
     skip_completed: bool
     conditions: list[BatchCondition]
+    base_config_path: Path = GLOBAL_CONFIG
+    cbt_controller: str = "legacy"
+    progressive_stage: str | None = None
+    output_tag: str = ""
     counsel_room: bool = False
 
 
@@ -264,6 +286,19 @@ def parse_args() -> argparse.Namespace:
         help="只跑指定条件；可重复传入；支持 Counsel-KBD2-G1-MILD、Counsel-KBD9-ALL-MOD；旧格式 Counsel-G1-MILD 等价于 KBD1",
     )
     parser.add_argument("--dry-run", action="store_true", help="覆盖脚本前面的 DRY_RUN=True")
+    parser.add_argument(
+        "--cbt-controller",
+        choices=CONTROLLERS,
+        default="legacy",
+        help="CBT controller condition；默认 legacy",
+    )
+    parser.add_argument(
+        "--progressive-stage",
+        choices=PROGRESSIVE_STAGES,
+        help="兼容旧命令的可选参数；progressive 自动使用唯一的 Stage D",
+    )
+    parser.add_argument("--config", default=None, help="base config JSON；默认 data/config.json")
+    parser.add_argument("--output-tag", default="", help="controller identity 后的附加输出标签")
     parser.add_argument("--max-parallel", type=int, default=None, help="并行运行的 condition 数，默认 2")
     parser.add_argument("--resume-batch", action="store_true", help="只续跑当前 batch 中可续的失败项")
     parser.add_argument("--resume-condition", default=None, help="只续跑指定条件；支持和 --condition 相同的选择器")
@@ -443,6 +478,17 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     if condition_selector is None and args.resume_condition:
         condition_selector = [args.resume_condition]
 
+    cbt_controller, progressive_stage = normalize_controller_request(
+        args.cbt_controller,
+        args.progressive_stage,
+    )
+    base_config_path = Path(args.config).expanduser() if args.config else GLOBAL_CONFIG
+    if not base_config_path.is_absolute():
+        base_config_path = BASE_DIR / base_config_path
+    base_config_path = base_config_path.resolve()
+    if not base_config_path.is_file():
+        raise FileNotFoundError(f"base config 不存在: {base_config_path}")
+
     return RuntimeConfig(
         name=base_name,
         start=args.start if args.start is not None else START_TIME,
@@ -468,6 +514,10 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
             if args.counsel_room
             else resolve_conditions(condition_selector)
         ),
+        base_config_path=base_config_path,
+        cbt_controller=cbt_controller,
+        progressive_stage=progressive_stage,
+        output_tag=str(args.output_tag or "").strip(),
         counsel_room=bool(args.counsel_room),
     )
 
@@ -513,6 +563,10 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  续跑条件:     {cfg.resume_condition or '(空)'}")
     print(f"  跳过已完成:   {cfg.skip_completed}")
     print(f"  dry-run:      {cfg.dry_run}")
+    print(f"  base config:  {cfg.base_config_path}")
+    print(f"  controller:   {cfg.cbt_controller}")
+    print(f"  stage:        {cfg.progressive_stage or '(none)'}")
+    print(f"  output tag:   {cfg.output_tag or '(none)'}")
     print(f"  启动剩余空间: >= {format_bytes(MIN_FREE_DISK_BYTES_TO_START)}")
     print(f"  运行保底空间: >= {format_bytes(MIN_FREE_DISK_BYTES_TO_CONTINUE)}")
     print("  条件列表:     " + ", ".join(condition.name for condition in cfg.conditions))
@@ -525,6 +579,15 @@ def build_trial_run_prefix(batch_name: str, condition_name: str) -> str:
 
 def build_trial_run_name(batch_name: str, condition_name: str) -> str:
     return f"{build_trial_run_prefix(batch_name, condition_name)}-{datetime.now().strftime('%m%d-%H%M')}"
+
+
+def condition_key(cfg: RuntimeConfig, condition: BatchCondition) -> str:
+    return build_condition_key(
+        condition.name,
+        cfg.cbt_controller,
+        cfg.progressive_stage,
+        cfg.output_tag,
+    )
 
 
 def slugify_condition_name(value: str) -> str:
@@ -547,19 +610,27 @@ def batch_runtime_config_dir(cfg: RuntimeConfig) -> Path:
 
 
 def batch_runtime_persona_dir(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
-    return batch_state_dir(cfg) / "runtime_personas" / slugify_condition_name(condition.name)
+    return batch_state_dir(cfg) / "runtime_personas" / slugify_condition_name(condition_key(cfg, condition))
 
 
 def batch_condition_state_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
-    return batch_state_dir(cfg) / f"{slugify_condition_name(condition.name)}.json"
+    return batch_state_dir(cfg) / f"{slugify_condition_name(condition_key(cfg, condition))}.json"
 
 
 def batch_condition_timing_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
-    return batch_state_dir(cfg) / "timings" / f"{slugify_condition_name(condition.name)}.jsonl"
+    return batch_state_dir(cfg) / "timings" / f"{slugify_condition_name(condition_key(cfg, condition))}.jsonl"
 
 
 def batch_condition_runtime_config_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
-    return batch_runtime_config_dir(cfg) / f"{slugify_condition_name(condition.name)}.json"
+    return batch_runtime_config_dir(cfg) / f"{slugify_condition_name(condition_key(cfg, condition))}.json"
+
+
+def batch_condition_manifest_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return (
+        batch_state_dir(cfg)
+        / "manifests"
+        / f"{slugify_condition_name(condition_key(cfg, condition))}.json"
+    )
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -776,16 +847,31 @@ def run_simulation_with_recovery(
     runtime_config_path: Path | None = None,
     resume: bool = False,
     stats: SimulationRunStats | None = None,
+    expected_manifest: dict[str, Any] | None = None,
 ) -> None:
     ensure_checkpoint_state(run_name, resume=resume, dry_run=cfg.dry_run)
     if cfg.dry_run:
-        print(f"[DRY-RUN] monitored simulation for {run_name}")
+        step_count = cfg.step if not resume else simulation_steps_for_attempt(
+            run_name,
+            cfg,
+            resume=True,
+        )
+        cmd = build_simulation_cmd(
+            run_name,
+            cfg,
+            resume=resume,
+            step_count=step_count,
+            runtime_config_path=runtime_config_path,
+        )
+        print(f"[DRY-RUN] start.py command: {' '.join(cmd)}")
         return
 
     stats = stats or SimulationRunStats()
     restart_count = 0
     resume_next = bool(resume)
     while True:
+        if resume_next and expected_manifest is not None:
+            validate_resume_identity(run_name, expected_manifest)
         ensure_free_disk_space(
             min_free_bytes=MIN_FREE_DISK_BYTES_TO_START,
             context=f"启动仿真子进程 {run_name}",
@@ -867,10 +953,22 @@ def run_simulation_with_recovery(
 
 def summary_output_stem(cfg: RuntimeConfig) -> str:
     if len(cfg.conditions) == len(ALL_CONDITIONS):
-        return cfg.name
+        identity = build_condition_key(
+            "all",
+            cfg.cbt_controller,
+            cfg.progressive_stage,
+            cfg.output_tag,
+        )
+        return f"{cfg.name}-{identity}"
     if len(cfg.conditions) == 1:
-        return f"{cfg.name}-{cfg.conditions[0].name}"
-    return f"{cfg.name}-subset-{len(cfg.conditions)}"
+        return f"{cfg.name}-{condition_key(cfg, cfg.conditions[0])}"
+    identity = build_condition_key(
+        f"subset-{len(cfg.conditions)}",
+        cfg.cbt_controller,
+        cfg.progressive_stage,
+        cfg.output_tag,
+    )
+    return f"{cfg.name}-{identity}"
 
 
 def load_json_file(path: Path) -> dict:
@@ -896,16 +994,6 @@ def write_json_file(path: Path, payload: Any) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def deep_merge_dict(base: dict, overlay: dict) -> dict:
-    merged = json.loads(json.dumps(base, ensure_ascii=False))
-    for key, value in (overlay or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def latest_snapshot_name_for_run(run_name: str) -> str:
     checkpoint_dir = checkpoint_dir_for_run(run_name)
     if not checkpoint_dir.is_dir():
@@ -927,10 +1015,8 @@ def condition_experiment_dir_exists(run_name: str) -> bool:
     return (EXPERIMENT_DATA_ROOT / run_name).is_dir()
 
 
-def runtime_config_template_path() -> Path:
-    if PERSISTENT_GLOBAL_CONFIG_BACKUP.exists():
-        return PERSISTENT_GLOBAL_CONFIG_BACKUP
-    return GLOBAL_CONFIG
+def group_overlay_path(cfg: RuntimeConfig, condition: BatchCondition) -> Path:
+    return COUNSEL_ROOM_OVERLAY if cfg.counsel_room else GROUP_OVERLAY_FILES[condition.group]
 
 
 def build_condition_runtime_config_payload(
@@ -939,18 +1025,30 @@ def build_condition_runtime_config_payload(
     *,
     embedding_base_url: str | None = None,
 ) -> dict[str, Any]:
-    template = load_json_file(runtime_config_template_path())
+    template = load_json_file(cfg.base_config_path)
     if cfg.counsel_room:
-        overlay = load_json_file(COUNSEL_ROOM_OVERLAY)
+        overlay = load_json_file(group_overlay_path(cfg, condition))
         assets_root = "assets/counsel_room"
         agent_roster = COUNSEL_ROOM_AGENTS
         agent_source_subdir = "counsel_room"
     else:
-        overlay = load_json_file(GROUP_OVERLAY_FILES[condition.group])
+        overlay = load_json_file(group_overlay_path(cfg, condition))
         assets_root = "assets/village"
         agent_roster = PERSONAS
         agent_source_subdir = "village"
-    merged = deep_merge_dict(template, overlay)
+    merged = merge_cbt_config(template, overlay)
+    merged = apply_controller_override(
+        merged,
+        cfg.cbt_controller,
+        cfg.progressive_stage,
+    )
+    validate_resolved_controller_config(
+        merged,
+        cfg.cbt_controller,
+        cfg.progressive_stage,
+        project_root=BASE_DIR,
+        available_agents=set(agent_roster),
+    )
     variant_runtime = prepare_kabuda_variant_runtime(
         base_dir=BASE_DIR,
         variant=condition.variant,
@@ -994,6 +1092,13 @@ def build_condition_runtime_config_payload(
     payload["agents"].setdefault("卡布达", {})
     payload["agents"]["卡布达"]["config_path"] = str(variant_runtime.agent_config_path)
     payload["agents"]["卡布达"]["depression_config_path"] = str(variant_runtime.depression_config_path)
+    validate_resolved_controller_config(
+        payload,
+        cfg.cbt_controller,
+        cfg.progressive_stage,
+        project_root=BASE_DIR,
+        available_agents=set(payload["agents"]),
+    )
     return payload
 
 
@@ -1011,15 +1116,156 @@ def ensure_condition_runtime_config(
     )
     if cfg.dry_run:
         print(f"[DRY-RUN] write runtime config: {path} (embedding={embedding_base_url or 'default'})")
+        identity_summary = controller_identity_from_config(payload)
+        identity_summary.pop("stage_flags", None)
+        print(
+            "[DRY-RUN] resolved CBT config:\n"
+            + json.dumps(
+                identity_summary,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return path
     write_json_file(path, payload)
     return path
+
+
+def build_manifest_for_condition(
+    cfg: RuntimeConfig,
+    condition: BatchCondition,
+    *,
+    run_name: str,
+    runtime_config_path: Path,
+    runtime_config: dict[str, Any],
+    resume_requested: bool,
+    checkpoint_exists: bool,
+) -> dict[str, Any]:
+    overlay_path = group_overlay_path(cfg, condition)
+    return build_condition_manifest(
+        project_root=BASE_DIR,
+        condition_name=condition.name,
+        condition_key=condition_key(cfg, condition),
+        controller=cfg.cbt_controller,
+        progressive_stage=cfg.progressive_stage,
+        output_tag=cfg.output_tag,
+        base_config_path=cfg.base_config_path,
+        base_config=load_json_file(cfg.base_config_path),
+        group_overlay_path=overlay_path,
+        group_overlay=load_json_file(overlay_path),
+        resolved_config_path=runtime_config_path,
+        resolved_config=runtime_config,
+        run_name=run_name,
+        resume_requested=resume_requested,
+        resume_checkpoint_exists=checkpoint_exists,
+        resume_snapshot=latest_snapshot_name_for_run(run_name),
+    )
+
+
+def validate_resume_identity(
+    run_name: str,
+    expected_manifest: dict[str, Any],
+    *,
+    existing_manifest_path: Path | None = None,
+) -> None:
+    if existing_manifest_path and existing_manifest_path.is_file():
+        existing_manifest = load_json_file(existing_manifest_path)
+        assert_identity_matches(
+            expected_manifest,
+            existing_manifest,
+            context=f"resume manifest {existing_manifest_path}",
+        )
+        expected_key = str(expected_manifest.get("condition_key", "") or "")
+        actual_key = str(existing_manifest.get("condition_key", "") or "")
+        if actual_key != expected_key:
+            raise ValueError(
+                f"resume manifest condition key 不匹配: "
+                f"expected={expected_key}, actual={actual_key}"
+            )
+        expected_run_name = str(expected_manifest.get("run_name", "") or "")
+        actual_run_name = str(existing_manifest.get("run_name", "") or "")
+        if actual_run_name != expected_run_name or expected_run_name != run_name:
+            raise ValueError(
+                "resume manifest run_name 不匹配: "
+                f"expected={expected_run_name}, actual={actual_run_name}, "
+                f"checkpoint={run_name}"
+            )
+
+    snapshot_name = latest_snapshot_name_for_run(run_name)
+    if not snapshot_name:
+        raise FileNotFoundError(f"resume checkpoint 没有可校验快照: {run_name}")
+    snapshot_path = checkpoint_dir_for_run(run_name) / snapshot_name
+    snapshot_config = load_json_file(snapshot_path)
+    expected_stage = expected_manifest.get("progressive_stage")
+    expected_mode = str(expected_manifest.get("mode", "") or "").strip().lower()
+    expected_controller = (
+        "progressive"
+        if expected_stage in PROGRESSIVE_STAGES
+        else expected_mode
+    )
+    snapshot_agents = snapshot_config.get("agents")
+    validate_resolved_controller_config(
+        snapshot_config,
+        expected_controller,
+        expected_stage,
+        project_root=BASE_DIR,
+        available_agents=(
+            set(snapshot_agents)
+            if isinstance(snapshot_agents, dict) and snapshot_agents
+            else None
+        ),
+    )
+    assert_checkpoint_identity(
+        expected_manifest,
+        snapshot_config,
+        context=f"resume checkpoint {snapshot_path}",
+    )
+
+
+def persist_condition_manifest(
+    cfg: RuntimeConfig,
+    condition: BatchCondition,
+    manifest: dict[str, Any],
+    *,
+    run_name: str,
+    include_checkpoint: bool = False,
+    include_experiment_dir: bool = False,
+) -> Path:
+    manifest_path = batch_condition_manifest_path(cfg, condition)
+    if cfg.dry_run:
+        if include_checkpoint or include_experiment_dir:
+            return manifest_path
+        print(f"[DRY-RUN] condition manifest path: {manifest_path}")
+        print(
+            "[DRY-RUN] condition manifest:\n"
+            + json.dumps(manifest, ensure_ascii=False, indent=2)
+        )
+        return manifest_path
+    write_json_file(manifest_path, manifest)
+    if include_checkpoint:
+        checkpoint_dir = checkpoint_dir_for_run(run_name)
+        if checkpoint_dir.is_dir():
+            write_json_file(checkpoint_dir / MANIFEST_FILENAME, manifest)
+    if include_experiment_dir:
+        experiment_dir = EXPERIMENT_DATA_ROOT / run_name
+        if experiment_dir.is_dir():
+            write_json_file(experiment_dir / MANIFEST_FILENAME, manifest)
+    return manifest_path
 
 
 def default_condition_state(cfg: RuntimeConfig, condition: BatchCondition) -> dict[str, Any]:
     return {
         "batch_name": cfg.name,
         "condition_name": condition.name,
+        "condition_key": condition_key(cfg, condition),
+        "controller_identity": controller_identity_label(
+            cfg.cbt_controller,
+            cfg.progressive_stage,
+        ),
+        "cbt_controller": cfg.cbt_controller,
+        "progressive_stage": cfg.progressive_stage,
+        "output_tag": cfg.output_tag,
+        "manifest_path": str(batch_condition_manifest_path(cfg, condition)),
         "variant": condition.variant,
         "group": condition.group,
         "severity": condition.severity,
@@ -1146,19 +1392,6 @@ def extract_scale_total(scored_result: dict, scale_name: str | None = None) -> f
             return float(sum(item_scores))
     return extract_reported_scale_total(scored_result)
 
-CN_SCORE_VALUES = {
-    "0": 0,
-    "1": 1,
-    "2": 2,
-    "3": 3,
-    "零": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-}
-
-
 def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
     rows = []
     with path.open("r", encoding="utf-8") as f:
@@ -1173,22 +1406,12 @@ def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
 
 def extract_item_scores(scored_result: dict, scale_name: str) -> list[int] | None:
     item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
-    if not item_key or not isinstance(scored_result, dict):
-        return None
-    items = scored_result.get(item_key)
-    if not isinstance(items, list):
-        return None
-
-    scores = []
-    for item in items:
-        score = item.get("score") if isinstance(item, dict) else None
-        if not isinstance(score, int) or score < 0 or score > 3:
-            return None
-        scores.append(score)
     expected_count = SCALE_ITEM_COUNTS.get(scale_name)
-    if expected_count is not None and len(scores) != expected_count:
-        return None
-    return scores
+    return extract_protocol_item_scores(
+        scored_result,
+        item_key,
+        expected_count=expected_count,
+    )
 
 
 def score_file_for_evaluation(result: dict, evaluation: dict, scale_name: str) -> Path:
@@ -1211,52 +1434,6 @@ def answer_file_for_evaluation(result: dict, evaluation: dict, scale_name: str) 
     if scored_file.name.endswith("_scored.json"):
         return scored_file.with_name(scored_file.name.replace("_scored.json", "_answered.jsonl"))
     return Path("")
-
-
-def has_ambiguous_score_context(text: str, start: int, end: int) -> bool:
-    context = text[max(0, start - 18) : min(len(text), end + 28)]
-    return any(
-        marker in context
-        for marker in [
-            "或者",
-            "不确定",
-            "之间",
-            "两三",
-            "一两",
-            "也可能",
-            "选0感觉是骗人的",
-        ]
-    )
-
-
-def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
-    patterns = [
-        r"(?:我)?\s*(?:会|想|大概|可能|应该|还是|就|其实)?\s*(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])",
-        r"([0-3零一二两三])\s*分",
-        r"(?:评分的话|打分的话|大概|应该|可能|算是|算|就是|我觉得|我想|我会|应该是|大概是|可能是|差不多)\s*[，,。\.……\s]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
-        r"(?:^|[，,。\.……\s])([0-3零一二两三])\s*吧",
-        r"^[\s（\(\）\)……。,.，、嗯唔]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
-    ]
-    hits = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, str(answer or "")):
-            context = answer[max(0, match.start() - 6) : match.end() + 6]
-            if any(marker in context for marker in ["不想选", "不是选", "不能选", "不敢选"]):
-                continue
-            score = CN_SCORE_VALUES.get(match.group(1))
-            if score is None:
-                continue
-            hits.append((match.start(), match.end(), score))
-    if not hits:
-        return None, "none"
-    hits.sort(key=lambda item: (item[0], item[1]))
-    first_start, first_end, first_score = hits[0]
-    if has_ambiguous_score_context(answer, first_start, first_end):
-        return first_score, "ambiguous"
-    for start, _end, score in hits[1:]:
-        if start - first_end < 35 and score != first_score:
-            return first_score, "ambiguous"
-    return first_score, "direct"
 
 
 def build_scale_score_validation(results: list[dict]) -> dict:
@@ -1348,6 +1525,9 @@ def trigger_sort_key(label: str, completed_session_count: int) -> tuple[int, int
         return (completed, 1, normalized)
     if normalized == "T4":
         return (completed, 2, normalized)
+    followup_match = re.fullmatch(r"followup_step_(\d+)", normalized)
+    if followup_match:
+        return (10**8 + int(followup_match.group(1)), 2, normalized)
     if normalized == "POST":
         return (10**9, 3, normalized)
     return (completed, 4, normalized)
@@ -1356,6 +1536,9 @@ def trigger_sort_key(label: str, completed_session_count: int) -> tuple[int, int
 def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeConfig) -> None:
     output_dir = EXPERIMENT_DATA_ROOT / run_name
     meta_path = output_dir / "trial_meta.json"
+    if cfg.dry_run:
+        print(f"[DRY-RUN] write trial metadata: {meta_path}")
+        return
     if not output_dir.exists():
         return
 
@@ -1416,6 +1599,7 @@ def run_simulation(
     runtime_config_path: Path | None = None,
     resume: bool = False,
     stats: SimulationRunStats | None = None,
+    expected_manifest: dict[str, Any] | None = None,
 ) -> None:
     run_simulation_with_recovery(
         run_name,
@@ -1423,6 +1607,7 @@ def run_simulation(
         runtime_config_path=runtime_config_path,
         resume=resume,
         stats=stats,
+        expected_manifest=expected_manifest,
     )
 
 
@@ -1489,7 +1674,7 @@ def resolve_condition_run_name(cfg: RuntimeConfig, condition: BatchCondition, st
     run_name = str(state.get("run_name", "") or "").strip()
     if run_name:
         return run_name
-    return build_trial_run_name(cfg.name, condition.name)
+    return build_trial_run_name(cfg.name, condition_key(cfg, condition))
 
 
 def should_resume_condition(cfg: RuntimeConfig, condition: BatchCondition, state: dict[str, Any]) -> bool:
@@ -1526,15 +1711,46 @@ def run_condition(
         condition,
         embedding_base_url=embedding_base_url,
     )
+    runtime_config = (
+        build_condition_runtime_config_payload(
+            condition,
+            cfg,
+            embedding_base_url=embedding_base_url,
+        )
+        if cfg.dry_run
+        else load_json_file(runtime_config_path)
+    )
     checkpoint_exists = condition_checkpoint_exists(run_name)
     resume_requested = should_resume_condition(cfg, condition, state)
 
     if state.get("status") == "completed" and not resume_requested and not cfg.skip_completed:
-        run_name = build_trial_run_name(cfg.name, condition.name)
+        run_name = build_trial_run_name(cfg.name, condition_key(cfg, condition))
         state = default_condition_state(cfg, condition)
         state["run_name"] = run_name
         write_condition_state(cfg, condition, state)
         checkpoint_exists = False
+
+    manifest = build_manifest_for_condition(
+        cfg,
+        condition,
+        run_name=run_name,
+        runtime_config_path=runtime_config_path,
+        runtime_config=runtime_config,
+        resume_requested=resume_requested,
+        checkpoint_exists=checkpoint_exists,
+    )
+    if resume_requested and checkpoint_exists:
+        validate_resume_identity(
+            run_name,
+            manifest,
+            existing_manifest_path=batch_condition_manifest_path(cfg, condition),
+        )
+    persist_condition_manifest(
+        cfg,
+        condition,
+        manifest,
+        run_name=run_name,
+    )
 
     if checkpoint_exists and not resume_requested and str(state.get("status", "") or "") not in {"completed", "simulation_done"}:
         raise RuntimeError(
@@ -1545,6 +1761,9 @@ def run_condition(
     print(f" 条件: {condition.name}")
     print("==========================================")
     print(f"  实际运行名:   {run_name}")
+    print(f"  condition key:{condition_key(cfg, condition)}")
+    print(f"  controller:   {manifest['controller_identity']}")
+    print(f"  version:      {manifest['controller_version']}")
     print(f"  variant:      {condition.variant}")
     print(f"  group:        {condition.group}")
     print(f"  severity:     {condition.severity}")
@@ -1591,6 +1810,14 @@ def run_condition(
                 runtime_config_path=runtime_config_path,
                 resume=resume_requested and checkpoint_exists,
                 stats=simulation_stats,
+                expected_manifest=manifest,
+            )
+            persist_condition_manifest(
+                cfg,
+                condition,
+                manifest,
+                run_name=run_name,
+                include_checkpoint=True,
             )
             update_condition_state(
                 cfg,
@@ -1689,6 +1916,14 @@ def run_condition(
             dry_run=cfg.dry_run,
         )
         collect_core_outputs(run_name, dry_run=cfg.dry_run)
+        persist_condition_manifest(
+            cfg,
+            condition,
+            manifest,
+            run_name=run_name,
+            include_checkpoint=True,
+            include_experiment_dir=True,
+        )
         update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="collect")
 
         if not cfg.dry_run:
@@ -1954,9 +2189,19 @@ def collect_batch_results(cfg: RuntimeConfig) -> tuple[list[dict], list[str]]:
         if run_name and status and status != "completed":
             warnings.append(f"跳过未完成条件: {condition.name} (status={status})")
             continue
-        run_dir = EXPERIMENT_DATA_ROOT / run_name if run_name else find_latest_trial_run_dir(cfg.name, condition.name)
+        run_dir = (
+            EXPERIMENT_DATA_ROOT / run_name
+            if run_name
+            else find_latest_trial_run_dir(
+                cfg.name,
+                condition_key(cfg, condition),
+            )
+        )
         if run_dir is None:
-            warnings.append(f"缺少结果目录: {build_trial_run_prefix(cfg.name, condition.name)}[-时间后缀]")
+            warnings.append(
+                "缺少结果目录: "
+                f"{build_trial_run_prefix(cfg.name, condition_key(cfg, condition))}[-时间后缀]"
+            )
             continue
         if not run_dir.is_dir():
             warnings.append(f"缺少结果目录: {run_dir.name}")
@@ -1967,6 +2212,23 @@ def collect_batch_results(cfg: RuntimeConfig) -> tuple[list[dict], list[str]]:
         if result is None:
             warnings.append(f"无法读取结果: {run_dir.name}")
             continue
+        manifest_path = batch_condition_manifest_path(cfg, condition)
+        manifest = load_optional_json_file(manifest_path)
+        if manifest is None:
+            warnings.append(f"缺少 CBT condition manifest: {manifest_path}")
+            continue
+        result.update(
+            {
+                "condition_key": condition_key(cfg, condition),
+                "controller_identity": manifest["controller_identity"],
+                "mode": manifest["mode"],
+                "controller_version": manifest["controller_version"],
+                "progressive_stage": manifest["progressive_stage"],
+                "capabilities": manifest["capabilities"],
+                "controller_manifest_path": str(manifest_path),
+                "controller_manifest": manifest,
+            }
+        )
         results.append(result)
     return results, warnings
 
@@ -2050,6 +2312,13 @@ def build_summary_payload(cfg: RuntimeConfig, results: list[dict], warnings: lis
     group_values = report_group_values(cfg)
     return {
         "batch_name": cfg.name,
+        "controller_identity": controller_identity_label(
+            cfg.cbt_controller,
+            cfg.progressive_stage,
+        ),
+        "cbt_controller": cfg.cbt_controller,
+        "progressive_stage": cfg.progressive_stage,
+        "output_tag": cfg.output_tag,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "summary_only": cfg.summary_only,
         "conditions": results,
@@ -2145,18 +2414,6 @@ def render_group_severity_matrix_markdown(
             lines.append(f"| {severity} | " + " | ".join(rendered) + " |")
         lines.append("")
     return lines
-
-
-def render_validation_number(value: Any) -> str:
-    if value is None:
-        return "—"
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if number.is_integer():
-        return str(int(number))
-    return f"{number:.1f}"
 
 
 def render_scale_score_validation_markdown(validation_payload: dict) -> list[str]:
@@ -2381,6 +2638,8 @@ def main() -> None:
 
     if (completed or cfg.summary_only or notes) and not cfg.dry_run:
         export_batch_summary(cfg)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

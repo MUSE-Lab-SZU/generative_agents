@@ -1,8 +1,7 @@
 import os
 import sys
 import json
-from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import gradio as gr
 
@@ -11,12 +10,21 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-from modules.game import create_game  # noqa: E402
 from modules.memory import Event  # noqa: E402
 from modules import utils  # noqa: E402
 from modules.intervention_manager import InterventionManager  # noqa: E402
 from modules.model.llm_model import create_llm_model  # noqa: E402
 from customization.depression_scale_agent.ExpertLLM import ExpertLLM  # type: ignore
+from customization.snapshot_ui_service import (  # noqa: E402
+    UserStub,
+    create_checkpoint_game,
+    list_agents as _list_agents,
+    list_simulations as _list_simulations,
+    list_snapshot_files as _list_snapshot_files,
+    load_config as _load_snapshot_config,
+    load_conversation as _load_conversation,
+    resolve_snapshot_file as _resolve_snapshot_file,
+)
 
 
 CHECKPOINTS_ROOT = os.path.join(BASE_DIR, "results", "checkpoints")
@@ -95,28 +103,6 @@ def _clone_json_safe(value: Any):
     return json.loads(json.dumps(_json_safe(value), ensure_ascii=False))
 
 
-@dataclass
-class UserStub:
-    name: str
-    tile: object
-
-    def __post_init__(self):
-        address = self.tile.get_address()
-        self._event = Event(
-            self.name,
-            "正在",
-            "聊天",
-            describe=f"{self.name} 正在聊天",
-            address=address,
-        )
-
-    def get_event(self):
-        return self._event
-
-    def get_tile(self):
-        return self.tile
-
-
 class ChatSession:
     def __init__(self, sim_name, snapshot_file=None, runtime_config=None, conversation=None):
         _load_env_file_once()
@@ -133,15 +119,12 @@ class ChatSession:
             raise ValueError(f"找不到存档: {sim_name}")
         if isinstance(self.config.get("time"), str):
             self.config["time"] = {"start": self.config.get("time")}
-        self.logger = utils.create_io_logger("info")
-        self.game = create_game(
+        self.logger, self.game = create_checkpoint_game(
             sim_name,
             STATIC_ROOT,
             self.config,
             self.conversation,
-            logger=self.logger,
         )
-        self.game.reset_game()
         self.intervention = InterventionManager(config=self.config, logger=self.logger)
         self.game.set_intervention_manager(self.intervention)
         self._forced_llm = None
@@ -216,12 +199,6 @@ class ChatSession:
                 bool(getattr(self.agent, "depression_dynamic", None)),
             )
         )
-
-    def _patch_prompt_for_forced_dynamic(self, prompt_payload, user, relation, chats, prompt_kwargs):
-        del user, relation, chats, prompt_kwargs
-        if not isinstance(prompt_payload, dict):
-            return prompt_payload
-        return dict(prompt_payload)
 
     def _dump_dynamic_state_for_trace(self):
         if not self.agent:
@@ -462,7 +439,7 @@ class ChatSession:
                     external_memory_context=external_memory_context,
                     **prompt_kwargs,
                 )
-                return prompt_payload, prompt_kwargs, route, trace_data
+                return prompt_payload, route, trace_data
             self.logger.info(
                 "[DEPR_SCALE][EXT_MEMORY_ROUTE] agent={} route=local reason={} query={}".format(
                     self.agent.name,
@@ -479,7 +456,7 @@ class ChatSession:
             **prompt_kwargs,
         )
         trace_data["prompt_route"] = route
-        return prompt_payload, prompt_kwargs, route, trace_data
+        return prompt_payload, route, trace_data
 
     def _generate_chat_forced_then_fallback(
         self,
@@ -489,7 +466,7 @@ class ChatSession:
         question_text="",
         capture_trace=False,
     ):
-        prompt_payload, prompt_kwargs, prompt_route, prompt_trace = self._build_prompt_payload_before_answer(
+        prompt_payload, prompt_route, prompt_trace = self._build_prompt_payload_before_answer(
             user, relation, chats, question_text
         )
         trace = {
@@ -523,9 +500,6 @@ class ChatSession:
             if runtime is not None:
                 forced_llm, forced_cfg = runtime
                 forced_prompt = dict(prompt_payload)
-                forced_prompt = self._patch_prompt_for_forced_dynamic(
-                    forced_prompt, user, relation, chats, prompt_kwargs
-                )
                 forced_prompt["failsafe"] = None
                 forced_prompt["retry"] = max(
                     1,
@@ -574,9 +548,7 @@ class ChatSession:
                 "[DEPR_SCALE][CHAT_ROUTE] route=default reason=fallback prompt_route={}".format(prompt_route)
             )
             self._last_generate_route = "default"
-            default_prompt = self._patch_prompt_for_forced_dynamic(
-                dict(prompt_payload), user, relation, chats, prompt_kwargs
-            )
+            default_prompt = dict(prompt_payload)
             trace["full_injected_prompt"] = str(default_prompt.get("prompt", "") or "")
             trace["final_prompt_payload_meta"] = self._build_prompt_payload_meta(default_prompt)
             llm = getattr(self.agent, "_llm", None)
@@ -677,13 +649,7 @@ class ChatSession:
 
 
 def list_simulations():
-    if not os.path.isdir(CHECKPOINTS_ROOT):
-        return []
-    return sorted(
-        d
-        for d in os.listdir(CHECKPOINTS_ROOT)
-        if os.path.isdir(os.path.join(CHECKPOINTS_ROOT, d))
-    )
+    return _list_simulations(CHECKPOINTS_ROOT)
 
 
 def list_question_jsonl_files():
@@ -708,44 +674,20 @@ def resolve_question_file_path(jsonl_name):
 
 
 def list_sim_json_files(sim_name):
-    folder = os.path.join(CHECKPOINTS_ROOT, sim_name)
-    if not os.path.isdir(folder):
-        return []
-    return sorted(
-        f
-        for f in os.listdir(folder)
-        if f.endswith(".json") and f != "conversation.json"
-    )
+    return _list_snapshot_files(CHECKPOINTS_ROOT, sim_name)
 
 
 def resolve_snapshot_file(sim_name, snapshot_file=None):
-    files = list_sim_json_files(sim_name)
-    if not files:
-        return None
-    if snapshot_file and snapshot_file in files:
-        return snapshot_file
-    return files[-1]
+    return _resolve_snapshot_file(CHECKPOINTS_ROOT, sim_name, snapshot_file)
 
 
 def load_config(sim_name, snapshot_file=None):
-    folder = os.path.join(CHECKPOINTS_ROOT, sim_name)
-    if not os.path.isdir(folder):
-        return None
-    selected = resolve_snapshot_file(sim_name, snapshot_file)
-    if not selected:
-        return None
-    latest = os.path.join(folder, selected)
-    with open(latest, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    if isinstance(config.get("time"), str):
-        config["time"] = {"start": config["time"]}
-    assets_root = os.path.join("assets", "village")
-    for agent_name in config.get("agents", {}):
-        if not str(config["agents"][agent_name].get("config_path", "") or "").strip():
-            config["agents"][agent_name]["config_path"] = os.path.join(
-                assets_root, "agents", agent_name.replace(" ", "_"), "agent.json"
-            )
-    return config
+    return _load_snapshot_config(
+        CHECKPOINTS_ROOT,
+        sim_name,
+        snapshot_file,
+        overwrite_agent_config_paths=False,
+    )
 
 
 def load_latest_config(sim_name):
@@ -753,18 +695,16 @@ def load_latest_config(sim_name):
 
 
 def load_conversation(sim_name):
-    path = os.path.join(CHECKPOINTS_ROOT, sim_name, "conversation.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_conversation(CHECKPOINTS_ROOT, sim_name)
 
 
 def list_agents(sim_name, snapshot_file=None):
-    config = load_config(sim_name, snapshot_file)
-    if not config:
-        return []
-    return sorted(config.get("agents", {}).keys())
+    return _list_agents(
+        CHECKPOINTS_ROOT,
+        sim_name,
+        snapshot_file,
+        overwrite_agent_config_paths=False,
+    )
 
 
 def ensure_session(sim_name, snapshot_file, session):

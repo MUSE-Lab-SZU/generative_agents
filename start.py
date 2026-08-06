@@ -4,7 +4,6 @@ import json
 import argparse
 import datetime
 import signal
-import sys
 
 from dotenv import load_dotenv, find_dotenv
 
@@ -12,17 +11,9 @@ from modules.game import create_game, get_game
 from modules import utils
 from modules.intervention_manager import InterventionManager
 from modules.staged_eval_manager import StagedEvalManager
+from simulation_roster import DEFAULT_VILLAGE_PERSONAS
 
-personas = [
-    "卡布达",  # 抑郁症患者
-    # "卡布达2",  # 抑郁症患者
-    # "卡布达3",  # 抑郁症患者
-    "金龟次郎",  # 家人（否认型父母）
-    "田德莉娜",  # 好友
-    "呱呱蛙",  # 邻居
-    "蜻蜓队长",  # 心理医生
-    "蟑螂恶霸" # 小混混
-]
+personas = list(DEFAULT_VILLAGE_PERSONAS)
 
 TRACE_STATE_SIDECAR_DIR = "trace_state_sidecars"
 TRACE_STATE_SNAPSHOT_KEYS = (
@@ -110,6 +101,14 @@ class SimulateServer:
 
         # 创建游戏
         game = create_game(name, static_root, config, conversation, logger=self.logger)
+        depression_trace_path = os.path.join(
+            checkpoints_folder,
+            "judge_traces",
+            "depression_dynamic_llm_trace.jsonl",
+        )
+        for agent in game.agents.values():
+            if hasattr(agent, "set_depression_trace_path"):
+                agent.set_depression_trace_path(depression_trace_path)
         game.reset_game()
 
         self.game = get_game()
@@ -342,17 +341,34 @@ class SimulateServer:
 
                 snapshot_config = _strip_snapshot_trace_state(self.config)
                 final_step = i == (self.start_step + step - 1)
-                if self._should_write_full_snapshot(
-                    step_no=step_no,
-                    final_step=final_step,
-                    staged_eval_triggered=staged_eval_triggered,
-                ):
+                rolling_resume_due = bool(
+                    self.staged_eval
+                    and hasattr(self.staged_eval, "should_capture_rolling_resume_checkpoint")
+                    and self.staged_eval.should_capture_rolling_resume_checkpoint(snapshot_config)
+                )
+                wrote_full_snapshot = bool(
+                    rolling_resume_due
+                    or self._should_write_full_snapshot(
+                        step_no=step_no,
+                        final_step=final_step,
+                        staged_eval_triggered=staged_eval_triggered,
+                    )
+                )
+                if wrote_full_snapshot:
                     self._write_full_snapshot(
                         snapshot_name=snapshot_name,
                         snapshot_stem=snapshot_stem,
                         snapshot_config=snapshot_config,
                         judge_trace_payload=judge_trace_payload,
                         forced_prompt_payload=forced_prompt_payload,
+                    )
+                if rolling_resume_due:
+                    self.staged_eval.capture_rolling_resume_checkpoint(
+                        runtime_config=snapshot_config,
+                        conversation=copy.deepcopy(self.game.conversation),
+                        step_no=step_no,
+                        sim_time=sim_time,
+                        snapshot_name=snapshot_name,
                     )
 
                 if stride > 0:
@@ -389,15 +405,17 @@ def get_config_from_log(checkpoints_folder):
     with open(snapshot_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     config = _restore_trace_state_sidecars(config, checkpoints_folder, snapshot_name)
-    if "checkpointing" not in config:
-        try:
-            with open("data/config.json", "r", encoding="utf-8") as defaults_f:
-                defaults = json.load(defaults_f)
-            checkpointing_cfg = defaults.get("checkpointing", {})
-            if isinstance(checkpointing_cfg, dict) and checkpointing_cfg:
-                config["checkpointing"] = copy.deepcopy(checkpointing_cfg)
-        except Exception:
-            pass
+    try:
+        with open("data/config.json", "r", encoding="utf-8") as defaults_f:
+            defaults = json.load(defaults_f)
+        default_checkpointing = defaults.get("checkpointing", {})
+        checkpointing_cfg = config.setdefault("checkpointing", {})
+        if isinstance(default_checkpointing, dict) and isinstance(checkpointing_cfg, dict):
+            for key, value in default_checkpointing.items():
+                if key not in checkpointing_cfg:
+                    checkpointing_cfg[key] = copy.deepcopy(value)
+    except Exception:
+        pass
 
     assets_root = os.path.join("assets", "village")
 

@@ -4,70 +4,23 @@ import argparse
 from datetime import datetime, timedelta
 
 from modules.maze import Maze
+from replay_protocol import FILE_MARKDOWN, FILE_MOVEMENT, FRAMES_PER_STEP
+from simulation_roster import resolve_run_context as _shared_resolve_run_context
 
 
 # 村庄模式的角色花名册兜底值（与 start.personas 保持一致）。正常回放时，
 # 角色花名册由 _resolve_run_context 从存档动态读取。
-_DEFAULT_VILLAGE_PERSONAS = [
-    "卡布达",
-    "金龟次郎",
-    "田德莉娜",
-    "呱呱蛙",
-    "蜻蜓队长",
-    "蟑螂恶霸",
-]
-
-
 def _assets_base(assets_root):
     """根据 assets 子目录名返回完整资源根路径。"""
     return f"frontend/static/assets/{assets_root}"
 
 
 def _resolve_run_context(checkpoints_folder, assets_root_override=None):
-    """从存档确定资源根目录和角色花名册。
+    return _shared_resolve_run_context(checkpoints_folder, assets_root_override)
 
-    assets_root 优先级：显式参数 > 首个 simulate-*.json 的 maze.path > village。
-    角色花名册优先读取存档 agents，存档缺失时回退到村庄默认角色。
-    """
-    assets_root = assets_root_override
-    roster = None
-    try:
-        names = sorted(
-            name
-            for name in os.listdir(checkpoints_folder)
-            if name.startswith("simulate-") and name.endswith(".json")
-        )
-    except OSError:
-        names = []
-
-    if names:
-        try:
-            with open(os.path.join(checkpoints_folder, names[0]), "r", encoding="utf-8") as f:
-                snapshot = json.load(f)
-        except (OSError, ValueError):
-            snapshot = {}
-
-        if assets_root is None:
-            maze_field = snapshot.get("maze")
-            maze_path = ""
-            if isinstance(maze_field, dict):
-                maze_path = str(maze_field.get("path", "") or "")
-            assets_root = "counsel_room" if "counsel_room" in maze_path else "village"
-
-        agents = snapshot.get("agents")
-        if isinstance(agents, dict) and agents:
-            roster = list(agents.keys())
-
-    if assets_root is None:
-        assets_root = "village"
-    if roster is None:
-        roster = list(_DEFAULT_VILLAGE_PERSONAS)
-    return assets_root, roster
-
-file_markdown = "simulation.md"
-file_movement = "movement.json"
-
-frames_per_step = 60  # 每个step包含的帧数
+file_markdown = FILE_MARKDOWN
+file_movement = FILE_MOVEMENT
+frames_per_step = FRAMES_PER_STEP  # 每个step包含的帧数
 
 
 # 从存档文件中读取stride

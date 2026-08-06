@@ -28,6 +28,12 @@ GROUP="${GROUP:-G9}"
 KBD="${KBD:-KBD6}"
 SEVERITY="${SEVERITY:-SEV}"
 COUNSEL_ROOM=false
+CBT_CONTROLLER="progressive"
+PROGRESSIVE_STAGE="D"
+PROGRESSIVE_STAGE_EXPLICIT=false
+BASE_CONFIG=""
+OUTPUT_TAG=""
+DRY_RUN=false
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
@@ -39,12 +45,19 @@ SIM_LOG="results/batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
 EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20,POST"
+EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20"
 # 同一 agent × 时间点 × 量表的固定完整复评次数（不是独立患者样本数）
 EVAL_REPEAT=10
 EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
-EVAL_MAX_PARALLEL=3
+EVAL_MAX_PARALLEL=6
 EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
+
+# 仿真后回访默认关闭，显式传 --followup 后插入无干预观察期。
+FOLLOWUP_ENABLED=false
+FOLLOWUP_STEPS=120
+FOLLOWUP_INTERVAL=30
+FOLLOWUP_SOURCE_LABEL="session_20"
+FOLLOWUP_MAX_PARALLEL=1
 
 # ============================================================
 # ↑↑↑ 实验参数在此修改 ↑↑↑
@@ -59,10 +72,23 @@ usage() {
   bash runshells/run_batch_then_repeat_eval.sh [参数]
 
 参数:
-  -n, --repeat-count N  要运行的独立实验轮数，默认使用脚本顶部配置
-  -j, --max-parallel N  同时运行的实验轮数，默认等于重复次数（全部并行）
-      --counsel-room    使用咨询室模式（固定 G4，并透传给批量实验脚本）
-  -h, --help            显示本帮助
+  -n, --repeat-count N       要运行的独立实验轮数，默认使用脚本顶部配置
+  -j, --max-parallel N       同时运行的实验轮数，默认等于重复次数（全部并行）
+      --counsel-room         使用咨询室模式（固定 G4，并透传给批量实验脚本）
+      --cbt-controller MODE  legacy|minimal|progressive；默认 progressive
+      --progressive-stage D  兼容旧命令的可选参数；progressive 自动使用 D
+      --config PATH          base config JSON；默认 data/config.json
+      --output-tag NAME      controller identity 后的附加输出标签
+      --followup             仿真后插入无干预回访阶段，并复评回访节点
+      --no-followup          不运行回访阶段（默认）
+      --followup-steps N     回访继续运行步数，默认 120
+      --followup-interval N  回访 snapshot 间隔，默认 30
+      --followup-source-label LABEL
+                             原仿真作为回访起点的 staged label，默认 session_20
+      --followup-max-parallel N
+                             同一轮内 follow-up condition 并行数，默认 1
+      --dry-run              完成合并、校验、命名和 manifest 展示，不运行仿真/复评
+  -h, --help                 显示本帮助
 
 示例:
   bash runshells/run_batch_then_repeat_eval.sh --repeat-count 3
@@ -87,6 +113,59 @@ while [[ $# -gt 0 ]]; do
       COUNSEL_ROOM=true
       shift
       ;;
+    --cbt-controller)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要 legacy|minimal|progressive。" >&2; exit 2; }
+      CBT_CONTROLLER="$2"
+      shift 2
+      ;;
+    --progressive-stage)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要 D。" >&2; exit 2; }
+      PROGRESSIVE_STAGE="$2"
+      PROGRESSIVE_STAGE_EXPLICIT=true
+      shift 2
+      ;;
+    --config)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要配置路径。" >&2; exit 2; }
+      BASE_CONFIG="$2"
+      shift 2
+      ;;
+    --output-tag)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要标签。" >&2; exit 2; }
+      OUTPUT_TAG="$2"
+      shift 2
+      ;;
+    --followup)
+      FOLLOWUP_ENABLED=true
+      shift
+      ;;
+    --no-followup)
+      FOLLOWUP_ENABLED=false
+      shift
+      ;;
+    --followup-steps)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要一个整数。" >&2; exit 2; }
+      FOLLOWUP_STEPS="$2"
+      shift 2
+      ;;
+    --followup-interval)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要一个整数。" >&2; exit 2; }
+      FOLLOWUP_INTERVAL="$2"
+      shift 2
+      ;;
+    --followup-source-label)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要一个 label。" >&2; exit 2; }
+      FOLLOWUP_SOURCE_LABEL="$2"
+      shift 2
+      ;;
+    --followup-max-parallel)
+      [[ $# -ge 2 ]] || { echo "错误: $1 需要一个整数。" >&2; exit 2; }
+      FOLLOWUP_MAX_PARALLEL="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -99,6 +178,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$CBT_CONTROLLER" in
+  progressive)
+    ;;
+  legacy|minimal)
+    if [[ "$PROGRESSIVE_STAGE_EXPLICIT" == true ]]; then
+      echo "错误: $CBT_CONTROLLER controller 不能搭配 --progressive-stage。" >&2
+      exit 2
+    fi
+    PROGRESSIVE_STAGE=""
+    ;;
+  *)
+    echo "错误: --cbt-controller 需要 legacy|minimal|progressive。" >&2
+    exit 2
+    ;;
+esac
+
 if [[ "$COUNSEL_ROOM" == true ]]; then
   GROUP="G4"
   SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
@@ -108,9 +203,33 @@ if [[ "$COUNSEL_ROOM" == true ]]; then
   EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 fi
 
+condition_key_cmd=(
+  python runshells/cbt_experiment_config.py condition-key
+  --condition "$SIM_CONDITION"
+  --cbt-controller "$CBT_CONTROLLER"
+)
+if [[ -n "$PROGRESSIVE_STAGE" ]]; then
+  condition_key_cmd+=(--progressive-stage "$PROGRESSIVE_STAGE")
+fi
+if [[ -n "$OUTPUT_TAG" ]]; then
+  condition_key_cmd+=(--output-tag "$OUTPUT_TAG")
+fi
+CONDITION_KEY="$("${condition_key_cmd[@]}")"
+SIM_LOG="results/batch-${EXP_DATE}-${CONDITION_KEY}_run.log"
+EVAL_NAME="repeat-${CONDITION_KEY}-${EXP_DATE}"
+EVAL_LOG="results/repeat-${CONDITION_KEY}-${EXP_DATE}.log"
+
 [[ "$REPEAT_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --repeat-count 必须是正整数。" >&2; exit 2; }
 [[ "$SIM_TARGET_STEP" =~ ^[1-9][0-9]*$ ]] || { echo "错误: SIM_TARGET_STEP 必须是正整数。" >&2; exit 2; }
 [[ "$SIM_STRIDE" =~ ^[1-9][0-9]*$ ]] || { echo "错误: SIM_STRIDE 必须是正整数。" >&2; exit 2; }
+[[ "$FOLLOWUP_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --followup-steps 必须是正整数。" >&2; exit 2; }
+[[ "$FOLLOWUP_INTERVAL" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --followup-interval 必须是正整数。" >&2; exit 2; }
+[[ "$FOLLOWUP_MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo "错误: --followup-max-parallel 必须是正整数。" >&2; exit 2; }
+[[ -n "$FOLLOWUP_SOURCE_LABEL" ]] || { echo "错误: --followup-source-label 不能为空。" >&2; exit 2; }
+if [[ "$FOLLOWUP_ENABLED" == true ]] && (( FOLLOWUP_INTERVAL > FOLLOWUP_STEPS )); then
+  echo "错误: 启用回访复评时 --followup-interval 不能大于 --followup-steps。" >&2
+  exit 2
+fi
 if [[ -z "$MAX_PARALLEL_REPEATS" ]]; then
   MAX_PARALLEL_REPEATS="$REPEAT_COUNT"
 fi
@@ -123,7 +242,9 @@ if [[ "$SIM_CONDITION" != "$EVAL_CONDITION" ]]; then
   exit 2
 fi
 
-mkdir -p results
+if [[ "$DRY_RUN" != true ]]; then
+  mkdir -p results
+fi
 
 suffix_path() {
   local path="$1"
@@ -133,6 +254,19 @@ suffix_path() {
   else
     printf '%s-%s\n' "$path" "$suffix"
   fi
+}
+
+followup_labels() {
+  local current="$FOLLOWUP_INTERVAL"
+  local labels=""
+  while (( current <= FOLLOWUP_STEPS )); do
+    if [[ -n "$labels" ]]; then
+      labels+=","
+    fi
+    labels+="followup_step_${current}"
+    ((current += FOLLOWUP_INTERVAL))
+  done
+  printf '%s\n' "$labels"
 }
 
 run_one_repeat() {
@@ -145,15 +279,16 @@ run_one_repeat() {
   local run_sim_log
   local run_eval_log
   local run_summary
+  local run_followup_name="followup-${CONDITION_KEY}-${EXP_DATE}-${suffix}"
+  local run_followup_summary="results/experiment_data/reports/${run_followup_name}_summary.json"
+  local selected_eval_summary
+  local selected_eval_labels
   run_sim_log=$(suffix_path "$SIM_LOG" "$suffix")
   run_eval_log=$(suffix_path "$EVAL_LOG" "$suffix")
-  run_summary="results/experiment_data/reports/${run_sim_name}-${SIM_CONDITION}_summary.json"
+  run_summary="results/experiment_data/reports/${run_sim_name}-${CONDITION_KEY}_summary.json"
+  selected_eval_summary="$run_summary"
+  selected_eval_labels="$EVAL_LABELS"
 
-  {
-    echo "=========================================="
-    echo " 重复实验 ${suffix}：仿真开始 $(date '+%F %T')"
-    echo " 仿真名称: $run_sim_name"
-  } > "$run_sim_log"
   local -a batch_cmd=(
     python runshells/run_batch_experiment.py
     --name "$run_sim_name"
@@ -161,10 +296,50 @@ run_one_repeat() {
     --step "$SIM_TARGET_STEP"
     --stride "$SIM_STRIDE"
     --max-parallel "$SIM_MAX_PARALLEL"
+    --skip-post-scale
+    --cbt-controller "$CBT_CONTROLLER"
   )
+  if [[ -n "$PROGRESSIVE_STAGE" ]]; then
+    batch_cmd+=(--progressive-stage "$PROGRESSIVE_STAGE")
+  fi
+  if [[ -n "$BASE_CONFIG" ]]; then
+    batch_cmd+=(--config "$BASE_CONFIG")
+  fi
+  if [[ -n "$OUTPUT_TAG" ]]; then
+    batch_cmd+=(--output-tag "$OUTPUT_TAG")
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    batch_cmd+=(--dry-run)
+  fi
   if [[ "$COUNSEL_ROOM" == true ]]; then
     batch_cmd+=(--counsel-room)
   fi
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "=========================================="
+    echo " 重复实验 ${suffix}：dry-run"
+    echo " 仿真名称: $run_sim_name"
+    BATCH_EMBEDDING_BASE_URLS="$SIM_EMBEDDING_BASE_URLS" "${batch_cmd[@]}"
+    if [[ "$FOLLOWUP_ENABLED" == true ]]; then
+      printf '[DRY-RUN] follow-up 将在仿真 summary 生成后执行:\n  python runshells/run_post_sim_followup.py --source-summary %q --source-label %q --name %q --steps %q --interval %q --max-parallel %q --dry-run\n' \
+        "$run_summary" "$FOLLOWUP_SOURCE_LABEL" "$run_followup_name" \
+        "$FOLLOWUP_STEPS" "$FOLLOWUP_INTERVAL" "$FOLLOWUP_MAX_PARALLEL"
+      selected_eval_summary="$run_followup_summary"
+      selected_eval_labels="$(followup_labels)"
+      run_eval_name="${run_eval_name}-followup"
+      run_eval_log=$(suffix_path "$run_eval_log" "followup")
+    fi
+    echo "[DRY-RUN] repeat eval 将读取 generation summary/manifest，但本次不执行:"
+    printf '  python runshells/run_archived_repeat_scale_eval.py --archive-results-root %q --condition %q --original-summary %q --labels %q --repeat %q --name %q --max-parallel %q --require-controller-manifest\n' \
+      "$EVAL_ARCHIVE_RESULTS_ROOT" "$EVAL_CONDITION" "$selected_eval_summary" "$selected_eval_labels" \
+      "$EVAL_REPEAT" "$run_eval_name" "$EVAL_MAX_PARALLEL"
+    return 0
+  fi
+
+  {
+    echo "=========================================="
+    echo " 重复实验 ${suffix}：仿真开始 $(date '+%F %T')"
+    echo " 仿真名称: $run_sim_name"
+  } > "$run_sim_log"
   BATCH_EMBEDDING_BASE_URLS="$SIM_EMBEDDING_BASE_URLS" \
     "${batch_cmd[@]}" >> "$run_sim_log" 2>&1 || return 1
 
@@ -173,20 +348,47 @@ run_one_repeat() {
     return 1
   fi
 
+  if [[ "$FOLLOWUP_ENABLED" == true ]]; then
+    {
+      echo "=========================================="
+      echo " 重复实验 ${suffix}：无干预回访开始 $(date '+%F %T')"
+      echo " 回访名称: $run_followup_name"
+      echo " 源 summary: $run_summary"
+    } >> "$run_sim_log"
+    python runshells/run_post_sim_followup.py \
+      --source-summary "$run_summary" \
+      --source-label "$FOLLOWUP_SOURCE_LABEL" \
+      --name "$run_followup_name" \
+      --steps "$FOLLOWUP_STEPS" \
+      --interval "$FOLLOWUP_INTERVAL" \
+      --max-parallel "$FOLLOWUP_MAX_PARALLEL" \
+      >> "$run_sim_log" 2>&1 || return 1
+    if [[ ! -f "$run_followup_summary" ]]; then
+      echo "错误: 重复实验 ${suffix} 未生成 follow-up summary: $run_followup_summary" >> "$run_sim_log"
+      return 1
+    fi
+    selected_eval_summary="$run_followup_summary"
+    selected_eval_labels="$(followup_labels)"
+    # 回访复评与原仿真复评使用独立批次名/日志，避免覆盖前者的汇总报告。
+    run_eval_name="${run_eval_name}-followup"
+    run_eval_log=$(suffix_path "$run_eval_log" "followup")
+  fi
+
   {
     echo "=========================================="
     echo " 重复实验 ${suffix}：复评开始 $(date '+%F %T')"
     echo " 复评名称: $run_eval_name"
-    echo " 原始 summary: $run_summary"
+    echo " 评估源 summary: $selected_eval_summary"
   } > "$run_eval_log"
   python runshells/run_archived_repeat_scale_eval.py \
     --archive-results-root "$EVAL_ARCHIVE_RESULTS_ROOT" \
     --condition "$EVAL_CONDITION" \
-    --original-summary "$run_summary" \
-    --labels "$EVAL_LABELS" \
+    --original-summary "$selected_eval_summary" \
+    --labels "$selected_eval_labels" \
     --repeat "$EVAL_REPEAT" \
     --name "$run_eval_name" \
     --max-parallel "$EVAL_MAX_PARALLEL" \
+    --require-controller-manifest \
     >> "$run_eval_log" 2>&1 || return 1
   echo "重复实验 ${suffix}：复评完成 $(date '+%F %T')" >> "$run_eval_log"
 }
@@ -214,6 +416,18 @@ echo " 批量仿真 + 重复评估量表（并行重复）"
 echo "=========================================="
 echo "  仿真条件:      $SIM_CONDITION"
 echo "  评估条件:      $EVAL_CONDITION"
+echo "  Condition key: $CONDITION_KEY"
+echo "  CBT controller:$CBT_CONTROLLER"
+echo "  Progressive:   ${PROGRESSIVE_STAGE:-'(none)'}"
+echo "  Output tag:    ${OUTPUT_TAG:-'(none)'}"
+echo "  Base config:   ${BASE_CONFIG:-data/config.json}"
+echo "  Dry-run:       $DRY_RUN"
+echo "  回访阶段:      $FOLLOWUP_ENABLED"
+if [[ "$FOLLOWUP_ENABLED" == true ]]; then
+  echo "  回访步数/间隔: ${FOLLOWUP_STEPS}/${FOLLOWUP_INTERVAL}"
+  echo "  回访源节点:    $FOLLOWUP_SOURCE_LABEL"
+  echo "  回访并行数:    $FOLLOWUP_MAX_PARALLEL"
+fi
 echo "  模式:          $([[ "$COUNSEL_ROOM" == true ]] && echo 咨询室 || echo 村庄)"
 echo "  目标总步数:    $SIM_TARGET_STEP"
 echo "  每步分钟数:    $SIM_STRIDE"
@@ -224,6 +438,18 @@ echo "  仿真日志格式:  $(suffix_path "$SIM_LOG" 'xx')"
 echo "  复评日志格式:  $(suffix_path "$EVAL_LOG" 'xx')"
 echo "=========================================="
 echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+  dry_index=1
+  while (( dry_index <= REPEAT_COUNT )); do
+    run_one_repeat "$dry_index"
+    ((dry_index += 1))
+  done
+  echo "=========================================="
+  echo " Dry-run 完成；未运行 start.py，未执行 repeat eval。"
+  echo "=========================================="
+  exit 0
+fi
 
 STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/batch-repeat-status.XXXXXX")
 declare -A PID_TO_REPEAT=()

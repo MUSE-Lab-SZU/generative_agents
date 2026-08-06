@@ -1,17 +1,27 @@
 """generative_agents.agent"""
 
 import os
+import json
 import math
 import random
 import datetime
 import copy
 import hashlib
+from contextlib import contextmanager
 
 from modules import memory, prompt, utils
 from modules.depression import DepressionSimulationEngine
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
 from modules.external_memory_bridge import ExternalMemoryBridge
+
+
+_LOCAL_ONLY_COMPLETION_HINTS = frozenset(
+    {
+        "summarize_relation",
+        "summarize_chats",
+    }
+)
 
 
 class Agent:
@@ -23,6 +33,9 @@ class Agent:
         self._forced_llm = None
         self._chat_route_ctx = None
         self.logger = logger
+        self._depression_trace_path = ""
+        self._depression_trace_context = {}
+        self._depression_trace_write_warned = False
 
         # agent config
         self.percept_config = config["percept"]
@@ -36,9 +49,10 @@ class Agent:
         self.reflection_policy = self._resolve_reflection_policy(
             self.think_config.get("reflection_policy", {})
         )
-        # lite 非会诊步：开启后，无 intervention lock 的步跳过 percept + 自发对话（保留
-        # schedule 重建与周期反思）。咨询室模式用，村庄模式默认 False 不受影响。
-        self._lite_non_consult_enabled = bool(self.think_config.get("lite_non_consult", False))
+        # 咨询室可选轻量模式：非会诊步跳过感知与自发对话；村庄默认关闭。
+        self._lite_non_consult_enabled = bool(
+            self.think_config.get("lite_non_consult", False)
+        )
         self.chat_iter = config["chat_iter"]
         global_chat_history = config.get("chat_history", {}) or {}
         local_chat_history = (config.get("_raw", {}) or {}).get("chat_history", {})
@@ -293,8 +307,11 @@ class Agent:
             output = None
             responses = []
 
+            local_only_completion = func_hint in _LOCAL_ONLY_COMPLETION_HINTS
             should_try_forced = False
-            if self.intervention and isinstance(self._chat_route_ctx, dict):
+            if local_only_completion:
+                route_reason = "hardcoded_local_only"
+            elif self.intervention and isinstance(self._chat_route_ctx, dict):
                 forced_flag = bool(self._chat_route_ctx.get("forced", False))
                 peer_agent = self._chat_route_ctx.get("peer_agent")
                 if forced_flag and peer_agent and hasattr(self.intervention, "should_route_forced_llm"):
@@ -507,12 +524,14 @@ class Agent:
                 start=utils.get_timer().daily_time(plan["start"]),
             )
         if self.is_awake():
-            # lite 非会诊步：无 intervention lock 时跳过 percept + make_plan（自发对话），
-            # 保留周期反思（抑郁在两次会诊间演化的唯一通道）。会诊步有 lock → full think。
-            _lock = self.status.get("intervention", {}).get("lock", {})
-            has_lock = bool(_lock.get("enabled"))
-            lite = self._lite_non_consult_enabled and not has_lock
-            if not lite:
+            lock = self.status.get("intervention", {}).get("lock", {})
+            has_lock = bool(isinstance(lock, dict) and lock.get("enabled", False))
+            lite_non_consult = self._lite_non_consult_enabled and not has_lock
+            if lite_non_consult:
+                # 不调用 percept / _reaction，仍在动作到期时按当前日程推进动作。
+                if self.action.finished():
+                    self.action = self._determine_action()
+            else:
                 self.percept()
                 self.make_plan(agents)
             periodic_result = self._maybe_reflect_periodic()
@@ -1525,8 +1544,6 @@ class Agent:
 
         repeat_streak_self = 0
         repeat_streak_other = 0
-        question_streak_self = 0
-        question_streak_other = 0
 
         retrieval_profile = {}
         retrieval_profile_meta = {
@@ -1603,6 +1620,20 @@ class Agent:
             "advice": "",
         }
 
+        def track_accepted_utterance(speaker_agent, other_agent, utterance, turn_no):
+            if (
+                self.intervention
+                and hasattr(self.intervention, "update_patient_state_after_utterance")
+            ):
+                self.intervention.update_patient_state_after_utterance(
+                    speaker=speaker_agent,
+                    other=other_agent,
+                    chats=chats,
+                    patient_utterance=utterance,
+                    forced=forced,
+                    turn_no=turn_no,
+                )
+
         for i in range(chat_iter_budget):
             turn_no = i + 1
             terminate_check_enabled_this_turn = True
@@ -1663,13 +1694,19 @@ class Agent:
                 terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
                 advice_text = ""
                 if isinstance(judge, dict):
-                    advice_text = str(judge.get("advice", "") or "")
+                    if hasattr(self.intervention, "build_doctor_reply_guidance"):
+                        advice_text = self.intervention.build_doctor_reply_guidance(judge)
+                    else:
+                        advice_text = str(judge.get("advice", "") or "")
                 doctor_turn_judge_cache = {
                     "valid": judge_valid,
                     "speaker": self.name,
                     "turn_no": int(turn_no),
                     "terminate": terminate_flag,
                     "advice": advice_text,
+                    "primary_strategy": str((judge or {}).get("primary_strategy", "") or ""),
+                    "micro_skill": str((judge or {}).get("micro_skill", "") or ""),
+                    "turn_goal": str((judge or {}).get("turn_goal", "") or ""),
                 }
                 self.logger.info(
                     "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
@@ -1694,11 +1731,6 @@ class Agent:
                 is_initiator=True,
                 turn_no=turn_no,
             )
-
-            if self._is_question_text(text):
-                question_streak_self += 1
-            else:
-                question_streak_self = 0
 
             if i > 0:
                 # 对于发起对话的Agent，从第2轮对话开始，检查是否出现“复读”现象
@@ -1745,6 +1777,7 @@ class Agent:
 
                 # 对于发起对话的Agent，从第2轮对话开始，检查话题是否结束
                 chats.append((self.name, text))
+                track_accepted_utterance(self, other, text, turn_no)
                 if not dialog_judge_enabled:
                     terminate_end = False
                     if terminate_check_enabled_this_turn:
@@ -1799,6 +1832,7 @@ class Agent:
                             break
             else:
                 chats.append((self.name, text))
+                track_accepted_utterance(self, other, text, turn_no)
 
             if dialog_judge_enabled and self_is_doctor_turn:
                 judge_cache_hit = (
@@ -1877,13 +1911,19 @@ class Agent:
                 terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
                 advice_text = ""
                 if isinstance(judge, dict):
-                    advice_text = str(judge.get("advice", "") or "")
+                    if hasattr(self.intervention, "build_doctor_reply_guidance"):
+                        advice_text = self.intervention.build_doctor_reply_guidance(judge)
+                    else:
+                        advice_text = str(judge.get("advice", "") or "")
                 doctor_turn_judge_cache = {
                     "valid": judge_valid,
                     "speaker": other.name,
                     "turn_no": int(turn_no),
                     "terminate": terminate_flag,
                     "advice": advice_text,
+                    "primary_strategy": str((judge or {}).get("primary_strategy", "") or ""),
+                    "micro_skill": str((judge or {}).get("micro_skill", "") or ""),
+                    "turn_goal": str((judge or {}).get("turn_goal", "") or ""),
                 }
                 self.logger.info(
                     "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
@@ -1908,11 +1948,6 @@ class Agent:
                 is_initiator=False,
                 turn_no=turn_no,
             )
-
-            if self._is_question_text(text):
-                question_streak_other += 1
-            else:
-                question_streak_other = 0
 
             if i > 0:
                 # 对于响应对话的Agent，从第2轮开始，检查是否出现“复读”现象
@@ -1958,6 +1993,7 @@ class Agent:
                         break
 
             chats.append((other.name, text))
+            track_accepted_utterance(other, self, text, turn_no)
 
             # 对于响应对话的Agent，从第1轮开始，检查话题是否结束
             if dialog_judge_enabled and other_is_doctor_turn:
@@ -2203,7 +2239,6 @@ class Agent:
                         chats=chats,
                         forced=forced,
                         turn_no=turn_no,
-                        is_initiator=is_initiator,
                     )
                     if not isinstance(consult_history_trace_context, dict):
                         consult_history_trace_context = {}
@@ -3077,9 +3112,6 @@ class Agent:
     def get_chat_focus_retrieve_max(self):
         return self.chat_focus_retrieve_max
 
-    def get_chat_recent_turn_focus_n(self):
-        return self.chat_recent_turn_focus_n
-
     def _depression_engine_ready(self):
         return bool(getattr(self, "depression_dynamic", None) is not None)
 
@@ -3193,11 +3225,23 @@ class Agent:
             return None
         try:
             self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
-            return self.depression_dynamic.initialize_graph_window(
-                location=self._dynamic_location(),
-                time_of_day=self._dynamic_time_of_day(),
-                roadmap_completion_func=self._depression_llm_completion,
-            )
+            location = self._dynamic_location()
+            time_of_day = self._dynamic_time_of_day()
+            with self._depression_trace_scope(
+                {
+                    "source": "graph_init",
+                    "location": location,
+                    "time_of_day": time_of_day,
+                    "other_agent": "",
+                    "relationship": "",
+                    "interaction_type": "主诉图初始化",
+                }
+            ):
+                return self.depression_dynamic.initialize_graph_window(
+                    location=location,
+                    time_of_day=time_of_day,
+                    roadmap_completion_func=self._depression_llm_completion,
+                )
         except Exception as exc:
             if self.logger:
                 self.logger.info(
@@ -3222,16 +3266,30 @@ class Agent:
             relation_summary=relation_summary,
             chats=chats,
         )
-        preview_prompt = self.depression_dynamic.preview_interaction_prompt(
-            location=context["location"],
-            time_of_day=context["time_of_day"],
-            other_agent=context["other_agent"],
-            relationship=context["relationship"],
-            interaction_type=context["interaction_type"],
-            conversation_content=context["conversation_content"],
-            roadmap_completion_func=self._depression_llm_completion,
-            emotion_completion_func=self._depression_llm_completion,
-        )
+        with self._depression_trace_scope(
+            {
+                "source": "chat_preview",
+                "location": context["location"],
+                "time_of_day": context["time_of_day"],
+                "other_agent": context["other_agent"],
+                "relationship": context["relationship"],
+                "interaction_type": context["interaction_type"],
+                "dialogue": {
+                    "patient_utterance": "",
+                    "counterpart_utterance": "",
+                },
+            }
+        ):
+            preview_prompt = self.depression_dynamic.preview_interaction_prompt(
+                location=context["location"],
+                time_of_day=context["time_of_day"],
+                other_agent=context["other_agent"],
+                relationship=context["relationship"],
+                interaction_type=context["interaction_type"],
+                conversation_content=context["conversation_content"],
+                roadmap_completion_func=self._depression_llm_completion,
+                emotion_completion_func=self._depression_llm_completion,
+            )
         next_kwargs = dict(kwargs)
         next_kwargs["depression_chat_block"] = preview_prompt
         return next_kwargs, context
@@ -3268,20 +3326,39 @@ class Agent:
             return None
 
         self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
+        trace_dialogue = {
+            "patient_utterance": event_content if event_source == "chat" else "",
+            "counterpart_utterance": (
+                str(counterpart_utterance or "").strip()
+                if event_source == "chat"
+                else ""
+            ),
+        }
         try:
-            return self.depression_dynamic.commit_event(
-                source=event_source,
-                location=location,
-                time_of_day=time_of_day,
-                other_agent=other_agent,
-                relationship=relationship,
-                interaction_type=interaction_type,
-                content=event_content,
-                metadata=metadata if isinstance(metadata, dict) else {},
-                counterpart_utterance=counterpart_utterance,
-                roadmap_completion_func=self._depression_llm_completion,
-                emotion_completion_func=self._depression_llm_completion,
-            )
+            with self._depression_trace_scope(
+                {
+                    "source": event_source,
+                    "location": location,
+                    "time_of_day": time_of_day,
+                    "other_agent": other_agent,
+                    "relationship": relationship,
+                    "interaction_type": interaction_type,
+                    "dialogue": trace_dialogue,
+                }
+            ):
+                return self.depression_dynamic.commit_event(
+                    source=event_source,
+                    location=location,
+                    time_of_day=time_of_day,
+                    other_agent=other_agent,
+                    relationship=relationship,
+                    interaction_type=interaction_type,
+                    content=event_content,
+                    metadata=metadata if isinstance(metadata, dict) else {},
+                    counterpart_utterance=counterpart_utterance,
+                    roadmap_completion_func=self._depression_llm_completion,
+                    emotion_completion_func=self._depression_llm_completion,
+                )
         except Exception as exc:
             if self.logger:
                 self.logger.info(
@@ -3529,8 +3606,145 @@ class Agent:
         self._log_depression_llm_call(prompt, output)
         return output
 
+    def set_depression_trace_path(self, path):
+        """设置动态抑郁 LLM 独立 trace 文件；写入采用追加 JSONL。"""
+        self._depression_trace_path = str(path or "").strip()
+        self._depression_trace_write_warned = False
+        if (
+            self._depression_trace_enabled()
+            and self.depression_dynamic
+            and self.logger
+            and hasattr(self.logger, "info")
+        ):
+            self.logger.info(
+                "[DEPRESSION_DYNAMIC_TRACE] agent={} path={}".format(
+                    self.name,
+                    self._depression_trace_path,
+                )
+            )
+
+    def _depression_trace_enabled(self):
+        cfg = (
+            self.depression_dynamic_global
+            if isinstance(self.depression_dynamic_global, dict)
+            else {}
+        )
+        return bool(cfg.get("log_enabled", False)) and bool(
+            self._depression_trace_path
+        )
+
+    @contextmanager
+    def _depression_trace_scope(self, context):
+        previous = copy.deepcopy(
+            self._depression_trace_context
+            if isinstance(self._depression_trace_context, dict)
+            else {}
+        )
+        self._depression_trace_context = self._normalize_depression_trace_context(
+            context
+        )
+        try:
+            yield
+        finally:
+            self._depression_trace_context = previous
+
+    @staticmethod
+    def _normalize_depression_trace_context(context):
+        context = copy.deepcopy(context) if isinstance(context, dict) else {}
+        dialogue = (
+            context.get("dialogue", {})
+            if isinstance(context.get("dialogue", {}), dict)
+            else {}
+        )
+        return {
+            "source": str(context.get("source", "") or "").strip(),
+            "location": str(context.get("location", "") or "").strip(),
+            "time_of_day": str(context.get("time_of_day", "") or "").strip(),
+            "other_agent": str(context.get("other_agent", "") or "").strip(),
+            "relationship": str(context.get("relationship", "") or "").strip(),
+            "interaction_type": str(
+                context.get("interaction_type", "") or ""
+            ).strip(),
+            "dialogue": {
+                "patient_utterance": str(
+                    dialogue.get("patient_utterance", "") or ""
+                ).strip(),
+                "counterpart_utterance": str(
+                    dialogue.get("counterpart_utterance", "") or ""
+                ).strip(),
+            },
+        }
+
+    @staticmethod
+    def _classify_depression_llm_call(prompt):
+        text = str(prompt or "").lstrip()
+        if text.startswith("你是主诉图推进判定器。"):
+            return "graph_transition"
+        if text.startswith("你是主诉图规划器。"):
+            return "graph_planner"
+        if text.startswith("你是 Emotion Inferencer。"):
+            return "emotion_inference"
+        return "unknown"
+
+    def _append_depression_llm_trace(self, prompt, response):
+        if not self._depression_trace_enabled():
+            return
+        try:
+            now_value = utils.get_timer().get_date()
+            sim_time = (
+                now_value.isoformat()
+                if hasattr(now_value, "isoformat")
+                else str(now_value or "")
+            )
+        except Exception:
+            sim_time = ""
+
+        trace_context = self._normalize_depression_trace_context(
+            self._depression_trace_context
+        )
+        response_text = str(response or "")
+        record = {
+            "schema_version": 1,
+            "sim_time": sim_time,
+            "agent": str(self.name or ""),
+            "call_type": self._classify_depression_llm_call(prompt),
+            "context": trace_context,
+            "prompt": str(prompt or ""),
+            "response": response_text,
+            "success": bool(response_text.strip()),
+        }
+        try:
+            trace_dir = os.path.dirname(
+                os.path.abspath(self._depression_trace_path)
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            with open(
+                self._depression_trace_path,
+                "a",
+                encoding="utf-8",
+            ) as trace_file:
+                trace_file.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+        except Exception as exc:
+            if (
+                not self._depression_trace_write_warned
+                and self.logger
+                and hasattr(self.logger, "warning")
+            ):
+                self._depression_trace_write_warned = True
+                self.logger.warning(
+                    "[DEPRESSION_DYNAMIC_TRACE_WRITE_FAIL] agent={} path={} error={}".format(
+                        self.name,
+                        self._depression_trace_path,
+                        exc,
+                    )
+                )
+
     def _log_depression_llm_call(self, prompt, response):
         """记录动态抑郁模块内部 LLM 调用的完整 prompt 和 response。"""
+        self._append_depression_llm_trace(prompt, response)
         if not self.logger or not hasattr(self.logger, "debug"):
             return
         title = "{}.depression_dynamic".format(self.name)

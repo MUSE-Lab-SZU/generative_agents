@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
 import shutil
@@ -10,6 +9,8 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, List
+
+from runshells.artifact_digest import canonical_json_sha256, file_sha256
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -28,6 +29,9 @@ SCALE_QUESTION_FILES = {
 SNAPSHOT_BUNDLE_SCHEMA_VERSION = 1
 SNAPSHOT_STORAGE_DIRNAME = "snapshot_storage"
 SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
+ROLLING_RESUME_DIRNAME = "recovery_checkpoint"
+ROLLING_RESUME_LATEST_DIRNAME = "latest"
+ROLLING_RESUME_ARTIFACT_KIND = "rolling_resume_checkpoint"
 
 
 class StagedEvalManager:
@@ -141,6 +145,109 @@ class StagedEvalManager:
 
     def was_trigger_enqueued_this_step(self) -> bool:
         return bool(self._step_trigger_enqueued)
+
+    def should_capture_rolling_resume_checkpoint(
+        self,
+        runtime_config: Dict[str, Any],
+    ) -> bool:
+        cfg = self._rolling_resume_cfg()
+        if not bool(cfg.get("enabled", False)):
+            return False
+        completed_session_count = self._compute_completed_session_count(runtime_config)
+        if completed_session_count <= 0:
+            return False
+        latest_job_path = os.path.join(
+            self.checkpoints_folder,
+            ROLLING_RESUME_DIRNAME,
+            ROLLING_RESUME_LATEST_DIRNAME,
+            "job.json",
+        )
+        try:
+            latest_job = self._load_worker_result(latest_job_path)
+            latest_count = self._safe_int(
+                latest_job.get("completed_session_count", 0),
+                0,
+            )
+        except Exception:
+            latest_count = 0
+        return completed_session_count > latest_count
+
+    def capture_rolling_resume_checkpoint(
+        self,
+        runtime_config: Dict[str, Any],
+        conversation: Dict[str, Any],
+        step_no: int,
+        sim_time: str,
+        snapshot_name: str,
+    ) -> Dict[str, Any] | None:
+        if not self.should_capture_rolling_resume_checkpoint(runtime_config):
+            return None
+
+        completed_session_count = self._compute_completed_session_count(runtime_config)
+        resume_root = os.path.join(self.checkpoints_folder, ROLLING_RESUME_DIRNAME)
+        os.makedirs(resume_root, exist_ok=True)
+        for entry_name in os.listdir(resume_root):
+            if entry_name.startswith(".latest-"):
+                shutil.rmtree(
+                    os.path.join(resume_root, entry_name),
+                    ignore_errors=True,
+                )
+        temp_dir = tempfile.mkdtemp(prefix=".latest-", dir=resume_root)
+        latest_dir = os.path.join(resume_root, ROLLING_RESUME_LATEST_DIRNAME)
+        previous_dir = os.path.join(resume_root, ".previous")
+        promoted = False
+        try:
+            snapshot_bundle, _storage_root = self._capture_snapshot_bundle(
+                trigger_label=f"session_{completed_session_count}",
+                trigger_dir=temp_dir,
+                runtime_config=runtime_config,
+                conversation=conversation,
+                step_no=step_no,
+                sim_time=sim_time,
+                snapshot_name=snapshot_name,
+                artifact_kind=ROLLING_RESUME_ARTIFACT_KIND,
+            )
+            job = {
+                "schema_version": 1,
+                "artifact_kind": ROLLING_RESUME_ARTIFACT_KIND,
+                "run_name": self.run_name,
+                "trigger_label": f"session_{completed_session_count}",
+                "completed_session_count": int(completed_session_count),
+                "step_no": int(step_no),
+                "sim_time": str(sim_time or ""),
+                "snapshot_name": str(snapshot_name or ""),
+                "runtime_config": copy.deepcopy(runtime_config),
+                "conversation": copy.deepcopy(conversation or {}),
+                "snapshot_bundle": snapshot_bundle,
+            }
+            self._write_json_atomic(os.path.join(temp_dir, "job.json"), job)
+
+            if os.path.exists(previous_dir):
+                shutil.rmtree(previous_dir)
+            if os.path.exists(latest_dir):
+                os.replace(latest_dir, previous_dir)
+            try:
+                os.replace(temp_dir, latest_dir)
+                promoted = True
+            except BaseException:
+                if os.path.exists(previous_dir) and not os.path.exists(latest_dir):
+                    os.replace(previous_dir, latest_dir)
+                raise
+            if os.path.exists(previous_dir):
+                shutil.rmtree(previous_dir)
+            self._log(
+                "info",
+                "[ROLLING_RESUME_CHECKPOINT] session_count={} step={} snapshot={} path={}".format(
+                    completed_session_count,
+                    step_no,
+                    snapshot_name,
+                    latest_dir,
+                ),
+            )
+            return job
+        finally:
+            if not promoted and os.path.isdir(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def is_t4_done(self) -> bool:
         return bool(self.state.get("t4_done", False))
@@ -471,10 +578,12 @@ class StagedEvalManager:
             return None
 
         current_step = max(0, self._safe_int(step_no, 0))
-        if current_step <= 0 or current_step % every_steps != 0:
+        anchor_step = max(0, self._safe_int(step_cfg.get("anchor_step", 0), 0))
+        elapsed_steps = current_step - anchor_step
+        if elapsed_steps <= 0 or elapsed_steps % every_steps != 0:
             return None
 
-        trigger_index = current_step // every_steps
+        trigger_index = elapsed_steps // every_steps
         max_triggers = max(0, self._safe_int(step_cfg.get("max_triggers", 0), 0))
         if max_triggers > 0 and trigger_index > max_triggers:
             return None
@@ -483,13 +592,40 @@ class StagedEvalManager:
             1,
             self._safe_int(step_cfg.get("virtual_session_interval", self._cfg().get("session_interval", 1)), 1),
         )
-        completed_session_count = int(trigger_index * virtual_session_interval)
+        label_value_mode = str(
+            step_cfg.get("label_value_mode", "virtual_session") or "virtual_session"
+        ).strip().lower()
+        if label_value_mode not in {"virtual_session", "relative_step"}:
+            raise ValueError(
+                "unsupported staged_eval.step_interval.label_value_mode: {}".format(
+                    label_value_mode
+                )
+            )
+        if label_value_mode == "relative_step":
+            completed_session_count = self._compute_completed_session_count(runtime_config)
+            label_value = elapsed_steps
+        else:
+            completed_session_count = int(trigger_index * virtual_session_interval)
+            label_value = completed_session_count
         label_prefix = str(step_cfg.get("label_prefix", "session") or "session").strip() or "session"
-        trigger_label = f"{label_prefix}_{completed_session_count}"
+        trigger_label = f"{label_prefix}_{label_value}"
         if self._is_label_finished_or_pending(trigger_label):
             return None
 
         try:
+            extra_metadata = {
+                "trigger_mode": "step_interval",
+                "step_interval_every_steps": every_steps,
+                "step_interval_anchor_step": anchor_step,
+                "step_interval_elapsed_steps": elapsed_steps,
+                "step_interval_virtual_session_interval": virtual_session_interval,
+                "step_interval_trigger_index": int(trigger_index),
+                "step_interval_label_prefix": label_prefix,
+                "step_interval_label_value_mode": label_value_mode,
+                "followup_phase": label_value_mode == "relative_step",
+            }
+            if label_value_mode == "virtual_session":
+                extra_metadata["completed_session_count_source"] = "step_interval"
             return self._enqueue_trigger(
                 trigger_label=trigger_label,
                 completed_session_count=completed_session_count,
@@ -498,14 +634,7 @@ class StagedEvalManager:
                 step_no=current_step,
                 sim_time=sim_time,
                 snapshot_name=snapshot_name,
-                extra_metadata={
-                    "trigger_mode": "step_interval",
-                    "completed_session_count_source": "step_interval",
-                    "step_interval_every_steps": every_steps,
-                    "step_interval_virtual_session_interval": virtual_session_interval,
-                    "step_interval_trigger_index": int(trigger_index),
-                    "step_interval_label_prefix": label_prefix,
-                },
+                extra_metadata=extra_metadata,
             )
         except Exception as exc:
             if self._capture_only():
@@ -598,6 +727,13 @@ class StagedEvalManager:
 
     def _cfg(self) -> Dict[str, Any]:
         cfg = self.config.get("staged_eval", {}) or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _rolling_resume_cfg(self) -> Dict[str, Any]:
+        checkpointing = self.config.get("checkpointing", {}) or {}
+        if not isinstance(checkpointing, dict):
+            return {}
+        cfg = checkpointing.get("rolling_resume", {}) or {}
         return cfg if isinstance(cfg, dict) else {}
 
     def _worker_cfg(self) -> Dict[str, Any]:
@@ -693,24 +829,11 @@ class StagedEvalManager:
 
     @staticmethod
     def _canonical_json_sha256(payload: Any) -> str:
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return canonical_json_sha256(payload)
 
     @staticmethod
     def _file_sha256(path: str) -> str:
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        return digest.hexdigest()
+        return file_sha256(path)
 
     def _storage_file_manifest(self, storage_root: str) -> tuple[List[Dict[str, Any]], int]:
         files: List[Dict[str, Any]] = []
@@ -741,6 +864,7 @@ class StagedEvalManager:
         step_no: int,
         sim_time: str,
         snapshot_name: str,
+        artifact_kind: str = "repeat_eval_snapshot",
     ) -> tuple[Dict[str, Any], str]:
         source_storage = os.path.join(self.checkpoints_folder, "storage")
         if not os.path.isdir(source_storage):
@@ -754,7 +878,7 @@ class StagedEvalManager:
             files, total_size = self._storage_file_manifest(temp_storage)
             manifest = {
                 "schema_version": SNAPSHOT_BUNDLE_SCHEMA_VERSION,
-                "artifact_kind": "repeat_eval_snapshot",
+                "artifact_kind": str(artifact_kind or "repeat_eval_snapshot"),
                 "storage_scope": "full",
                 "trigger_label": str(trigger_label or ""),
                 "step_no": int(step_no),
@@ -778,6 +902,7 @@ class StagedEvalManager:
 
         bundle = {
             "schema_version": SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+            "artifact_kind": str(artifact_kind or "repeat_eval_snapshot"),
             "storage_scope": "full",
             "storage_relpath": SNAPSHOT_STORAGE_DIRNAME,
             "manifest_relpath": SNAPSHOT_MANIFEST_FILENAME,
@@ -1110,9 +1235,13 @@ class StagedEvalManager:
                 "trigger_mode",
                 "completed_session_count_source",
                 "step_interval_every_steps",
+                "step_interval_anchor_step",
+                "step_interval_elapsed_steps",
                 "step_interval_virtual_session_interval",
                 "step_interval_trigger_index",
                 "step_interval_label_prefix",
+                "step_interval_label_value_mode",
+                "followup_phase",
             }
             for key, value in queued_metadata.items():
                 if key not in metadata or key in preserved_queued_keys:

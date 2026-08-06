@@ -25,8 +25,6 @@ import concurrent.futures
 import copy
 import json
 import math
-import os
-import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +42,11 @@ from kabuda_variant_runtime import (
     VARIANT_SOURCE_AGENT_NAMES,
     VARIANTS,
     prepare_kabuda_variant_runtime,
+)
+from scale_protocol import (
+    extract_direct_answer_score,
+    extract_item_scores as extract_protocol_item_scores,
+    render_validation_number,
 )
 
 
@@ -516,19 +519,6 @@ SCALE_ITEM_SCORE_KEYS = {
     "BDI-II": "bdi_ii_scores",
 }
 
-CN_SCORE_VALUES = {
-    "0": 0,
-    "1": 1,
-    "2": 2,
-    "3": 3,
-    "零": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-}
-
-
 def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
@@ -544,66 +534,7 @@ def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
 
 def extract_item_scores(scored_result: dict[str, Any] | None, scale_name: str) -> list[int] | None:
     item_key = SCALE_ITEM_SCORE_KEYS.get(scale_name)
-    if not item_key or not isinstance(scored_result, dict):
-        return None
-    items = scored_result.get(item_key)
-    if not isinstance(items, list):
-        return None
-
-    scores: list[int] = []
-    for item in items:
-        score = item.get("score") if isinstance(item, dict) else None
-        if not isinstance(score, int) or score < 0 or score > 3:
-            return None
-        scores.append(score)
-    return scores
-
-
-def has_ambiguous_score_context(text: str, start: int, end: int) -> bool:
-    context = text[max(0, start - 18) : min(len(text), end + 28)]
-    return any(
-        marker in context
-        for marker in [
-            "或者",
-            "不确定",
-            "之间",
-            "两三",
-            "一两",
-            "也可能",
-            "选0感觉是骗人的",
-        ]
-    )
-
-
-def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
-    patterns = [
-        r"(?:我)?\s*(?:会|想|大概|可能|应该|还是|就|其实)?\s*(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])",
-        r"([0-3零一二两三])\s*分",
-        r"(?:评分的话|打分的话|大概|应该|可能|算是|算|就是|我觉得|我想|我会|应该是|大概是|可能是|差不多)\s*[，,。\.……\s]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
-        r"(?:^|[，,。\.……\s])([0-3零一二两三])\s*吧",
-        r"^[\s（\(\）\)……。,.，、嗯唔]*([0-3零一二两三])\s*(?:吧|。|，|,|$)",
-    ]
-    hits = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, str(answer or "")):
-            context = answer[max(0, match.start() - 6) : match.end() + 6]
-            if any(marker in context for marker in ["不想选", "不是选", "不能选", "不敢选"]):
-                continue
-            score = CN_SCORE_VALUES.get(match.group(1))
-            if score is None:
-                continue
-            hits.append((match.start(), match.end(), score))
-    if not hits:
-        return None, "none"
-
-    hits.sort(key=lambda item: (item[0], item[1]))
-    first_start, first_end, first_score = hits[0]
-    if has_ambiguous_score_context(answer, first_start, first_end):
-        return first_score, "ambiguous"
-    for start, _end, score in hits[1:]:
-        if start - first_end < 35 and score != first_score:
-            return first_score, "ambiguous"
-    return first_score, "direct"
+    return extract_protocol_item_scores(scored_result, item_key)
 
 
 def scale_file_path(result: dict[str, Any], scale_name: str, file_key: str) -> Path:
@@ -766,18 +697,6 @@ def build_scale_score_validation(results: list[dict[str, Any]]) -> dict[str, Any
         "item_mismatches": item_mismatches,
         "corrected_scores": build_corrected_scale_records(results),
     }
-
-
-def render_validation_number(value: Any) -> str:
-    if value is None:
-        return "—"
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if number.is_integer():
-        return str(int(number))
-    return f"{number:.1f}"
 
 
 def group_corrected_records(records: list[dict[str, Any]], *keys: str) -> dict[tuple[Any, ...], list[dict[str, Any]]]:

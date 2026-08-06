@@ -64,7 +64,10 @@ class DepressionSimulationEngine:
         agent_name = self._infer_agent_name(resolved)
         self.graph_manager = ComplaintGraphManager(resolved, now_provider=self._clock_provider)
         self.context_builder = SessionContextBuilder(self_name=agent_name)
-        self.context_analyzer = self.context_builder  # 兼容旧字段名
+        # Deprecated compatibility alias. New code must use ``context_builder``.
+        # Keep until external scripts/checkpoints have completed one audited
+        # reproduction cycle without reading ``context_analyzer``.
+        self.context_analyzer = self.context_builder
         self.memory_system = TraumaMemorySystem(resolved.get("memory", {}))
         self.emotion_inferencer = EmotionInferencer(resolved.get("emotion", {}))
         self.prompt_builder = DynamicPromptBuilder(resolved.get("prompt", {}))
@@ -454,6 +457,7 @@ class DepressionSimulationEngine:
             self.context_builder.current_context = copy.deepcopy(self.last_session_context)
             self.context_builder.context_history = [copy.deepcopy(self.last_session_context)]
         self.context_builder.set_self_name(self._infer_agent_name(refreshed))
+        # Keep the deprecated alias synchronized while restoring old state.
         self.context_analyzer = self.context_builder
 
         memory_payload = payload.get("memory_system", {}) if isinstance(payload.get("memory_system", {}), dict) else {}

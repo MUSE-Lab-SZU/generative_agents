@@ -158,6 +158,7 @@ def prepare_kabuda_variant_runtime(
         raise ValueError(f"unknown agent source subdir: {agent_source_subdir}")
 
     source_agent_name = VARIANT_SOURCE_AGENT_NAMES[resolved_variant]
+    source_memory_path = Path(base_dir) / MEMORY_INJECTION_CONFIG_PATHS[resolved_variant]
     village_agent_dir = (
         Path(base_dir)
         / "frontend"
@@ -206,6 +207,8 @@ def prepare_kabuda_variant_runtime(
         raise FileNotFoundError(source_agent_path)
     if not source_depression_path.is_file():
         raise FileNotFoundError(source_depression_path)
+    if not source_memory_path.is_file():
+        raise FileNotFoundError(source_memory_path)
 
     agent_payload = normalize_runtime_agent_name(
         load_json_file(source_agent_path),
@@ -224,15 +227,22 @@ def prepare_kabuda_variant_runtime(
         source_name=source_agent_name,
         runtime_name=runtime_agent_name,
     )
+    memory_injection_payload = normalize_runtime_agent_name(
+        load_json_file(source_memory_path),
+        source_name=source_agent_name,
+        runtime_name=runtime_agent_name,
+    )
     agent_payload["name"] = runtime_agent_name
     depression_payload["name"] = runtime_agent_name
 
     output_dir = Path(output_dir)
     agent_output_path = output_dir / "agent.json"
     depression_output_path = output_dir / SEVERITY_CONFIG_NAMES[severity]
+    memory_injection_output_path = output_dir / "memory_injections.json"
     if not dry_run:
         atomic_write_json(agent_output_path, agent_payload)
         atomic_write_json(depression_output_path, depression_payload)
+        atomic_write_json(memory_injection_output_path, memory_injection_payload)
 
     return KabudaVariantRuntime(
         variant=resolved_variant,
@@ -241,7 +251,7 @@ def prepare_kabuda_variant_runtime(
         source_agent_dir=source_agent_dir,
         agent_config_path=agent_output_path,
         depression_config_path=depression_output_path,
-        memory_injection_config_path=MEMORY_INJECTION_CONFIG_PATHS[resolved_variant],
+        memory_injection_config_path=str(memory_injection_output_path),
     )
 
 

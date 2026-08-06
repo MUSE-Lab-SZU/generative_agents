@@ -3,8 +3,11 @@ import json
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request
 
-from compress import frames_per_step, file_movement
-from start import personas
+from replay_protocol import FILE_MOVEMENT, FRAMES_PER_STEP
+from simulation_roster import replay_roster
+
+file_movement = FILE_MOVEMENT
+frames_per_step = FRAMES_PER_STEP
 
 app = Flask(
     __name__,
@@ -32,6 +35,7 @@ def index():
 
     with open(replay_file, "r", encoding="utf-8") as f:
         params = json.load(f)
+    personas = replay_roster(params)
 
     if step < 1:
         step = 1

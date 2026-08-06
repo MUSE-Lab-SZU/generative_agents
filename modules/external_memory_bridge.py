@@ -230,25 +230,6 @@ class ExternalMemoryBridge:
             return "none"
         return "+".join(out)
 
-    def _resolve_session_adjust_policy(self, session_before: str) -> str:
-        modes = self._resolve_session_adjust_modes(session_before=session_before, force_all_session_l2=False)
-        if not modes:
-            return "none"
-        if len(modes) > 1:
-            self._log(
-                "warning",
-                "[EXT_MEMORY_LEVEL_POLICY_CONFLICT] agent={} session={} resolved_modes={} preferred={}".format(
-                    self.agent_name,
-                    str(session_before or "").strip(),
-                    ",".join(modes),
-                    modes[-1],
-                ),
-            )
-        return modes[-1]
-
-    def get_session_adjust_policy(self, session_before: str) -> str:
-        return self._resolve_session_adjust_policy(session_before)
-
     def resolve_remote_id_by_node_id(self, node_id: str) -> str:
         node_id = str(node_id or "").strip()
         if not node_id:
