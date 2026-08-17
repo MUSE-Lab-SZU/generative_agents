@@ -26,6 +26,7 @@ class Game:
         self.record_iterval = config.get("record_iterval", 30)
         self.logger = logger or utils.IOLogger()
         self.intervention = None
+        self.event_recorder = None
         self.maze = Maze(self.load_static(config["maze"]["path"]), self.logger)
         self.conversation = conversation
         self.agents = {}
@@ -68,6 +69,11 @@ class Game:
         self.intervention = manager
         for agent in self.agents.values():
             agent.intervention = manager
+
+    def set_event_recorder(self, recorder):
+        self.event_recorder = recorder
+        for agent in self.agents.values():
+            agent.event_recorder = recorder
 
     def agent_think(self, name, status):
         agent = self.get_agent(name)

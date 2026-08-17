@@ -3133,6 +3133,7 @@ class InterventionManager:
                 raw = self._call_forced_llm_json(
                     prompt_text=prompt_text,
                     retry=int(policy.get("retry", 2) or 2),
+                    caller="session_eval",
                 )
             normalized = self._normalize_session_eval_output(raw)
             self._log_highlight(
@@ -3376,7 +3377,11 @@ class InterventionManager:
                     "prev_session_eval_reason": str(prev_session_eval_reason or ""),
                 },
             )
-            raw = self._call_forced_llm_json(prompt_text, retry=int(policy.get("retry", 2) or 2))
+            raw = self._call_forced_llm_json(
+                prompt_text,
+                retry=int(policy.get("retry", 2) or 2),
+                caller="dialog_judge",
+            )
             normalized = self._normalize_dialog_judge_output(raw)
             normalized["valid"] = True
             self._log_highlight(
@@ -5551,6 +5556,11 @@ class InterventionManager:
                 "task_count": len(tasks or []),
                 "outcome_count": len(outcomes or []),
                 "chat_summary": str(outcome_summary or ""),
+                "behavior_events": [
+                    str(item.get("event", "") or "").strip()
+                    for item in outcomes or []
+                    if isinstance(item, dict) and str(item.get("event", "") or "").strip()
+                ][:5],
                 "step": int(self.config.get("step", 0) or 0),
                 "started_at": self._fmt_dt(self._now()),
             }
@@ -5823,21 +5833,70 @@ class InterventionManager:
             return ""
         return str(meeting.get("prompt_file", "") or "").strip()
 
-    def get_meeting_prompt_injection(self, speaker: Any, other: Any, forced: bool = False) -> str:
-        if not self.enabled or (not bool(forced)):
+    def get_resident_chat_prompt_injection(self, speaker: Any, other: Any) -> str:
+        """Return the configured resident-side prefix for any chat with the target patient."""
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        injection_cfg = intervention_cfg.get("resident_chat_prompt_injection", {}) or {}
+        if not isinstance(injection_cfg, dict) or not bool(injection_cfg.get("enabled", False)):
             return ""
-        prompt_file = self.get_meeting_prompt_file(speaker, other, forced=forced)
+
+        target_patient = str(injection_cfg.get("target_patient", "") or "").strip()
+        speaker_name = str(getattr(speaker, "name", "") or "").strip()
+        other_name = str(getattr(other, "name", "") or "").strip()
+        if not target_patient or other_name != target_patient or speaker_name == target_patient:
+            return ""
+
+        prompt_file = str(injection_cfg.get("prompt_file", "") or "").strip()
         if not prompt_file:
             return ""
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(prompt_file)
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {
+                    "speaker": speaker_name,
+                    "other": other_name,
+                    "doctor": speaker_name,
+                    "patient": target_patient,
+                    "meeting_kind": "resident_chat",
+                    "meeting_id": "",
+                    "current_time": self._resolve_trace_step_time(),
+                },
+            )
+        except Exception as exc:
+            self._log_highlight(
+                "RESIDENT_CHAT_PROMPT_LOAD_ERROR speaker={} other={} prompt_file={} detail={}".format(
+                    speaker_name,
+                    other_name,
+                    prompt_file,
+                    str(exc),
+                )
+            )
+            return ""
+        prompt_text = str(prompt_text or "").strip()
+        if not prompt_text:
+            return ""
+        return "<RESIDENT_CHAT_PROMPT_INJECTION>\n{}\n</RESIDENT_CHAT_PROMPT_INJECTION>".format(
+            prompt_text
+        )
+
+    def get_meeting_prompt_injection(self, speaker: Any, other: Any, forced: bool = False) -> str:
+        prompt_blocks = [self.get_resident_chat_prompt_injection(speaker, other)]
+        prompt_blocks = [block for block in prompt_blocks if block]
+        if not self.enabled or (not bool(forced)):
+            return "\n".join(prompt_blocks)
+        prompt_file = self.get_meeting_prompt_file(speaker, other, forced=forced)
+        if not prompt_file:
+            return "\n".join(prompt_blocks)
         meeting = self.resolve_meeting_context(speaker, other, forced=forced)
         if not isinstance(meeting, dict):
-            return ""
+            return "\n".join(prompt_blocks)
         prompt_target = str(meeting.get("prompt_target", "all") or "all").strip().lower()
         speaker_name = str(getattr(speaker, "name", "") or "")
         if prompt_target == "doctor" and speaker_name != str(meeting.get("doctor", "") or ""):
-            return ""
+            return "\n".join(prompt_blocks)
         if prompt_target == "patient" and speaker_name != str(meeting.get("patient", "") or ""):
-            return ""
+            return "\n".join(prompt_blocks)
         try:
             prompt_tpl = self._load_prompt_txt_or_raise(prompt_file)
             prompt_text = self._render_prompt_template(
@@ -5861,11 +5920,14 @@ class InterventionManager:
                     str(exc),
                 )
             )
-            return ""
+            return "\n".join(prompt_blocks)
         prompt_text = str(prompt_text or "").strip()
         if not prompt_text:
-            return ""
-        return "<MEETING_PROMPT_INJECTION>\n{}\n</MEETING_PROMPT_INJECTION>".format(prompt_text)
+            return "\n".join(prompt_blocks)
+        prompt_blocks.append(
+            "<MEETING_PROMPT_INJECTION>\n{}\n</MEETING_PROMPT_INJECTION>".format(prompt_text)
+        )
+        return "\n".join(prompt_blocks)
 
     def _resolve_doctor_patient_pair(self, a: Any, b: Any):
         meeting = self._resolve_active_meeting(a, b)
@@ -8249,7 +8311,11 @@ class InterventionManager:
             attempt = 0
             while True:
                 attempt += 1
-                llm_raw = self._call_forced_llm_json(prompt_text, retry=retry)
+                llm_raw = self._call_forced_llm_json(
+                    prompt_text,
+                    retry=retry,
+                    caller="consult_record_generate",
+                )
                 projected, dropped = project_whitelist(llm_raw)
                 self._log_consult(
                     "PARSE project done attempt={} dropped_count={} dropped_paths={}".format(

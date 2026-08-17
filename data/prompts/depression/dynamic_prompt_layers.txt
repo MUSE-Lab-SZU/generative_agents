@@ -11,7 +11,7 @@ ${base_prompt}
 ${optional_sections}推进原则：
 - 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。
 - 即使出现一点松动，也应表现为试探性的、会反复的变化。
-- 若当前对话没有真正触及这个节点，就不要跨越到下一个节点。
+- 只根据当前处境自然回应，不要猜测或迎合系统预设的后续状态。
 ${graph_window_section}
 
 @@ dynamic_stage_summary_section
@@ -29,17 +29,6 @@ ${graph_window_section}
 - 暴露程度：${disclosure}
 - 语气底色：${tone}
 - 常见修正方式：${repair_pattern}
-
-@@ stage_graph_window_section
-
-当前节点的候选主诉分支：
-${graph_window_items}${next_limit_section}
-
-@@ dynamic_stage_graph_window_item
-- [${marker}] ${label}：${summary}
-
-@@ dynamic_stage_next_limit_section
-- 若本轮确实出现推进，只能自然靠近候选分支之一：${candidate_labels}；不要跨越式跳转。
 
 @@ context_layer
 === 会话上下文层 ===

@@ -1,20 +1,4 @@
-﻿<患者状态>
-${patient_state}
-</患者状态>
-
-<本阶段会话Prompt>
-${session_prompt}
-</本阶段会话Prompt>
-
-<当前阶段进度状态>
-${prev_session_eval_reason}
-</当前阶段进度状态>
-
-<本次对话历史>
-${conversation}
-</本次对话历史>
-
-<任务>
+﻿<任务>
 你是强制干预对话中的“判断LLM”。只输出一个 JSON 对象，用于：
 1) 给医生下一句提供回复策略（advice）；
 2) 判断医生本句输出后是否结束本次对话（terminate）。
@@ -79,3 +63,19 @@ true 表示医生本句说完后结束本次对话；false 表示继续。先判
 terminate 必须是 JSON 布尔值；advice 必须是符合上述结构的字符串。
 不要输出解释、注释、代码块或额外文本。
 </输出格式规则>
+
+<患者状态>
+${patient_state}
+</患者状态>
+
+<本阶段会话Prompt>
+${session_prompt}
+</本阶段会话Prompt>
+
+<当前阶段进度状态>
+${prev_session_eval_reason}
+</当前阶段进度状态>
+
+<本次对话历史>
+${conversation}
+</本次对话历史>

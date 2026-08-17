@@ -98,7 +98,7 @@ class DepressionSimulationEngine:
         """预览一轮互动会生成的动态 prompt：只读当前主诉节点，不判 advance/hold、不写状态。
 
         是否推进主诉图属于提交层（commit_event）的职责，要依据角色真正说出的内容来判断；
-        而预览发生在角色开口之前，那句话还不存在，所以这里只用“当前节点 + 候选分支 +
+        而预览发生在角色开口之前，那句话还不存在，所以这里只用“当前节点 +
         瞬时情绪”渲染本轮该怎么说，绝不移动指针，也不调用 graph_transition 判定。
         """
         if not self.enabled:

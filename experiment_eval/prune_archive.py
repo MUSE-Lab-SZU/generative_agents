@@ -1,4 +1,4 @@
-"""Safely retain evaluation-ready artifacts from completed experiment archives.
+"""Safely curate analysis-ready artifacts from experiment archives.
 
 The tool is intentionally coupled to :mod:`experiment_eval`: report loading and
 process-metric extraction are executed against the staged copy before any
@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from .loader import find_report_files, load_records
+from .loader import find_report_files, load_records, resolve_followup_source_summary
 from .process import extract_process_metrics
 
 
@@ -50,11 +50,28 @@ OPERATION_MODE = "backup"  # "prune"=替换并清理源目录；"backup"=复制�
 BACKUP_OUTPUT_DIR: str | Path = "draw_data"  # backup 模式必填；相对路径从 RESULTS_ROOT 解析
 BACKUP_COMPLETED_ONLY = False  # 仅 backup：只保留已有 complete repeat summary 的画图输入
 BACKUP_INCLUDE_RUN_PREFIXES: tuple[str, ...] = ()  # 例：("followup-",)
+INCLUDE_RAW_SCALE_TRACES = False  # trace/job/snapshot 副本通常占绝大多数空间
+INCLUDE_MERGED_CONSULTATION_DIALOGUES = True
+INCLUDE_DYNAMIC_LLM_TRACES = True
 APPLY_CHANGES = False  # False=只读计划；True=校验通过后执行所选模式
 KEEP_BACKUP = False  # 仅 prune：True=替换后保留旧完整目录，因此暂时不释放其空间
 STAGING_PARENT: str | Path = ""  # 留空使用系统临时目录；也可填写空间充足的目录
 
 RAW_EVALUATION_PATTERNS = ("*_answered.jsonl", "*_scored.json", "*_trace.json")
+SMALL_EVALUATION_METADATA = {
+    "metadata.json",
+    "snapshot_manifest.json",
+    "worker_result.json",
+    "index.json",
+    "state.json",
+}
+CURATED_RUN_FILES = {
+    "cbt_condition_manifest.json",
+    "followup_manifest.json",
+    "trial_meta.json",
+    "conversation.json",
+    "simulation_events.jsonl",
+}
 PATH_ONLY_PROCESS_FIELDS = {"judge_trace_path", "final_checkpoint_path"}
 
 
@@ -92,12 +109,17 @@ class PrunePlan:
     incomplete_run_names: list[str]
     superseded_incomplete_run_names: list[str]
     unreported_run_names: list[str]
+    followup_run_names: list[str]
+    report_only_run_names: list[str]
     items: list[CopyItem]
     source_bytes: int
     retained_bytes: int
     raw_evaluation_file_count: int
     completed_only: bool
     include_run_prefixes: tuple[str, ...]
+    include_raw_scale_traces: bool
+    include_merged_consultation_dialogues: bool
+    include_dynamic_llm_traces: bool
 
     @property
     def estimated_reclaimed_bytes(self) -> int:
@@ -307,11 +329,239 @@ class _PlanBuilder:
         )
 
 
-def _latest_checkpoint(run_dir: Path) -> Path:
-    candidates = sorted(run_dir.glob("simulate-*.json"))
-    if not candidates:
-        raise FileNotFoundError(f"No simulate checkpoint found: {run_dir}")
-    return candidates[-1]
+def _followup_run_names(reports_dir: Path) -> list[str]:
+    """Return branches explicitly identified by archived follow-up manifests."""
+
+    names: set[str] = set()
+    for path in reports_dir.glob("**/*_summary.json"):
+        payload = _read_json(path)
+        if payload.get("artifact_kind") != "post_sim_followup_summary":
+            continue
+        for condition in payload.get("conditions") or []:
+            if isinstance(condition, dict) and condition.get("run_name"):
+                names.add(str(condition["run_name"]))
+    return sorted(names)
+
+
+def _add_first_existing(
+    builder: _PlanBuilder,
+    candidates: list[tuple[Path, str, Path]],
+    *,
+    reason: str,
+    required: bool = False,
+) -> None:
+    """Keep one canonical copy when checkpoint/experiment copies are duplicates."""
+
+    for source, destination_root, source_target in candidates:
+        if source.is_file():
+            builder.add_file(
+                source,
+                destination_root=destination_root,
+                source_target=source_target,
+                reason=reason,
+            )
+            return
+    if required:
+        raise FileNotFoundError(
+            f"No {reason} found in: " + ", ".join(str(value[0]) for value in candidates)
+        )
+
+
+def _add_filtered_tree(
+    builder: _PlanBuilder,
+    source: Path,
+    *,
+    destination_root: str,
+    source_target: Path,
+    reason: str,
+    include_raw_scale_traces: bool,
+) -> None:
+    """Keep analysis artifacts while dropping embedded snapshot/work copies."""
+
+    if not source.is_dir():
+        return
+    for path in source.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(source).parts
+        if any(part in {"_tmp", "snapshot_storage"} for part in relative_parts):
+            continue
+        if path.name == "job.json":
+            continue
+        if (
+            not include_raw_scale_traces
+            and (path.name.endswith("_trace.json") or path.name.endswith("_trace.jsonl"))
+        ):
+            continue
+        builder.add_file(
+            path,
+            destination_root=destination_root,
+            source_target=source_target,
+            reason=reason,
+        )
+
+
+def _add_curated_run(
+    builder: _PlanBuilder,
+    layout: ArchiveLayout,
+    run_name: str,
+    *,
+    completed_only: bool,
+    include_raw_scale_traces: bool,
+    include_merged_consultation_dialogues: bool,
+    include_dynamic_llm_traces: bool,
+) -> None:
+    checkpoint_run = layout.checkpoint_container / run_name
+    experiment_run = layout.experiment_container / run_name
+    checkpoints = sorted(checkpoint_run.glob("simulate-*.json"))
+    if not checkpoints:
+        raise FileNotFoundError(f"No simulate checkpoint found: {checkpoint_run}")
+    for checkpoint in ([checkpoints[-1]] if completed_only else checkpoints):
+        builder.add_file(
+            checkpoint,
+            destination_root="checkpoint",
+            source_target=layout.checkpoint_target,
+            reason=(
+                "final simulation checkpoint"
+                if completed_only
+                else "simulation checkpoint timeline"
+            ),
+        )
+
+    for name in CURATED_RUN_FILES:
+        _add_first_existing(
+            builder,
+            [
+                (experiment_run / name, "experiment", layout.experiment_target),
+                (checkpoint_run / name, "checkpoint", layout.checkpoint_target),
+            ],
+            reason="run provenance/process artifact",
+            required=name == "cbt_condition_manifest.json",
+        )
+    _add_first_existing(
+        builder,
+        [
+            (
+                experiment_run / "traces" / "judge_conversation.json",
+                "experiment",
+                layout.experiment_target,
+            ),
+            (
+                checkpoint_run / "judge_traces" / "judge_conversation.json",
+                "checkpoint",
+                layout.checkpoint_target,
+            ),
+        ],
+        reason="judge conversation",
+        required=True,
+    )
+    checkpoint_judge = checkpoint_run / "judge_traces" / "judge_conversation.json"
+    if checkpoint_judge.is_file():
+        builder.add_file(
+            checkpoint_judge,
+            destination_root="checkpoint",
+            source_target=layout.checkpoint_target,
+            reason="interpretive judge-conversation path compatibility",
+        )
+
+    # A completed run's storage is the only durable copy of the agents' raw
+    # memory/index state.  It is needed for resume, exact downstream
+    # re-evaluation and forensic inspection, so it is retained even in a
+    # completed-only analysis backup.
+    storage_tree = checkpoint_run / "storage"
+    if storage_tree.is_dir():
+        builder.add_tree(
+            storage_tree,
+            destination_root="checkpoint",
+            source_target=layout.checkpoint_target,
+            reason="completed-run storage",
+        )
+
+    # Dynamic traces are run-specific audit evidence.  Selecting a single
+    # archive-wide example silently discarded other groups/personas (for
+    # example non-G1 runs), so retain the trace belonging to every included
+    # curated run.
+    dynamic_trace = (
+        checkpoint_run / "judge_traces" / "depression_dynamic_llm_trace.jsonl"
+    )
+    if include_dynamic_llm_traces and dynamic_trace.is_file():
+        builder.add_file(
+            dynamic_trace,
+            destination_root="checkpoint",
+            source_target=layout.checkpoint_target,
+            reason="per-run dynamic LLM audit trace",
+        )
+    if completed_only:
+        return
+
+    merged_dialogues = experiment_run / "traces" / "merge_consultation_dialogues.json"
+    if include_merged_consultation_dialogues and merged_dialogues.is_file():
+        builder.add_file(
+            merged_dialogues,
+            destination_root="experiment",
+            source_target=layout.experiment_target,
+            reason="merged consultation dialogues",
+        )
+
+    for tree, destination_root, target, reason in (
+        (
+            experiment_run / "visualizations",
+            "experiment",
+            layout.experiment_target,
+            "run visualizations",
+        ),
+        (
+            experiment_run / "traces" / "forced_prompt_traces",
+            "experiment",
+            layout.experiment_target,
+            "intervention prompt traces",
+        ),
+        (
+            checkpoint_run / "consult_history",
+            "checkpoint",
+            layout.checkpoint_target,
+            "consultation history",
+        ),
+    ):
+        if tree.is_dir():
+            builder.add_tree(
+                tree,
+                destination_root=destination_root,
+                source_target=target,
+                reason=reason,
+            )
+
+    # Prefer experiment_data copies of staged scales and prompt traces.  Follow-up
+    # branches often have only checkpoint copies, so fall back to those.
+    prompt_tree = experiment_run / "traces" / "forced_prompt_traces"
+    if not prompt_tree.is_dir():
+        checkpoint_prompts = checkpoint_run / "forced_prompt_traces"
+        if checkpoint_prompts.is_dir():
+            builder.add_tree(
+                checkpoint_prompts,
+                destination_root="checkpoint",
+                source_target=layout.checkpoint_target,
+                reason="intervention prompt traces",
+            )
+    scale_tree = experiment_run / "scales" / "staged"
+    if scale_tree.is_dir():
+        _add_filtered_tree(
+            builder,
+            scale_tree,
+            destination_root="experiment",
+            source_target=layout.experiment_target,
+            reason="curated staged scale artifacts",
+            include_raw_scale_traces=include_raw_scale_traces,
+        )
+    else:
+        _add_filtered_tree(
+            builder,
+            checkpoint_run / "staged_eval",
+            destination_root="checkpoint",
+            source_target=layout.checkpoint_target,
+            reason="curated staged evaluation artifacts",
+            include_raw_scale_traces=include_raw_scale_traces,
+        )
 
 
 def _select_complete_reports_by_prefix(
@@ -337,13 +587,50 @@ def _select_complete_reports_by_prefix(
     return selected
 
 
+def _referenced_original_report(reports_dir: Path, report_path: Path) -> Path | None:
+    """Resolve a repeat summary's archived source report by unique basename.
+
+    Repeat summaries commonly store an absolute path from the machine that
+    created them.  A relocated archive therefore cannot rely on that path,
+    while :mod:`experiment_eval.archive_data` still needs the source report
+    for controller and provenance metadata.  Resolve within the archive just
+    as the archive interface does.
+    """
+
+    payload = _read_json(report_path)
+    declared = str(payload.get("source_original_summary") or "").strip()
+    if not declared:
+        return None
+    basename = Path(declared).name
+    matches = sorted(
+        path for path in reports_dir.glob(f"**/{basename}") if path.is_file()
+    )
+    if not matches and "-followup_summary" in report_path.name:
+        followup_path, _ = resolve_followup_source_summary(report_path, payload)
+        if followup_path is not None:
+            return followup_path
+    if len(matches) != 1:
+        raise ValueError(
+            "Cannot uniquely resolve source_original_summary for completed-only "
+            f"backup: {report_path}: {declared!r}"
+        )
+    return matches[0]
+
+
 def build_plan(
     layout: ArchiveLayout,
     *,
     completed_only: bool = False,
     include_run_prefixes: tuple[str, ...] = (),
+    include_raw_scale_traces: bool = False,
+    include_merged_consultation_dialogues: bool = True,
+    include_dynamic_llm_traces: bool = True,
 ) -> PrunePlan:
-    all_complete_report_paths = find_report_files(layout.reports_dir, recursive=False)
+    # Pruning must see completed follow-up repeat summaries as well as root
+    # summaries; plotting discovery excludes them by default.
+    all_complete_report_paths = find_report_files(
+        layout.reports_dir, recursive=False, include_followup=True
+    )
     if not all_complete_report_paths:
         raise ValueError(f"No complete repeat summaries found: {layout.reports_dir}")
     all_records, _, _ = load_records(all_complete_report_paths)
@@ -370,7 +657,12 @@ def build_plan(
         incomplete_run_name_set & set(all_complete_run_names)
     )
     incomplete_run_names = sorted(incomplete_run_name_set - set(all_complete_run_names))
-    reported_run_names = set(all_complete_run_names) | set(incomplete_run_names)
+    followup_run_names = _followup_run_names(layout.reports_dir)
+    reported_run_names = (
+        set(all_complete_run_names)
+        | set(incomplete_run_names)
+        | set(followup_run_names)
+    )
     checkpoint_run_names = {
         path.name
         for path in layout.checkpoint_container.iterdir()
@@ -388,6 +680,8 @@ def build_plan(
         )
     }
     unreported_run_names = sorted((checkpoint_run_names | experiment_run_names) - reported_run_names)
+    physical_run_names = checkpoint_run_names | experiment_run_names
+    report_only_run_names = sorted(reported_run_names - physical_run_names)
     all_run_names = (
         complete_run_names
         if completed_only
@@ -408,6 +702,24 @@ def build_plan(
                 source_target=layout.experiment_target,
                 reason="complete repeat summary",
             )
+            original_report = _referenced_original_report(
+                layout.reports_dir, report_path
+            )
+            if original_report is not None:
+                builder.add_file(
+                    original_report,
+                    destination_root="experiment",
+                    source_target=layout.experiment_target,
+                    reason="repeat summary source report",
+                )
+                original_markdown = original_report.with_suffix(".md")
+                if original_markdown.is_file():
+                    builder.add_file(
+                        original_markdown,
+                        destination_root="experiment",
+                        source_target=layout.experiment_target,
+                        reason="repeat summary source report markdown",
+                    )
     else:
         builder.add_tree(
             layout.reports_dir,
@@ -436,9 +748,11 @@ def build_plan(
         )
 
     for run_name in all_run_names:
-        checkpoint_run = layout.checkpoint_container / run_name
-        experiment_run = layout.experiment_container / run_name
+        if run_name in report_only_run_names:
+            continue
         if run_name in rescue_runs:
+            checkpoint_run = layout.checkpoint_container / run_name
+            experiment_run = layout.experiment_container / run_name
             rescue_reason = "incomplete-run rescue" if run_name in incomplete_run_names else "unreported-run rescue"
             if checkpoint_run.is_dir():
                 builder.add_tree(
@@ -455,47 +769,15 @@ def build_plan(
                     reason=f"{rescue_reason} experiment data",
                 )
             continue
-
-        builder.add_file(
-            _latest_checkpoint(checkpoint_run),
-            destination_root="checkpoint",
-            source_target=layout.checkpoint_target,
-            reason="final simulation checkpoint",
+        _add_curated_run(
+            builder,
+            layout,
+            run_name,
+            completed_only=completed_only,
+            include_raw_scale_traces=include_raw_scale_traces,
+            include_merged_consultation_dialogues=include_merged_consultation_dialogues,
+            include_dynamic_llm_traces=include_dynamic_llm_traces,
         )
-        builder.add_file(
-            checkpoint_run / "cbt_condition_manifest.json",
-            destination_root="checkpoint",
-            source_target=layout.checkpoint_target,
-            reason="CBT condition manifest",
-        )
-
-        checkpoint_judge = checkpoint_run / "judge_traces" / "judge_conversation.json"
-        experiment_judge = experiment_run / "traces" / "judge_conversation.json"
-        if not checkpoint_judge.is_file() and not experiment_judge.is_file():
-            raise FileNotFoundError(f"No judge_conversation.json for complete run: {run_name}")
-        if checkpoint_judge.is_file():
-            builder.add_file(
-                checkpoint_judge,
-                destination_root="checkpoint",
-                source_target=layout.checkpoint_target,
-                reason="judge conversation",
-            )
-        if experiment_judge.is_file():
-            builder.add_file(
-                experiment_judge,
-                destination_root="experiment",
-                source_target=layout.experiment_target,
-                reason="judge conversation",
-            )
-            for name in ("cbt_condition_manifest.json", "trial_meta.json"):
-                optional = experiment_run / name
-                if optional.is_file():
-                    builder.add_file(
-                        optional,
-                        destination_root="experiment",
-                        source_target=layout.experiment_target,
-                        reason="run provenance metadata",
-                    )
 
     raw_paths: set[Path] = set()
     if not completed_only:
@@ -505,9 +787,14 @@ def build_plan(
             )
         raw_parent_dirs = {path.parent for path in raw_paths}
         for parent in raw_parent_dirs:
-            for path in parent.glob(RAW_EVALUATION_PATTERNS[2]):
+            for name in SMALL_EVALUATION_METADATA:
+                path = parent / name
                 if path.is_file():
                     raw_paths.add(path)
+            if include_raw_scale_traces:
+                for path in parent.glob(RAW_EVALUATION_PATTERNS[2]):
+                    if path.is_file():
+                        raw_paths.add(path)
         for path in sorted(raw_paths):
             builder.add_file(
                 path,
@@ -528,12 +815,17 @@ def build_plan(
         incomplete_run_names=incomplete_run_names,
         superseded_incomplete_run_names=superseded_incomplete_run_names,
         unreported_run_names=unreported_run_names,
+        followup_run_names=followup_run_names,
+        report_only_run_names=report_only_run_names,
         items=items,
         source_bytes=source_bytes,
         retained_bytes=retained_bytes,
         raw_evaluation_file_count=len(raw_paths),
         completed_only=completed_only,
         include_run_prefixes=include_run_prefixes,
+        include_raw_scale_traces=include_raw_scale_traces,
+        include_merged_consultation_dialogues=include_merged_consultation_dialogues,
+        include_dynamic_llm_traces=include_dynamic_llm_traces,
     )
 
 
@@ -552,12 +844,14 @@ def print_plan(plan: PrunePlan, *, operation_mode: str = "prune") -> None:
     print(f"  checkpoint target:         {plan.layout.checkpoint_target}")
     print(f"  experiment-data target:    {plan.layout.experiment_target}")
     print(f"  complete report records:   {len(plan.complete_report_paths)}")
-    print(f"  complete run directories:  {len(plan.complete_run_names)}")
+    print(f"  complete report runs:       {len(plan.complete_run_names)}")
     print(f"  incomplete report files:   {len(plan.incomplete_report_paths)}")
     print(f"  active incomplete runs:    {len(plan.incomplete_run_names)}")
     print(f"  superseded incomplete runs: {len(plan.superseded_incomplete_run_names)}")
     print(f"  unreported rescue runs:    {len(plan.unreported_run_names)}")
-    print(f"  raw answer/score/traces:    {plan.raw_evaluation_file_count}")
+    print(f"  linked follow-up branches: {len(plan.followup_run_names)}")
+    print(f"  report-only runs:          {len(plan.report_only_run_names)}")
+    print(f"  retained raw scale files:  {plan.raw_evaluation_file_count}")
     print(f"  current archive size:       {_format_bytes(plan.source_bytes)}")
     print(f"  retained size estimate:     {_format_bytes(plan.retained_bytes)}")
     if operation_mode == "prune":
@@ -567,6 +861,28 @@ def print_plan(plan: PrunePlan, *, operation_mode: str = "prune") -> None:
     if plan.completed_only:
         print("  retention scope:           completed repeat summaries only")
         print("  raw scale audit artifacts: skipped")
+    elif plan.include_raw_scale_traces:
+        print("  raw scale traces:          retained (large opt-in artifacts)")
+    else:
+        print("  raw scale traces:          omitted; answers/scores/metadata retained")
+    merged_dialogue_count = sum(
+        item.destination_relative.name == "merge_consultation_dialogues.json"
+        for item in plan.items
+    )
+    dynamic_trace_count = sum(
+        item.destination_relative.name == "depression_dynamic_llm_trace.jsonl"
+        for item in plan.items
+    )
+    completed_storage_run_count = len(
+        {
+            item.source.relative_to(plan.layout.checkpoint_container).parts[0]
+            for item in plan.items
+            if item.reason == "completed-run storage"
+        }
+    )
+    print(f"  merged consultation dialogues: {merged_dialogue_count} retained")
+    print(f"  dynamic LLM traces:        {dynamic_trace_count} retained")
+    print(f"  completed-run storage:     {completed_storage_run_count} runs retained")
     if plan.include_run_prefixes:
         print(f"  included run prefixes:     {', '.join(plan.include_run_prefixes)}")
         print(f"  excluded complete runs:    {len(plan.excluded_complete_run_names)}")
@@ -738,8 +1054,12 @@ def validate_retained_layout(
     *,
     expected_run_names: set[str] | None = None,
 ) -> None:
-    source_reports = find_report_files(source.reports_dir, recursive=False)
-    retained_reports = find_report_files(retained.reports_dir, recursive=False)
+    source_reports = find_report_files(
+        source.reports_dir, recursive=False, include_followup=True
+    )
+    retained_reports = find_report_files(
+        retained.reports_dir, recursive=False, include_followup=True
+    )
     if expected_run_names is not None:
         source_reports = _reports_for_expected_runs(source_reports, expected_run_names)
     source_records, source_labels, source_scales = load_records(source_reports)
@@ -769,13 +1089,18 @@ def validate_retained_layout(
         raise ValueError("Retained files changed process/dose metrics")
     if source_stages != retained_stages:
         raise ValueError("Retained files changed progressive-stage metrics")
-    unavailable = [
-        row["stable_id"]
+    source_by_id = {str(row["stable_id"]): row for row in source_process}
+    regressions = [
+        str(row["stable_id"])
         for row in retained_process
-        if not row.get("raw_artifacts_available") or row.get("total_turns") is None
+        if source_by_id.get(str(row["stable_id"]), {}).get("raw_artifacts_available")
+        and not row.get("raw_artifacts_available")
     ]
-    if unavailable:
-        raise ValueError("Retained layout lacks plot inputs for: " + ", ".join(unavailable))
+    if regressions:
+        raise ValueError(
+            "Retained layout lost raw process inputs that existed in the source: "
+            + ", ".join(regressions)
+        )
 
 
 def _backup_path(target: Path, stamp: str) -> Path:
@@ -868,8 +1193,12 @@ def install_backup(
     if backup_output.exists():
         raise FileExistsError(f"Refusing to overwrite backup output: {backup_output}")
     backup_output.parent.mkdir(parents=True, exist_ok=True)
+    can_move_staged = (
+        checkpoint_stage.stat().st_dev == backup_output.parent.stat().st_dev
+        and experiment_stage.stat().st_dev == backup_output.parent.stat().st_dev
+    )
     free_bytes = shutil.disk_usage(backup_output.parent).free
-    if free_bytes < plan.retained_bytes * 1.05:
+    if not can_move_staged and free_bytes < plan.retained_bytes * 1.05:
         raise OSError(
             f"Insufficient backup space below {backup_output.parent}: "
             f"need about {_format_bytes(plan.retained_bytes)}, have {_format_bytes(free_bytes)}"
@@ -885,10 +1214,17 @@ def install_backup(
     final_layout = _backup_layout(plan.layout, backup_output)
     published = False
     try:
-        shutil.copytree(checkpoint_stage, temporary_layout.checkpoint_target)
-        shutil.copytree(experiment_stage, temporary_layout.experiment_target)
+        if can_move_staged:
+            # Staging already contains checksum-verified copies.  On the same
+            # filesystem, move those trees into the publication directory so
+            # backup mode does not need a second full copy of large storage
+            # and audit traces.  Source archives remain untouched.
+            os.replace(checkpoint_stage, temporary_layout.checkpoint_target)
+            os.replace(experiment_stage, temporary_layout.experiment_target)
+        else:
+            shutil.copytree(checkpoint_stage, temporary_layout.checkpoint_target)
+            shutil.copytree(experiment_stage, temporary_layout.experiment_target)
         for item in plan.items:
-            staged_file = _copy_destination(item, checkpoint_stage, experiment_stage)
             installed_root = (
                 temporary_layout.checkpoint_target
                 if item.destination_root == "checkpoint"
@@ -897,8 +1233,8 @@ def install_backup(
             installed_file = installed_root / item.destination_relative
             if (
                 not installed_file.is_file()
-                or staged_file.stat().st_size != installed_file.stat().st_size
-                or _sha256(staged_file) != _sha256(installed_file)
+                or item.source.stat().st_size != installed_file.stat().st_size
+                or _sha256(item.source) != _sha256(installed_file)
             ):
                 raise ValueError(f"Backup file checksum mismatch: {installed_file}")
         validate_retained_layout(
@@ -982,6 +1318,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--include-raw-scale-traces",
+        action=argparse.BooleanOptionalAction,
+        default=INCLUDE_RAW_SCALE_TRACES,
+        help=(
+            "Retain large *_trace.json files from repeated/staged scale jobs. "
+            "Answers, scores and metadata are retained without this opt-in."
+        ),
+    )
+    parser.add_argument(
+        "--include-merged-consultation-dialogues",
+        action=argparse.BooleanOptionalAction,
+        default=INCLUDE_MERGED_CONSULTATION_DIALOGUES,
+        help="Retain each run's traces/merge_consultation_dialogues.json (default: enabled).",
+    )
+    parser.add_argument(
+        "--include-dynamic-llm-traces",
+        "--include-one-dynamic-llm-trace",
+        dest="include_dynamic_llm_traces",
+        action=argparse.BooleanOptionalAction,
+        default=INCLUDE_DYNAMIC_LLM_TRACES,
+        help=(
+            "Retain each included run's depression_dynamic_llm_trace.jsonl "
+            "(default: enabled; the old --include-one-* spelling is a compatibility alias)."
+        ),
+    )
+    parser.add_argument(
         "--apply",
         action=argparse.BooleanOptionalAction,
         default=APPLY_CHANGES,
@@ -1024,6 +1386,9 @@ def main(argv: list[str] | None = None) -> int:
             layout,
             completed_only=args.completed_only,
             include_run_prefixes=include_run_prefixes,
+            include_raw_scale_traces=args.include_raw_scale_traces,
+            include_merged_consultation_dialogues=args.include_merged_consultation_dialogues,
+            include_dynamic_llm_traces=args.include_dynamic_llm_traces,
         )
         backup_output = None
         if args.mode == "backup":

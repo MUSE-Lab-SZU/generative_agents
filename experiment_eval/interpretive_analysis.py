@@ -22,6 +22,7 @@ from .loader import find_report_files, load_records
 from .visualization.interpretive_plots import render_interpretive_figures
 from .visualization.weighted_kappa_plots import render_weighted_kappa_figures
 from .weighted_kappa import build_weighted_kappa
+from modules.model.llm_model import record_prompt_cache_usage
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -115,6 +116,13 @@ def run_semantic_api(
                 decoded = response.json()
                 if not isinstance(decoded, dict):
                     raise ValueError("semantic API response envelope is not an object")
+                record_prompt_cache_usage(
+                    decoded,
+                    caller="experiment_eval_semantic",
+                    provider="openai",
+                    model=str(llm["model"]),
+                    base_url=endpoint,
+                )
                 response_payload = decoded
                 break
             except (requests.RequestException, ValueError) as exc:
@@ -148,6 +156,16 @@ def write_life_state_report(out_dir: Path, life_state: dict[str, list[dict[str, 
         and row["scale"] == "COMBINED_EQUAL_SCALE_WEIGHT"
     ]
     ranked = sorted(overall, key=lambda row: float(row["mean_change"]))
+    n_outer_runs = max((int(row["n_outer_runs"]) for row in overall), default=0)
+    group_ns = sorted(
+        {
+            int(row["n_outer_runs"])
+            for row in life_state["summary"]
+            if row["stratum_type"] == "group"
+            and row["metric_level"] == "symptom"
+            and row["scale"] == "COMBINED_EQUAL_SCALE_WEIGHT"
+        }
+    )
     lines = [
         "# 从量表条目看仿真生活状态发生了什么变化",
         "",
@@ -157,7 +175,7 @@ def write_life_state_report(out_dir: Path, life_state: dict[str, list[dict[str, 
         "",
         "- 负数表示该症状在 `session_20` 比 `T0` 少，即模拟生活状态向改善方向变化。",
         "- 正数表示症状更多，即向恶化方向变化。",
-        "- 每个 snapshot 先把 10 次重复回答取均值，再把 26 个独立仿真 run 用作统计样本。",
+        f"- 每个 snapshot 先把重复回答取均值，再把 {n_outer_runs} 个独立仿真 run 用作统计样本。",
         "- 这些结果描述的是 agent 在仿真内的量表回答变化，不等于真实患者疗效。",
         "",
         "## 九类生活状态的前后变化",
@@ -194,19 +212,19 @@ def write_life_state_report(out_dir: Path, life_state: dict[str, list[dict[str, 
             "",
             (
                 f"- BDI-II 烦躁不安条目平均变化为 {float(bdi_agitation['mean_change']):+.2f}，"
-                f"23/26 个 runs 恶化；这是当前最明确的反向变化。"
+                f"{bdi_agitation['worsened_n']}/{bdi_agitation['n_outer_runs']} 个 runs 恶化；这是当前最明确的反向变化。"
                 if bdi_agitation
                 else ""
             ),
             (
                 f"- BDI-II 易怒条目平均变化为 {float(bdi_irritability['mean_change']):+.2f}，"
-                f"19/26 个 runs 恶化。"
+                f"{bdi_irritability['worsened_n']}/{bdi_irritability['n_outer_runs']} 个 runs 恶化。"
                 if bdi_irritability
                 else ""
             ),
             (
                 f"- PHQ-9 风险条目平均变化为 {float(phq_risk['mean_change']):+.2f}，"
-                f"15/26 个 runs 恶化，且总体 CI 跨 0；不能汇报成风险改善。"
+                f"{phq_risk['worsened_n']}/{phq_risk['n_outer_runs']} 个 runs 恶化，且总体 CI 跨 0；不能汇报成风险改善。"
                 if phq_risk
                 else ""
             ),
@@ -220,7 +238,9 @@ def write_life_state_report(out_dir: Path, life_state: dict[str, list[dict[str, 
             "",
             "## 组间图的限制",
             "",
-            "G2/G3/G4/G5/G6/G7/G9 各只有 2 个 outer runs；G1 虽有 12 个 runs，但混合了多个 persona，而其他组主要是 KBD2。因此组间热图只能描述现有仿真结果，不能把差异简单归因于组别。",
+            "观察到的 outer n/group="
+            + (",".join(map(str, group_ns)) or "不可用")
+            + "；当前是部分 persona × group 交叉设计。因此组间热图只能描述现有仿真结果，不能把差异简单归因于组别。",
             "",
             "## 对应文件",
             "",
@@ -345,12 +365,21 @@ def write_plain_kappa_report(out_dir: Path, kappa: dict[str, Any]) -> Path:
     sensitivity = {row["scale"]: row for row in overall if row["weights"] == "linear"}
     item_primary = [row for row in kappa["item"] if row["weights"] == "quadratic" and row.get("kappa") is not None]
     lowest = sorted(item_primary, key=lambda row: float(row["kappa"]))[:5]
+    item_long = kappa.get("item_long") or []
+    run_count = len({str(row["stable_id"]) for row in item_long})
+    timepoints = sorted({str(row["timepoint"]) for row in item_long})
+    repeat_count = len({str(row["measurement_repeat_id"]) for row in item_long})
+    pair_count = repeat_count * (repeat_count - 1) // 2
+    item_counts = {
+        scale: len({int(row["item_id"]) for row in item_long if row["scale"] == scale})
+        for scale in ("PHQ-9", "BDI-II")
+    }
     lines = [
         "# Weighted Kappa：不懂统计也能直接汇报的版本",
         "",
         "## 一句话解释",
         "",
-        "同一个冻结状态让模型重复回答 10 次同一道 0–3 分题目，Weighted Kappa 检查这 10 次回答是否大体一致。",
+        f"同一个冻结状态让模型重复回答 {repeat_count} 次同一道 0–3 分题目，Weighted Kappa 检查这些回答是否大体一致。",
         "",
         "例如同一道题 10 次都在 1 分或 2 分附近，说明回答比较稳定；如果一会儿 0 分、一会儿 3 分，说明这道题不稳定。Weighted 的意思是：差 1 分算小分歧，差 3 分算大分歧。",
         "",
@@ -362,12 +391,12 @@ def write_plain_kappa_report(out_dir: Path, kappa: dict[str, Any]) -> Path:
         "",
         "## 本次计算用了什么数据",
         "",
-        "- 26 个独立仿真 runs；",
-        "- 每个 run 的 T0、session_4、session_8、session_12、session_16、session_20；",
-        "- PHQ-9 的 9 个条目和 BDI-II 的 21 个条目；",
-        "- 每个冻结节点重复回答 10 次；",
-        "- 总计 46,800 个条目回答；",
-        "- 10 次 repeat 两两比较，共 45 对。",
+        f"- {run_count} 个独立仿真 runs；",
+        f"- 每个 run 的 {', '.join(timepoints)}；",
+        f"- PHQ-9 的 {item_counts['PHQ-9']} 个条目和 BDI-II 的 {item_counts['BDI-II']} 个条目；",
+        f"- 每个冻结节点重复回答 {repeat_count} 次；",
+        f"- 总计 {len(item_long):,} 个条目回答；",
+        f"- {repeat_count} 次 repeat 两两比较，共 {pair_count} 对。",
         "",
         "量表总分没有计算 Kappa，总分稳定性继续使用 ICC。Kappa 配对时必须是完全相同的 `snapshot × scale × item`，不会把不同时间点或不同条目错配。",
         "",
@@ -414,7 +443,9 @@ def write_plain_kappa_report(out_dir: Path, kappa: dict[str, Any]) -> Path:
             "",
             "## 汇报时可以直接这样说",
             "",
-            "> 我们在每个冻结评估节点让模型重复完成 10 次量表，用 Weighted Kappa 检查逐条目回答是否稳定。BDI-II 的 quadratic Kappa 为 0.749，PHQ-9 为 0.570，说明 BDI-II 的重复条目回答整体更一致。这个指标只说明重复测量稳定性，不代表症状是否改善；生活状态改善需要另外看 T0 到 session_20 的条目变化。",
+            f"> 我们在每个冻结评估节点让模型重复完成 {repeat_count} 次量表，用 Weighted Kappa 检查逐条目回答是否稳定。"
+            f"BDI-II 的 quadratic Kappa 为 {float(primary['BDI-II']['kappa']):.3f}，PHQ-9 为 {float(primary['PHQ-9']['kappa']):.3f}，"
+            "说明 BDI-II 的重复条目回答整体更一致。这个指标只说明重复测量稳定性，不代表症状是否改善；生活状态改善需要另外看 T0 到 session_20 的条目变化。",
             "",
         ]
     )
@@ -425,7 +456,7 @@ def write_plain_kappa_report(out_dir: Path, kappa: dict[str, Any]) -> Path:
 def write_master_report(out_dir: Path) -> Path:
     path = out_dir / "README.md"
     path.write_text(
-        """# 0802 可解释性补充分析
+        """# 0802+0808 可解释性补充分析
 
 本目录直接回答三个问题：
 
@@ -445,6 +476,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reports-dir", type=Path, required=True)
     parser.add_argument("--checkpoints-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--repeat-alias",
+        action="append",
+        default=[],
+        metavar="PATH_MATCH=REPEAT_ID",
+    )
     parser.add_argument("--semantic-api", action="store_true")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "data" / "config.json")
     parser.add_argument("--dotenv", type=Path, default=PROJECT_ROOT / ".env")
@@ -458,7 +495,17 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     report_files = find_report_files(reports_dir, recursive=True)
-    records, labels, scales = load_records(report_files)
+    repeat_aliases: list[tuple[str, str]] = []
+    for value in args.repeat_alias:
+        if "=" not in value:
+            raise SystemExit(f"Invalid --repeat-alias: {value}")
+        path_match, label = value.split("=", 1)
+        if not path_match or not label:
+            raise SystemExit(f"Invalid --repeat-alias: {value}")
+        repeat_aliases.append((path_match, label))
+    records, labels, scales = load_records(
+        report_files, repeat_aliases=repeat_aliases
+    )
     life_state = build_life_state_analysis(records, labels, scales)
     complaint = extract_complaint_evaluation_nodes(records, labels, checkpoints_root)
     kappa = build_weighted_kappa(records, labels, scales)
@@ -499,7 +546,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     _write_csv(out_dir / "complaint_semantic_outputs.csv", _semantic_rows(semantic_outputs))
     render_interpretive_figures(life_state, complaint, labels, out_dir)
-    render_weighted_kappa_figures(kappa, out_dir, "0802 integrated 26-run analysis")
+    render_weighted_kappa_figures(
+        kappa, out_dir, f"0808 integrated {len(records)}-run analysis"
+    )
     write_life_state_report(out_dir, life_state)
     write_complaint_report(out_dir, complaint, semantic_outputs)
     write_plain_kappa_report(out_dir, kappa)

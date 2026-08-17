@@ -285,6 +285,8 @@ def write_subset_report(
 ) -> Path:
     path = out_dir / "analysis_report.md"
     entities = sorted({_record_entity(record, entity_field) for record in records}, key=group_sort_key)
+    repeat_ids = sorted({record.repeat_id for record in records}, key=group_sort_key)
+    later_repeat_text = "、".join(repeat_ids[2:]) or "其余重复"
     agreement_counts: dict[str, Counter[str]] = defaultdict(Counter)
     symptom_labels: dict[str, str] = {}
     for row in agreement:
@@ -295,10 +297,10 @@ def write_subset_report(
         "",
         "## 分析口径",
         "",
-        f"- 包含 {len(entities)} 个{('人设' if entity_field == 'persona' else '实验条件')}、{len(records)} 次独立仿真；每个实体保留 R01/R02 两行。",
+        f"- 包含 {len(entities)} 个{('人设' if entity_field == 'persona' else '实验条件')}、{len(records)} 次独立仿真；观察到的 outer run ID 为 {', '.join(repeat_ids)}。",
         "- 生活状态分析单位是一条独立 outer run，不跨人设或条件先求平均。",
         "- 10 次 measurement repeat 只在同一 snapshot 内取均值，用于降低测量随机性。",
-        "- 汇总依据是 R01/R02 是否复现同一方向，不把两个 run 的均值当作确定效应。",
+        f"- `R01/R02 reproducibility` 专图只比较前两次预设复现；{later_repeat_text} 仍进入单-run 热图、轨迹、条目、主诉和 Kappa 统计。",
         "",
         "## 一、生活状态：哪些变化能在 R01/R02 复现",
         "",
@@ -512,7 +514,7 @@ def write_subset_report(
             "",
             "### 各实体描述性 Kappa",
             "",
-            "每个实体只有两个 outer runs，因此不强行给实体级 CI；下面只用于识别哪些人设/条件的重复量表回答更稳定。",
+            "每个实体的独立 outer runs 很少，因此不强行给实体级 CI；下面只用于识别哪些人设/条件的重复量表回答更稳定。",
             "",
             "| 实体 | Scale | Quadratic κ | 有效对象 |",
             "|---|---|---:|---:|",
@@ -528,7 +530,7 @@ def write_subset_report(
             "## 汇报边界",
             "",
             "- 这里描述的是生成式 agent 的仿真内变化，不是真实患者疗效。",
-            "- R01/R02 同方向比跨实体总平均更有解释力，但每个实体仍只有两次独立实验。",
+            f"- R01/R02 同方向比跨实体总平均更有解释力；每个实体当前有 {len(repeat_ids)} 次独立实验，{later_repeat_text} 不进入这张两次复现专图。",
             "- 主诉 advance 阈值 0.5 是透明的描述性规则，不是临床验证阈值。",
             "- 风险条目永远单列，不并入一般生活状态好坏判断。",
             "",
@@ -600,24 +602,24 @@ def write_master_report(
     path = out_dir / "README.md"
     origin_counts = Counter(row["data_origin"] for row in input_inventory)
     lines = [
-        "# 0802 分组可解释性论文图与汇报分析",
+        "# 0802+0808 分组可解释性论文图与汇报分析",
         "",
-        "输入是 `0802-local-remote-integrated-draw_data`，不是单独的本地或远程副本。"
         f"按每个 run 的 `trial_meta.json` 复核：远程平台 {origin_counts['remote_workspace']} 个 runs，"
-        f"本地服务器 {origin_counts['local_server']} 个 runs；逐 run 证据见 [`input_run_inventory.csv`](input_run_inventory.csv)。",
+        f"本地服务器 {origin_counts['local_server']} 个 runs，来源未知 {origin_counts['unknown']} 个 runs；"
+        "逐 run 证据见 [`input_run_inventory.csv`](input_run_inventory.csv)。",
         "",
-        "本目录不再合并 26 个 runs。两套分析完全分开：",
+        "本目录不把部分交叉设计直接池化成一个组间效应。两套分析完全分开：",
         "",
-        "1. [`cross_persona_g1/analysis_report.md`](cross_persona_g1/analysis_report.md)：跨人设 G1，6个人设 × R01/R02；",
-        "2. [`kbd2_conditions/analysis_report.md`](kbd2_conditions/analysis_report.md)：KBD2 的8个实验条件 × R01/R02。",
+        "1. [`cross_persona_g1/analysis_report.md`](cross_persona_g1/analysis_report.md)：跨人设 G1；",
+        "2. [`kbd2_conditions/analysis_report.md`](kbd2_conditions/analysis_report.md)：KBD2 的8个实验条件。",
         "",
-        "KBD2-G1 的 R01/R02 按研究问题同时出现在两套分析中：在第一套代表 KBD2 这一人设，在第二套代表 G1 这一条件；它们没有在任何一套组内重复计数。",
+        "KBD2-G1 的 runs 按研究问题同时出现在两套分析中：在第一套代表 KBD2 这一人设，在第二套代表 G1 这一条件；它们没有在任何一套组内重复计数。",
         "",
-        "生活状态图中每一行都是单次独立实验。R01/R02 的汇总只判断方向能否复现，不用跨人设/条件平均替代单次实验。",
+        "生活状态图中每一行都是单次独立实验。R01/R02 专图只判断前两次方向能否复现；R03–R05 保留在其他分析中。",
         "",
         "主诉图用‘主诉 advance 比例 × 同期非风险生活状态变化’判断过程与结果是否一致；风险条目上升单独加黑边警告。",
         "",
-        "Weighted Kappa 也在两套子样本中分别重新计算，未使用 26-run 混合结果。",
+        "Weighted Kappa 也在两套子样本中分别重新计算，未使用跨设计池化结果。",
         "",
     ]
     for result in results:
@@ -665,42 +667,70 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reports-dir", type=Path, required=True)
     parser.add_argument("--checkpoints-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--repeat-alias",
+        action="append",
+        default=[],
+        metavar="PATH_MATCH=REPEAT_ID",
+    )
+    parser.add_argument(
+        "--subset",
+        choices=("all", "cross-persona-g1", "kbd2-conditions"),
+        default="all",
+        help="Run both separated analyses or resume one subset only.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     report_files = find_report_files(args.reports_dir.resolve(), recursive=True)
-    records, labels, scales = load_records(report_files)
+    repeat_aliases: list[tuple[str, str]] = []
+    for value in args.repeat_alias:
+        if "=" not in value:
+            raise SystemExit(f"Invalid --repeat-alias: {value}")
+        path_match, label = value.split("=", 1)
+        if not path_match or not label:
+            raise SystemExit(f"Invalid --repeat-alias: {value}")
+        repeat_aliases.append((path_match, label))
+    records, labels, scales = load_records(
+        report_files, repeat_aliases=repeat_aliases
+    )
     g1_records = [record for record in records if record.group == "G1"]
     kbd2_records = [record for record in records if record.kbd == "KBD2"]
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     input_inventory = build_input_inventory(records, args.reports_dir.resolve().parent)
     _write_csv(out_dir / "input_run_inventory.csv", input_inventory)
-    results = [
-        analyze_subset(
-            g1_records,
-            labels,
-            scales,
-            args.checkpoints_root.resolve(),
-            out_dir / "cross_persona_g1",
-            title="跨人设 G1",
-            entity_field="persona",
-            entity_type="persona",
-        ),
-        analyze_subset(
-            kbd2_records,
-            labels,
-            scales,
-            args.checkpoints_root.resolve(),
-            out_dir / "kbd2_conditions",
-            title="KBD2 不同实验条件",
-            entity_field="group",
-            entity_type="group",
-        ),
-    ]
-    write_master_report(out_dir, results, input_inventory)
+    results: list[dict[str, Any]] = []
+    if args.subset in {"all", "cross-persona-g1"}:
+        results.append(
+            analyze_subset(
+                g1_records,
+                labels,
+                scales,
+                args.checkpoints_root.resolve(),
+                out_dir / "cross_persona_g1",
+                title="跨人设 G1",
+                entity_field="persona",
+                entity_type="persona",
+            )
+        )
+    if args.subset in {"all", "kbd2-conditions"}:
+        results.append(
+            analyze_subset(
+                kbd2_records,
+                labels,
+                scales,
+                args.checkpoints_root.resolve(),
+                out_dir / "kbd2_conditions",
+                title="KBD2 不同实验条件",
+                entity_field="group",
+                entity_type="group",
+            )
+        )
+    if args.subset == "all":
+        write_master_report(out_dir, results, input_inventory)
     (out_dir / "analysis_manifest.json").write_text(
         json.dumps(
             [
@@ -712,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         encoding="utf-8",
     )
-    print(f"Wrote two separated analysis sets to {out_dir}")
+    print(f"Wrote {len(results)} separated analysis set(s) to {out_dir}")
     return 0
 
 

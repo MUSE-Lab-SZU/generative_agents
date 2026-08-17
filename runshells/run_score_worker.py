@@ -13,6 +13,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -26,6 +27,15 @@ from modules.model.llm_model import (
     format_call_error_details,
     safe_exception_message_for_log,
 )
+
+
+def parse_json_reply(reply):
+    """Parse a JSON response, accepting explanatory text before a fenced block."""
+    text = reply.strip()
+    fenced_json = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced_json:
+        text = fenced_json.group(1).strip()
+    return json.loads(text)
 
 
 def main():
@@ -62,7 +72,11 @@ def main():
     llm_started_at = time.monotonic()
     try:
         llm = ExpertLLM()
-        reply = llm.generate(user_prompt, system_prompt=system_prompt)
+        reply = llm.generate(
+            user_prompt,
+            system_prompt=system_prompt,
+            caller="repeat_eval_score",
+        )
         if not reply:
             print(f"[ERROR] ExpertLLM 返回空")
             sys.exit(1)
@@ -88,14 +102,8 @@ def main():
         sys.exit(1)
 
     # 解析 JSON
-    text = reply.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines)
-
     try:
-        result = json.loads(text)
+        result = parse_json_reply(reply)
     except json.JSONDecodeError as e:
         # 保存原始回复以供调试
         result = {"raw_reply": reply, "parse_error": str(e)}

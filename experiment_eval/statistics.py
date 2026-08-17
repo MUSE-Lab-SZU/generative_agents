@@ -283,23 +283,99 @@ def trajectory_metrics(record: ExperimentRecord, labels: list[str], scale: str) 
     }
 
 
+def _absolute_agreement_icc(matrix: np.ndarray) -> dict[str, float]:
+    """Two-way random, absolute-agreement ICC(A,1) and ICC(A,k)."""
+    n_targets, k = matrix.shape
+    target_means = matrix.mean(axis=1)
+    repeat_means = matrix.mean(axis=0)
+    grand_mean = float(matrix.mean())
+    ms_target = float(k * np.square(target_means - grand_mean).sum() / (n_targets - 1))
+    ms_repeat = float(n_targets * np.square(repeat_means - grand_mean).sum() / (k - 1))
+    residual = matrix - target_means[:, None] - repeat_means[None, :] + grand_mean
+    ms_error = float(np.square(residual).sum() / ((n_targets - 1) * (k - 1)))
+    single_denominator = (
+        ms_target + (k - 1) * ms_error + k * (ms_repeat - ms_error) / n_targets
+    )
+    average_denominator = ms_target + (ms_repeat - ms_error) / n_targets
+    return {
+        "icc_a_1": (ms_target - ms_error) / single_denominator if single_denominator else 1.0,
+        "icc_a_k": (ms_target - ms_error) / average_denominator if average_denominator else 1.0,
+        "target_mean_square": ms_target,
+        "repeat_mean_square": ms_repeat,
+        "residual_mean_square": ms_error,
+    }
+
+
+def _cluster_bootstrap_icc(
+    matrix: np.ndarray,
+    cluster_ids: list[str],
+    *,
+    seed: int,
+    replicates: int = 300,
+) -> dict[str, Any]:
+    clusters = sorted(set(cluster_ids))
+    if len(clusters) < 5:
+        return {
+            "icc_a_1_ci95_lower": None,
+            "icc_a_1_ci95_upper": None,
+            "icc_a_k_ci95_lower": None,
+            "icc_a_k_ci95_upper": None,
+            "ci_method": None,
+            "bootstrap_valid_replicates": 0,
+            "ci_reason": "fewer_than_5_independent_outer_run_clusters",
+        }
+    indices = {cluster: [i for i, value in enumerate(cluster_ids) if value == cluster] for cluster in clusters}
+    rng = np.random.default_rng(seed)
+    single: list[float] = []
+    average: list[float] = []
+    for _ in range(replicates):
+        sampled = rng.choice(clusters, size=len(clusters), replace=True)
+        sample_indices = [index for cluster in sampled for index in indices[str(cluster)]]
+        estimate = _absolute_agreement_icc(matrix[sample_indices, :])
+        if math.isfinite(estimate["icc_a_1"]) and math.isfinite(estimate["icc_a_k"]):
+            single.append(estimate["icc_a_1"])
+            average.append(estimate["icc_a_k"])
+    if len(single) < max(30, replicates // 2):
+        return {
+            "icc_a_1_ci95_lower": None,
+            "icc_a_1_ci95_upper": None,
+            "icc_a_k_ci95_lower": None,
+            "icc_a_k_ci95_upper": None,
+            "ci_method": None,
+            "bootstrap_valid_replicates": len(single),
+            "ci_reason": "too_few_valid_cluster_bootstrap_replicates",
+        }
+    return {
+        "icc_a_1_ci95_lower": float(np.quantile(single, 0.025)),
+        "icc_a_1_ci95_upper": float(np.quantile(single, 0.975)),
+        "icc_a_k_ci95_lower": float(np.quantile(average, 0.025)),
+        "icc_a_k_ci95_upper": float(np.quantile(average, 0.975)),
+        "ci_method": "outer_run_cluster_percentile_bootstrap",
+        "bootstrap_valid_replicates": len(single),
+        "ci_reason": None,
+    }
+
+
 def measurement_icc(
     records: list[ExperimentRecord], labels: list[str], scale: str
 ) -> dict[str, Any]:
-    """One-way random-effects ICC across frozen snapshot targets.
+    """Repeat reliability across frozen targets, including ICC(A,1)/(A,k).
 
-    Rows are independent snapshot targets and columns are repeated measurements of
-    the same target. This estimates measurement repeat reliability, not outer-run
-    reliability or clinical test-retest reliability.
+    Rows are frozen snapshot targets and columns are repeat positions. ICC(A,1)
+    is the primary absolute-agreement estimate; ICC(A,k) is reliability of the
+    mean of K repeat generations. Legacy ICC(1,1)/(1,k) fields are retained for
+    compatibility.
     """
     rows: list[list[float]] = []
     target_ids: list[str] = []
+    cluster_ids: list[str] = []
     for record in records:
         for label in labels:
             values = (record.series.get(scale, {}).get(label) or {}).get("values") or []
             if values:
                 rows.append([float(value) for value in values])
                 target_ids.append(f"{record.stable_id}::{label}")
+                cluster_ids.append(record.stable_id)
     if not rows:
         return {
             "icc_1_1": None,
@@ -326,16 +402,152 @@ def measurement_icc(
     denominator = between_ms + (k - 1) * within_ms
     icc_single = (between_ms - within_ms) / denominator if denominator else 1.0
     icc_average = (between_ms - within_ms) / between_ms if between_ms else 1.0
+    agreement = _absolute_agreement_icc(matrix)
+    interval = _cluster_bootstrap_icc(
+        matrix,
+        cluster_ids,
+        seed=sum((index + 1) * ord(char) for index, char in enumerate(scale)),
+    )
     return {
         "icc_1_1": icc_single,
         "icc_1_k": icc_average,
         "between_target_mean_square": between_ms,
         "within_target_mean_square": within_ms,
+        **agreement,
+        **interval,
         "n_snapshot_targets": n_targets,
         "k_measurement": k,
+        "n_outer_run_clusters": len(set(cluster_ids)),
         "status": "ok",
         "scope": "measurement repeats nested in frozen snapshot targets",
+        "icc_definition": (
+            "ICC(A,1) / ICC(2,1): two-way random-effects, absolute agreement, single measurement; "
+            "ICC(A,K) / ICC(2,K): absolute agreement of the mean of K repeats"
+        ),
         "target_ids": target_ids,
+    }
+
+
+def measurement_error_summary(
+    records: list[ExperimentRecord], labels: list[str], scale: str
+) -> dict[str, Any]:
+    """Absolute-agreement SEM and MDC95 in the original total-score unit."""
+    reliability = measurement_icc(records, labels, scale)
+    snapshot_rows: list[dict[str, Any]] = []
+    for record in records:
+        for label in labels:
+            values = (record.series.get(scale, {}).get(label) or {}).get("values") or []
+            if len(values) < 2:
+                continue
+            snapshot_rows.append(
+                {
+                    "stable_id": record.stable_id,
+                    "persona": record.kbd,
+                    "group": record.group,
+                    "outer_run_id": record.repeat_id,
+                    "timepoint": label,
+                    "scale": scale,
+                    "repeat_sd": stdev(float(value) for value in values),
+                    "n_measurement_repeats": len(values),
+                }
+            )
+    if reliability.get("status") != "ok":
+        return {
+            "scale": scale,
+            "sem": None,
+            "mdc95": None,
+            "status": reliability.get("status"),
+            "snapshot_rows": snapshot_rows,
+        }
+    n_targets = int(reliability["n_snapshot_targets"])
+    repeat_component = max(
+        (float(reliability["repeat_mean_square"]) - float(reliability["residual_mean_square"]))
+        / n_targets,
+        0.0,
+    )
+    error_variance = float(reliability["residual_mean_square"]) + repeat_component
+    sem = math.sqrt(max(error_variance, 0.0))
+    return {
+        "scale": scale,
+        "sem": sem,
+        "mdc95": 1.96 * math.sqrt(2.0) * sem,
+        "error_variance": error_variance,
+        "n_snapshot_targets": n_targets,
+        "n_outer_run_clusters": reliability["n_outer_run_clusters"],
+        "k_measurement": reliability["k_measurement"],
+        "status": "ok",
+        "definition": (
+            "SEM_agreement=sqrt(MS_error + max((MS_repeat-MS_error)/n_targets, 0)); "
+            "MDC95=1.96*sqrt(2)*SEM_agreement"
+        ),
+        "snapshot_rows": snapshot_rows,
+    }
+
+
+def _spearman_with_cluster_ci(
+    rows: list[dict[str, Any]], x_key: str, y_key: str, *, seed: int
+) -> dict[str, Any]:
+    x = [float(row[x_key]) for row in rows]
+    y = [float(row[y_key]) for row in rows]
+    if len(rows) < 2 or len(set(x)) < 2 or len(set(y)) < 2:
+        return {"spearman_rho": None, "spearman_p": None, "ci95_lower": None, "ci95_upper": None, "ci_method": None}
+    correlation = spearmanr(x, y)
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        clusters.setdefault(str(row["stable_id"]), []).append(row)
+    estimates: list[float] = []
+    if len(clusters) >= 5:
+        cluster_ids = sorted(clusters)
+        rng = np.random.default_rng(seed)
+        for _ in range(300):
+            sampled = rng.choice(cluster_ids, size=len(cluster_ids), replace=True)
+            boot = [row for cluster in sampled for row in clusters[str(cluster)]]
+            bx = [float(row[x_key]) for row in boot]
+            by = [float(row[y_key]) for row in boot]
+            if len(set(bx)) > 1 and len(set(by)) > 1:
+                value = float(spearmanr(bx, by).statistic)
+                if math.isfinite(value):
+                    estimates.append(value)
+    return {
+        "spearman_rho": float(correlation.statistic),
+        "spearman_p": float(correlation.pvalue),
+        "ci95_lower": float(np.quantile(estimates, 0.025)) if estimates else None,
+        "ci95_upper": float(np.quantile(estimates, 0.975)) if estimates else None,
+        "ci_method": "outer_run_cluster_percentile_bootstrap" if estimates else None,
+    }
+
+
+def cross_scale_concurrent_validity(
+    records: list[ExperimentRecord], labels: list[str], first_scale: str = "PHQ-9", second_scale: str = "BDI-II"
+) -> dict[str, Any]:
+    """Align total scores within persona/condition/timepoint."""
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        for label in labels:
+            first = score_at(record, first_scale, label)
+            second = score_at(record, second_scale, label)
+            if first is None or second is None:
+                continue
+            rows.append(
+                {
+                    "stable_id": record.stable_id,
+                    "persona": record.kbd,
+                    "group": record.group,
+                    "outer_run_id": record.repeat_id,
+                    "timepoint": label,
+                    "first_total": first,
+                    "second_total": second,
+                }
+            )
+    correlation = _spearman_with_cluster_ci(rows, "first_total", "second_total", seed=20260812)
+    return {
+        "first_scale": first_scale,
+        "second_scale": second_scale,
+        "n_aligned_snapshots": len(rows),
+        "n_outer_runs": len({row["stable_id"] for row in rows}),
+        **correlation,
+        "p_value_note": "naive two-sided Spearman p ignores repeated timepoints; cluster-bootstrap CI is primary",
+        "rows": rows,
     }
 
 
@@ -344,35 +556,49 @@ def cross_scale_convergence(
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for record in records:
-        first = trajectory_metrics(record, labels, first_scale).get("normalized_delta")
-        second = trajectory_metrics(record, labels, second_scale).get("normalized_delta")
-        if first is None or second is None:
+        shared = [
+            label for label in labels
+            if score_at(record, first_scale, label) is not None and score_at(record, second_scale, label) is not None
+        ]
+        if not shared:
             continue
+        baseline = "T0" if "T0" in shared else shared[0]
+        endpoint = next((label for label in ENDPOINT_LABEL_PRIORITY if label in shared), shared[-1])
+        first = float(score_at(record, first_scale, endpoint)) - float(score_at(record, first_scale, baseline))
+        second = float(score_at(record, second_scale, endpoint)) - float(score_at(record, second_scale, baseline))
+        direction_agrees = (first == 0 and second == 0) or (first * second > 0)
         rows.append(
             {
                 "stable_id": record.stable_id,
                 "group": record.group,
                 "kbd": record.kbd,
+                "persona": record.kbd,
                 "repeat_id": record.repeat_id,
-                "first_normalized_delta": first,
-                "second_normalized_delta": second,
-                "direction_agrees": (first == 0 and second == 0) or (first * second > 0),
+                "baseline_label": baseline,
+                "endpoint_label": endpoint,
+                "first_delta": first,
+                "second_delta": second,
+                "first_normalized_delta": first / (SCALE_RANGES[first_scale][1] - SCALE_RANGES[first_scale][0]),
+                "second_normalized_delta": second / (SCALE_RANGES[second_scale][1] - SCALE_RANGES[second_scale][0]),
+                "direction_agrees": direction_agrees,
+                "trend": (
+                    "both_improved" if first < 0 and second < 0 else
+                    "both_worsened" if first > 0 and second > 0 else
+                    "both_stable" if first == 0 and second == 0 else "discordant"
+                ),
             }
         )
-    x = [row["first_normalized_delta"] for row in rows]
-    y = [row["second_normalized_delta"] for row in rows]
-    if len(rows) >= 2 and len(set(x)) > 1 and len(set(y)) > 1:
-        correlation = spearmanr(x, y)
-        rho, p_value = float(correlation.statistic), float(correlation.pvalue)
-    else:
-        rho, p_value = None, None
+    correlation = _spearman_with_cluster_ci(rows, "first_delta", "second_delta", seed=20260813)
     return {
         "first_scale": first_scale,
         "second_scale": second_scale,
         "n_outer_runs": len(rows),
         "direction_agreement_rate": mean(row["direction_agrees"] for row in rows) if rows else None,
-        "spearman_rho": rho,
-        "spearman_p_exploratory": p_value,
+        "baseline_rule": "common T0 when available, otherwise first common observed timepoint",
+        "endpoint_rule": "common POST > NOW > last common observed timepoint",
+        **correlation,
+        "spearman_p_exploratory": correlation["spearman_p"],
+        "direction_note": "negative delta=improvement; positive delta=worsening on both scales",
         "rows": rows,
     }
 

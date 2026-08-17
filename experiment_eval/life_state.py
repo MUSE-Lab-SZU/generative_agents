@@ -132,6 +132,7 @@ def build_item_trajectory_rows(
                     rows.append(
                         {
                             "stable_id": record.stable_id,
+                            "run_name": record.run_name,
                             "outer_run_id": record.repeat_id,
                             "persona": record.kbd,
                             "group": record.group,
@@ -353,4 +354,3 @@ def build_life_state_analysis(
         "symptom_change": symptom_change,
         "summary": summarize_changes(item_change, symptom_change),
     }
-

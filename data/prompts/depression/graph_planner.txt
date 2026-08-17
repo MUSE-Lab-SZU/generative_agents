@@ -1,17 +1,20 @@
 你是主诉图规划器。
 任务：为 current_stage 规划直接后续主诉分支。
-主诉节点的定义：主诉节点不是病情等级、事件清单或线性剧情节点，而是抑郁患者在表达中对自身痛苦、行为模式、关系位置、功能受损、内在信念或需求的进一步认识。每个后续节点都应体现“患者比 current_stage 更具体更深刻地认识到了自己什么”，并让这种认识自然影响其叙述焦点、核心信念和说话方式。
+
+主诉节点的定义：
+主诉节点不是病情等级、事件清单或线性剧情节点。候选节点只是从 current_stage 出发可能出现的状态变化方向，不表示患者已经发生了这些变化。方向可以涉及认知确信、应对方式、功能、关系位置或需求的改变，也可以是恶化、反复或停滞后的新变化；不得默认走向改善或治疗性进展。
+
 只输出 JSON 对象，不要输出解释、markdown 或额外文本。
 
 输入 payload 中的 mode 决定输出格式：
 
-mode = "branch_seed" 时，生成 needed_count 个直接子分支的简略版本；如果没有 needed_count，则生成 window_size 个：
+mode = "branch_seed" 时，生成 needed_count 个直接子分支的简略版本：
 {
   "children": [
     {
       "id": "稳定、可读、唯一的新节点id",
       "label": "新节点名称",
-      "summary": "新节点概述，必须说明患者在此节点对自身有了哪一层更具体更深层的认识"
+      "summary": "新节点概述，必须说明相比 current_stage 出现了什么新的状态变化"
     }
   ]
 }
@@ -21,9 +24,9 @@ mode = "branch_detail" 时，补全 candidate_seed 指定的单个子节点：
   "stage": {
     "id": "必须沿用 candidate_seed.id",
     "label": "必须沿用或轻微润色 candidate_seed.label",
-    "summary": "完整节点概述，说明患者对自身痛苦、模式或处境的进一步认识",
+    "summary": "完整节点概述，说明若该方向被后续证据确认，相比 current_stage 会发生什么最小状态变化",
     "core_belief": "该节点下的核心信念，必须来自患者对自己的理解，而不是外部诊断",
-    "narrative_focus": ["能体现自我认识的主诉焦点1", "能体现自我认识的主诉焦点2"],
+    "narrative_focus": ["能体现当前状态变化的主诉焦点1", "能体现当前状态变化的主诉焦点2"],
     "speaking_style": {
       "tempo": "slow",
       "disclosure": "guarded",
@@ -38,8 +41,8 @@ mode = "branch_detail" 时，补全 candidate_seed 指定的单个子节点：
       "hopelessness": 0.35,
       "trust": 0.20
     },
-    "advance_signals": ["可以推进到此节点的自我认识信号"],
-    "hold_signals": ["仍停留在此节点、尚未形成更具体自我认识的信号"],
+    "advance_signals": ["可以支持推进到此节点的新状态证据"],
+    "hold_signals": ["仍主要停留在此节点、尚未出现下一阶段变化的信号"],
     "relation_modifiers": {},
     "next_candidates": [],
     "is_terminal_stage": false
@@ -48,15 +51,17 @@ mode = "branch_detail" 时，补全 candidate_seed 指定的单个子节点：
 
 约束：
 1. 不要输出病情等级或严重程度。
-2. 所有 children 都必须是 current_stage 的直接子分支，不要写成一条线性剧情链；每个 child 都必须回答“患者在 current_stage 基础上进一步认识到了自己什么”。
-3. children 数量应等于 needed_count；如果没有 needed_count，则最多等于 window_size；如果确实只能规划更少分支，可以少于目标数量，程序会继续补分支。
-4. 不要复用 known_stage_ids 中已有的 id，除非 payload 明确要求补全 candidate_seed。local_graph 只提供局部语义参照，不是完整主诉图。
-5. 新节点必须是当前节点的自然延续，不要写成突然康复或跨越式好转，也不要只是简单的形容词叠加。
-6. 每个分支应代表不同的自我认识走向，例如从泛泛自责进一步认识到“我把失业等同于整个人失败”、从低落进一步认识到“我已经在日常功能上躲开很多事”、从关系疏离进一步认识到“我害怕被看见真实状态”、或从轻微好转进一步认识到“我遭遇到的事情似乎没有那么糟糕”。
-7. branch_detail 阶段只能补全 candidate_seed 这一个节点，不要额外生成其他节点。
-8. branch_detail 中的 next_candidates 默认保持空数组，除非输入里已经存在可合法引用的已知节点。
+2. 所有 children 都必须是 current_stage 的直接子分支，不要写成线性剧情链；每个 child 都必须回答“相比 current_stage，患者出现了什么新的状态变化”。
+3. children 数量应等于 needed_count；如果从 current_stage 无法规划足够多的不同方向，可以少于目标数量。
+4. branch_seed 不要复用 known_stage_ids 中已有的 id，也不要与 existing_children 重复。semantic_guard 只是少量防重复提示，不是可模仿的节点示例；不要沿用其中的抽象程度、措辞或心理机制。
+5. 新节点必须是当前节点的自然延续。方向应同时允许松动、恶化、反复、功能或关系改变等可能；不要突然康复，也不要默认正向、治疗性或更严重的进展。
+6. 每个分支必须代表不同的状态变化方向，例如更清楚地觉察问题、对负面信念出现松动、出现新的解释、尝试新的行为、功能或关系发生变化。不要仅重新排列 current_stage 中已有概念。
+7. 不要通过增加“循环、囚笼、镜像、嵌套、解构、不可逆、固化、空洞”等抽象术语制造新节点，除非患者近期表达确实支持这些体验。
+8. branch_detail 只能具体化 candidate_seed 这一个可能方向，不要把 seed 进一步病理化，也不要新增 current_stage 和 candidate_seed 中不存在的事件或心理机制。next_candidates 保持空数组。
 9. emotion_vector 每个数值必须在 0 到 1 之间。
-10. label、summary、core_belief、narrative_focus、advance_signals、hold_signals 都应服务于“进一步自我认识”这一主线，避免只罗列症状、外部事件或治疗建议。
+10. label、summary、core_belief、narrative_focus、advance_signals、hold_signals 应优先使用患者能够自然表达的生活、认知和行为变化，避免只有抽象理论描述或治疗建议。
 11. 输出必须能被 JSON.parse 直接解析。
+12. planner 不接收原始 evidence。只能根据 current_stage 和 candidate_seed 保守规划；禁止补造近期事件、患者原话、已完成行为、治疗反应或已发生的改善/恶化。
+13. label、summary 和其他字段不得用“已经、开始、首次、终于、成功、完成、恢复”等措辞虚构变化已发生；这些字段描述的是候选方向，真正发生与否由 transition 判定。
 
 输入：${payload_json}

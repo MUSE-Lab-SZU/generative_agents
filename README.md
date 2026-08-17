@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-08-06
+> 更新时间：2026-08-18
 
 ## 关键测试结果速查
 
@@ -28,6 +28,37 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-08-18：为 DeepSeek/OpenAI 兼容请求新增 prompt cache 命中/未命中 token 观测：按调用来源记录单次及进程累计用量，日志仅保留脱敏 endpoint 与模型元数据、不写入 prompt 内容；普通模型、会谈 judge/eval、量表评分、语义分析和专家工具均传递可追溯 caller。
+- 2026-08-18：重排对话生成、终止判定、会谈历史摘要及 legacy judge/session-eval 提示词，将稳定任务规则与输出格式置于运行态角色、记忆和对话内容之前；新增回归测试锁定 DeepSeek 的静态前缀顺序。
+- 2026-08-17：主诉图推进改为两阶段 LLM 判定：先在不提供候选节点的条件下提取患者已发生的变化，再仅以该变化匹配候选分支；无变化或无法精确匹配时保持当前节点。候选规划与补分支不再接收原始证据或暗示变化已发生，患者动态发言 prompt 亦移除未来候选分支，避免预设路径泄漏和候选反向诱导。
+- 2026-08-17：重写动态抑郁主诉图的规划与推进口径：候选分支和推进均须由患者自身的新状态、认知松动、行为尝试、功能/关系变化或有证据的恶化支持，不再因表述更抽象、复杂或病理化而自动推进；反思判定更保守，并以近期对话和行为事件构造受限证据上下文。
+- 2026-08-17：主诉图 planner/transition 调用现写入可对齐的动态 LLM trace；新增脚本可从 checkpoint 和对话记录导出患者动态 prompt、会谈中的最终节点变化及其前置规划器调用，以及对话/复评主诉图分析，便于审计实际 prompt、LLM 输出和状态迁移。
+- 2026-08-17：归档 repeat scale eval 支持更细粒度的 interrupted-job 恢复，并可在成功后清理逐题 trace、job 与阶段快照副本以节省空间。`run_batch_then_repeat_eval.sh` 默认仿真目标改为 72 步、评估至 `session_12`，follow-up 起点改为 `session_12`；可用 `--keep-raw-artifacts` 保留复评底稿，G10/G11/G12 自动使用 legacy controller。
+- 2026-08-17：完善自然负向居民聊天提示词：仅在患者明确表达痛苦或寻求理解时呈现低回应、失配和撤回投入，普通生活聊天保持自然，且禁止将负向互动伪装为有效建议、鼓励或危机干预。
+- 2026-08-13：新增 G10/G11/G12 自然居民聊天效价组。三组沿用 G2 的无强制会谈与 step 定期量表配置，不启用随机居民聊天调度；每次实际对话生成居民发言时，仅当对方为“卡布达”才分别注入中性、负向、积极专有前缀，卡布达侧及无卡布达参与的对话不注入。
+- 2026-08-12：`experiment_eval` 确立面向汇报的精简出图政策，主 CLI 默认改为 `--report-mode core`，不再默认展开 `by-repeat` 或历史全图集；manifest/README 需列出 canonical 图及因重复、样本量/设计或字段缺失而未生成的图，完整规则见 `experiment_eval/README.md`。
+- 2026-08-12：新增 `python -m experiment_eval.scale_credibility` 量表可信度图集：输出 ICC(A,1)/ICC(A,K)、SEM/MDC95 与 repeat SD、逐条目 quadratic Weighted Kappa 热图，以及 PHQ-9/BDI-II 同期收敛效度和统一基线/终点变化一致性；支持按实验条件或人设分层，并写出可追溯 CSV。
+- 2026-08-12：论文长表分析新增 `--paper-figure symptom-composite`，在显式两组、两量表及共同人设/时间点条件下生成总分轨迹和逐 outer run 条目前后变化热图；过程 engagement 图同步改为正式 CBT 会谈 turn 剂量与相对 T0 量表变化，排除偶发医患对话。
+- 2026-08-12：补充按需重绘脚本与回归测试，用于批次/量表可信度/症状复合图的精选重绘；归档复评和批量实验恢复改为容忍被磁盘写满截断的 JSON，并以原子方式写入状态文件。
+- 2026-08-11：新增 `python -m experiment_eval.pooled_followup_analysis`，针对归档接口导出的 outcome 长表生成 0802/0808 批次一致性、合并分布与分面箱线图诊断，并对 0802 的无干预 follow-up 输出轨迹、维持/反弹、个体变化和实际间隔图；随访仅按 parent lineage 回接根 outer run，不增加独立样本量。
+- 2026-08-11：主评估、跨人设、解释性分析和 `archive_data` 新增可重复的 `--repeat-alias PATH_MATCH=REPEAT_ID`，支持按报告路径重映射 outer repeat；归档报告解析兼容旧 follow-up 命名和已迁移路径，`prune_archive` 同步保留被 repeat summary 引用的原始报告，默认额外保留合并咨询对话及一份完整 dynamic LLM trace。
+- 2026-08-11：跨人设/分层解释报告与热图改为根据实际 outer run、repeat 和设计覆盖动态写入样本量，并可通过 `--subset` 单独续跑分层子分析；评分 worker 现可解析含说明文字的 fenced JSON 回复，Docker 依赖安装切换至南京大学 PyTorch 镜像。
+- 2026-08-11：新增 `python -m experiment_eval.archive_data`，可从可迁移的 `results` 存档导出以根 outer run 为统计单位的 run catalog、量表/条目长表、基线特征、过程事件、条件覆盖与可用性审计；回访分支仅通过 provenance 关联到原始 run，主入口的自动报告发现默认排除回访 repeat summary，避免将其误计为独立样本。
+- 2026-08-11：重构 `experiment_eval.prune_archive` 的分析型归档策略：保留报告、仿真 checkpoint、配置/回访 provenance、对话事件、咨询与 prompt trace、staged 量表元数据和可视化产物，并识别已链接回访与仅报告 run；大型量表 trace、内嵌 snapshot/work 副本默认不保留，可通过 `--include-raw-scale-traces` 显式纳入。
+- 2026-08-11：过程 engagement 提取现在从归档的 condition manifest 识别目标患者与医生，输出目标参与、双方 turn/字符数、会谈规则/来源和发起者等可审计字段；分面箱线图与 persona profile 同步修正输入别名及 study/setting 语义，避免把严重程度误作研究设置。
+- 2026-08-11：`run_resume_batch_then_repeat_eval.sh --refresh-model-routing` 现会在 strict partial resume 的无干预回访启动前刷新已有回访 checkpoint 的模型路由，便于中断后切换端点继续运行。
+- 2026-08-10：整理 `experiment_eval` 绘图目录：图实现按 outcomes/persona/symptoms 等图族归入 `charts/<family>/<chart_id>/`，数据、统计与工作流分别归入 `data/`、`analysis/`、`workflows/`；删除无仓库内调用的根目录 re-export 和旧 `faceted_boxplots` CLI，统一从 `python -m experiment_eval` 或正式模块路径调用。
+- 2026-08-10：扩展 `experiment_eval` 的论文图表流水线：统一入口新增 Change+CI（含 complete-case/QC/复现敏感性与可选 ANCOVA）和 interaction engagement/process 图，并将提取、统计、绘图与数据可用性审计分层输出；新增 CSV 统计产物可追溯显著性校正、覆盖窗口及缺失/解析诊断。
+- 2026-08-10：新增规范条目长表驱动的逐症状轨迹、混合模型/FDR effect forest、EBIC graphical-lasso symptom network 与 persona/SHAP 图表族，并加入独立 outer run 推断、样本量与可行性闸门；同时提供 persona Z-score 治疗反应 profile 和 `experiment_eval.charts.faceted_boxplot_*` 分面箱线图，均支持规范数据或已严格校验的 repeat summary。
+- 2026-08-10：重构 `experiment_eval` 的主评估入口与绘图编排：新增 `python -m experiment_eval` 模块入口、集中 CLI 默认值和可复用 batch pipeline，并将核心/展示/附录、轨迹、结局、可靠性、过程及跨人设图拆分为独立模块和 registry 调度；评估 README 同步补充输入输出、统计单位与图表职责说明。
+- 2026-08-10：恢复批处理新增可选 `--refresh-model-routing`（可用 `--routing-config` 指定来源），仅将 LLM/BGE 的 `base_url` 与负载均衡配置同步到最新恢复快照，并在 `results/recovery_backups/` 留存备份；默认端点池与智算平台 vLLM 服务相应调整为 2 个 Qwen、2 个 BGE 实例（3 卡），同时下调默认显存占用。
+- 2026-08-09：无干预回访支持 strict partial resume：`run_post_sim_followup.py` 会校验同一请求、连续且完整的 `followup_step_*` bundle 与对应 root snapshot，从最后一个有效节点恢复运行；中断后的 root snapshot、storage 与 conversation 会先备份至 `results/checkpoints/_partial_followup_resume_backups/`。`run_resume_batch_then_repeat_eval.sh --followup` 默认启用，可用 `--no-followup-resume-partial` 关闭；回访后复评继续通过独立报告和 `--resume-partial` 补齐。
+- 2026-08-08：调整 `runshells/run_batch_then_repeat_eval.sh --followup` 流程：无干预回访与原仿真 repeat eval 并行执行，回访完成后再以独立名称、报告和日志运行回访节点复评；dry-run 输出同步展示并行关系，避免两阶段产物互相覆盖。
+- 2026-08-08：增强 `runshells/run_resume_batch_then_repeat_eval.sh` 的恢复能力：原仿真和回访复评均使用独立源 summary 与标签，已完整报告自动跳过，未完成报告通过 `--resume-partial` 续跑；脚本会等待并校验回访 summary，复评失败时终止关联回访任务并保留对应错误日志。
+- 2026-08-08：为 OpenAI 兼容的对话与 embedding 模型新增进程内 round-robin 端点池。`load_balancing.ports` 复用既有 `base_url` 的协议、主机和 API 路径，仅轮换端口；对话请求会选择独立 OpenAI client，LlamaIndex embedding 同步/异步请求亦通过独立 client 池轮换，避免并发请求改写彼此端点。默认配置现启用 3 个 Qwen 与 3 个 BGE 端口。
+- 2026-08-08：新增 `runshells/vllm_services_plat.sh`，支持远程智算平台按 GPU/端口列表启动、停止和查看多实例 vLLM 服务；可在 3 张卡各运行一个 Qwen，并在第 4 张卡上运行 3 个 BGE 副本且自动降低同卡显存占用。`docs/RUNBOOK.md` 补充对应启动命令与六端点预检流程。
+- 2026-08-08：新增默认启用、可配置的 `simulation_events.jsonl` 仿真可观测日志（schema `simulation_events_v1`）：每步记录各 Agent 的位置、活动/行动、会谈标识和规划路径长度，并在对话完成后记录双方、物理地点、时间及强制会谈元数据。记录采用只追加、best-effort 写入，故障仅告警而不参与 LLM 调用或仿真控制；事件日志会随单次实验收集，并由 `experiment_eval.prune_archive` 保留在评估归档中。
+- 2026-08-08：收紧 Progressive D 会后小目标完成审计的默认达标比例，由 60% 提升至 80%；同时将对应评估 Prompt 的角色名称泛化为“会后小目标评估器”。
 - 2026-08-06：扩展量表可靠性评估：`experiment_eval` 在既有总分 ICC 之外新增 PHQ-9/BDI-II 0–3 有序条目的 repeat-pair Weighted Cohen’s Kappa（quadratic 为主、linear 为敏感性分析），严格以 `snapshot_id × scale × item` 配对；输出可追溯条目长表、总体/分层/逐条目 CSV、统计说明和 Kappa 热图/forest 图，并在加载阶段校验各 repeat 的条目数一致。
 - 2026-08-06：新增解释性分析与 checkpoint 专家访谈工具：独立的 life-state、主诉评估节点与分层报告按条目将两量表归并为九类生活状态，只在精确评估节点读取 judge trace 的主诉阶段，并报告其与量表结局的对齐及重复测量一致性。`python customization/expert_checkpoint_chat/app.py` 提供专家治疗师访谈页面，只读加载存档 checkpoint，优先校验并复制严格快照，必要时按 node/time 上界作明确标记的回退；会话 JSONL 与沙箱存储分离至本地运行目录，`Game/create_game` 现可显式指定 `storage_root`。
 - 2026-08-05：增强实验归档与过程评估：`python -m experiment_eval.prune_archive` 新增非破坏 `backup` 模式，源存档不变而将评估所需内容复制至新目录；`--completed-only` 可只保留已有 complete repeat summary 的画图输入，`--include-run-prefix` 可进一步筛选如 `followup-` 回访 run，并拒绝拆分混合报告或覆盖/嵌套目标。已有 complete summary 会覆盖同 run 的旧 incomplete 记录。过程指标现区分“有 checkpoint”与“有 judge trace”，图表在跨人设时标出 KBD 并按人设聚合，避免同组不同人设混淆。
@@ -305,7 +336,7 @@ data/config.json
 | `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
 | `replay.py`   | 回放 Web 服务入口（Flask）                                        |
 | `runshells/`  | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
-| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9）                  |
+| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9/g10/g11/g12）      |
 | `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
 | `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
 | `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |

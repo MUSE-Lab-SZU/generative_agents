@@ -73,8 +73,9 @@ class DynamicPromptBuilder:
 
     def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        current_window = graph_snapshot.get("current_graph_window", [])
-        current_window = current_window if isinstance(current_window, list) else []
+        # graph_snapshot 仍保留在调用接口中供其他内部模块使用，但患者发言
+        # prompt 只读取 current_stage，不能看到候选分支或 next_candidates。
+        del graph_snapshot
 
         # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
@@ -123,45 +124,6 @@ class DynamicPromptBuilder:
                 )
             )
 
-        graph_window_section = ""
-        if self.include_graph_window and current_window:
-            graph_window_items = []
-            for idx, stage in enumerate(current_window):
-                if not isinstance(stage, dict):
-                    continue
-                # idx=0 永远是当前节点；后面的节点是并列候选分支。
-                marker = "当前" if idx == 0 else f"分支{idx}"
-                graph_window_items.append(
-                    self._render_block(
-                        "dynamic_stage_graph_window_item",
-                        {
-                            "marker": marker,
-                            "label": str(stage.get("label", "未知节点") or "未知节点"),
-                            "summary": str(stage.get("summary", "") or "").strip(),
-                        },
-                    )
-                )
-            next_limit_section = ""
-            if len(current_window) > 1:
-                candidate_labels = [
-                    str(stage.get("label", "") or "").strip()
-                    for stage in current_window[1:]
-                    if isinstance(stage, dict) and str(stage.get("label", "") or "").strip()
-                ]
-                if candidate_labels:
-                    next_limit_section = self._render_block(
-                        "dynamic_stage_next_limit_section",
-                        {"candidate_labels": "、".join(candidate_labels[:6])},
-                    )
-            graph_window_section = render_prompt_section(
-                "depression/dynamic_prompt_layers",
-                "stage_graph_window_section",
-                {
-                    "graph_window_items": "".join(graph_window_items),
-                    "next_limit_section": next_limit_section,
-                },
-            )
-
         return self._with_trailing_newline(
             render_prompt_section(
                 "depression/dynamic_prompt_layers",
@@ -169,7 +131,7 @@ class DynamicPromptBuilder:
                 {
                     "label": label,
                     "optional_sections": "".join(optional_sections),
-                    "graph_window_section": graph_window_section,
+                    "graph_window_section": "",
                 },
             ).strip()
         )

@@ -17,6 +17,7 @@ from .schema import (
     group_sort_key,
     label_sort_key,
     normalize_group,
+    normalize_repeat_id,
     scale_sort_key,
     severity_sort_key,
     stable_component,
@@ -44,23 +45,158 @@ def display_path(path: Path, project_root: Path | None = None) -> str:
     return str(path)
 
 
-def find_report_files(reports_dir: Path, recursive: bool) -> list[Path]:
+def _local_source_summary(
+    path: Path, payload: dict[str, Any]
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Resolve an archived ``source_original_summary`` by basename.
+
+    Historical summaries commonly retain absolute paths from the remote
+    machine.  Relocating an archive changes the prefix, but not the report
+    basename.  A basename is accepted only when it resolves uniquely beside
+    the repeat summary and the referenced artifact declares its kind.
+    """
+    source = str(payload.get("source_original_summary") or "").strip()
+    if not source:
+        return None, None
+    basename = Path(source).name
+    matches = [
+        candidate
+        for candidate in path.parent.glob(f"**/{basename}")
+        if candidate.is_file()
+    ]
+    if len(matches) != 1:
+        return None, None
+    try:
+        source_payload = read_json(matches[0])
+    except (OSError, json.JSONDecodeError, ValueError):
+        return matches[0], None
+    return matches[0], source_payload
+
+
+def resolve_followup_source_summary(
+    path: Path, payload: dict[str, Any]
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Resolve a follow-up source even when its transient absolute path expired.
+
+    Older ``followup_repeat_watch`` summaries reference an intermediate
+    ``sources/*_source.json`` file that was not always archived.  The canonical
+    ``post_sim_followup_summary`` is still present and can be matched without
+    ambiguity by the branch ``run_name`` recorded in both artifacts.
+    """
+
+    source_path, source_payload = _local_source_summary(path, payload)
+    if source_payload and source_payload.get("artifact_kind") == "post_sim_followup_summary":
+        return source_path, source_payload
+    branch_names = {
+        str(condition.get("run_name"))
+        for condition in (payload.get("conditions") or [])
+        if isinstance(condition, dict) and condition.get("run_name")
+    }
+    if not branch_names:
+        return None, None
+    if not all(run_name.startswith("followup-") for run_name in branch_names):
+        return None, None
+    if path.name.startswith("repeat-") and path.name.endswith(
+        "-followup_summary.json"
+    ):
+        canonical_name = (
+            "followup-"
+            + path.name[len("repeat-") : -len("-followup_summary.json")]
+            + "_summary.json"
+        )
+        canonical = path.parent / canonical_name
+        if canonical.is_file():
+            try:
+                canonical_payload = read_json(canonical)
+            except (OSError, json.JSONDecodeError, ValueError):
+                canonical_payload = {}
+            canonical_names = {
+                str(condition.get("run_name"))
+                for condition in (canonical_payload.get("conditions") or [])
+                if isinstance(condition, dict) and condition.get("run_name")
+            }
+            if (
+                canonical_payload.get("artifact_kind")
+                == "post_sim_followup_summary"
+                and branch_names & canonical_names
+            ):
+                return canonical, canonical_payload
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for candidate in path.parent.glob("**/*_summary.json"):
+        if candidate == path or not candidate.is_file():
+            continue
+        try:
+            candidate_payload = read_json(candidate)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if candidate_payload.get("artifact_kind") != "post_sim_followup_summary":
+            continue
+        candidate_names = {
+            str(condition.get("run_name"))
+            for condition in (candidate_payload.get("conditions") or [])
+            if isinstance(condition, dict) and condition.get("run_name")
+        }
+        if branch_names & candidate_names:
+            matches.append((candidate, candidate_payload))
+    return matches[0] if len(matches) == 1 else (None, None)
+
+
+def is_followup_repeat_summary(
+    path: Path, payload: dict[str, Any] | None = None
+) -> bool:
+    """Return true only for a repeat summary with explicit follow-up provenance."""
+    payload = payload or read_json(path)
+    condition_runs = [
+        str(condition.get("run_name") or "")
+        for condition in (payload.get("conditions") or [])
+        if isinstance(condition, dict)
+    ]
+    if (
+        path.name.startswith("repeat-")
+        and path.name.endswith("-followup_summary.json")
+        and condition_runs
+        and all(run_name.startswith("followup-") for run_name in condition_runs)
+    ):
+        return True
+    _, source_payload = resolve_followup_source_summary(path, payload)
+    return bool(
+        source_payload
+        and source_payload.get("artifact_kind") == "post_sim_followup_summary"
+    )
+
+
+def find_report_files(
+    reports_dir: Path, recursive: bool, *, include_followup: bool = False
+) -> list[Path]:
     pattern = "**/*_summary.json" if recursive else "*_summary.json"
-    candidates = sorted(path for path in reports_dir.glob(pattern) if path.is_file() and "repeat-" in path.name)
+    candidates = sorted(
+        path
+        for path in reports_dir.glob(pattern)
+        if path.is_file() and "repeat-" in path.name
+    )
     by_batch: dict[str, list[Path]] = {}
     unreadable: list[str] = []
     for path in candidates:
         try:
-            batch_name = str(read_json(path).get("batch_name") or path.stem.removesuffix("_summary"))
+            payload = read_json(path)
+            if not include_followup and is_followup_repeat_summary(path, payload):
+                continue
+            batch_name = str(
+                payload.get("batch_name") or path.stem.removesuffix("_summary")
+            )
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             unreadable.append(f"{path}: {exc}")
             continue
         by_batch.setdefault(batch_name, []).append(path)
     conflicts = {name: paths for name, paths in by_batch.items() if len(paths) > 1}
     if conflicts:
-        details = "; ".join(f"{name}: {', '.join(str(path) for path in paths)}" for name, paths in conflicts.items())
+        details = "; ".join(
+            f"{name}: {', '.join(str(path) for path in paths)}"
+            for name, paths in conflicts.items()
+        )
         raise ValueError(
-            "Duplicate batch_name values found across report files; use explicit --report-file selection. " + details
+            "Duplicate batch_name values found across report files; use explicit --report-file selection. "
+            + details
         )
     if unreadable:
         raise ValueError("Unreadable repeat summary files: " + "; ".join(unreadable))
@@ -297,6 +433,7 @@ def load_records(
     paths: list[Path],
     group_aliases: list[tuple[str, str]] | None = None,
     *,
+    repeat_aliases: list[tuple[str, str]] | None = None,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> tuple[list[ExperimentRecord], list[str], list[str]]:
     records: list[ExperimentRecord] = []
@@ -314,7 +451,16 @@ def load_records(
                 "select one explicitly"
             )
         seen_batch_paths[batch_name] = path
-        repeat_id = parse_repeat_id(path, batch_name)
+        repeat_matches = [
+            label for path_match, label in (repeat_aliases or []) if path_match in str(path)
+        ]
+        if len(repeat_matches) > 1:
+            raise ValueError(f"Multiple repeat aliases match report: {path}")
+        repeat_id = (
+            normalize_repeat_id(repeat_matches[0])
+            if repeat_matches
+            else parse_repeat_id(path, batch_name)
+        )
         matches = [label for path_match, label in (group_aliases or []) if path_match in str(path)]
         if len(matches) > 1:
             raise ValueError(f"Multiple group aliases match report: {path}")

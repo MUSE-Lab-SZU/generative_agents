@@ -127,6 +127,9 @@ DRY_RUN = False
 # 是否只基于已有重复结果重新生成报告
 REPORT_ONLY = False
 
+# 是否在完整报告写入后清理复评工作底稿。底层入口默认关闭，由批处理包装脚本显式开启。
+CLEANUP_COMPLETED_ARTIFACTS = False
+
 # 是否把目标患者动态抑郁状态重置为初始 depression_config 状态后复评
 RESET_TARGET_DEPRESSION_STATE = False
 
@@ -157,6 +160,7 @@ class RuntimeConfig:
     reset_target_depression_state: bool
     allow_legacy_final_storage: bool
     output_group: str
+    cleanup_completed_artifacts: bool = False
     require_controller_manifest: bool = False
 
 
@@ -191,6 +195,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=DRY_RUN, help="只打印计划，不实际执行")
     parser.add_argument("--report-only", action=argparse.BooleanOptionalAction, default=REPORT_ONLY, help="只基于已有重复结果重新生成报告")
+    parser.add_argument(
+        "--cleanup-completed-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=CLEANUP_COMPLETED_ARTIFACTS,
+        help="完整报告写入并校验后，清理复评 job/trace 和 experiment_data 中重复的阶段快照",
+    )
     parser.add_argument("--reset-target-depression-state", action=argparse.BooleanOptionalAction, default=RESET_TARGET_DEPRESSION_STATE, help="把目标患者动态抑郁状态重置为初始 depression_config 状态后复评")
     parser.add_argument(
         "--allow-legacy-final-storage",
@@ -379,6 +389,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         reset_target_depression_state=bool(args.reset_target_depression_state),
         allow_legacy_final_storage=bool(args.allow_legacy_final_storage),
         output_group=str(args.output_group or "").strip().lower(),
+        cleanup_completed_artifacts=bool(args.cleanup_completed_artifacts),
         require_controller_manifest=bool(args.require_controller_manifest),
     )
 
@@ -462,6 +473,7 @@ def print_effective_config(cfg: RuntimeConfig, original_summary: dict[str, Any])
     print(f"  resume-partial:  {cfg.resume_partial}")
     print(f"  dry-run:         {cfg.dry_run}")
     print(f"  report-only:     {cfg.report_only}")
+    print(f"  cleanup complete:{cfg.cleanup_completed_artifacts}")
     print(f"  aggregation:     {AGGREGATION_METHOD_VERSION}")
     print(f"  reset depression:{cfg.reset_target_depression_state}")
     print(f"  legacy storage:  {cfg.allow_legacy_final_storage}")
@@ -643,7 +655,10 @@ def load_optional_json(path: Path) -> dict[str, Any] | None:
         return None
     try:
         payload = load_json_file(path)
-    except json.JSONDecodeError:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # Disk exhaustion can truncate a JSON artifact in the middle of a
+        # multibyte character.  In resume mode it must be regenerated, not
+        # allowed to abort task inspection or final report generation.
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -715,6 +730,28 @@ def answer_file_complete(output_dir: Path, job: dict[str, Any], scale_name: str)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return False
     return sorted(observed_ids) == expected_ids
+
+
+def completed_answer_spec(
+    output_dir: Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Load the large worker job, or its compact post-completion protocol."""
+
+    job = load_optional_json(output_dir / "job.json")
+    if job:
+        return job
+    if metadata is None:
+        metadata = load_optional_json(output_dir / "metadata.json")
+    if not isinstance(metadata, dict):
+        return None
+    protocol = metadata.get("evaluation_protocol")
+    if not isinstance(protocol, dict):
+        return None
+    question_files = protocol.get("scale_question_files")
+    if not isinstance(question_files, dict) or not question_files:
+        return None
+    return protocol
 
 
 def score_result_complete(
@@ -1007,6 +1044,7 @@ def evaluation_protocol_metadata(cfg: RuntimeConfig, job: dict[str, Any]) -> dic
     target_think_config = target_config.get("think", {}) if isinstance(target_config.get("think"), dict) else {}
     intervention = runtime_config.get("intervention", {}) if isinstance(runtime_config.get("intervention"), dict) else {}
     scale_question_files = job.get("scale_question_files", {}) if isinstance(job.get("scale_question_files"), dict) else {}
+    scale_item_ids = job.get("scale_item_ids", {}) if isinstance(job.get("scale_item_ids"), dict) else {}
     return {
         "method_version": AGGREGATION_METHOD_VERSION,
         "expected_repeats": cfg.repeat,
@@ -1015,6 +1053,11 @@ def evaluation_protocol_metadata(cfg: RuntimeConfig, job: dict[str, Any]) -> dic
         "scale_question_files": {
             scale_name: str(scale_question_files.get(scale_name, SCALES[scale_name]["question_file"]))
             for scale_name in SCALES
+        },
+        "scale_item_ids": {
+            scale_name: list(scale_item_ids[scale_name])
+            for scale_name in SCALES
+            if isinstance(scale_item_ids.get(scale_name), list)
         },
         "scale_scoring_prompts": {
             scale_name: SCALES[scale_name]["scoring_prompt"]
@@ -1329,11 +1372,11 @@ def task_complete(cfg: RuntimeConfig, task: RepeatTask) -> bool:
         or not isinstance(metadata.get("evaluation_protocol"), dict)
     ):
         return False
-    job = load_optional_json(output_dir / "job.json")
-    if not job:
+    answer_spec = completed_answer_spec(output_dir, metadata)
+    if not answer_spec:
         return False
     return all(
-        answer_file_complete(output_dir, job, scale_name)
+        answer_file_complete(output_dir, answer_spec, scale_name)
         and score_result_complete(output_dir / f"{scale_name}_scored.json", scale_name)
         for scale_name in SCALES
     )
@@ -1694,9 +1737,14 @@ def load_repeat_rows(cfg: RuntimeConfig, condition_name: str, label: str, scale_
         scored_path = output_dir / f"{scale_name}_scored.json"
         answers_path = output_dir / f"{scale_name}_answered.jsonl"
         scored = load_optional_json(scored_path)
-        job = load_optional_json(output_dir / "job.json")
+        metadata = load_optional_json(output_dir / "metadata.json")
+        answer_spec = completed_answer_spec(output_dir, metadata)
         item_records = extract_scored_item_records(scored, scale_name)
-        answers_complete = bool(job) and answer_file_complete(output_dir, job, scale_name)
+        answers_complete = bool(answer_spec) and answer_file_complete(
+            output_dir,
+            answer_spec,
+            scale_name,
+        )
         try:
             answer_rows = load_jsonl(answers_path) if answers_complete else []
         except (OSError, json.JSONDecodeError):
@@ -2669,6 +2717,277 @@ def require_complete_report(cfg: RuntimeConfig, payload: dict[str, Any], md_path
     )
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _validate_cleanup_scope(path: Path, allowed_root: Path) -> None:
+    allowed_resolved = allowed_root.resolve()
+    target_resolved = path.resolve(strict=False)
+    if not _is_within(target_resolved, allowed_resolved):
+        raise ValueError(f"cleanup target escapes allowed root: {path}")
+
+
+def _validate_cleanup_target(path: Path, allowed_root: Path) -> None:
+    """Reject path escapes, including symlinks that resolve outside the scope."""
+
+    _validate_cleanup_scope(path, allowed_root)
+    allowed_resolved = allowed_root.resolve()
+    if not path.is_dir() or path.is_symlink():
+        return
+    for current_root, dirnames, filenames in os.walk(path, followlinks=False):
+        current = Path(current_root)
+        for name in [*dirnames, *filenames]:
+            nested = current / name
+            if not nested.is_symlink():
+                continue
+            nested_resolved = nested.resolve(strict=False)
+            if not _is_within(nested_resolved, allowed_resolved):
+                raise ValueError(f"cleanup tree contains escaping symlink: {nested}")
+
+
+def _cleanup_target_stats(path: Path) -> tuple[int, int]:
+    if path.is_symlink() or path.is_file():
+        try:
+            return 1, int(path.lstat().st_size)
+        except FileNotFoundError:
+            return 0, 0
+    if not path.is_dir():
+        return 0, 0
+    file_count = 0
+    total_bytes = 0
+    for current_root, dirnames, filenames in os.walk(path, followlinks=False):
+        current = Path(current_root)
+        for name in [*dirnames, *filenames]:
+            child = current / name
+            if child.is_dir() and not child.is_symlink():
+                continue
+            try:
+                total_bytes += int(child.lstat().st_size)
+                file_count += 1
+            except FileNotFoundError:
+                continue
+    return file_count, total_bytes
+
+
+def _remove_cleanup_target(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        # A concurrent cleanup for the same source run may have removed it.
+        return
+
+
+def _add_cleanup_candidate(
+    candidates: dict[str, tuple[Path, Path, str]],
+    path: Path,
+    allowed_root: Path,
+    category: str,
+) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    candidates.setdefault(str(path.absolute()), (path, allowed_root, category))
+
+
+def _build_cleanup_candidates(
+    cfg: RuntimeConfig,
+    original_summary: dict[str, Any],
+) -> tuple[list[tuple[Path, Path, str]], list[str]]:
+    candidates: dict[str, tuple[Path, Path, str]] = {}
+    warnings: list[str] = []
+    output_root = repeat_root(cfg)
+
+    for condition in selected_conditions(cfg, original_summary):
+        condition_name = str(condition.get("condition_name", "") or "")
+        for repeat_idx in range(1, cfg.repeat + 1):
+            for label in cfg.labels:
+                label_dir = repeat_label_dir(
+                    cfg,
+                    condition_name,
+                    repeat_idx,
+                    label,
+                )
+                for name in ("job.json", "resume_job.json"):
+                    _add_cleanup_candidate(
+                        candidates,
+                        label_dir / name,
+                        output_root,
+                        "repeat_job",
+                    )
+                for pattern in ("*_trace.json", "*_trace.jsonl"):
+                    for trace_path in label_dir.glob(pattern):
+                        _add_cleanup_candidate(
+                            candidates,
+                            trace_path,
+                            output_root,
+                            "repeat_scale_trace",
+                        )
+                _add_cleanup_candidate(
+                    candidates,
+                    label_dir / "_tmp",
+                    output_root,
+                    "repeat_tmp",
+                )
+
+        run_name = str(condition.get("run_name", "") or "").strip()
+        if not run_name:
+            continue
+        staged_root = experiment_data_root(cfg) / run_name / "scales" / "staged"
+        if not staged_root.exists() and not staged_root.is_symlink():
+            continue
+        try:
+            _validate_cleanup_target(staged_root, experiment_data_root(cfg))
+            for name in ("job.json", "resume_job.json"):
+                for job_path in staged_root.rglob(name):
+                    _add_cleanup_candidate(
+                        candidates,
+                        job_path,
+                        experiment_data_root(cfg),
+                        "experiment_staged_job",
+                    )
+            for directory_name in ("snapshot_storage", "_tmp"):
+                for directory in staged_root.rglob(directory_name):
+                    _add_cleanup_candidate(
+                        candidates,
+                        directory,
+                        experiment_data_root(cfg),
+                        "experiment_staged_snapshot"
+                        if directory_name == "snapshot_storage"
+                        else "experiment_staged_tmp",
+                    )
+        except (OSError, ValueError) as exc:
+            warnings.append(f"{staged_root}: {exc}")
+
+    for suffix in ("json", "md"):
+        _add_cleanup_candidate(
+            candidates,
+            reports_dir(cfg) / f"{cfg.name}_incomplete.{suffix}",
+            reports_dir(cfg),
+            "superseded_incomplete_report",
+        )
+
+    return (
+        sorted(candidates.values(), key=lambda item: len(item[0].parts)),
+        warnings,
+    )
+
+
+def cleanup_completed_artifacts(
+    cfg: RuntimeConfig,
+    original_summary: dict[str, Any],
+    payload: dict[str, Any],
+    json_path: Path,
+    md_path: Path,
+) -> dict[str, Any] | None:
+    if not cfg.cleanup_completed_artifacts or cfg.dry_run:
+        return None
+    completion = payload.get("completion", {})
+    persisted_report = load_optional_json(json_path)
+    persisted_completion = (
+        persisted_report.get("completion", {})
+        if isinstance(persisted_report, dict)
+        else {}
+    )
+    if (
+        not isinstance(completion, dict)
+        or completion.get("ready_for_final_report") is not True
+        or not isinstance(persisted_report, dict)
+        or not isinstance(persisted_completion, dict)
+        or persisted_completion.get("ready_for_final_report") is not True
+        or not md_path.is_file()
+    ):
+        print("[WARN] 正式完整报告未通过落盘校验，跳过复评底稿清理。")
+        return None
+
+    repeat_base = experiment_data_root(cfg) / REPEAT_OUTPUT_SUBDIR
+    try:
+        _validate_cleanup_scope(repeat_root(cfg), repeat_base)
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] 复评输出目录未通过边界校验，跳过清理：{exc}")
+        return None
+
+    candidates, warnings = _build_cleanup_candidates(cfg, original_summary)
+    removed_target_count = 0
+    removed_file_count = 0
+    removed_bytes = 0
+    by_category: dict[str, dict[str, int]] = {}
+    for path, allowed_root, category in candidates:
+        if not path.exists() and not path.is_symlink():
+            continue
+        try:
+            _validate_cleanup_target(path, allowed_root)
+            file_count, byte_count = _cleanup_target_stats(path)
+            _remove_cleanup_target(path)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"{path}: {exc}")
+            continue
+        if file_count == 0 and byte_count == 0:
+            continue
+        removed_target_count += 1
+        removed_file_count += file_count
+        removed_bytes += byte_count
+        category_stats = by_category.setdefault(
+            category,
+            {"removed_targets": 0, "removed_files": 0, "removed_bytes": 0},
+        )
+        category_stats["removed_targets"] += 1
+        category_stats["removed_files"] += file_count
+        category_stats["removed_bytes"] += byte_count
+
+    manifest_path = repeat_root(cfg) / "artifact_cleanup_manifest.json"
+    previous = load_optional_json(manifest_path) or {}
+    manifest = {
+        "schema_version": 1,
+        "artifact_kind": "completed_repeat_eval_cleanup",
+        "policy": "repeat_workfiles_only",
+        "status": "partial" if warnings else "complete",
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "summary_path": str(json_path),
+        "summary_sha256": file_sha256(json_path),
+        "checkpoint_cleanup": False,
+        "removed_target_count": int(previous.get("removed_target_count", 0) or 0)
+        + removed_target_count,
+        "removed_file_count": int(previous.get("removed_file_count", 0) or 0)
+        + removed_file_count,
+        "removed_bytes": int(previous.get("removed_bytes", 0) or 0) + removed_bytes,
+        "last_run": {
+            "removed_target_count": removed_target_count,
+            "removed_file_count": removed_file_count,
+            "removed_bytes": removed_bytes,
+            "by_category": by_category,
+        },
+        "retained_classes": [
+            "answered",
+            "scored",
+            "metadata",
+            "worker_result",
+            "controller_manifest",
+            "formal_reports",
+            "all_checkpoints",
+        ],
+        "warnings": warnings,
+    }
+    write_json_file(manifest_path, manifest)
+    if warnings:
+        print(
+            f"[WARN] 复评底稿清理部分完成：释放约 {removed_bytes / (1024 ** 2):.2f} MiB，"
+            f"{len(warnings)} 项未清理；详见 {manifest_path}"
+        )
+    else:
+        print(
+            f"[CLEANUP] 复评底稿清理完成：删除 {removed_file_count} 个文件，"
+            f"释放约 {removed_bytes / (1024 ** 2):.2f} MiB；manifest={manifest_path}"
+        )
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     cfg = resolve_runtime_config(args)
@@ -2695,8 +3014,20 @@ def main() -> None:
         print("[INFO] report-only: 跳过 worker 调用，只汇总已有重复结果")
 
     payload = build_summary_payload(cfg, original_summary, warnings)
-    _json_path, md_path = write_report_outputs(cfg, payload)
+    json_path, md_path = write_report_outputs(cfg, payload)
     require_complete_report(cfg, payload, md_path)
+    try:
+        cleanup_completed_artifacts(
+            cfg,
+            original_summary,
+            payload,
+            json_path,
+            md_path,
+        )
+    except Exception as exc:
+        # Cleanup is operational housekeeping and must not invalidate a
+        # scientifically complete report.
+        print(f"[WARN] 正式报告已完成，但复评底稿清理失败：{exc}")
     print(f"\n[Done] 存档重复评估报告: {md_path}")
 
 

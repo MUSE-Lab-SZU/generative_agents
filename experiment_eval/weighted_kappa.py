@@ -407,3 +407,49 @@ def build_weighted_kappa(
         "matrix": matrix_rows,
         "item_long": observations,
     }
+
+
+def build_item_weighted_kappa_by_entity(
+    records: list[ExperimentRecord],
+    labels: list[str],
+    scales: list[str],
+    *,
+    entity_field: str,
+) -> dict[str, Any]:
+    """Reuse the canonical item κ estimator separately for each group/persona."""
+    if entity_field not in {"group", "kbd"}:
+        raise ValueError("entity_field must be 'group' or 'kbd'")
+    entities = sorted(
+        {str(getattr(record, entity_field)) for record in records},
+        key=group_sort_key,
+    )
+    rows: list[dict[str, Any]] = []
+    for entity in entities:
+        selected = [record for record in records if str(getattr(record, entity_field)) == entity]
+        payload = build_weighted_kappa(
+            selected,
+            labels,
+            scales,
+            bootstrap_replicates=0,
+        )
+        for row in payload.get("item") or []:
+            if row.get("weights") != "quadratic":
+                continue
+            rows.append(
+                {
+                    "entity_type": "persona" if entity_field == "kbd" else "condition",
+                    "entity": entity,
+                    **row,
+                }
+            )
+    return {
+        "metadata": {
+            "rated_object": "snapshot_id × scale × item within entity",
+            "rater": "measurement_repeat_id",
+            "weights": "quadratic",
+            "aggregate": "unweighted mean of valid repeat-pair kappas",
+            "ci_note": "heatmap shows point estimates; the canonical overall item table retains cluster-bootstrap CI",
+        },
+        "entities": entities,
+        "item": rows,
+    }

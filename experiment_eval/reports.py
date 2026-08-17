@@ -14,10 +14,12 @@ from .schema import (
 )
 from .statistics import (
     baseline_adjusted_endpoint_contrasts,
+    cross_scale_concurrent_validity,
     cross_scale_convergence,
     delta_ci,
     group_endpoint_contrasts,
     group_time_contrasts,
+    measurement_error_summary,
     measurement_icc,
     safety_proxy_metrics,
     trajectory_metrics,
@@ -108,7 +110,9 @@ def build_metrics(
         "final_delta": {},
         "stability_metrics": {},
         "measurement_reliability": {},
+        "measurement_error": {},
         "weighted_kappa": {key: value for key, value in weighted_kappa.items() if key != "item_long"},
+        "cross_scale_concurrent_validity": cross_scale_concurrent_validity(records, labels),
         "cross_scale_convergence": cross_scale_convergence(records, labels),
         "group_endpoint_contrasts": group_endpoint_contrasts(records, labels, scales),
         "baseline_adjusted_endpoint_contrasts": baseline_adjusted_endpoint_contrasts(records, labels, scales),
@@ -119,6 +123,7 @@ def build_metrics(
     }
     for scale in scales:
         payload["measurement_reliability"][scale] = measurement_icc(records, labels, scale)
+        payload["measurement_error"][scale] = measurement_error_summary(records, labels, scale)
     for record in records:
         key = record.stable_id
         payload["records"][key] = {
@@ -460,10 +465,22 @@ def write_data_dictionary(out_dir: Path) -> Path:
 | `process_metrics.csv` | 独立仿真 run | turns/chars/stage completion/fixed-prompt meetings | 剂量与 CBT 交付 |
 | `process_group_balance.csv` | group contrast × dose metric | outer-run Hedges' g | 注意力/暴露平衡审计 |
 | `stage_metrics.csv` | run × CBT prompt meeting | stage/subgoal/transition | 阶段停留与推进审计 |
+| `change_score_rows.csv` | outer run × outcome × timepoint | baseline/current/change/QC/replicate | Change+CI 的规范输入层 |
+| `change_score_summary.csv` | panel × outcome × timepoint × group | mean/adjusted change、outer-run CI | Change+CI 柱和误差线 |
+| `change_score_contrasts.csv` | panel × outcome × timepoint × group pair | Holm-adjusted p/star | 显著性括号的完整统计来源 |
+| `engagement_events.csv` | 一次 conversation | timestamp/participants/turns/type/duration proxy | 过程图事件层；duration proxy 不是真实 elapsed duration |
+| `engagement_daily_summary.csv` | group × simulation day | frequency、secondary metric、outer-run CI | Engagement Panel A |
+| `engagement_24h_summary.csv` | group × fixed time bin | interactions/day、outer-run CI | Engagement Panel B |
+| `engagement_session_outcome_summary.csv` | group × CBT session × metric | 正式 session turn 数、相对 T0 评分变化、outer-run CI | Engagement Panel A |
+| `paper_figure_data_availability.json` | batch | 字段来源、缺失字段、空 panel、解析告警 | 禁止把缺失数据静默当 0 |
 | `item_statistics.csv` | snapshot × scale item | item repeat mean/SD/agreement/entropy | 条目信度与安全代理复核 |
 | `weighted_kappa_summary.csv` | scale × 分层 × 权重 | repeat-pair κ 的均值、覆盖、cluster CI/原因 | 总体及 persona/group/timepoint 一致性 |
 | `weighted_kappa_pairwise.csv` | scale × 分层 × repeat pair × 权重 | Cohen weighted κ、有效/缺失对象数、NA 原因 | repeat 矩阵与边际分布敏感性检查 |
 | `weighted_kappa_item.csv` | scale × item × 权重 | 条目 κ、outer-run cluster bootstrap CI | PHQ-9/BDI-II 条目级一致性 |
+| `measurement_reliability_summary.csv` | scale | ICC(A,1)/(A,K)、cluster bootstrap CI、SEM、MDC95 | 总分重复可靠性与测量误差 |
+| `measurement_error_snapshot.csv` | snapshot × scale | 同一冻结快照 K 次总分的 SD | 误差分布图输入 |
+| `cross_scale_concurrent_validity.csv` | outer run × timepoint | 对齐的 PHQ-9/BDI-II 总分 | 同期收敛效度 |
+| `cross_scale_change_agreement.csv` | outer run | 统一 baseline/endpoint 的两量表变化 | 治疗变化一致性 |
 | `safety_proxy_metrics.csv` | 独立仿真 run | item 9、恶化与 response-like flags | 自动筛查；所有 flag 须人工复核 |
 
 `session_20` 表示第 20 次咨询后的观察点，不自动等于 POST。固定回访提示词阶段仍有强制医患会谈，因此不是无干预延迟随访。
@@ -514,6 +531,47 @@ def write_weighted_kappa_csvs(out_dir: Path, metrics: dict[str, Any]) -> tuple[P
     pairwise_path = _write_rows_csv(out_dir / "weighted_kappa_pairwise.csv", payload.get("pairwise") or [])
     item_path = _write_rows_csv(out_dir / "weighted_kappa_item.csv", payload.get("item") or [])
     return summary_path, pairwise_path, item_path
+
+
+def write_scale_credibility_csvs(out_dir: Path, metrics: dict[str, Any]) -> dict[str, Path]:
+    summary_rows: list[dict[str, Any]] = []
+    snapshot_rows: list[dict[str, Any]] = []
+    for scale in metrics["scales"]:
+        reliability = metrics["measurement_reliability"].get(scale, {})
+        error = metrics["measurement_error"].get(scale, {})
+        summary_rows.append(
+            {
+                "scale": scale,
+                "n_snapshot_targets": reliability.get("n_snapshot_targets"),
+                "n_outer_run_clusters": reliability.get("n_outer_run_clusters"),
+                "k_measurement": reliability.get("k_measurement"),
+                "icc_a_1": reliability.get("icc_a_1"),
+                "icc_a_1_ci95_lower": reliability.get("icc_a_1_ci95_lower"),
+                "icc_a_1_ci95_upper": reliability.get("icc_a_1_ci95_upper"),
+                "icc_a_k": reliability.get("icc_a_k"),
+                "icc_a_k_ci95_lower": reliability.get("icc_a_k_ci95_lower"),
+                "icc_a_k_ci95_upper": reliability.get("icc_a_k_ci95_upper"),
+                "icc_definition": reliability.get("icc_definition"),
+                "ci_method": reliability.get("ci_method"),
+                "sem": error.get("sem"),
+                "mdc95": error.get("mdc95"),
+                "measurement_error_definition": error.get("definition"),
+                "status": reliability.get("status"),
+            }
+        )
+        snapshot_rows.extend(error.get("snapshot_rows") or [])
+    return {
+        "summary": _write_rows_csv(out_dir / "measurement_reliability_summary.csv", summary_rows),
+        "snapshot": _write_rows_csv(out_dir / "measurement_error_snapshot.csv", snapshot_rows),
+        "concurrent": _write_rows_csv(
+            out_dir / "cross_scale_concurrent_validity.csv",
+            metrics["cross_scale_concurrent_validity"].get("rows") or [],
+        ),
+        "change": _write_rows_csv(
+            out_dir / "cross_scale_change_agreement.csv",
+            metrics["cross_scale_convergence"].get("rows") or [],
+        ),
+    }
 
 
 def write_statistics_detail_csv(out_dir: Path, metrics: dict[str, Any]) -> Path:
@@ -598,14 +656,26 @@ def write_statistics_report(out_dir: Path, metrics: dict[str, Any]) -> Path:
             "",
             "## 测量可靠性",
             "",
-            "| Scale | Snapshot targets | K | ICC(1,1) | ICC(1,K) |",
-            "|---|---:|---:|---:|---:|",
+            "- 主结果为 two-way random absolute agreement：ICC(A,1)/ICC(2,1) 表示单次生成，ICC(A,K)/ICC(2,K) 表示 K 次均值；CI 按独立 outer run 聚类 bootstrap。",
+            "",
+            "| Scale | Snapshot targets | outer clusters | K | ICC(A,1) [95% CI] | ICC(A,K) [95% CI] | SEM | MDC95 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for scale, reliability in metrics["measurement_reliability"].items():
+        error = metrics["measurement_error"].get(scale, {})
+        single_interval = (
+            "NA" if reliability.get("icc_a_1_ci95_lower") is None else
+            f"{reliability['icc_a_1']:.3f} [{reliability['icc_a_1_ci95_lower']:.3f}, {reliability['icc_a_1_ci95_upper']:.3f}]"
+        )
+        average_interval = (
+            "NA" if reliability.get("icc_a_k_ci95_lower") is None else
+            f"{reliability['icc_a_k']:.3f} [{reliability['icc_a_k_ci95_lower']:.3f}, {reliability['icc_a_k_ci95_upper']:.3f}]"
+        )
         lines.append(
-            f"| {scale} | {reliability.get('n_snapshot_targets')} | {reliability.get('k_measurement')} | "
-            f"{_number(reliability.get('icc_1_1'), 3)} | {_number(reliability.get('icc_1_k'), 3)} |"
+            f"| {scale} | {reliability.get('n_snapshot_targets')} | {reliability.get('n_outer_run_clusters')} | "
+            f"{reliability.get('k_measurement')} | {single_interval} | {average_interval} | "
+            f"{_number(error.get('sem'), 3)} | {_number(error.get('mdc95'), 3)} |"
         )
     lines.extend(
         [
@@ -638,15 +708,19 @@ def write_statistics_report(out_dir: Path, metrics: dict[str, Any]) -> Path:
             f"{row.get('n_valid_repeat_pairs')}/{row.get('n_repeat_pairs')} | {row.get('n_valid')} | "
             f"{row.get('n_missing')} | {reason} |"
         )
+    concurrent = metrics["cross_scale_concurrent_validity"]
     convergence = metrics["cross_scale_convergence"]
     lines.extend(
         [
             "",
-            "## PHQ-9 / BDI-II 收敛性",
+            "## PHQ-9 / BDI-II 跨量表效度与变化一致性",
             "",
-            f"- 外层 run 数：{convergence.get('n_outer_runs')}。",
+            f"- 同期收敛效度：对齐 {concurrent.get('n_aligned_snapshots')} 个 persona/condition/timepoint；Spearman ρ={_number(concurrent.get('spearman_rho'), 3)}，cluster 95% CI [{_number(concurrent.get('ci95_lower'), 3)}, {_number(concurrent.get('ci95_upper'), 3)}]。",
+            "- 同期数据包含同一 outer run 的重复时间点，因此以 outer-run cluster bootstrap CI 为主，不把朴素 p 值作为显著性结论。",
+            "",
+            f"- 治疗变化一致性外层 run 数：{convergence.get('n_outer_runs')}；两量表使用同一 baseline 与 endpoint。",
             f"- 终点变化方向一致率：{_number(convergence.get('direction_agreement_rate') * 100 if convergence.get('direction_agreement_rate') is not None else None)}%。",
-            f"- Spearman ρ：{_number(convergence.get('spearman_rho'), 3)}（探索性 p={_number(convergence.get('spearman_p_exploratory'), 3)}）。",
+            f"- ΔPHQ-9 与 ΔBDI-II Spearman ρ：{_number(convergence.get('spearman_rho'), 3)}，95% CI [{_number(convergence.get('ci95_lower'), 3)}, {_number(convergence.get('ci95_upper'), 3)}]（p={_number(convergence.get('spearman_p'), 3)}）。负值表示改善，正值表示恶化。",
             "",
             "## 外层组间对照（探索性）",
             "",
@@ -725,6 +799,8 @@ def write_statistics_report(out_dir: Path, metrics: dict[str, Any]) -> Path:
             "- `process_group_balance.csv`：组间剂量标准化差；`safety_proxy_metrics.csv`：需人工复核的量表代理标记。",
             "- `item_statistics.csv`：条目级 mean、sample SD、两两 exact agreement rate、Shannon entropy (bits)。",
             "- `weighted_kappa_summary.csv` / `weighted_kappa_pairwise.csv` / `weighted_kappa_item.csv`：总体、分层、repeat-pair 与条目级有序一致性。",
+            "- `measurement_reliability_summary.csv` / `measurement_error_snapshot.csv`：absolute-agreement ICC、SEM/MDC95 与快照内 repeat SD。",
+            "- `cross_scale_concurrent_validity.csv` / `cross_scale_change_agreement.csv`：对齐总分与统一 baseline/endpoint 的跨量表变化。",
             "- `chart_metrics_summary.json`：完整机器可读统计、CI 方法和假设。",
             "",
             "本报告为生成式 Agent 仿真的描述统计，不代表真实患者临床疗效。",
@@ -757,6 +833,38 @@ def write_chart_index(out_dir: Path, chart_paths: list[Path], metrics: dict[str,
         lines.extend([f"### {chart_path.stem.replace('_', ' ')}", "", f"![{chart_path.stem}]({chart_path.name})", ""])
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def write_paper_figure_data(
+    out_dir: Path,
+    *,
+    change_rows: list[dict[str, Any]],
+    change_estimates: list[dict[str, Any]],
+    change_contrasts: list[dict[str, Any]],
+    engagement_events: list[dict[str, Any]],
+    engagement_coverage: list[dict[str, Any]],
+    engagement_daily: list[dict[str, Any]],
+    engagement_time_bins: list[dict[str, Any]],
+    engagement_sessions: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> dict[str, Path]:
+    """Write the extraction/statistics layers consumed by the new paper figures."""
+    paths = {
+        "change_score_rows": _write_rows_csv(out_dir / "change_score_rows.csv", change_rows),
+        "change_score_summary": _write_rows_csv(out_dir / "change_score_summary.csv", change_estimates),
+        "change_score_contrasts": _write_rows_csv(out_dir / "change_score_contrasts.csv", change_contrasts),
+        "engagement_events": _write_rows_csv(out_dir / "engagement_events.csv", engagement_events),
+        "engagement_run_coverage": _write_rows_csv(out_dir / "engagement_run_coverage.csv", engagement_coverage),
+        "engagement_daily_summary": _write_rows_csv(out_dir / "engagement_daily_summary.csv", engagement_daily),
+        "engagement_24h_summary": _write_rows_csv(out_dir / "engagement_24h_summary.csv", engagement_time_bins),
+        "engagement_session_outcome_summary": _write_rows_csv(
+            out_dir / "engagement_session_outcome_summary.csv", engagement_sessions
+        ),
+    }
+    diagnostics_path = out_dir / "paper_figure_data_availability.json"
+    diagnostics_path.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths["data_availability"] = diagnostics_path
+    return paths
 
 
 def write_batch_reports(
@@ -804,6 +912,7 @@ def write_batch_reports(
     measurement_long_path = write_measurement_repeat_long_csv(out_dir, records, labels, scales)
     item_measurement_long_path = write_item_measurement_repeat_long_csv(out_dir, records, labels, scales)
     kappa_summary_path, kappa_pairwise_path, kappa_item_path = write_weighted_kappa_csvs(out_dir, metrics)
+    credibility_paths = write_scale_credibility_csvs(out_dir, metrics)
     outer_metrics_path = write_outer_run_metrics_csv(out_dir, metrics)
     contrasts_path = write_group_contrasts_csv(out_dir, metrics)
     adjusted_contrasts_path = write_adjusted_contrasts_csv(out_dir, metrics)
@@ -830,6 +939,10 @@ def write_batch_reports(
         "weighted_kappa_summary_csv_path": _display_path(kappa_summary_path, project_root),
         "weighted_kappa_pairwise_csv_path": _display_path(kappa_pairwise_path, project_root),
         "weighted_kappa_item_csv_path": _display_path(kappa_item_path, project_root),
+        "measurement_reliability_summary_csv_path": _display_path(credibility_paths["summary"], project_root),
+        "measurement_error_snapshot_csv_path": _display_path(credibility_paths["snapshot"], project_root),
+        "cross_scale_concurrent_validity_csv_path": _display_path(credibility_paths["concurrent"], project_root),
+        "cross_scale_change_agreement_csv_path": _display_path(credibility_paths["change"], project_root),
         "outer_run_metrics_csv_path": _display_path(outer_metrics_path, project_root),
         "group_contrasts_csv_path": _display_path(contrasts_path, project_root),
         "baseline_adjusted_contrasts_csv_path": _display_path(adjusted_contrasts_path, project_root),

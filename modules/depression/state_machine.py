@@ -427,7 +427,9 @@ class ComplaintGraphManager:
         child_stages = self._infer_branch_plan(
             completion_func=completion_func,
             parent_stage=current_stage,
-            session_context=planning_context,
+            # prompt 只会从原始上下文提取受限证据；planning_context 仍用于
+            # 记录“主诉图补足”这一运行态动作，二者不再混为一份 LLM 输入。
+            session_context=session_context,
             conversation_content=str(conversation_content or ""),
             llm_cfg=llm_cfg,
         )
@@ -756,8 +758,8 @@ class ComplaintGraphManager:
         llm_cfg: Optional[Dict[str, Any]],
         counterpart_utterance: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """调用 LLM 判定本轮是否推进主诉节点。"""
-        prompt = self._build_transition_prompt(
+        """先盲判本轮新增变化，再将已确认变化匹配到候选节点。"""
+        change_prompt = self._build_transition_change_prompt(
             current_stage=current_stage,
             session_context=session_context,
             conversation_content=conversation_content,
@@ -765,11 +767,87 @@ class ComplaintGraphManager:
             llm_cfg=llm_cfg,
         )
         try:
-            raw = str(completion_func(prompt) or "")
+            raw_change = str(completion_func(change_prompt) or "")
         except Exception:
-            raw = ""
-        parsed = self._parse_json_object(raw)
-        return self._normalize_transition_signal(parsed, current_stage)
+            raw_change = ""
+        runtime_event = self._runtime_event_from_context(session_context)
+        source = str(runtime_event.get("source", "chat") or "chat").strip()
+        reflection_evidence = self._reflection_evidence_for_prompt(runtime_event)
+        detected_change = self._normalize_transition_change(
+            payload=self._parse_json_object(raw_change),
+            source=source,
+            conversation_content=conversation_content,
+            reflection_evidence=reflection_evidence,
+        )
+        if not detected_change.get("has_new_change", False):
+            return {
+                "matched": False,
+                "match_reason": str(
+                    detected_change.get("reason", "no_new_patient_change")
+                    or "no_new_patient_change"
+                )[:180],
+                "action": "hold",
+                "next_graph": [str(current_stage.get("id", "") or "")],
+            }
+
+        match_prompt = self._build_transition_prompt(
+            current_stage=current_stage,
+            session_context=session_context,
+            conversation_content=conversation_content,
+            counterpart_utterance=counterpart_utterance,
+            llm_cfg=llm_cfg,
+            detected_change=detected_change,
+        )
+        try:
+            raw_match = str(completion_func(match_prompt) or "")
+        except Exception:
+            raw_match = ""
+        parsed_match = self._parse_json_object(raw_match)
+        return self._normalize_transition_signal(parsed_match, current_stage)
+
+    def _build_transition_change_prompt(
+        self,
+        current_stage: Dict[str, Any],
+        session_context: Dict[str, Any],
+        conversation_content: str,
+        llm_cfg: Optional[Dict[str, Any]],
+        counterpart_utterance: str = "",
+    ) -> str:
+        """构造候选不可见的本轮新增状态变化提取 prompt。"""
+        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
+        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        runtime_event = self._runtime_event_from_context(session_context)
+        source = str(runtime_event.get("source", "chat") or "chat").strip()
+        payload: Dict[str, Any] = {
+            "task": "transition_change_detection",
+            "source": source,
+            "current_stage": self._transition_stage_view(current_stage, current=True),
+        }
+        if source == "reflection":
+            payload["reflection_evidence"] = self._reflection_evidence_for_prompt(runtime_event)
+        else:
+            scene = (
+                session_context.get("scene", {})
+                if isinstance(session_context.get("scene", {}), dict)
+                else {}
+            )
+            participants = (
+                session_context.get("participants", {})
+                if isinstance(session_context.get("participants", {}), dict)
+                else {}
+            )
+            payload.update(
+                {
+                    "patient_evidence": self._clip_text(conversation_content, limit=text_limit),
+                    "counterpart_context": self._clip_text(counterpart_utterance, limit=text_limit),
+                    "interaction_type": str(scene.get("interaction_type", "") or "").strip(),
+                    "relationship": str(participants.get("relationship", "") or "").strip(),
+                }
+            )
+        return render_prompt(
+            "depression/graph_transition_change",
+            {"payload_json": json.dumps(payload, ensure_ascii=False)},
+        )
 
     def _build_transition_prompt(
         self,
@@ -778,25 +856,174 @@ class ComplaintGraphManager:
         conversation_content: str,
         llm_cfg: Optional[Dict[str, Any]],
         counterpart_utterance: str = "",
+        detected_change: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """构造主诉图推进判定 prompt。"""
-        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
-        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
+        """构造已确认变化到候选节点的匹配 prompt。"""
+        del conversation_content, counterpart_utterance, llm_cfg
         candidate_ids = self._candidate_ids_for_stage(current_stage, self.window_size)
+        runtime_event = self._runtime_event_from_context(session_context)
         payload = {
             "task": "transition_decision",
-            "current_stage": copy.deepcopy(current_stage),
-            "candidate_stages": [copy.deepcopy(self.stage_catalog[item]) for item in candidate_ids],
-            "candidate_ids": candidate_ids,
-            "session_context": session_context,
-            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-            "counterpart_utterance": self._clip_text(counterpart_utterance, limit=text_limit),
-            "state_duration_minutes": round(float(self.get_state_duration()), 4),
+            "source": str(runtime_event.get("source", "chat") or "chat").strip(),
+            "current_stage": self._transition_stage_view(current_stage, current=True),
+            "candidate_stages": [
+                self._transition_stage_view(self.stage_catalog[item], current=False)
+                for item in candidate_ids
+            ],
+            "detected_change": {
+                "change": self._clip_text(
+                    (detected_change or {}).get("change", ""), limit=240
+                ),
+                "evidence_quotes": [
+                    self._clip_text(item, limit=240)
+                    for item in self._to_list(
+                        (detected_change or {}).get("evidence_quotes", [])
+                    )[:6]
+                    if self._clip_text(item, limit=240)
+                ],
+            },
         }
         return render_prompt(
             "depression/graph_transition",
             {"payload_json": json.dumps(payload, ensure_ascii=False)},
         )
+
+    def _normalize_transition_change(
+        self,
+        payload: Any,
+        source: str,
+        conversation_content: str,
+        reflection_evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """校验变化必须由本轮证据中的逐字片段支持。"""
+        if not isinstance(payload, dict):
+            return {
+                "has_new_change": False,
+                "change": "",
+                "evidence_quotes": [],
+                "reason": "no_change_detection_result",
+            }
+        has_new_change = self._coerce_bool(payload.get("has_new_change", False))
+        change = self._clip_text(payload.get("change", ""), limit=240)
+        reason = self._clip_text(payload.get("reason", ""), limit=180)
+        normalized_source = str(source or "chat").strip()
+        if normalized_source == "reflection":
+            evidence_texts = [
+                self._clip_text(item, limit=360)
+                for key in ("patient_key_utterances", "behavior_or_life_events")
+                for item in self._to_list(reflection_evidence.get(key, []))
+                if self._clip_text(item, limit=360)
+            ]
+            required_quote_count = 2
+        else:
+            evidence_texts = [self._clip_text(conversation_content, limit=6000)]
+            required_quote_count = 1
+
+        valid_quotes: List[str] = []
+        seen = set()
+        had_consumed_quote = False
+        for item in self._to_list(payload.get("evidence_quotes", [])):
+            quote = self._clip_text(item, limit=240)
+            if not quote or quote in seen:
+                continue
+            if not any(quote in evidence for evidence in evidence_texts if evidence):
+                continue
+            if self._advance_evidence_was_consumed(quote):
+                had_consumed_quote = True
+                continue
+            seen.add(quote)
+            valid_quotes.append(quote)
+            if len(valid_quotes) >= 6:
+                break
+
+        if not has_new_change or not change or len(valid_quotes) < required_quote_count:
+            return {
+                "has_new_change": False,
+                "change": "",
+                "evidence_quotes": [],
+                "reason": (
+                    "advance_evidence_already_consumed"
+                    if had_consumed_quote
+                    else reason or "no_fresh_supported_patient_change"
+                ),
+            }
+        return {
+            "has_new_change": True,
+            "change": change,
+            "evidence_quotes": valid_quotes,
+            "reason": reason,
+        }
+
+    def _advance_evidence_was_consumed(self, evidence_quote: str) -> bool:
+        """同一段患者证据不能再次支持后续 advance；不限制新证据的推进次数。"""
+        quote = str(evidence_quote or "").strip()
+        if not quote:
+            return True
+        for row in reversed(self.dialogue_history):
+            if not isinstance(row, dict) or str(row.get("action", "") or "") != "advance":
+                continue
+            consumed_text = str(row.get("conversation_excerpt", "") or "").strip()
+            if consumed_text and quote in consumed_text:
+                return True
+        return False
+
+    def _reflection_evidence_for_prompt(self, runtime_event: Dict[str, Any]) -> Dict[str, Any]:
+        """提取反思判定可用的原始证据，不透传反思结论或运行态元数据。"""
+        metadata = (
+            runtime_event.get("metadata", {})
+            if isinstance(runtime_event.get("metadata", {}), dict)
+            else {}
+        )
+        evidence = (
+            metadata.get("reflection_evidence", {})
+            if isinstance(metadata.get("reflection_evidence", {}), dict)
+            else {}
+        )
+
+        def _texts(key: str, limit: int) -> List[str]:
+            results: List[str] = []
+            seen = set()
+            for item in self._to_list(evidence.get(key, [])):
+                text = self._clip_text(item, limit=360)
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                results.append(text)
+                if len(results) >= limit:
+                    break
+            return results
+
+        return {
+            "interaction_background": self._clip_text(
+                evidence.get("interaction_background", ""), limit=120
+            ),
+            "patient_key_utterances": _texts("patient_key_utterances", 6),
+            "behavior_or_life_events": _texts("behavior_or_life_events", 5),
+        }
+
+    @staticmethod
+    def _transition_stage_view(stage: Dict[str, Any], current: bool) -> Dict[str, Any]:
+        """仅保留推进判定直接需要的节点语义。"""
+        stage = stage if isinstance(stage, dict) else {}
+        payload = {
+            "id": str(stage.get("id", "") or ""),
+            "label": str(stage.get("label", "") or ""),
+            "summary": str(stage.get("summary", "") or ""),
+            "core_belief": str(stage.get("core_belief", "") or ""),
+            "narrative_focus": copy.deepcopy(
+                stage.get("narrative_focus", [])
+                if isinstance(stage.get("narrative_focus", []), list)
+                else []
+            ),
+        }
+        if current:
+            payload["hold_signals"] = copy.deepcopy(
+                stage.get("hold_signals", [])
+                if isinstance(stage.get("hold_signals", []), list)
+                else []
+            )
+            payload["is_terminal_stage"] = bool(stage.get("is_terminal_stage", False))
+        return payload
 
     def _normalize_transition_signal(
         self,
@@ -1105,13 +1332,110 @@ class ComplaintGraphManager:
         return results
 
     def _stage_summary_for_prompt(self, stage: Dict[str, Any]) -> Dict[str, Any]:
-        """返回用于 prompt 去重和语义参照的紧凑节点摘要。"""
+        """返回候选分支列表使用的紧凑节点摘要。"""
+        payload = stage if isinstance(stage, dict) else {}
+        return {
+            "id": str(payload.get("id", "") or "")[:80],
+            "label": str(payload.get("label", "") or "")[:80],
+            "semantic": self._clip_text(
+                payload.get("summary", "")
+                or payload.get("core_belief", "")
+                or "；".join(str(item) for item in self._to_list(payload.get("narrative_focus", []))),
+                limit=120,
+            ),
+        }
+
+    def _planner_stage_view(self, stage: Dict[str, Any]) -> Dict[str, Any]:
+        """仅保留规划直接需要的当前节点语义。"""
         payload = stage if isinstance(stage, dict) else {}
         return {
             "id": str(payload.get("id", "") or "")[:80],
             "label": str(payload.get("label", "") or "")[:80],
             "summary": self._clip_text(payload.get("summary", ""), limit=220),
+            "core_belief": self._clip_text(payload.get("core_belief", ""), limit=160),
+            "narrative_focus": [
+                self._clip_text(item, limit=80)
+                for item in self._to_list(payload.get("narrative_focus", []))[:6]
+                if self._clip_text(item, limit=80)
+            ],
         }
+
+    @staticmethod
+    def _planner_semantic_units(value: Any) -> set:
+        """以中英文双字符片段做轻量相关性排序，不引入额外 NLP 依赖。"""
+        text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(value or "").lower())
+        if not text:
+            return set()
+        if len(text) == 1:
+            return {text}
+        return {text[index : index + 2] for index in range(len(text) - 1)}
+
+    def _semantic_guard_for_prompt(
+        self,
+        parent_stage: Dict[str, Any],
+        mode: str,
+        candidate_seed: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """返回少量最相关旧节点；它们只用于防重复，不充当生成示例。"""
+        cfg = self.planner if isinstance(self.planner, dict) else {}
+        configured_limit = self._bounded_int(
+            cfg.get("prompt_semantic_guard_limit"), 20, 0, 80
+        )
+        mode_cap = 2 if str(mode or "") == "branch_detail" else 4
+        guard_limit = min(configured_limit, mode_cap)
+        if guard_limit <= 0:
+            return []
+
+        parent_view = self._planner_stage_view(parent_stage)
+        seed_view = candidate_seed if isinstance(candidate_seed, dict) else {}
+        reference = json.dumps(
+            [
+                parent_view.get("label", ""),
+                parent_view.get("summary", ""),
+                parent_view.get("core_belief", ""),
+                parent_view.get("narrative_focus", []),
+                seed_view.get("label", ""),
+                seed_view.get("summary", ""),
+            ],
+            ensure_ascii=False,
+        )
+        generic_units = {
+            "患者",
+            "主诉",
+            "阶段",
+            "节点",
+            "当前",
+            "状态",
+            "变化",
+            "开始",
+            "意识",
+            "自己",
+        }
+        reference_units = self._planner_semantic_units(reference) - generic_units
+        current_id = str(parent_stage.get("id", "") or "").strip()
+        seed_id = str(
+            (candidate_seed if isinstance(candidate_seed, dict) else {}).get("id", "") or ""
+        ).strip()
+        excluded_ids = {current_id, seed_id}
+        if str(mode or "") != "branch_detail":
+            excluded_ids.update(
+                self._candidate_ids_for_stage(parent_stage, self.window_size)
+            )
+        ranked: List[tuple] = []
+        for index, stage in enumerate(self.stage_catalog.values()):
+            stage_id = str(stage.get("id", "") or "").strip()
+            if not stage_id or stage_id in excluded_ids:
+                continue
+            compact = self._stage_summary_for_prompt(stage)
+            stage_units = self._planner_semantic_units(
+                "{} {}".format(compact.get("label", ""), compact.get("semantic", ""))
+            ) - generic_units
+            overlap = len(reference_units.intersection(stage_units))
+            if overlap <= 0:
+                continue
+            ranked.append((overlap, index, compact))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in ranked[:guard_limit]]
 
     def _prompt_known_stage_ids(self) -> List[str]:
         """返回 prompt 所需的已占用 ID；程序端仍负责最终唯一性校验。"""
@@ -1126,54 +1450,21 @@ class ComplaintGraphManager:
         parent_stage: Dict[str, Any],
         mode: str,
     ) -> Dict[str, Any]:
-        """构造有界的主诉图 prompt 视图，不改变运行态 catalog。
-
-        完整 ``stage_catalog`` 是程序的权威图索引，不能为了缩短 prompt 而删减。
-        LLM 只需看到当前节点、直接子节点、近期路径和少量语义参照；所有已
-        占用 ID 则以短字符串索引传递，用于降低重复生成的概率。
-        """
-        cfg = self.planner if isinstance(self.planner, dict) else {}
-        path_limit = self._bounded_int(cfg.get("prompt_recent_path_limit"), 4, 1, 12)
-        guard_limit = self._bounded_int(cfg.get("prompt_semantic_guard_limit"), 20, 0, 80)
-        current_id = str(parent_stage.get("id", "") or "").strip()
+        """构造 branch_seed/repair 共用的紧凑分支规划视图。"""
         child_ids = self._candidate_ids_for_stage(parent_stage, self.window_size)
-
-        # planned_graph 可能包含前瞻节点；仅取已经走到 current 的实际路径。
-        path_ids = self._normalize_graph_ids(
-            self.planned_graph[: min(max(0, int(self.stage_index)) + 1, len(self.planned_graph))]
-        )
-        recent_path = [
-            self._stage_summary_for_prompt(self.stage_catalog[stage_id])
-            for stage_id in path_ids[-path_limit:]
-            if stage_id in self.stage_catalog
-        ]
         existing_children = [
-            copy.deepcopy(self.stage_catalog[stage_id])
+            self._stage_summary_for_prompt(self.stage_catalog[stage_id])
             for stage_id in child_ids
             if stage_id in self.stage_catalog
         ]
-
-        # 优先使用近期新增节点作为语义防重参照；当前节点、路径和直接子节点
-        # 已通过其他字段完整表达，无须重复。
-        excluded_ids = {current_id, *child_ids, *path_ids}
-        semantic_guard: List[Dict[str, Any]] = []
-        for stage in reversed(list(self.stage_catalog.values())):
-            if len(semantic_guard) >= guard_limit:
-                break
-            stage_id = str(stage.get("id", "") or "").strip()
-            if not stage_id or stage_id in excluded_ids:
-                continue
-            semantic_guard.append(self._stage_summary_for_prompt(stage))
-
         return {
-            "snapshot_version": 1,
             "mode": str(mode or "branch_seed"),
-            "current_stage": copy.deepcopy(parent_stage),
-            "local_graph": {
-                "recent_path": recent_path,
-                "existing_children": existing_children,
-                "semantic_guard": semantic_guard,
-            },
+            "current_stage": self._planner_stage_view(parent_stage),
+            "existing_children": existing_children,
+            "semantic_guard": self._semantic_guard_for_prompt(
+                parent_stage=parent_stage,
+                mode=mode,
+            ),
             "known_stage_ids": self._prompt_known_stage_ids(),
         }
 
@@ -1187,20 +1478,29 @@ class ComplaintGraphManager:
         candidate_seed: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构造分支规划器 prompt。"""
-        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
-        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        payload = self._build_prompt_graph_snapshot(parent_stage, mode)
-        payload.update({
-            "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
-            "needed_count": max(
+        del session_context, conversation_content, llm_cfg
+        normalized_mode = str(mode or "branch_seed")
+        if normalized_mode == "branch_detail":
+            seed = copy.deepcopy(candidate_seed if isinstance(candidate_seed, dict) else {})
+            payload = {
+                "mode": normalized_mode,
+                "current_stage": self._planner_stage_view(parent_stage),
+                "candidate_seed": seed,
+                "semantic_guard": self._semantic_guard_for_prompt(
+                    parent_stage=parent_stage,
+                    mode=normalized_mode,
+                    candidate_seed=seed,
+                ),
+            }
+        else:
+            payload = self._build_prompt_graph_snapshot(
+                parent_stage,
+                normalized_mode,
+            )
+            payload["needed_count"] = max(
                 0,
                 self.window_size - len(self._candidate_ids_for_stage(parent_stage, self.window_size)),
-            ),
-            "window_size": int(self.window_size),
-            "candidate_seed": copy.deepcopy(candidate_seed if isinstance(candidate_seed, dict) else {}),
-            "session_context": session_context,
-            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
-        })
+            )
         payload_json = json.dumps(payload, ensure_ascii=False)
         return render_prompt(
             "depression/graph_planner",
@@ -1218,17 +1518,15 @@ class ComplaintGraphManager:
         needed_count: int,
     ) -> str:
         """构造候选分支补齐 prompt。"""
-        cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
-        text_limit = self._bounded_int(cfg.get("max_text_length"), 1200, 200, 6000)
-        payload = self._build_prompt_graph_snapshot(parent_stage, "branch_repair")
+        del session_context, conversation_content, llm_cfg
+        payload = self._build_prompt_graph_snapshot(
+            parent_stage,
+            "branch_repair",
+        )
         payload.update({
-            "existing_next_candidates": self._candidate_ids_for_stage(parent_stage, self.window_size),
             "accepted_branch_candidates": copy.deepcopy(accepted_branches),
             "rejected_branch_candidates": copy.deepcopy(rejected_branches),
             "needed_count": max(0, int(needed_count)),
-            "window_size": int(self.window_size),
-            "session_context": session_context,
-            "conversation_content": self._clip_text(conversation_content, limit=text_limit),
         })
         repair_context = (
             "之前被拒绝使用的子分支数量：{}\n"

@@ -7,11 +7,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
+from modules.model.endpoint_pool import next_endpoint, resolve_endpoint_urls
+
 
 DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
 DEFAULT_LLM_RETRY = 10
 ERROR_LOG_TEXT_LIMIT = 500
 ERROR_CAUSE_CHAIN_LIMIT = 3
+
+
+_PROCESS_PROMPT_CACHE_USAGE = {}
 
 
 _SENSITIVE_LOG_PATTERNS = (
@@ -64,6 +69,137 @@ def _safe_attr(obj, name, default=None):
         return getattr(obj, name, default)
     except Exception:
         return default
+
+
+def _mapping_or_model_dump(value):
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = _safe_attr(value, "model_dump")
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    to_dict = _safe_attr(value, "to_dict")
+    if callable(to_dict):
+        try:
+            dumped = to_dict()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    return {}
+
+
+def _nonnegative_int(value, default=0):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def extract_prompt_cache_usage(response):
+    """Extract DeepSeek-compatible prompt cache fields without SDK coupling."""
+    response_data = _mapping_or_model_dump(response)
+    usage = response_data.get("usage") if response_data else _safe_attr(response, "usage")
+    usage_data = _mapping_or_model_dump(usage)
+
+    def _usage_value(name):
+        if name in usage_data:
+            return usage_data.get(name)
+        return _safe_attr(usage, name)
+
+    hit_raw = _usage_value("prompt_cache_hit_tokens")
+    miss_raw = _usage_value("prompt_cache_miss_tokens")
+    if hit_raw is None and miss_raw is None:
+        return None
+
+    hit_tokens = _nonnegative_int(hit_raw)
+    miss_tokens = _nonnegative_int(miss_raw)
+    cache_input_tokens = hit_tokens + miss_tokens
+    return {
+        "prompt_tokens": _nonnegative_int(_usage_value("prompt_tokens"), cache_input_tokens),
+        "completion_tokens": _nonnegative_int(_usage_value("completion_tokens")),
+        "total_tokens": _nonnegative_int(_usage_value("total_tokens")),
+        "prompt_cache_hit_tokens": hit_tokens,
+        "prompt_cache_miss_tokens": miss_tokens,
+        "prompt_cache_rate": (
+            round(hit_tokens / cache_input_tokens, 6)
+            if cache_input_tokens > 0
+            else 0.0
+        ),
+    }
+
+
+def record_prompt_cache_usage(
+    response,
+    *,
+    caller,
+    provider,
+    model,
+    base_url,
+):
+    """Log one cache observation plus per-process totals for its call type."""
+    usage = extract_prompt_cache_usage(response)
+    if usage is None:
+        return None
+
+    key = (
+        str(provider or ""),
+        str(model or ""),
+        str(caller or "llm_normal"),
+    )
+    aggregate = _PROCESS_PROMPT_CACHE_USAGE.setdefault(
+        key,
+        {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+        },
+    )
+    aggregate["requests"] += 1
+    for field in (
+        "prompt_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ):
+        aggregate[field] += int(usage.get(field, 0) or 0)
+    aggregate_cache_tokens = (
+        aggregate["prompt_cache_hit_tokens"]
+        + aggregate["prompt_cache_miss_tokens"]
+    )
+    cumulative = dict(aggregate)
+    cumulative["prompt_cache_rate"] = (
+        round(
+            aggregate["prompt_cache_hit_tokens"] / aggregate_cache_tokens,
+            6,
+        )
+        if aggregate_cache_tokens > 0
+        else 0.0
+    )
+    log_payload = {
+        "caller": str(caller or "llm_normal"),
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "endpoint": sanitize_endpoint_for_log(base_url),
+        "request": usage,
+        "process_cumulative": cumulative,
+    }
+    print(
+        "[LLM_PROMPT_CACHE] {}".format(
+            json.dumps(
+                log_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+        flush=True,
+    )
+    return log_payload
 
 
 def _exception_message(exc):
@@ -267,6 +403,9 @@ class LLMModel:
         self._provider = config.get("provider", "")
         self._api_key = config["api_key"]
         self._base_url = config["base_url"]
+        self._endpoint_urls = resolve_endpoint_urls(config)
+        self._endpoint_config = config
+        self._active_base_url = self._base_url
         self._model = config["model"]
         self._meta_responses = []
         self._summary = {"total": [0, 0, 0]}
@@ -297,7 +436,7 @@ class LLMModel:
             started_at = time.monotonic()
             stage = "request"
             try:
-                meta_response = self._completion(prompt, **kwargs)
+                meta_response = self._completion(prompt, caller=caller, **kwargs)
                 stage = "response_normalization"
                 meta_response = meta_response.strip()
                 self._meta_responses.append(meta_response)
@@ -316,7 +455,7 @@ class LLMModel:
                     stage=stage,
                     provider=self._provider,
                     model=self._model,
-                    base_url=self._base_url,
+                    base_url=self._active_base_url,
                     attempt=attempt,
                     total_attempts=retry,
                     retrying=attempt < retry,
@@ -367,17 +506,28 @@ class OpenAILLMModel(LLMModel):
     def setup(self, config):
         from openai import OpenAI
 
-        return OpenAI(
-            api_key=self._api_key,
-            base_url=self._base_url,
-            timeout=self._request_timeout_seconds,
-        )
+        return {
+            base_url: OpenAI(
+                api_key=self._api_key,
+                base_url=base_url,
+                timeout=self._request_timeout_seconds,
+            )
+            for base_url in self._endpoint_urls
+        }
 
-    def _completion(self, prompt, temperature=0.5):
+    def _completion(self, prompt, temperature=0.5, caller="llm_normal"):
         prompt = prepare_prompt_for_model(prompt, self._model)
         messages = [{"role": "user", "content": prompt}]
-        response = self._handle.chat.completions.create(
+        self._active_base_url = next_endpoint(self._endpoint_config, self._endpoint_urls)
+        response = self._handle[self._active_base_url].chat.completions.create(
             model=self._model, messages=messages, temperature=temperature
+        )
+        record_prompt_cache_usage(
+            response,
+            caller=caller,
+            provider=self._provider,
+            model=self._model,
+            base_url=self._active_base_url,
         )
         if len(response.choices) > 0:
             return strip_qwen_think_tags(response.choices[0].message.content)
@@ -398,7 +548,8 @@ class OllamaLLMModel(LLMModel):
             "temperature": temperature,
             "stream": False,
         }
-        request_url = f"{self._base_url}/chat/completions"
+        self._active_base_url = next_endpoint(self._endpoint_config, self._endpoint_urls)
+        request_url = f"{self._active_base_url}/chat/completions"
 
         try:
             response = requests.post(
@@ -442,7 +593,8 @@ class OllamaLLMModel(LLMModel):
             )
         return response.json()
 
-    def _completion(self, prompt, temperature=0.5):
+    def _completion(self, prompt, temperature=0.5, caller="llm_normal"):
+        del caller
         prompt = prepare_prompt_for_model(prompt, self._model)
         messages = [{"role": "user", "content": prompt}]
         response = self.ollama_chat(messages=messages, temperature=temperature)

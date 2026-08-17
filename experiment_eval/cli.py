@@ -1,12 +1,20 @@
-"""Command-line orchestration for experimental metric reporting."""
+"""Main command-line entry point for experimental metric reporting."""
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 from typing import Any
 
+from .cli_config import (
+    BATCH_MODE,
+    OUT_DIR,
+    PROJECT_ROOT,
+    RECURSIVE,
+    REPORTS_DIR,
+    TITLE_PREFIX,
+    parse_args,
+)
 from .loader import (
     available_groups,
     available_kbds,
@@ -17,87 +25,18 @@ from .loader import (
     records_for_group,
     records_for_repeat,
 )
+from .data.longitudinal import long_data_from_records, read_long_data
+from .paper_longitudinal import LONG_FIGURE_TYPES, render_long_format_paper_figures
+from .persona_profile import PROFILE_FIGURE_TYPES, render_persona_profile
+from .data.persona_profile import (
+    persona_profile_data_from_records,
+    read_persona_profile_data,
+)
+from .analysis.persona_predictor import read_feature_data
+from .pipeline import combined_records, render_chart_batch
 from .process import extract_process_metrics
-from .visualization.scale_plots import render_appendix, render_lines_only, render_presentation
-from .visualization.core_plots import render_core_figures
-from .reports import write_batch_reports
-from .schema import ExperimentRecord, group_sort_key, normalize_group, normalize_kbd, normalize_repeat_id
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPORTS_DIR = PROJECT_ROOT / "results" / "experiment_data" / "reports"
-OUT_DIR = PROJECT_ROOT / "docs" / "experiment_evaluation"
-RECURSIVE = False
-TITLE_PREFIX = "In-silico experiment evaluation"
-BATCH_MODE = "compare-all"
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot KBD repeat summary charts from archived report JSON files.")
-    parser.add_argument("--reports-dir", type=Path, default=None)
-    parser.add_argument("--report-file", type=Path, action="append", default=None)
-    parser.add_argument("--group-alias", action="append", default=None, metavar="PATH_MATCH=LABEL")
-    parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument(
-        "--experiment-data-root",
-        type=Path,
-        default=None,
-        help="Optional raw experiment_data root used for conversation-dose/process metrics.",
-    )
-    parser.add_argument(
-        "--checkpoints-root",
-        type=Path,
-        default=None,
-        help="Optional checkpoint root used for CBT stage and prompt-completion metrics.",
-    )
-    parser.add_argument("--dataset-label", default=None, help="Dataset/protocol label written into every report.")
-    parser.add_argument("--recursive", dest="recursive", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--title-prefix", default=None)
-    parser.add_argument(
-        "--batch-mode",
-        choices=["single", "by-group", "by-repeat", "compare-all", "all"],
-        default=None,
-    )
-    parser.add_argument("--kbd", action="append", default=None)
-    parser.add_argument("--group", action="append", default=None)
-    parser.add_argument("--repeat-id", action="append", default=None)
-    parser.add_argument(
-        "--combine-kbds",
-        action="store_true",
-        help="Combine selected KBD variants in the same chart batches instead of writing one subtree per KBD.",
-    )
-    parser.add_argument(
-        "--report-mode",
-        choices=["core", "lines-only", "presentation", "appendix", "all"],
-        default="all",
-        help="Generate core paper figures, lines-only samples, presentation charts, appendix charts, or all charts.",
-    )
-    parser.add_argument(
-        "--error-bar",
-        choices=["ci95", "sd", "none"],
-        default="ci95",
-        help="Uncertainty shown on presentation trajectories (default: ci95).",
-    )
-    parser.add_argument(
-        "--y-axis",
-        choices=["full", "adaptive"],
-        default="full",
-        help="Presentation trajectory y-axis; full uses PHQ-9 0–27 and BDI-II 0–63.",
-    )
-    parser.add_argument("--show-repeat-points", action="store_true", help="Overlay raw repeat total scores on trajectories.")
-    parser.add_argument(
-        "--outer-summary",
-        choices=["none", "mean-ci"],
-        default="none",
-        help="Optionally overlay outer-experiment means and t CIs; independent runs remain visible.",
-    )
-    parser.add_argument(
-        "--core-figures",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Generate paper-oriented contrast, convergence, ICC, waterfall, and process figures.",
-    )
-    return parser.parse_args(argv)
+from .data.engagement import extract_engagement_events
+from .schema import group_sort_key, normalize_group, normalize_kbd, normalize_repeat_id
 
 
 def _resolve(path: Path) -> Path:
@@ -115,7 +54,9 @@ def _aliases(values: list[str] | None) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     for item in values or []:
         if "=" not in item:
-            raise SystemExit(f"Invalid --group-alias (expected PATH_MATCH=LABEL): {item}")
+            raise SystemExit(
+                f"Invalid --group-alias (expected PATH_MATCH=LABEL): {item}"
+            )
         path_match, label = (part.strip() for part in item.split("=", 1))
         if not path_match or not label:
             raise SystemExit(f"Invalid --group-alias (empty match or label): {item}")
@@ -123,112 +64,148 @@ def _aliases(values: list[str] | None) -> list[tuple[str, str]]:
     return result
 
 
-def _unique_plot_labels(records: list[ExperimentRecord]) -> list[ExperimentRecord]:
-    labels = [(record.plot_label, record.severity) for record in records]
-    if len(labels) == len(set(labels)):
-        return records
-    return records_for_all_comparison(records)
+def _render_long_figures(args: Any, frame: Any, out_dir: Path) -> dict[str, Any]:
+    feature_frame = None
+    if args.feature_data:
+        feature_path = _resolve(args.feature_data)
+        if not feature_path.is_file():
+            raise SystemExit(f"Feature data not found: {feature_path}")
+        try:
+            feature_frame = read_feature_data(feature_path)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"Failed to load feature data: {exc}") from exc
+    try:
+        return render_long_format_paper_figures(
+            frame,
+            out_dir / "long_format_paper_figures",
+            figure_types=args.paper_figure or [],
+            scales=args.symptom_scale or ["PHQ-9"],
+            feature_frame=feature_frame,
+            cbt_group=args.cbt_group,
+            control_group=args.control_group,
+            interval=args.symptom_interval,
+            forest_timepoints=args.forest_timepoint,
+            total_effect_reference=args.total_effect_reference,
+            fdr_alpha=args.fdr_alpha,
+            shap_target=args.shap_target,
+            shap_scale=args.shap_scale,
+            shap_endpoint=args.shap_endpoint,
+            shap_min_samples=args.shap_min_samples,
+            network_mode=args.symptom_network_mode,
+            network_scale=args.symptom_network_scale,
+            network_groups=args.symptom_network_group,
+            network_timepoints=args.symptom_network_timepoint,
+            network_min_n=args.symptom_network_min_n,
+            network_ebic_gamma=args.symptom_network_ebic_gamma,
+            network_alpha_min_ratio=args.symptom_network_alpha_min_ratio,
+            network_alpha_count=args.symptom_network_alpha_count,
+            network_edge_threshold=args.symptom_network_edge_threshold,
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"Failed to render long-format paper figures: {exc}") from exc
 
 
-def render_chart_batch(
-    records: list[ExperimentRecord],
-    labels: list[str],
-    scales: list[str],
-    out_dir: Path,
-    title_prefix: str,
-    *,
-    batch_kind: str,
-    report_mode: str,
-    error_bar: str,
-    y_axis: str,
-    show_repeat_points: bool,
-    outer_summary: str,
-    core_figures: bool,
-    process_rows: list[dict[str, Any]],
-    stage_rows: list[dict[str, Any]],
-    dataset_label: str,
+def _render_persona_profile(
+    args: Any, frame: Any, out_dir: Path, title_prefix: str
 ) -> dict[str, Any]:
-    if not records:
-        raise ValueError(f"No records selected for chart batch: {batch_kind}")
-    records = _unique_plot_labels(records)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    chart_paths: list[Path] = []
-    if report_mode == "lines-only":
-        chart_paths.extend(render_lines_only(records, labels, scales, out_dir, title_prefix, y_axis=y_axis))
-    if report_mode in {"presentation", "all"}:
-        chart_paths.extend(
-            render_presentation(
-                records,
-                labels,
-                scales,
-                out_dir,
-                title_prefix,
-                error_bar=error_bar,
-                y_axis=y_axis,
-                show_repeat_points=show_repeat_points,
-                outer_summary=outer_summary,
-            )
+    try:
+        return render_persona_profile(
+            frame,
+            out_dir,
+            method=args.profile_zscore,
+            scales=args.profile_scale,
+            persona_order=args.persona_order,
+            group_order=args.profile_group_order,
+            panel_by=args.profile_panel_by,
+            setting_order=args.profile_setting_order,
+            baseline_timepoint=args.profile_baseline,
+            post_timepoint=args.profile_post,
+            uncertainty=args.profile_uncertainty,
+            title=f"{title_prefix}: persona treatment-response profile",
         )
-    if report_mode in {"appendix", "all"}:
-        chart_paths.extend(render_appendix(records, labels, scales, out_dir, title_prefix))
-    if core_figures and report_mode in {"core", "presentation", "all"}:
-        stable_ids = {record.stable_id for record in records}
-        chart_paths.extend(
-            render_core_figures(
-                records,
-                labels,
-                scales,
-                out_dir,
-                title_prefix,
-                process_rows=[row for row in process_rows if row["stable_id"] in stable_ids],
-                stage_rows=[row for row in stage_rows if row["stable_id"] in stable_ids],
-            )
-        )
-    kappa_figure_batch = (
-        batch_kind in {"single", "combined KBD selection", "cross-KBD independent experiments"}
-        or batch_kind.startswith("all independent experiments")
-    )
-    return write_batch_reports(
-        out_dir,
-        records,
-        labels,
-        scales,
-        chart_paths,
-        batch_kind=batch_kind,
-        report_mode=report_mode,
-        error_bar=error_bar,
-        y_axis=y_axis,
-        outer_summary=outer_summary,
-        process_rows=[row for row in process_rows if row["stable_id"] in {record.stable_id for record in records}],
-        stage_rows=[row for row in stage_rows if row["stable_id"] in {record.stable_id for record in records}],
-        dataset_label=dataset_label,
-        project_root=PROJECT_ROOT,
-        title_prefix=title_prefix,
-        render_weighted_kappa=kappa_figure_batch and report_mode in {"core", "presentation", "all"},
-    )
-
-
-def _combined_records(records: list[ExperimentRecord], *, include_group: bool = True) -> list[ExperimentRecord]:
-    """Label records uniquely when multiple KBD variants share one chart batch."""
-    return [
-        record.with_plot_label(
-            "-".join(
-                part
-                for part in (record.kbd, record.group if include_group else None, record.repeat_id)
-                if part is not None
-            )
-        )
-        for record in records
-    ]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"Failed to render persona profile: {exc}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    reports_dir = _resolve(args.reports_dir) if args.reports_dir is not None else REPORTS_DIR
+    reports_dir = (
+        _resolve(args.reports_dir) if args.reports_dir is not None else REPORTS_DIR
+    )
     out_dir = _resolve(args.out_dir) if args.out_dir is not None else OUT_DIR
     recursive = args.recursive if args.recursive is not None else RECURSIVE
     title_prefix = args.title_prefix if args.title_prefix is not None else TITLE_PREFIX
     batch_mode = args.batch_mode if args.batch_mode is not None else BATCH_MODE
+    paper_figure_types = args.paper_figure or ["change-ci", "engagement"]
+    if not args.paper_figures:
+        paper_figure_types = []
+    long_figure_types = [
+        value for value in paper_figure_types if value in LONG_FIGURE_TYPES
+    ]
+    profile_requested = any(
+        value in PROFILE_FIGURE_TYPES for value in paper_figure_types
+    )
+    batch_paper_types = [
+        value
+        for value in paper_figure_types
+        if value not in LONG_FIGURE_TYPES and value not in PROFILE_FIGURE_TYPES
+    ]
+    if not 0 < args.fdr_alpha <= 1:
+        raise SystemExit("--fdr-alpha must be within (0, 1]")
+    if args.shap_min_samples < 5:
+        raise SystemExit("--shap-min-samples must be at least 5")
+    if args.symptom_network_min_n is not None and args.symptom_network_min_n < 2:
+        raise SystemExit("--symptom-network-min-n must be at least 2")
+    if not 0.0 <= args.symptom_network_ebic_gamma <= 1.0:
+        raise SystemExit("--symptom-network-ebic-gamma must be between 0 and 1")
+    if not 0.0 < args.symptom_network_alpha_min_ratio <= 1.0:
+        raise SystemExit("--symptom-network-alpha-min-ratio must be in (0, 1]")
+    if args.symptom_network_alpha_count < 2:
+        raise SystemExit("--symptom-network-alpha-count must be at least 2")
+    if not 0.0 <= args.symptom_network_edge_threshold < 1.0:
+        raise SystemExit("--symptom-network-edge-threshold must be in [0, 1)")
+
+    # A canonical long table can drive the long-format families without any
+    # repeat-summary directory.  Mixed old/new requests continue below.
+    if (
+        long_figure_types
+        and args.long_data
+        and not batch_paper_types
+        and not profile_requested
+    ):
+        long_path = _resolve(args.long_data)
+        if not long_path.is_file():
+            raise SystemExit(f"Long data not found: {long_path}")
+        try:
+            long_frame = read_long_data(long_path)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"Failed to load long data: {exc}") from exc
+        result = _render_long_figures(args, long_frame, out_dir)
+        print(f"Read {len(long_frame)} canonical item rows from {_display(long_path)}")
+        print(f"Long-format paper figures: {_display(Path(result['out_dir']))}")
+        print(f"- manifest: {_display(Path(result['manifest']))}")
+        return 0
+
+    if (
+        profile_requested
+        and args.persona_profile_data
+        and not batch_paper_types
+        and not long_figure_types
+    ):
+        profile_path = _resolve(args.persona_profile_data)
+        if not profile_path.is_file():
+            raise SystemExit(f"Persona-profile data not found: {profile_path}")
+        try:
+            profile_frame = read_persona_profile_data(profile_path)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"Failed to load persona-profile data: {exc}") from exc
+        result = _render_persona_profile(args, profile_frame, out_dir, title_prefix)
+        print(
+            f"Read {len(profile_frame)} persona-profile rows from {_display(profile_path)}"
+        )
+        print(f"Persona profile: {_display(Path(result['out_dir']))}")
+        print(f"- manifest: {_display(Path(result['manifest']))}")
+        return 0
 
     if args.report_file:
         report_files = []
@@ -247,15 +224,20 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"No repeat summary JSON files found in {reports_dir}")
 
     group_aliases = _aliases(args.group_alias)
+    repeat_aliases = _aliases(args.repeat_alias)
     try:
-        records, labels, scales = load_records(report_files, group_aliases)
+        records, labels, scales = load_records(
+            report_files, group_aliases, repeat_aliases=repeat_aliases
+        )
     except (ValueError, KeyError, TypeError) as exc:
         raise SystemExit(f"Failed to load repeat summary data: {exc}") from exc
     if not records or not labels or not scales:
         raise SystemExit("No plottable records found.")
 
     all_kbds = available_kbds(records)
-    requested_kbds = [normalize_kbd(value) for value in args.kbd] if args.kbd else all_kbds
+    requested_kbds = (
+        [normalize_kbd(value) for value in args.kbd] if args.kbd else all_kbds
+    )
     missing_kbds = sorted(set(requested_kbds) - set(all_kbds), key=group_sort_key)
     if missing_kbds:
         raise SystemExit(f"Requested KBD variants not found: {', '.join(missing_kbds)}")
@@ -263,24 +245,104 @@ def main(argv: list[str] | None = None) -> int:
 
     all_groups = available_groups(records)
     all_repeats = sorted({record.repeat_id for record in records}, key=group_sort_key)
-    requested_groups = [normalize_group(value) for value in args.group] if args.group else all_groups
-    requested_repeats = [normalize_repeat_id(value) for value in args.repeat_id] if args.repeat_id else all_repeats
+    requested_groups = (
+        [normalize_group(value) for value in args.group] if args.group else all_groups
+    )
+    requested_repeats = (
+        [normalize_repeat_id(value) for value in args.repeat_id]
+        if args.repeat_id
+        else all_repeats
+    )
     missing_groups = sorted(set(requested_groups) - set(all_groups), key=group_sort_key)
-    missing_repeats = sorted(set(requested_repeats) - set(all_repeats), key=group_sort_key)
+    missing_repeats = sorted(
+        set(requested_repeats) - set(all_repeats), key=group_sort_key
+    )
     if missing_groups:
         raise SystemExit(f"Requested groups not found: {', '.join(missing_groups)}")
     if missing_repeats:
-        raise SystemExit(f"Requested repeat ids not found: {', '.join(missing_repeats)}")
+        raise SystemExit(
+            f"Requested repeat ids not found: {', '.join(missing_repeats)}"
+        )
     records = [record for record in records if record.group in requested_groups]
     records = [record for record in records if record.repeat_id in requested_repeats]
 
-    experiment_data_root = _resolve(args.experiment_data_root) if args.experiment_data_root else None
-    checkpoints_root = _resolve(args.checkpoints_root) if args.checkpoints_root else None
+    long_figure_result: dict[str, Any] | None = None
+    if long_figure_types:
+        if args.long_data:
+            long_path = _resolve(args.long_data)
+            if not long_path.is_file():
+                raise SystemExit(f"Long data not found: {long_path}")
+            try:
+                long_frame = read_long_data(long_path)
+            except (ValueError, TypeError) as exc:
+                raise SystemExit(f"Failed to load long data: {exc}") from exc
+        else:
+            long_frame = long_data_from_records(records, labels, scales)
+        long_figure_result = _render_long_figures(args, long_frame, out_dir)
+    profile_result: dict[str, Any] | None = None
+    if profile_requested:
+        if args.persona_profile_data:
+            profile_path = _resolve(args.persona_profile_data)
+            if not profile_path.is_file():
+                raise SystemExit(f"Persona-profile data not found: {profile_path}")
+            try:
+                profile_frame = read_persona_profile_data(profile_path)
+            except (ValueError, TypeError) as exc:
+                raise SystemExit(f"Failed to load persona-profile data: {exc}") from exc
+        else:
+            profile_frame = persona_profile_data_from_records(records, labels, scales)
+        profile_result = _render_persona_profile(
+            args, profile_frame, out_dir, title_prefix
+        )
+
+    if not batch_paper_types and (
+        long_figure_result is not None or profile_result is not None
+    ):
+        if long_figure_result is not None:
+            source = (
+                _display(_resolve(args.long_data))
+                if args.long_data
+                else "validated repeat summaries"
+            )
+            print(f"Prepared {len(long_frame)} canonical item rows from {source}")
+            print(
+                f"Long-format paper figures: {_display(Path(long_figure_result['out_dir']))}"
+            )
+            print(f"- manifest: {_display(Path(long_figure_result['manifest']))}")
+        if profile_result is not None:
+            source = (
+                _display(_resolve(args.persona_profile_data))
+                if args.persona_profile_data
+                else "validated repeat summaries"
+            )
+            print(f"Prepared persona-profile data from {source}")
+            print(f"Persona profile: {_display(Path(profile_result['out_dir']))}")
+            print(f"- manifest: {_display(Path(profile_result['manifest']))}")
+        return 0
+
+    experiment_data_root = (
+        _resolve(args.experiment_data_root) if args.experiment_data_root else None
+    )
+    checkpoints_root = (
+        _resolve(args.checkpoints_root) if args.checkpoints_root else None
+    )
     process_rows, stage_rows = extract_process_metrics(
         records,
         experiment_data_root=experiment_data_root,
         checkpoints_root=checkpoints_root,
         project_root=PROJECT_ROOT,
+    )
+    if args.engagement_bin_hours <= 0 or 24 % args.engagement_bin_hours:
+        raise SystemExit("--engagement-bin-hours must be a positive divisor of 24")
+    engagement_events, engagement_coverage, engagement_availability = (
+        extract_engagement_events(
+            records,
+            experiment_data_root=experiment_data_root,
+            checkpoints_root=checkpoints_root,
+            project_root=PROJECT_ROOT,
+        )
+        if "engagement" in batch_paper_types
+        else ([], [], {"status": "not_requested"})
     )
     dataset_label = args.dataset_label or reports_dir.name
 
@@ -294,6 +356,17 @@ def main(argv: list[str] | None = None) -> int:
         "process_rows": process_rows,
         "stage_rows": stage_rows,
         "dataset_label": dataset_label,
+        "paper_figure_types": batch_paper_types,
+        "long_format_paper_figures": long_figure_result,
+        "paper_outcomes": args.paper_outcome or ["PHQ-9"],
+        "change_panel_b": args.change_panel_b,
+        "change_estimator": args.change_estimator,
+        "change_significance_label": args.change_significance_label,
+        "engagement_events": engagement_events,
+        "engagement_coverage": engagement_coverage,
+        "engagement_availability": engagement_availability,
+        "engagement_bin_hours": args.engagement_bin_hours,
+        "engagement_secondary": args.engagement_secondary,
     }
     batches: list[dict[str, Any]] = []
     if args.combine_kbds:
@@ -302,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         if batch_mode == "single":
             batches.append(
                 render_chart_batch(
-                    _combined_records(records),
+                    combined_records(records),
                     labels,
                     scales,
                     out_dir,
@@ -316,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                 group_records = [record for record in records if record.group == group]
                 batches.append(
                     render_chart_batch(
-                        _combined_records(group_records, include_group=False),
+                        combined_records(group_records, include_group=False),
                         labels,
                         scales,
                         out_dir / "by_group" / group,
@@ -327,12 +400,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         if batch_mode in {"by-repeat", "all"}:
             for repeat_id in requested_repeats:
-                repeat_records = [record for record in records if record.repeat_id == repeat_id]
+                repeat_records = [
+                    record for record in records if record.repeat_id == repeat_id
+                ]
                 if not repeat_records:
                     continue
                 batches.append(
                     render_chart_batch(
-                        _combined_records(repeat_records),
+                        combined_records(repeat_records),
                         labels,
                         scales,
                         out_dir / "by_repeat" / repeat_id,
@@ -342,10 +417,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
         if batch_mode in {"compare-all", "all"}:
-            destination = out_dir / "all_independent_experiments" if batch_mode == "all" else out_dir
+            destination = (
+                out_dir / "all_independent_experiments"
+                if batch_mode == "all"
+                else out_dir
+            )
             batches.append(
                 render_chart_batch(
-                    _combined_records(records),
+                    combined_records(records),
                     labels,
                     scales,
                     destination,
@@ -355,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
 
-    for kbd in ([] if args.combine_kbds else requested_kbds):
+    for kbd in [] if args.combine_kbds else requested_kbds:
         kbd_records = [record for record in records if record.kbd == kbd]
         if not kbd_records:
             continue
@@ -363,9 +442,21 @@ def main(argv: list[str] | None = None) -> int:
         kbd_out = out_dir / "by_kbd" / kbd if multiple_kbds else out_dir
         kbd_title = f"{title_prefix}: {kbd}" if multiple_kbds else title_prefix
         kbd_groups = available_groups(kbd_records)
-        kbd_repeats = sorted({record.repeat_id for record in kbd_records}, key=group_sort_key)
+        kbd_repeats = sorted(
+            {record.repeat_id for record in kbd_records}, key=group_sort_key
+        )
         if batch_mode == "single":
-            batches.append(render_chart_batch(kbd_records, labels, scales, kbd_out, kbd_title, batch_kind="single", **common))
+            batches.append(
+                render_chart_batch(
+                    kbd_records,
+                    labels,
+                    scales,
+                    kbd_out,
+                    kbd_title,
+                    batch_kind="single",
+                    **common,
+                )
+            )
         if batch_mode in {"by-group", "all"}:
             for group in kbd_groups:
                 batches.append(
@@ -395,7 +486,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
         if batch_mode in {"compare-all", "all"}:
-            destination = kbd_out / "all_independent_experiments" if batch_mode == "all" else kbd_out
+            destination = (
+                kbd_out / "all_independent_experiments"
+                if batch_mode == "all"
+                else kbd_out
+            )
             batches.append(
                 render_chart_batch(
                     records_for_all_comparison(kbd_records),
@@ -423,8 +518,27 @@ def main(argv: list[str] | None = None) -> int:
         "show_repeat_points": args.show_repeat_points,
         "outer_summary": args.outer_summary,
         "core_figures": args.core_figures,
+        "paper_figure_types": paper_figure_types,
+        "persona_profile": profile_result,
+        "paper_outcomes": args.paper_outcome or ["PHQ-9"],
+        "change_panel_b": args.change_panel_b,
+        "change_estimator": args.change_estimator,
+        "change_significance_label": args.change_significance_label,
+        "engagement_bin_hours": args.engagement_bin_hours,
+        "engagement_secondary": args.engagement_secondary,
+        "symptom_network_mode": args.symptom_network_mode,
+        "symptom_network_scale": args.symptom_network_scale,
+        "symptom_network_groups": args.symptom_network_group,
+        "symptom_network_timepoints": args.symptom_network_timepoint,
+        "symptom_network_min_n": args.symptom_network_min_n,
+        "symptom_network_ebic_gamma": args.symptom_network_ebic_gamma,
+        "symptom_network_alpha_min_ratio": args.symptom_network_alpha_min_ratio,
+        "symptom_network_alpha_count": args.symptom_network_alpha_count,
+        "symptom_network_edge_threshold": args.symptom_network_edge_threshold,
         "dataset_label": dataset_label,
-        "experiment_data_root": _display(experiment_data_root) if experiment_data_root else None,
+        "experiment_data_root": (
+            _display(experiment_data_root) if experiment_data_root else None
+        ),
         "checkpoints_root": _display(checkpoints_root) if checkpoints_root else None,
         "batch_mode": batch_mode,
         "combine_kbds": args.combine_kbds,
@@ -433,15 +547,33 @@ def main(argv: list[str] | None = None) -> int:
         "repeat_ids": requested_repeats,
         "batches": batches,
     }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
-    source = "explicit --report-file selection" if args.report_file else _display(reports_dir)
+    source = (
+        "explicit --report-file selection"
+        if args.report_file
+        else _display(reports_dir)
+    )
     print(f"Read {len(report_files)} report JSON files from {source}")
     print(f"Detected KBD variants: {', '.join(requested_kbds)}")
     print(f"Detected groups: {', '.join(available_groups(records))}")
     print(f"Selected repeats: {', '.join(requested_repeats)}")
     print(f"Detected severities: {', '.join(available_severities(records))}")
     print(f"Detected scales: {', '.join(scales)}")
+    if long_figure_result:
+        print(
+            f"Long-format paper figures: {_display(Path(long_figure_result['out_dir']))}"
+        )
+        print(
+            f"  audit: {_display(Path(long_figure_result['out_dir']) / 'paper_figure_feasibility.md')}"
+        )
+    if profile_result:
+        print(f"Persona profile: {_display(Path(profile_result['out_dir']))}")
+        print(
+            f"  audit: {_display(Path(profile_result['out_dir']) / 'persona_profile_feasibility.md')}"
+        )
     print(f"Wrote {len(batches)} chart batches to {_display(out_dir)}")
     for batch in batches:
         print(f"- {batch['batch_kind']}: {batch['out_dir']}")
@@ -450,3 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  item CSV: {batch['item_statistics_csv_path']}")
     print(f"- manifest: {_display(manifest_path)}")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -319,6 +319,13 @@ def collect_core_outputs(name: str, *, dry_run: bool) -> None:
         if not dry_run:
             shutil.copy2(conv_src, dst)
 
+    events_src = checkpoint_dir / "simulation_events.jsonl"
+    if events_src.exists():
+        dst = output_dir / "simulation_events.jsonl"
+        print(f"[COLLECT] {events_src} -> {dst}")
+        if not dry_run:
+            shutil.copy2(events_src, dst)
+
     staged_src = checkpoint_dir / "staged_eval"
     if staged_src.is_dir():
         dst = scales_dir / "staged"

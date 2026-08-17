@@ -36,6 +36,7 @@ class Agent:
         self._depression_trace_path = ""
         self._depression_trace_context = {}
         self._depression_trace_write_warned = False
+        self.event_recorder = None
 
         # agent config
         self.percept_config = config["percept"]
@@ -1193,6 +1194,40 @@ class Agent:
             return True
         return ("吗" in content) or ("么" in content)
 
+    def _build_interaction_event_record(
+        self,
+        other,
+        start,
+        forced,
+        meeting_ctx,
+        conversation_index,
+    ):
+        """Build observability-only metadata for one completed conversation."""
+        context = meeting_ctx if isinstance(meeting_ctx, dict) else {}
+        meeting_kind = str(context.get("meeting_kind", "") or "")
+        meeting_id = str(context.get("meeting_id", "") or "")
+        self_tile = self.get_tile()
+        other_tile = other.get_tile()
+        return {
+            "event_type": meeting_kind or ("forced_chat" if forced else "normal_chat"),
+            "agent": str(self.name or ""),
+            "peer": str(other.name or ""),
+            "location": self_tile.get_address(as_list=False),
+            "coord": list(self.coord) if self.coord is not None else None,
+            "peer_location": other_tile.get_address(as_list=False),
+            "peer_coord": list(other.coord) if other.coord is not None else None,
+            "activity": "对话",
+            "session_id": meeting_id,
+            "rule_id": str(context.get("rule_id", "") or ""),
+            "meeting_source": str(context.get("meeting_source", "") or ""),
+            "conversation_index": int(conversation_index),
+            "simulation_time": (
+                start.strftime("%Y%m%d-%H:%M:%S")
+                if isinstance(start, datetime.datetime)
+                else str(start or "")
+            ),
+        }
+
     def _set_chat_route_ctx(self, other, forced=False):
         prev_self_ctx = self._chat_route_ctx
         prev_other_ctx = getattr(other, "_chat_route_ctx", None)
@@ -2150,12 +2185,15 @@ class Agent:
         if doctor_memory_address:
             chat_meta_common["memory_address_override"] = doctor_memory_address
         forced_meeting_id = ""
+        forced_meeting_ctx = {}
         if forced and self.intervention and hasattr(self.intervention, "resolve_meeting_context"):
             try:
                 meeting_ctx = self.intervention.resolve_meeting_context(self, other, forced=True)
                 if isinstance(meeting_ctx, dict):
+                    forced_meeting_ctx = copy.deepcopy(meeting_ctx)
                     forced_meeting_id = str(meeting_ctx.get("meeting_id", "") or "")
             except Exception:
+                forced_meeting_ctx = {}
                 forced_meeting_id = ""
         if forced_meeting_id:
             chat_meta_common["meeting_id"] = forced_meeting_id
@@ -2180,6 +2218,19 @@ class Agent:
             chat_meta=copy.deepcopy(chat_meta_common),
             meeting_id=forced_meeting_id,
         )
+        interaction_record = None
+        recorder = getattr(self, "event_recorder", None)
+        if recorder is not None:
+            try:
+                interaction_record = self._build_interaction_event_record(
+                    other=other,
+                    start=start,
+                    forced=forced,
+                    meeting_ctx=forced_meeting_ctx,
+                    conversation_index=len(self.conversation.get(key, [])) - 1,
+                )
+            except Exception:
+                interaction_record = None
         self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
         if self.intervention:
             self.intervention.after_chat(
@@ -2189,6 +2240,8 @@ class Agent:
                 chat_summary,
                 start,
             )
+        if interaction_record is not None:
+            recorder.append_interaction(interaction_record)
         return True
 
     def _external_memory_ingest_hook(self, payload):
@@ -3402,62 +3455,105 @@ class Agent:
         trigger_context=None,
     ):
         trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
-        focus_items = self._normalize_depression_text_list(focus, limit=5)
-        thoughts, evidence_ids, thought_node_ids = [], [], []
+        del focus  # 反思问题是上游 LLM 的关注点，不作为患者状态推进证据。
+        evidence_ids = []
         for entry in entries or []:
             if not isinstance(entry, dict):
                 continue
-            thought = str(entry.get("thought", "") or "").strip()
-            if thought:
-                thoughts.append(thought)
-            thought_node_id = str(entry.get("node_id", "") or "").strip()
-            if thought_node_id:
-                thought_node_ids.append(thought_node_id)
             evidence_ids.extend(
                 self._normalize_depression_text_list(entry.get("evidence", []), limit=20)
             )
 
-        thoughts = self._dedupe_depression_texts(thoughts, limit=8)
         evidence_ids = self._dedupe_depression_texts(evidence_ids, limit=20)
-        thought_node_ids = self._dedupe_depression_texts(thought_node_ids, limit=20)
+        patient_utterances = self._extract_depression_patient_utterances(
+            trigger_context.get("chat_transcript", ""),
+            patient_name=self.name,
+        )
+        behavior_events = self._normalize_depression_text_list(
+            trigger_context.get("behavior_events", []), limit=5
+        )
+        if not patient_utterances and not behavior_events:
+            behavior_events = self._resolve_depression_reflection_events(evidence_ids)
 
-        rows = []
-        source_text = str(trigger_source or "").strip()
-        if source_text:
-            rows.append("触发来源：" + source_text)
-        meeting_id = str(trigger_context.get("meeting_id", "") or "").strip()
-        if meeting_id:
-            rows.append("会话ID：" + meeting_id[:80])
-        chat_summary = str(trigger_context.get("chat_summary", "") or "").strip()
-        if chat_summary:
-            rows.append("会话摘要：" + chat_summary[:240])
-        chat_transcript = str(trigger_context.get("chat_transcript", "") or "").strip()
-        if chat_transcript:
-            rows.append("会话片段：" + chat_transcript[:360])
-        if focus_items:
-            rows.append("反思焦点：" + "；".join(focus_items[:3]))
-        if thoughts:
-            rows.append("反思结论：" + "；".join(thoughts[:5]))
-        rows.append("证据数量：{}".format(len(evidence_ids)))
-        if evidence_ids:
-            rows.append("证据线索：" + "，".join(evidence_ids[:8]))
-
-        metadata = {
-            "trigger_source": source_text,
-            "trigger_context": {
-                "event": str(trigger_context.get("event", "") or "")[:80],
-                "meeting_kind": str(trigger_context.get("meeting_kind", "") or "")[:80],
-                "meeting_id": meeting_id[:120],
-                "target_role": str(trigger_context.get("target_role", "") or "")[:40],
-                "chat_node_id": str(trigger_context.get("chat_node_id", "") or "")[:120],
-            },
-            "focus": focus_items,
-            "thought_count": len(thoughts),
-            "thoughts": thoughts,
-            "evidence_ids": evidence_ids,
-            "thought_node_ids": thought_node_ids,
+        reflection_evidence = {
+            "interaction_background": self._depression_reflection_background(
+                trigger_source=trigger_source,
+                trigger_context=trigger_context,
+            ),
+            "patient_key_utterances": patient_utterances,
+            "behavior_or_life_events": behavior_events,
         }
+        rows = ["会话背景：" + reflection_evidence["interaction_background"]]
+        if patient_utterances:
+            rows.append("患者关键表达：")
+            rows.extend("- " + item for item in patient_utterances)
+        if behavior_events:
+            rows.append("行为或生活事件：")
+            rows.extend("- " + item for item in behavior_events)
+        if not patient_utterances and not behavior_events:
+            rows.append("本次没有可核验的患者原话或实际事件。")
+
+        metadata = {"reflection_evidence": reflection_evidence}
         return "\n".join(rows), metadata
+
+    def _extract_depression_patient_utterances(self, transcript, patient_name=""):
+        """从真实会话文本中按说话人抽取患者原话，并覆盖互动前后。"""
+        patient = str(patient_name or self.name or "").strip()
+        utterances = []
+        for raw_line in str(transcript or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            separator = ":" if ":" in line else "：" if "：" in line else ""
+            if not separator:
+                continue
+            speaker, text = line.split(separator, 1)
+            if str(speaker or "").strip() != patient:
+                continue
+            clipped = str(text or "").strip()[:360]
+            if clipped:
+                utterances.append(clipped)
+        utterances = self._dedupe_depression_texts(utterances, limit=20)
+        if len(utterances) <= 6:
+            return utterances
+        # 反思判断看整段互动的变化，保留开头两次表达和最后四次表达。
+        return utterances[:2] + utterances[-4:]
+
+    def _resolve_depression_reflection_events(self, evidence_ids):
+        """在缺少会话/任务证据时，将反思引用还原为原始事件文本。"""
+        associate = getattr(self, "associate", None)
+        if associate is None or not hasattr(associate, "find_concept"):
+            return []
+        events = []
+        for node_id in evidence_ids or []:
+            try:
+                concept = associate.find_concept(node_id)
+            except Exception:
+                continue
+            if str(getattr(concept, "node_type", "") or "").strip() != "event":
+                continue
+            description = str(getattr(concept, "describe", "") or "").strip()
+            if description:
+                events.append(description[:360])
+        return self._dedupe_depression_texts(events, limit=5)
+
+    @staticmethod
+    def _depression_reflection_background(trigger_source, trigger_context):
+        """把触发信息压成非解释性的互动背景，不暴露运行态标识。"""
+        context = trigger_context if isinstance(trigger_context, dict) else {}
+        event = str(context.get("event", "") or trigger_source or "").strip()
+        meeting_kind = str(context.get("meeting_kind", "") or "").strip()
+        if event == "environment_task_result":
+            return "环境任务完成后的反思"
+        if event == "after_chat":
+            if meeting_kind == "doctor_consult":
+                return "医患咨询结束后的会后反思"
+            if meeting_kind:
+                return "一段互动结束后的会后反思"
+            return "会话结束后的反思"
+        if event in {"periodic", "periodic_step"}:
+            return "一段近期互动后的定期反思"
+        return "一段近期互动后的反思"
 
     def _normalize_depression_text_list(self, value, limit=20):
         if value is None:
@@ -3678,7 +3774,9 @@ class Agent:
     @staticmethod
     def _classify_depression_llm_call(prompt):
         text = str(prompt or "").lstrip()
-        if text.startswith("你是主诉图推进判定器。"):
+        if text.startswith("你是患者主诉状态变化提取器。"):
+            return "graph_transition_change"
+        if text.startswith(("你是主诉图推进判定器。", "你是患者主诉状态推进判定器。")):
             return "graph_transition"
         if text.startswith("你是主诉图规划器。"):
             return "graph_planner"

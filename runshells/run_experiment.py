@@ -529,6 +529,11 @@ def collect_trial_data(
         shutil.copy2(conv_file, os.path.join(output_dir, "conversation.json"))
         print("  [COLLECT] conversation.json → experiment_data/")
 
+    events_file = os.path.join(checkpoint_dir, "simulation_events.jsonl")
+    if os.path.exists(events_file):
+        shutil.copy2(events_file, os.path.join(output_dir, "simulation_events.jsonl"))
+        print("  [COLLECT] simulation_events.jsonl → experiment_data/")
+
     staged_eval_dir = os.path.join(checkpoint_dir, "staged_eval")
     if os.path.isdir(staged_eval_dir):
         dst_staged = os.path.join(scales_dir, "staged")

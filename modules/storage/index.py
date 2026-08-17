@@ -14,10 +14,63 @@ from modules.model.llm_model import (
     resolve_ollama_timeout_seconds,
     safe_exception_message_for_log,
 )
+from modules.model.endpoint_pool import next_endpoint, resolve_endpoint_urls
 
 
 STORAGE_RETRY_MAX = 3
 STORAGE_RETRY_SLEEP_SECONDS = 5
+
+
+def _create_openai_embedding(embedding_config):
+    """Build one OpenAI embedding client, or a process-wide round-robin pool."""
+    from llama_index.embeddings.openai import OpenAIEmbedding
+
+    endpoint_urls = resolve_endpoint_urls(embedding_config)
+    if len(endpoint_urls) == 1:
+        return OpenAIEmbedding(
+            model_name=embedding_config["model"],
+            api_base=endpoint_urls[0],
+            api_key=embedding_config["api_key"],
+        )
+
+    # A subclass keeps LlamaIndex's BaseEmbedding contract intact.  Each child
+    # owns one immutable client, so concurrent embedding requests cannot change
+    # another request's endpoint.
+    from pydantic import PrivateAttr
+
+    class RoundRobinOpenAIEmbedding(OpenAIEmbedding):
+        _endpoint_models = PrivateAttr(default_factory=list)
+
+        def _next_model(self):
+            endpoint = next_endpoint(embedding_config, endpoint_urls)
+            return self._endpoint_models[endpoint_urls.index(endpoint)]
+
+        def _get_text_embedding(self, text):
+            return self._next_model()._get_text_embedding(text)
+
+        def _get_text_embeddings(self, texts):
+            return self._next_model()._get_text_embeddings(texts)
+
+        async def _aget_text_embedding(self, text):
+            return await self._next_model()._aget_text_embedding(text)
+
+        async def _aget_text_embeddings(self, texts):
+            return await self._next_model()._aget_text_embeddings(texts)
+
+    pool = RoundRobinOpenAIEmbedding(
+        model_name=embedding_config["model"],
+        api_base=endpoint_urls[0],
+        api_key=embedding_config["api_key"],
+    )
+    pool._endpoint_models = [
+        OpenAIEmbedding(
+            model_name=embedding_config["model"],
+            api_base=endpoint,
+            api_key=embedding_config["api_key"],
+        )
+        for endpoint in endpoint_urls
+    ]
+    return pool
 
 
 class LlamaIndex:
@@ -44,13 +97,7 @@ class LlamaIndex:
                 },
             )
         elif embedding_config["provider"] == "openai":
-            from llama_index.embeddings.openai import OpenAIEmbedding
-
-            embed_model = OpenAIEmbedding(
-                model_name=embedding_config["model"],
-                api_base=embedding_config["base_url"],
-                api_key=embedding_config["api_key"],
-            )
+            embed_model = _create_openai_embedding(embedding_config)
         else:
             raise NotImplementedError(
                 "embedding provider {} is not supported".format(embedding_config["provider"])

@@ -163,7 +163,11 @@ def on_start_dialogue(
 
     for idx in range(int(max_turns)):
         try:
-            expert_reply = llm.chat(expert_messages, system_prompt=system_prompt or None)
+            expert_reply = llm.chat(
+                expert_messages,
+                system_prompt=system_prompt or None,
+                caller="expert_private_chat",
+            )
         except Exception as exc:
             yield chat_messages, f"专家模型调用失败: {exc}", session
             return

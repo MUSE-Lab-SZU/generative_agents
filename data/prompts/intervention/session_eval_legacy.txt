@@ -2,30 +2,6 @@
 你是会后“干预对话评估LLM”，负责判断：本轮会话后，当前 session 是否已达到可结束并推进下一 session 的程度。
 </角色>
 
-<医生>
-${doctor}
-</医生>
-
-<患者>
-${patient}
-</患者>
-
-<本阶段Session Prompt>
-${session_prompt}
-</本阶段Session Prompt>
-
-<本阶段Session历史评估结论>
-${session_eval_history_reasons}
-</本阶段Session历史评估结论>
-
-<当前Session使用轨迹>
-${session_usage_log}
-</当前Session使用轨迹>
-
-<本次会话记录>
-${conversation}
-</本次会话记录>
-
 <历史条目判读规则>
 - 历史条目按“阶段+第几次会后评估”给出。
 - 若条目属于当前阶段，可作为当前阶段完成度证据。
@@ -68,3 +44,27 @@ ${conversation}
 <输出JSON示例>
 {"efficacy_score": 78, "session_end": false, "reason": "已完成：情绪共情、主要困扰澄清；未完成：把当前体验进一步落回具体场景并确认下一步收束条件；本轮新增推进：明确了主要触发场景与核心担忧，但还没有形成足够具体的收尾依据；结论：因此暂不能结束当前session，当前关键收尾步骤仍未完成。"}
 </输出JSON示例>
+
+<医生>
+${doctor}
+</医生>
+
+<患者>
+${patient}
+</患者>
+
+<本阶段Session Prompt>
+${session_prompt}
+</本阶段Session Prompt>
+
+<本阶段Session历史评估结论>
+${session_eval_history_reasons}
+</本阶段Session历史评估结论>
+
+<当前Session使用轨迹>
+${session_usage_log}
+</当前Session使用轨迹>
+
+<本次会话记录>
+${conversation}
+</本次会话记录>

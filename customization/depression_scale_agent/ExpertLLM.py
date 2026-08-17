@@ -1,6 +1,7 @@
 import os
 
 from dotenv import find_dotenv, load_dotenv
+from modules.model.llm_model import record_prompt_cache_usage
 
 load_dotenv(find_dotenv())
 
@@ -22,9 +23,17 @@ class ExpertLLM:
         resolved_base_url = base_url or os.getenv("EXPERT_LLM_BASE_URL") or "https://api.deepseek.com"
 
         self._model = resolved_model
+        self._base_url = resolved_base_url
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base_url, timeout=timeout)
 
-    def generate(self, user_prompt, system_prompt=None, temperature=0.2, **kwargs):
+    def generate(
+        self,
+        user_prompt,
+        system_prompt=None,
+        temperature=0.2,
+        caller="expert_generate",
+        **kwargs
+    ):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -36,11 +45,25 @@ class ExpertLLM:
             temperature=temperature,
             **kwargs,
         )
+        record_prompt_cache_usage(
+            response,
+            caller=caller,
+            provider="openai",
+            model=self._model,
+            base_url=self._base_url,
+        )
         if response.choices:
             return response.choices[0].message.content
         return ""
 
-    def chat(self, messages, system_prompt=None, temperature=0.2, **kwargs):
+    def chat(
+        self,
+        messages,
+        system_prompt=None,
+        temperature=0.2,
+        caller="expert_chat",
+        **kwargs
+    ):
         if not isinstance(messages, list):
             raise TypeError("messages must be a list of role/content dicts.")
 
@@ -54,6 +77,13 @@ class ExpertLLM:
             messages=merged,
             temperature=temperature,
             **kwargs,
+        )
+        record_prompt_cache_usage(
+            response,
+            caller=caller,
+            provider="openai",
+            model=self._model,
+            base_url=self._base_url,
         )
         if response.choices:
             return response.choices[0].message.content

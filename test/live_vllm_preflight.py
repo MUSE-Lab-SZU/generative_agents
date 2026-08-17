@@ -20,6 +20,15 @@ def _api_base(base_url: str) -> str:
     return _root_url(base_url) + "/v1"
 
 
+def _endpoint_list(value: str, fallback: str) -> List[str]:
+    """Parse optional comma-separated endpoints while preserving old CLI flags."""
+    raw_urls = str(value or "").split(",") if value else [fallback]
+    urls = [url.strip() for url in raw_urls if url.strip()]
+    if not urls:
+        raise ValueError("endpoint list cannot be empty")
+    return urls
+
+
 def _json_dict(response: requests.Response) -> Dict[str, Any]:
     try:
         payload = response.json()
@@ -153,6 +162,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local vLLM preflight before simulations")
     parser.add_argument("--chat-base-url", default="http://127.0.0.1:18000", help="vLLM chat service base URL")
     parser.add_argument("--embed-base-url", default="http://127.0.0.1:18001", help="vLLM embedding service base URL")
+    parser.add_argument(
+        "--chat-base-urls",
+        default="",
+        help="comma-separated chat endpoints; overrides --chat-base-url and checks every service",
+    )
+    parser.add_argument(
+        "--embed-base-urls",
+        default="",
+        help="comma-separated embedding endpoints; overrides --embed-base-url and checks every service",
+    )
     parser.add_argument("--timeout", type=float, default=30.0, help="per-request timeout in seconds")
     parser.add_argument("--chat-model", default="qwen3-8b-vllm", help="served chat model name")
     parser.add_argument("--embed-model", default="bge-m3-vllm", help="served embedding model name")
@@ -169,41 +188,45 @@ def main() -> int:
     checks: List[Tuple[str, Tuple[bool, str]]] = []
 
     if not args.skip_chat:
-        checks.extend(
-            [
-                ("chat_health", check_health(args.chat_base_url, args.timeout, "chat")),
-                ("chat_version", check_version(args.chat_base_url, args.timeout, "chat")),
-                ("chat_models", check_models(args.chat_base_url, args.timeout, args.chat_model, "chat")),
-                (
-                    "chat",
-                    check_chat(
-                        base_url=args.chat_base_url,
-                        timeout=args.timeout,
-                        model=args.chat_model,
-                        prompt=args.chat_prompt,
-                        temperature=args.temperature,
+        for index, base_url in enumerate(_endpoint_list(args.chat_base_urls, args.chat_base_url), start=1):
+            label = f"chat[{index}]"
+            checks.extend(
+                [
+                    (f"{label}_health", check_health(base_url, args.timeout, label)),
+                    (f"{label}_version", check_version(base_url, args.timeout, label)),
+                    (f"{label}_models", check_models(base_url, args.timeout, args.chat_model, label)),
+                    (
+                        label,
+                        check_chat(
+                            base_url=base_url,
+                            timeout=args.timeout,
+                            model=args.chat_model,
+                            prompt=args.chat_prompt,
+                            temperature=args.temperature,
+                        ),
                     ),
-                ),
-            ]
-        )
+                ]
+            )
 
     if not args.skip_embed:
-        checks.extend(
-            [
-                ("embed_health", check_health(args.embed_base_url, args.timeout, "embed")),
-                ("embed_version", check_version(args.embed_base_url, args.timeout, "embed")),
-                ("embed_models", check_models(args.embed_base_url, args.timeout, args.embed_model, "embed")),
-                (
-                    "embed",
-                    check_embed(
-                        base_url=args.embed_base_url,
-                        timeout=args.timeout,
-                        model=args.embed_model,
-                        text=args.embed_text,
+        for index, base_url in enumerate(_endpoint_list(args.embed_base_urls, args.embed_base_url), start=1):
+            label = f"embed[{index}]"
+            checks.extend(
+                [
+                    (f"{label}_health", check_health(base_url, args.timeout, label)),
+                    (f"{label}_version", check_version(base_url, args.timeout, label)),
+                    (f"{label}_models", check_models(base_url, args.timeout, args.embed_model, label)),
+                    (
+                        label,
+                        check_embed(
+                            base_url=base_url,
+                            timeout=args.timeout,
+                            model=args.embed_model,
+                            text=args.embed_text,
+                        ),
                     ),
-                ),
-            ]
-        )
+                ]
+            )
 
     failed = False
     for name, (ok, message) in checks:

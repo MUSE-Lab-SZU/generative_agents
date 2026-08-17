@@ -972,7 +972,11 @@ def on_expert_review(answered_file, system_prompt, model_name):
 
     try:
         llm = ExpertLLM(model=model_name)
-        reply = llm.generate(content, system_prompt=system_prompt or None)
+        reply = llm.generate(
+            content,
+            system_prompt=system_prompt or None,
+            caller="depression_scale_expert_review",
+        )
         return reply or ""
     except Exception as exc:
         return f"专家模型调用失败: {exc}"

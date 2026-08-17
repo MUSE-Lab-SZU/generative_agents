@@ -281,7 +281,11 @@ def score_answers(answers: list[dict], scoring_prompt_path: Path) -> dict:
 
     print("[INFO] 调用 ExpertLLM...")
     llm = ExpertLLM()
-    reply = llm.generate(user_prompt, system_prompt=system_prompt)
+    reply = llm.generate(
+        user_prompt,
+        system_prompt=system_prompt,
+        caller="extra_scale_score",
+    )
     if not reply:
         raise RuntimeError("ExpertLLM 返回空")
 

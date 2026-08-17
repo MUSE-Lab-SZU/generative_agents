@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -173,6 +174,9 @@ GROUP_OVERLAY_FILES = {
     "g6": GROUP_OVERLAY_DIR / "g6_supportive_counseling.json",
     "g7": GROUP_OVERLAY_DIR / "g7_memory_removed.json",
     "g9": GROUP_OVERLAY_DIR / "g9_positive_resident_chat.json",
+    "g10": GROUP_OVERLAY_DIR / "g10_spontaneous_neutral_resident_chat.json",
+    "g11": GROUP_OVERLAY_DIR / "g11_spontaneous_negative_resident_chat.json",
+    "g12": GROUP_OVERLAY_DIR / "g12_spontaneous_positive_resident_chat.json",
 }
 
 COUNSEL_ROOM_OVERLAY = BASE_DIR / "data" / "config_counsel_room.json"
@@ -184,7 +188,7 @@ SEVERITY_SHORT_NAMES = {
     "severe": "SEV",
 }
 SEVERITIES = ["mild", "moderate", "severe"]
-GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7", "g9"]
+GROUPS = ["g1", "g2", "g3", "g5", "g6", "g7", "g9", "g10", "g11", "g12"]
 WILDCARD_TOKENS = {"*", "ALL"}
 VARIANT_SELECTOR_ALIASES = dict(KABUDA_VARIANT_SELECTOR_ALIASES)
 GROUP_SELECTOR_ALIASES = {group.upper(): group for group in GROUPS}
@@ -981,7 +985,9 @@ def load_optional_json_file(path: Path) -> dict | None:
         return None
     try:
         payload = load_json_file(path)
-    except json.JSONDecodeError:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # A full filesystem can leave a partially written UTF-8 JSON file.
+        # Treat it as unavailable so resume logic can rebuild the artifact.
         return None
     if not isinstance(payload, dict):
         return None
@@ -990,8 +996,24 @@ def load_optional_json_file(path: Path) -> dict | None:
 
 def write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temp_path = Path(f.name)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def latest_snapshot_name_for_run(run_name: str) -> str:

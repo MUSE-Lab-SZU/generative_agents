@@ -10,6 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 from modules.game import create_game, get_game
 from modules import utils
 from modules.intervention_manager import InterventionManager
+from modules.simulation_event_recorder import SimulationEventRecorder
 from modules.staged_eval_manager import StagedEvalManager
 from simulation_roster import DEFAULT_VILLAGE_PERSONAS
 
@@ -99,8 +100,15 @@ class SimulateServer:
         else:
             self.logger = utils.create_io_logger(verbose)
 
+        self.event_recorder = SimulationEventRecorder(
+            checkpoints_folder,
+            self.config,
+            logger=self.logger,
+        )
+
         # 创建游戏
         game = create_game(name, static_root, config, conversation, logger=self.logger)
+        game.set_event_recorder(self.event_recorder)
         depression_trace_path = os.path.join(
             checkpoints_folder,
             "judge_traces",
@@ -205,6 +213,48 @@ class SimulateServer:
             snapshot_config,
         )
 
+    def _record_agent_states(self, step_plan_paths):
+        """Best-effort raw state capture; never participate in simulation flow."""
+        try:
+            records = []
+            for agent_name, status in self.agent_status.items():
+                agent = self.game.get_agent(agent_name)
+                coord = status.get("coord")
+                tile = self.game.maze.tile_at(coord)
+                event = agent.get_event()
+                chat_state = (
+                    agent.status.get("chat_action_state", {})
+                    if isinstance(agent.status, dict)
+                    else {}
+                )
+                if not isinstance(chat_state, dict):
+                    chat_state = {}
+                activity = event.get_describe(False)
+                if event.fit(predicate="对话"):
+                    activity = "对话"
+                records.append(
+                    {
+                        "event_type": "agent_state",
+                        "agent": str(agent_name or ""),
+                        "peer": str(chat_state.get("other", "") or ""),
+                        "location": tile.get_address(as_list=False),
+                        "coord": list(coord) if coord is not None else None,
+                        "activity": str(activity or ""),
+                        "action_predicate": str(event.predicate or ""),
+                        "action_object": str(event.object or ""),
+                        "action_start": agent.action.start.strftime("%Y%m%d-%H:%M:%S"),
+                        "action_duration_minutes": int(agent.action.duration or 0),
+                        "session_id": str(chat_state.get("meeting_id", "") or ""),
+                        "planned_path_length": int(step_plan_paths.get(agent_name, 0) or 0),
+                    }
+                )
+            self.event_recorder.append_agent_states(records)
+        except Exception as exc:
+            if self.logger and hasattr(self.logger, "warning"):
+                self.logger.warning(
+                    "[SIMULATION_AGENT_STATE_RECORD_FAIL] error={}".format(str(exc))
+                )
+
     def simulate(self, step, stride=0):
         timer = utils.get_timer()
         try:
@@ -219,6 +269,7 @@ class SimulateServer:
                         self.logger.info("[SIMULATION_AUTO_STOP] reason=t4_done")
                         break
                 step_no = i + 1
+                self.event_recorder.begin_step(step_no, timer.get_date())
                 title = "Simulate Step[{}/{}, time: {}]".format(step_no, self.start_step + step, timer.get_date())
                 self.logger.info("\n" + utils.split_line(title, "="))
                 self.intervention.on_step_start(self.game, timer.get_date())
@@ -230,8 +281,10 @@ class SimulateServer:
                         step_no=step_no,
                         sim_time=t0_sim_time,
                     )
+                step_plan_paths = {}
                 for name, status in self.agent_status.items():
                     plan = self.game.agent_think(name, status)["plan"]
+                    step_plan_paths[name] = len(plan.get("path") or [])
                     agent = self.game.get_agent(name)
                     if name not in self.config["agents"]:
                         self.config["agents"][name] = {}
@@ -370,6 +423,8 @@ class SimulateServer:
                         sim_time=sim_time,
                         snapshot_name=snapshot_name,
                     )
+
+                self._record_agent_states(step_plan_paths)
 
                 if stride > 0:
                     timer.forward(stride)

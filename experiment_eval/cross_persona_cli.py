@@ -19,7 +19,7 @@ from .cross_persona import (
 from .loader import find_report_files, load_records
 from .process import extract_process_metrics
 from .schema import ExperimentRecord, group_sort_key, normalize_group, normalize_kbd
-from .visualization.cross_persona_plots import (
+from .charts.persona import (
     plot_leave_one_persona_out,
     plot_outcome_heatmap,
     plot_persona_contrast_forest,
@@ -31,11 +31,25 @@ from .visualization.cross_persona_plots import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAJECTORY_DIRS = [
-    PROJECT_ROOT / "results" / "experiment_data-0727-KBD2" / "experiment_data" / "reports",
-    PROJECT_ROOT / "results" / "experiment_data-0727-KBD4" / "experiment_data" / "reports",
-    PROJECT_ROOT / "results" / "experiment_data-0727-KBD6" / "experiment_data" / "reports",
+    PROJECT_ROOT
+    / "results"
+    / "experiment_data-0727-KBD2"
+    / "experiment_data"
+    / "reports",
+    PROJECT_ROOT
+    / "results"
+    / "experiment_data-0727-KBD4"
+    / "experiment_data"
+    / "reports",
+    PROJECT_ROOT
+    / "results"
+    / "experiment_data-0727-KBD6"
+    / "experiment_data"
+    / "reports",
 ]
-DEFAULT_HETEROGENEITY_DIR = PROJECT_ROOT / "results" / "experiment_data" / "reports" / "0718"
+DEFAULT_HETEROGENEITY_DIR = (
+    PROJECT_ROOT / "results" / "experiment_data" / "reports" / "0718"
+)
 DEFAULT_PROCESS_DATA_ROOT = PROJECT_ROOT / "results" / "experiment_data" / "0718"
 DEFAULT_PROCESS_CHECKPOINTS_ROOT = PROJECT_ROOT / "results" / "checkpoints" / "0718"
 DEFAULT_OUT_DIR = (
@@ -52,6 +66,18 @@ def _display(path: Path) -> str:
         return str(path.relative_to(PROJECT_ROOT))
     except ValueError:
         return str(path)
+
+
+def _aliases(values: list[str] | None) -> list[tuple[str, str]]:
+    aliases: list[tuple[str, str]] = []
+    for value in values or []:
+        if "=" not in value:
+            raise SystemExit(f"Invalid alias (expected PATH_MATCH=LABEL): {value}")
+        path_match, label = value.split("=", 1)
+        if not path_match or not label:
+            raise SystemExit(f"Invalid alias: {value}")
+        aliases.append((path_match, label))
+    return aliases
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
@@ -81,9 +107,14 @@ def _inventory_rows(
     counts = Counter((record.kbd, record.group) for record in records)
     rows: list[dict[str, Any]] = []
     for (persona, group), count in sorted(
-        counts.items(), key=lambda item: (group_sort_key(item[0][0]), group_sort_key(item[0][1]))
+        counts.items(),
+        key=lambda item: (group_sort_key(item[0][0]), group_sort_key(item[0][1])),
     ):
-        cell = [record for record in records if record.kbd == persona and record.group == group]
+        cell = [
+            record
+            for record in records
+            if record.kbd == persona and record.group == group
+        ]
         rows.append(
             {
                 "dataset": dataset,
@@ -136,13 +167,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trajectory-group", action="append", default=None)
     parser.add_argument("--first-group", default="G1")
     parser.add_argument("--second-group", default="G9")
+    parser.add_argument(
+        "--repeat-alias",
+        action="append",
+        default=None,
+        metavar="PATH_MATCH=REPEAT_ID",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     trajectory_dirs = [
-        _resolve(path) for path in (args.trajectory_reports_dir or DEFAULT_TRAJECTORY_DIRS)
+        _resolve(path)
+        for path in (args.trajectory_reports_dir or DEFAULT_TRAJECTORY_DIRS)
     ]
     heterogeneity_dir = _resolve(args.heterogeneity_reports_dir)
     out_dir = _resolve(args.out_dir)
@@ -154,12 +192,15 @@ def main(argv: list[str] | None = None) -> int:
     ]
     first_group = normalize_group(args.first_group)
     second_group = normalize_group(args.second_group)
+    repeat_aliases = _aliases(args.repeat_alias)
 
     trajectory_files = _discover(trajectory_dirs)
     heterogeneity_files = _discover([heterogeneity_dir])
-    trajectory_records, trajectory_labels, trajectory_scales = load_records(trajectory_files)
+    trajectory_records, trajectory_labels, trajectory_scales = load_records(
+        trajectory_files, repeat_aliases=repeat_aliases
+    )
     heterogeneity_records, heterogeneity_labels, heterogeneity_scales = load_records(
-        heterogeneity_files
+        heterogeneity_files, repeat_aliases=repeat_aliases
     )
     trajectory_records = [
         record
@@ -213,13 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     inventory_rows = [
         *_inventory_rows(
-            trajectory_records, trajectory_labels, trajectory_scales, "0727 trajectory"
+            trajectory_records, trajectory_labels, trajectory_scales, "trajectory selection"
         ),
         *_inventory_rows(
             heterogeneity_records,
             heterogeneity_labels,
             heterogeneity_scales,
-            "0718 heterogeneity",
+            "heterogeneity selection",
         ),
     ]
 
@@ -277,23 +318,29 @@ def main(argv: list[str] | None = None) -> int:
             "in-silico exploratory cross-persona analysis; K repeats are measurement repeats, "
             "not independent outer runs"
         ),
-        "process_experiment_data_root": _display(_resolve(args.process_experiment_data_root)),
+        "process_experiment_data_root": _display(
+            _resolve(args.process_experiment_data_root)
+        ),
         "process_checkpoints_root": _display(_resolve(args.process_checkpoints_root)),
         "csv_files": [_display(path) for path in csv_paths],
         "charts": [{"png": _display(path)} for path in chart_paths],
     }
     manifest_path = out_dir / "analysis_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    observed_cell_ns = sorted(
+        {int(row["n_outer_runs"]) for row in inventory_rows if row.get("n_outer_runs")}
+    )
     index_lines = [
-        "# 跨人设论文图示例",
+        "# 跨人设与部分交叉设计图",
         "",
-        "- 0727：KBD2/KBD4/KBD6 × G1/G4；同协议轨迹和描述性方差分解。",
-        "- 0718：KBD2/KBD4/KBD6 × G1/G3/G4/G5/G6/G7/G9；G1−G9 forest、热图和 LOPO。",
+        f"- 轨迹选择：{len(trajectory_records)} 个独立 outer runs；人设 {', '.join(personas)}；组别 {', '.join(trajectory_groups)}。",
+        f"- 异质性选择：{len(heterogeneity_records)} 个独立 outer runs；用于 {first_group}−{second_group} forest、热图和 LOPO。",
         "- 所有区间的统计单位均为 outer run；K=10 只用于冻结快照均值和测量噪声。",
-        "- 0718 每个人设×组只有 2 个 outer run，相关结果全部是探索性。",
-        "",
-        "- [分析方案](../../../cross_persona_analysis_plan.md)",
-        "- [逐图结果说明](../../../cross_persona_results_notes.md)",
+        "- 观察到的 persona×group 单元 outer n="
+        + (",".join(map(str, observed_cell_ns)) or "unavailable")
+        + "；缺失单元保持 NA，结果均为探索性。",
         "",
         "## Figures",
         "",
@@ -311,9 +358,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     (out_dir / "README.md").write_text("\n".join(index_lines), encoding="utf-8")
 
-    print(f"Loaded {len(trajectory_records)} trajectory outer-run records from 0727 archives")
-    print(f"Loaded {len(heterogeneity_records)} heterogeneity outer-run records from 0718")
-    print(f"Wrote {len(chart_paths)} PNG figures and {len(csv_paths)} CSV files to {_display(out_dir)}")
+    print(
+        f"Loaded {len(trajectory_records)} trajectory outer-run records"
+    )
+    print(
+        f"Loaded {len(heterogeneity_records)} heterogeneity outer-run records"
+    )
+    print(
+        f"Wrote {len(chart_paths)} PNG figures and {len(csv_paths)} CSV files to {_display(out_dir)}"
+    )
     return 0
 
 

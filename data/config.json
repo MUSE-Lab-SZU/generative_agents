@@ -16,7 +16,14 @@
         "base_url": "http://127.0.0.1:18000/v1",
         "api_key": "EMPTY",
         "retry": 3,
-        "request_timeout_seconds": 120
+        "request_timeout_seconds": 120,
+        "load_balancing": {
+          "enabled": true,
+          "ports": [
+            18000,
+            18002
+          ]
+        }
       },
       "interval": 1000,
       "poignancy_max": 50,
@@ -62,7 +69,14 @@
         "provider": "openai",
         "model": "bge-m3-vllm",
         "base_url": "http://127.0.0.1:18001/v1",
-        "api_key": "EMPTY"
+        "api_key": "EMPTY",
+        "load_balancing": {
+          "enabled": true,
+          "ports": [
+            18001,
+            18004
+          ]
+        }
       },
       "retention": 32,
       "recent_dedup_limit": 0,
@@ -455,6 +469,12 @@
     "periodic_every_steps": 56,
     "write_final_snapshot": true,
     "write_on_staged_eval_trigger": true,
+    "event_log": {
+      "enabled": true,
+      "filename": "simulation_events.jsonl",
+      "record_interactions": true,
+      "record_agent_states": true
+    },
     "rolling_resume": {
       "enabled": true
     }

@@ -1,0 +1,49 @@
+{
+  "intervention": {
+    "enabled": false,
+    "meeting_queue": {
+      "enabled": false
+    },
+    "order_extract": {
+      "enabled": false
+    },
+    "session_prompt_injection": {
+      "enabled": false
+    },
+    "forced_llm": {
+      "enabled": true
+    },
+    "dialog_judge": {
+      "enabled": false
+    },
+    "session_eval": {
+      "enabled": false
+    },
+    "consult_history": {
+      "enabled": false
+    },
+    "depression_dynamic": {
+      "enabled": true
+    },
+    "memory_injection": {
+      "enabled": true
+    },
+    "memory_policy": {
+      "enabled": true
+    },
+    "resident_chat_prompt_injection": {
+      "enabled": true,
+      "target_patient": "卡布达",
+      "prompt_file": "data/prompts/intervention/resident_chat_positive_support.txt"
+    }
+  },
+  "staged_eval": {
+    "step_interval": {
+      "enabled": true,
+      "every_steps": 24,
+      "virtual_session_interval": 4,
+      "label_prefix": "session",
+      "max_triggers": 0
+    }
+  }
+}
