@@ -38,6 +38,8 @@ results/compressed/
 
 docs/*
 !docs/主诉图_catalog与分支Prompt字段说明.md
+!docs/town_method/
+!docs/town_method/**
 tests/
 
 # Experiment outputs and large artifacts
