@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达3",
   "complaint_graph": {
     "initial_stage_id": "mild_social_misread_self_doubt",
+    "root_complaint_anchor": "一次公开社交误会后，卡布达将他人的反应理解为自己令人厌烦；他因此怀疑自己不受欢迎，并担心继续出现会给别人添麻烦。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

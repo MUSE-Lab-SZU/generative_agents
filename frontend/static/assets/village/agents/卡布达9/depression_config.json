@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达9",
   "complaint_graph": {
     "initial_stage_id": "moderate_archive_failure_shame",
+    "root_complaint_anchor": "一次归档出错后，卡布达将记录失误理解为自己失职且不可靠；他因此认为自己不再值得他人信任，并担心再次承担记录工作。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

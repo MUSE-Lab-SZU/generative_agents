@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达9",
   "complaint_graph": {
     "initial_stage_id": "severe_archive_total_failure",
+    "root_complaint_anchor": "一次归档出错后，卡布达将记录失误视为自己不够可靠的证据；他认为自己难以继续获得他人托付，并担心再次承担记录责任。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

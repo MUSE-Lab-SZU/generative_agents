@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "severe_job_loss_total_collapse",
+    "root_complaint_anchor": "卡布达被辞退后，将失业与自身能力和个人价值紧密联系；他反复认为自己难以再获得认可，并减少向他人解释近况。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

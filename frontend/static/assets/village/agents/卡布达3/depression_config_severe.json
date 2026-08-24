@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达3",
   "complaint_graph": {
     "initial_stage_id": "severe_social_erasure",
+    "root_complaint_anchor": "一次社交误会后，卡布达持续把他人的反应理解为失望或排斥；他认为自己容易让别人尴尬，并倾向退出原有社交联系。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

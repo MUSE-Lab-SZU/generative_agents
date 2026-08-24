@@ -835,3 +835,4 @@ def test_agent_reflection_payload_is_committed_once():
     assert "反思结论：我把失业理解成自己没用。" in call["content"]
     assert call["metadata"]["evidence_ids"] == ["event-1", "chat-2"]
     assert call["metadata"]["thought_node_ids"] == ["thought-1", "thought-2"]
+

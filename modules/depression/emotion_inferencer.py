@@ -44,7 +44,9 @@ class EmotionInferencer:
         return self._sanitize(parsed, fallback, payload)
 
     def build_prompt(self, payload: Dict[str, Any]) -> str:
-        current_stage = json.dumps(payload.get("current_stage", {}) or {}, ensure_ascii=False)
+        current_stage = json.dumps(
+            self._current_stage_view(payload.get("current_stage", {})), ensure_ascii=False
+        )
         graph_snapshot = json.dumps(
             self._slim_graph_snapshot(payload.get("graph_snapshot", {})), ensure_ascii=False
         )
@@ -63,24 +65,20 @@ class EmotionInferencer:
         )
 
     @staticmethod
-    def _slim_graph_snapshot(graph_snapshot: Any) -> Dict[str, Any]:
-        """只保留与瞬时语气相关的字段，避免整份状态机快照（全部 stages、
-        stage_history、dialogue_history 等）给 LLM 引入无关的自由发挥空间。"""
-        graph_snapshot = graph_snapshot if isinstance(graph_snapshot, dict) else {}
-        window = graph_snapshot.get("current_graph_window", [])
-        window = window if isinstance(window, list) else []
-        candidate_branches = [
-            {
-                "label": str(stage.get("label", "") or ""),
-                "summary": str(stage.get("summary", "") or ""),
-            }
-            for stage in window[1:]
-            if isinstance(stage, dict)
-        ]
+    def _current_stage_view(current_stage: Any) -> Dict[str, Any]:
+        """返回 emotion prompt 使用的当前节点视图，不透传未来候选 ID。"""
+        stage = current_stage if isinstance(current_stage, dict) else {}
         return {
-            "current_stage_label": str(graph_snapshot.get("current_stage_label", "") or ""),
-            "candidate_branches": candidate_branches,
+            str(key): value
+            for key, value in stage.items()
+            if str(key) != "next_candidates"
         }
+
+    @staticmethod
+    def _slim_graph_snapshot(graph_snapshot: Any) -> Dict[str, Any]:
+        """保留调用接口，但不向 emotion prompt 暴露任何候选图内容。"""
+        del graph_snapshot
+        return {}
 
     def build_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """基于 stage + relationship + flags 的规则化情绪兜底。"""

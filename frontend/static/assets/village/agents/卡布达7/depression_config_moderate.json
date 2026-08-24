@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达7",
   "complaint_graph": {
     "initial_stage_id": "moderate_shop_failure_shame",
+    "root_complaint_anchor": "收到差评和退货后，卡布达将售后问题概括为自己什么都做不好；他因此怀疑自己无法经营好小店，并担心持续受到顾客否定。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

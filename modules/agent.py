@@ -2240,6 +2240,14 @@ class Agent:
                 chat_summary,
                 start,
             )
+        # This boundary is shared by doctor, forced-resident and natural chats.
+        # Any after-chat reflection above has already contributed detector hints.
+        self._finalize_depression_domain_windows(
+            other=other,
+            chats=chats,
+            start_time=start,
+            meeting_id=forced_meeting_id,
+        )
         if interaction_record is not None:
             recorder.append_interaction(interaction_record)
         return True
@@ -3238,6 +3246,11 @@ class Agent:
             return None
 
         try:
+            domain_state_cfg = (
+                global_cfg.get("domain_state", {})
+                if isinstance(global_cfg.get("domain_state", {}), dict)
+                else {}
+            )
             engine = DepressionSimulationEngine(
                 {
                     "config_path": config_path,
@@ -3245,6 +3258,7 @@ class Agent:
                     "agent_name": self.name,
                 },
                 clock_provider=utils.get_timer().get_date,
+                domain_state_enabled=domain_state_cfg.get("enabled", True),
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
             state_payload = config.get("depression_dynamic_state", {})
@@ -3597,6 +3611,101 @@ class Agent:
             counterpart_utterance=context.get("counterpart_utterance", ""),
         )
 
+    def _finalize_depression_domain_windows(
+        self, other, chats, start_time, meeting_id=""
+    ):
+        """Close one domain window per dynamic agent after a complete chat."""
+        transcript = "\n".join(
+            "{}: {}".format(str(name or "").strip(), str(text or "").strip())
+            for name, text in (chats or [])
+            if str(text or "").strip()
+        ).strip()
+        if not transcript:
+            return []
+        started_at = (
+            start_time.isoformat()
+            if hasattr(start_time, "isoformat")
+            else str(start_time or "")
+        )
+        pair_names = sorted(
+            [str(getattr(self, "name", "") or ""), str(getattr(other, "name", "") or "")]
+        )
+        base_id = str(meeting_id or "").strip()
+        if not base_id:
+            digest = hashlib.sha1(transcript.encode("utf-8")).hexdigest()[:16]
+            base_id = "conversation|{}|{}|{}".format(
+                started_at, "<->".join(pair_names), digest
+            )
+        results = []
+        for target, counterpart in ((self, other), (other, self)):
+            engine = getattr(target, "depression_dynamic", None)
+            if engine is None or not hasattr(engine, "finalize_domain_window"):
+                continue
+            target_name = str(getattr(target, "name", "") or "")
+            patient_lines = [
+                str(text or "").strip()
+                for name, text in (chats or [])
+                if str(name or "").strip() == target_name and str(text or "").strip()
+            ]
+            if not patient_lines:
+                continue
+            relationship = ""
+            interaction_type = ""
+            try:
+                relationship = target._infer_dynamic_relationship(counterpart, "")
+                interaction_type = target._infer_dynamic_interaction_type(
+                    counterpart, relationship, chats
+                )
+            except Exception:
+                pass
+            trace_context = {
+                "source": "domain_window",
+                "location": target._dynamic_location() if hasattr(target, "_dynamic_location") else "",
+                "time_of_day": target._dynamic_time_of_day() if hasattr(target, "_dynamic_time_of_day") else "",
+                "other_agent": str(getattr(counterpart, "name", "") or ""),
+                "relationship": relationship,
+                "interaction_type": interaction_type,
+                "dialogue": {
+                    "patient_utterance": "\n".join(patient_lines),
+                    "counterpart_utterance": "",
+                },
+            }
+            try:
+                with target._depression_trace_scope(trace_context):
+                    result = engine.finalize_domain_window(
+                        # Keep the public argument name for compatibility, but
+                        # the updater now receives the complete labeled window.
+                        patient_dialogue=transcript,
+                        window_id="{}|{}".format(base_id, target_name),
+                        window_context={
+                            "started_at": started_at,
+                            "participants": pair_names,
+                            "patient": target_name,
+                            "interaction_type": interaction_type,
+                            "location": (
+                                target._dynamic_location()
+                                if hasattr(target, "_dynamic_location")
+                                else ""
+                            ),
+                            "time_of_day": (
+                                target._dynamic_time_of_day()
+                                if hasattr(target, "_dynamic_time_of_day")
+                                else ""
+                            ),
+                        },
+                        completion_func=target._depression_llm_completion,
+                    )
+                results.append(result)
+            except Exception as exc:
+                logger = getattr(target, "logger", None)
+                if logger and hasattr(logger, "info"):
+                    logger.info(
+                        "[DEPRESSION_DYNAMIC] agent={} domain window finalize failed: {}".format(
+                            target_name, exc
+                        )
+                    )
+        return results
+
     def _build_depression_chat_context(self, other, relation_summary, chats):
         location = self._dynamic_location()
         relationship = self._infer_dynamic_relationship(other, relation_summary)
@@ -3774,8 +3883,12 @@ class Agent:
     @staticmethod
     def _classify_depression_llm_call(prompt):
         text = str(prompt or "").lstrip()
-        if text.startswith("你是患者主诉状态变化提取器。"):
+        if text.startswith(
+            ("你是患者主诉图的变化检测器。", "你是患者主诉状态变化提取器。")
+        ):
             return "graph_transition_change"
+        if text.startswith("你是长期抑郁症状 domain 的窗口级裁决器。"):
+            return "domain_window_update"
         if text.startswith(("你是主诉图推进判定器。", "你是患者主诉状态推进判定器。")):
             return "graph_transition"
         if text.startswith("你是主诉图规划器。"):

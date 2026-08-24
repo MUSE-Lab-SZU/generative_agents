@@ -5,6 +5,11 @@
 === 基础人格层 ===
 ${base_prompt}
 
+@@ root_complaint_anchor_layer
+=== 长期病例背景 ===
+核心主诉锚点：${root_complaint_anchor}
+使用边界：允许近期事件和当前主诉按实际进展自然演变，包括出现新主题、阶段推进、好转或反复；本背景仅用于维持长期病例脉络，不要求每轮关联或提及，也不得限制当前主诉更新。
+
 @@ stage_layer
 === 当前主诉节点层 ===
 当前节点：${label}
@@ -16,6 +21,10 @@ ${graph_window_section}
 
 @@ dynamic_stage_summary_section
 节点概述：${summary}
+
+@@ dynamic_stage_domain_state_section
+=== 持续症状状态 ===
+${domain_lines}
 
 @@ dynamic_stage_core_belief_section
 核心信念：${core_belief}

@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达2",
   "complaint_graph": {
     "initial_stage_id": "mild_comparison_self_doubt",
+    "root_complaint_anchor": "反复听到家人和熟人称赞他人后，卡布达开始将比较结果理解为自己不够好；他因此怀疑自己没有值得被看见的地方，并更在意他人的评价。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

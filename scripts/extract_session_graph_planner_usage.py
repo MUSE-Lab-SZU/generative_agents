@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""导出每个医生 session 的最终主诉图变化及其前置 graph planner 调用。
+"""导出每个医生 session 的最终主诉图变化及其前置 detector / planner 调用。
 
 数据来源：
 * ``judge_traces/judge_conversation.json``：医生 session 的边界和患者轮次；
@@ -7,9 +7,10 @@
 
 对每个医生 session，报告会列出：
 1. 最后一条患者对话的主诉图节点变化；
-2. 为该变化的父节点生成候选分支的最近一个 ``graph_planner`` 调用；
-3. 会后最后一个反思的主诉图节点变化；
-4. 为该反思变化的父节点生成候选分支的最近一个 ``graph_planner`` 调用。
+2. 该变化的前置 ``graph_transition_change`` 检测器调用及其原始输出；
+3. 实际传入 ``graph_planner`` 的程序校验后 ``verified_change``；
+4. 为该变化的父节点生成候选分支的最近一个 ``graph_planner`` 调用；
+5. 会后最后一个反思的同类记录。
 
 提示词均从 JSONL 的 ``prompt`` 字段原样复制，包含模板固定规则和当次实际输入。
 
@@ -129,7 +130,7 @@ def transition_details(record: Mapping[str, Any]) -> dict[str, Any]:
     action = str(decision.get("action", "") or "")
     target_id = str(decision.get("target_stage_id", "") or "")
     if action == "advance":
-        after = next(
+        llm_candidate = next(
             (
                 dict(candidate)
                 for candidate in candidates
@@ -138,11 +139,24 @@ def transition_details(record: Mapping[str, Any]) -> dict[str, Any]:
             {},
         )
     else:
-        after = dict(current)
+        llm_candidate = dict(current)
+    runtime = record.get("_runtime_transition", {})
+    runtime = dict(runtime) if isinstance(runtime, Mapping) else {}
+    runtime_available = str(runtime.get("status", "") or "") == "available"
+    runtime_transition = runtime.get("transition", {})
+    runtime_transition = (
+        dict(runtime_transition) if isinstance(runtime_transition, Mapping) else {}
+    )
+    before = runtime.get("before", {}) if runtime_available else current
+    after = runtime.get("after", {}) if runtime_available else {}
     return {
-        "action": action,
-        "before": current,
-        "after": after,
+        "llm_action": action,
+        "llm_candidate": llm_candidate,
+        "commit_status": "available" if runtime_available else "unavailable",
+        "commit_action": str(runtime_transition.get("action", "") or "") if runtime_available else "",
+        "commit_reason": str(runtime.get("reason", "") or "") if not runtime_available else "",
+        "before": dict(before) if isinstance(before, Mapping) else {},
+        "after": dict(after) if isinstance(after, Mapping) else {},
         "prompt": str(record.get("prompt", "") or ""),
         "response": str(record.get("response", "") or ""),
         "context": record.get("context", {}),
@@ -159,11 +173,18 @@ def matching_chat_transitions(
     expected_time = meeting_time(str(meeting.get("meeting_id", "") or ""))
     turns = session.get("turns", [])
     turns = turns if isinstance(turns, list) else []
-    patient_texts = {
-        str(turn.get("patient", "") or "").strip()
-        for turn in turns
-        if isinstance(turn, Mapping) and str(turn.get("patient", "") or "").strip()
-    }
+    runtime_by_patient_text: dict[str, list[dict[str, Any]]] = {}
+    for turn in turns:
+        if not isinstance(turn, Mapping):
+            continue
+        patient_text = str(turn.get("patient", "") or "").strip()
+        if not patient_text:
+            continue
+        runtime = turn.get("complaint_graph", {})
+        runtime_by_patient_text.setdefault(patient_text, []).append(
+            dict(runtime) if isinstance(runtime, Mapping) else {}
+        )
+    matched_per_text: dict[str, int] = {}
     matched = []
     for record in records:
         context = record.get("context", {})
@@ -175,9 +196,22 @@ def matching_chat_transitions(
             and isinstance(context, Mapping)
             and str(context.get("source", "") or "") == "chat"
             and str(record.get("sim_time", "") or "") == expected_time
-            and utterance in patient_texts
+            and utterance in runtime_by_patient_text
         ):
-            matched.append(record)
+            occurrence = matched_per_text.get(utterance, 0)
+            runtime_rows = runtime_by_patient_text[utterance]
+            runtime = (
+                runtime_rows[occurrence]
+                if occurrence < len(runtime_rows)
+                else {
+                    "status": "unavailable",
+                    "reason": "duplicate_patient_text_occurrence_not_aligned",
+                }
+            )
+            annotated = dict(record)
+            annotated["_runtime_transition"] = runtime
+            matched.append(annotated)
+            matched_per_text[utterance] = occurrence + 1
     return matched
 
 
@@ -185,6 +219,7 @@ def matching_reflection_transition(
     records: list[dict[str, Any]],
     patient: str,
     last_chat: Mapping[str, Any],
+    session: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Find the reflection committed after the session's final chat transition."""
     timestamp = str(last_chat.get("sim_time", "") or "")
@@ -199,7 +234,16 @@ def matching_reflection_transition(
         and isinstance(record.get("context"), Mapping)
         and str(record["context"].get("source", "") or "") == "reflection"
     ]
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    annotated = dict(candidates[0])
+    graph_summary = session.get("complaint_graph", {})
+    graph_summary = graph_summary if isinstance(graph_summary, Mapping) else {}
+    runtime = graph_summary.get("reflection", {})
+    annotated["_runtime_transition"] = (
+        dict(runtime) if isinstance(runtime, Mapping) else {}
+    )
+    return annotated
 
 
 def previous_matching_planner(
@@ -231,7 +275,134 @@ def previous_matching_planner(
     return fallback
 
 
-def markdown_block_for_transition(title: str, transition: Mapping[str, Any] | None, planner: Mapping[str, Any] | None) -> list[str]:
+def planner_verified_change(planner: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact verified-change view that was sent to a planner."""
+    payload = prompt_payload(planner.get("prompt"))
+    value = payload.get("verified_change", {})
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def previous_matching_change_detector(
+    records: list[dict[str, Any]],
+    planner: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Find the detector whose verified result led to the selected planner call.
+
+    ``verified_change`` itself is not the detector's raw LLM output: the state
+    machine filters its quotes before constructing the planner prompt.  Match
+    by agent, simulation time, source and parent node, then prefer an exact
+    ``change`` / evidence-quote match with the verified payload.
+    """
+    planner_payload = prompt_payload(planner.get("prompt"))
+    current = planner_payload.get("current_stage", {})
+    parent_id = str(current.get("id", "") or "") if isinstance(current, Mapping) else ""
+    verified = planner_verified_change(planner)
+    expected_change = str(verified.get("change", "") or "").strip()
+    expected_quotes = {
+        str(item or "").strip()
+        for item in verified.get("evidence_quotes", [])
+        if str(item or "").strip()
+    }
+    planner_index = int(planner.get("_trace_index", -1))
+    planner_time = str(planner.get("sim_time", "") or "")
+    planner_agent = str(planner.get("agent", "") or "")
+    planner_context = planner.get("context", {})
+    planner_source = (
+        str(planner_context.get("source", "") or "")
+        if isinstance(planner_context, Mapping)
+        else ""
+    )
+    fallback: dict[str, Any] | None = None
+    for record in reversed(records):
+        if int(record.get("_trace_index", -1)) >= planner_index:
+            continue
+        if record.get("call_type") != "graph_transition_change":
+            continue
+        if str(record.get("agent", "") or "") != planner_agent:
+            continue
+        if str(record.get("sim_time", "") or "") != planner_time:
+            continue
+        context = record.get("context", {})
+        if not isinstance(context, Mapping) or str(context.get("source", "") or "") != planner_source:
+            continue
+        try:
+            detector_payload = prompt_payload(record.get("prompt"))
+            detector_current = detector_payload.get("current_stage", {})
+            detector_parent_id = (
+                str(detector_current.get("id", "") or "")
+                if isinstance(detector_current, Mapping)
+                else ""
+            )
+            detector_output = decode_json_object(record.get("response"), "变化检测器输出")
+        except ExtractionError:
+            continue
+        if parent_id and detector_parent_id != parent_id:
+            continue
+        if not detector_output.get("has_new_change", False):
+            continue
+        if fallback is None:
+            fallback = record
+        detector_change = str(detector_output.get("change", "") or "").strip()
+        detector_quotes = {
+            str(item or "").strip()
+            for item in detector_output.get("evidence_quotes", [])
+            if str(item or "").strip()
+        }
+        if detector_change == expected_change and detector_quotes == expected_quotes:
+            return record
+    return fallback
+
+
+def markdown_block_for_detector(
+    detector: Mapping[str, Any] | None,
+    planner: Mapping[str, Any],
+) -> list[str]:
+    """Render detector raw I/O and the verified payload actually sent onward."""
+    verified = planner_verified_change(planner)
+    lines = [
+        "#### 前置变化检测器（graph_transition_change）",
+        "",
+        "> 检测器原始输出会再经过逐字证据校验；下方 `verified_change` 才是实际传入 planner 的内容。",
+        "",
+        "##### 实际传入 planner 的 verified_change（程序校验后）",
+        "",
+        "```json",
+        json.dumps(verified, ensure_ascii=False, indent=2),
+        "```",
+        "",
+    ]
+    if not detector:
+        lines.extend(["未找到可安全对齐的前置 `graph_transition_change` 调用。", ""])
+        return lines
+    output = decode_json_object(detector.get("response"), "变化检测器输出")
+    lines.extend(
+        [
+            "- 检测器原始结论：`has_new_change={}`".format(output.get("has_new_change", "未知")),
+            "- 原始变化描述：{}".format(str(output.get("change", "") or "（无）")),
+            "",
+            "##### 检测器完整实际提示词（原样）",
+            "",
+            "```text",
+            str(detector.get("prompt", "") or ""),
+            "```",
+            "",
+            "##### 检测器 LLM 输出（原样）",
+            "",
+            "```text",
+            str(detector.get("response", "") or ""),
+            "```",
+            "",
+        ]
+    )
+    return lines
+
+
+def markdown_block_for_transition(
+    title: str,
+    transition: Mapping[str, Any] | None,
+    planner: Mapping[str, Any] | None,
+    detector: Mapping[str, Any] | None,
+) -> list[str]:
     lines = ["### {}".format(title), ""]
     if not transition:
         lines.extend(["未找到可对齐的主诉图推进器记录。", ""])
@@ -242,13 +413,35 @@ def markdown_block_for_transition(title: str, transition: Mapping[str, Any] | No
     context = details["context"] if isinstance(details["context"], Mapping) else {}
     dialogue = context.get("dialogue", {}) if isinstance(context, Mapping) else {}
     dialogue = dialogue if isinstance(dialogue, Mapping) else {}
+    summary_lines = [
+        "- LLM 推进判定：`{}`".format(details["llm_action"] or "未知"),
+    ]
+    if details["commit_status"] == "available":
+        summary_lines.extend(
+            [
+                "- 真实 commit：`{}`".format(details["commit_action"] or "未知"),
+                "- 已提交节点：**{}** → **{}**".format(
+                    str(before.get("stage_label", before.get("stage_id", "未知节点")) or "未知节点"),
+                    str(after.get("stage_label", after.get("stage_id", "未知节点")) or "未知节点"),
+                ),
+            ]
+        )
+    else:
+        summary_lines.append(
+            "- 真实 commit：无法从 judge trace 安全对齐（`{}`）".format(
+                details["commit_reason"] or "runtime_transition_unavailable"
+            )
+        )
+    if details["llm_action"] == "advance":
+        candidate = details["llm_candidate"]
+        summary_lines.append(
+            "- LLM 提议候选：**{}**".format(
+                str(candidate.get("label", candidate.get("id", "未知节点")) or "未知节点")
+            )
+        )
     lines.extend(
-        [
-            "- 判定：`{}`".format(details["action"] or "未知"),
-            "- 节点变化：**{}** → **{}**".format(
-                str(before.get("label", before.get("id", "未知节点")) or "未知节点"),
-                str(after.get("label", after.get("id", "未知节点")) or "未知节点"),
-            ),
+        summary_lines
+        + [
             "- 患者本轮话语：{}".format(str(dialogue.get("patient_utterance", "") or "") or "（反思触发，不是单句患者对话）"),
             "",
             "#### 推进器完整实际提示词（原样）",
@@ -263,16 +456,17 @@ def markdown_block_for_transition(title: str, transition: Mapping[str, Any] | No
             details["response"],
             "```",
             "",
-            "#### 前一个 graph_planner 调用",
-            "",
         ]
     )
     if not planner:
-        lines.extend(["未找到同父节点的前置 `graph_planner` 调用。", ""])
+        lines.extend(["未找到同父节点的前置 `graph_planner` 调用，因此没有可展示的 verified_change。", ""])
         return lines
+    lines.extend(markdown_block_for_detector(detector, planner))
     planner_payload = prompt_payload(planner.get("prompt"))
     lines.extend(
         [
+            "#### 前一个 graph_planner 调用",
+            "",
             "- planner mode：`{}`".format(planner_payload.get("mode", "未知")),
             "- 被规划的父节点：**{}**".format(
                 str((planner_payload.get("current_stage", {}) or {}).get("label", "未知节点"))
@@ -300,8 +494,10 @@ def build_markdown(checkpoint: Path, sessions: list[Any], records: list[dict[str
         "# 医生 session 的最终主诉图变化与前置 Planner",
         "",
         "- checkpoint：`{}`".format(checkpoint),
-        "- 对齐规则：最后对话变化按 `meeting_id` 时间 + session 中患者原话定位；反思变化取该最后对话之后、同一仿真时间的第一条 reflection 推进记录。",
+        "- 对齐规则：LLM 调用按 `meeting_id` 时间 + session 中患者原话定位；真实 chat commit 读取对应 turn 的 `complaint_graph`，真实 reflection commit 读取 session 汇总的 `complaint_graph.reflection`。不得把 LLM 的 `action=advance` 直接当成已提交推进。",
         "- planner 对齐规则：从对应推进器调用向前回溯，选择最近一条 `graph_planner` 且其 `current_stage.id` 与推进器父节点一致的调用。",
+        "- detector 对齐规则：从已选 planner 向前回溯，匹配相同患者、仿真时间、source 与父节点的 `graph_transition_change`；若其原始 `change` 和证据引文与 planner 的 `verified_change` 完全一致则优先采用。",
+        "- `verified_change` 是程序完成逐字证据校验后传给 planner 的最小变化视图，不必与检测器原始输出逐字段相同。",
         "- 下方 prompt/response 均直接复制自 `depression_dynamic_llm_trace.jsonl`，没有重写。",
         "",
     ]
@@ -313,18 +509,26 @@ def build_markdown(checkpoint: Path, sessions: list[Any], records: list[dict[str
         patient = patient_from_session(raw_session, requested_agent)
         chat_records = matching_chat_transitions(records, patient, raw_session)
         last_chat = chat_records[-1] if chat_records else None
-        reflection = matching_reflection_transition(records, patient, last_chat) if last_chat else None
+        reflection = (
+            matching_reflection_transition(records, patient, last_chat, raw_session)
+            if last_chat
+            else None
+        )
         lines.extend(
             [
                 "## Session {}：{}".format(number, str(meeting.get("meeting_id", "") or "未知 meeting")),
                 "",
                 "- 患者：{}".format(patient),
-                "- 医生 session 中可对齐的患者对话推进次数：{}".format(len(chat_records)),
+                "- 医生 session 中可对齐的患者对话判定次数：{}".format(len(chat_records)),
                 "",
             ]
         )
-        lines.extend(markdown_block_for_transition("最后一个对话节点变化", last_chat, previous_matching_planner(records, last_chat) if last_chat else None))
-        lines.extend(markdown_block_for_transition("最后一个反思节点变化", reflection, previous_matching_planner(records, reflection) if reflection else None))
+        chat_planner = previous_matching_planner(records, last_chat) if last_chat else None
+        chat_detector = previous_matching_change_detector(records, chat_planner) if chat_planner else None
+        reflection_planner = previous_matching_planner(records, reflection) if reflection else None
+        reflection_detector = previous_matching_change_detector(records, reflection_planner) if reflection_planner else None
+        lines.extend(markdown_block_for_transition("最后一个对话节点变化", last_chat, chat_planner, chat_detector))
+        lines.extend(markdown_block_for_transition("最后一个反思节点变化", reflection, reflection_planner, reflection_detector))
     return "\n".join(lines)
 
 

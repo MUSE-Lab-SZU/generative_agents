@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达8",
   "complaint_graph": {
     "initial_stage_id": "mild_injury_identity_self_doubt",
+    "root_complaint_anchor": "旧伤复发并停训后，卡布达将训练受限理解为自己退步且失去证明能力的方式；他因此怀疑训练之外是否还有值得被认可的地方。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

@@ -2799,8 +2799,16 @@ class InterventionManager:
 
 
     def build_doctor_reply_guidance(self, judge: Any) -> str:
-        if self.get_cbt_controller_mode() != "minimal" or not isinstance(judge, dict):
-            return str((judge or {}).get("advice", "") or "") if isinstance(judge, dict) else ""
+        if not isinstance(judge, dict):
+            return ""
+        root_strategy_context = str(
+            judge.get("_root_complaint_strategy_context", "") or ""
+        ).strip()
+        if self.get_cbt_controller_mode() != "minimal":
+            guidance = str(judge.get("advice", "") or "").strip()
+            if root_strategy_context:
+                guidance = "{}\n{}".format(guidance, root_strategy_context).strip()
+            return guidance
         glossary = self._minimal_term_glossary()
         primary = self._doctor_guidance_term(
             str(judge.get("primary_strategy", "") or ""),
@@ -2826,6 +2834,8 @@ class InterventionManager:
                     "\n已知患者材料：{}\n回应边界：围绕一个明确材料缺口推进；"
                     "不要重复泛问感受、身体感觉或已经核对过的安全问题。"
                 ).format(internal)
+        if root_strategy_context:
+            guidance += "\n" + root_strategy_context
         return guidance
 
     @staticmethod
@@ -3364,14 +3374,21 @@ class InterventionManager:
                 )
             )
             prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("prompt_file", "") or ""))
+            patient_state_text = self._build_patient_dynamic_state_text(
+                patient_agent=patient,
+                doctor_agent=doctor,
+                policy=policy,
+            )
+            root_strategy_context = self._build_root_complaint_strategy_context(patient)
+            if root_strategy_context:
+                patient_state_text = "{}\n\n{}".format(
+                    str(patient_state_text or "").strip(),
+                    root_strategy_context,
+                ).strip()
             prompt_text = self._render_prompt_template(
                 prompt_tpl,
                 {
-                    "patient_state": self._build_patient_dynamic_state_text(
-                        patient_agent=patient,
-                        doctor_agent=doctor,
-                        policy=policy,
-                    ),
+                    "patient_state": patient_state_text,
                     "conversation": to_conversation_text(chats or []),
                     "session_prompt": str(session_prompt_text or ""),
                     "prev_session_eval_reason": str(prev_session_eval_reason or ""),
@@ -3384,6 +3401,8 @@ class InterventionManager:
             )
             normalized = self._normalize_dialog_judge_output(raw)
             normalized["valid"] = True
+            if root_strategy_context:
+                normalized["_root_complaint_strategy_context"] = root_strategy_context
             self._log_highlight(
                 "[DIALOG_JUDGE_NORM] turn={} terminate={}".format(
                     int(turn_no or 0),
@@ -3551,6 +3570,7 @@ class InterventionManager:
         latest_patient_reply = self._extract_latest_patient_utterance(
             chats or [], patient.name
         )
+        root_strategy_context = self._build_root_complaint_strategy_context(patient)
         subgoal_progress_text = ""
         if bool(policy.get("subgoal_progress_enabled", False)):
             try:
@@ -3598,14 +3618,22 @@ class InterventionManager:
                             progress_state,
                         )
                     ),
-                    "PATIENT_STATE": (
-                        compact_progressive_d_patient_state_text(patient_state)
-                        if progressive_d_v3
-                        else compact_patient_state_text(patient_state)
+                    "PATIENT_STATE": "{}{}".format(
+                        (
+                            compact_progressive_d_patient_state_text(patient_state)
+                            if progressive_d_v3
+                            else compact_patient_state_text(patient_state)
+                        ),
+                        (
+                            "\n" + root_strategy_context
+                            if root_strategy_context and not progressive_d_v3
+                            else ""
+                        ),
                     ),
                     "PATIENT_INTERNAL_STATE": (
-                        self._compact_progressive_d_patient_internal_state(
-                            patient
+                        "{}{}".format(
+                            self._compact_progressive_d_patient_internal_state(patient),
+                            "\n" + root_strategy_context if root_strategy_context else "",
                         )
                         if progressive_d_v3
                         else ""
@@ -3632,6 +3660,8 @@ class InterventionManager:
             )
         output = copy.deepcopy(normalized)
         output["valid"] = True
+        if root_strategy_context:
+            output["_root_complaint_strategy_context"] = root_strategy_context
         if progressive_d_v3:
             output["_patient_internal_state"] = (
                 self._compact_progressive_d_patient_internal_state(patient)
@@ -3877,6 +3907,32 @@ class InterventionManager:
         except Exception:
             return int(default)
 
+    def _get_root_complaint_anchor(self, patient_agent: Any) -> str:
+        """Read the checkpointed case anchor without consulting current_stage."""
+        engine = getattr(patient_agent, "depression_dynamic", None)
+        if engine is None or not callable(getattr(engine, "get_current_state_info", None)):
+            return ""
+        try:
+            info = engine.get_current_state_info()
+        except Exception:
+            return ""
+        if not isinstance(info, dict):
+            return ""
+        return str(info.get("root_complaint_anchor", "") or "").strip()
+
+    def _build_root_complaint_strategy_context(self, patient_agent: Any) -> str:
+        anchor = self._get_root_complaint_anchor(patient_agent)
+        if not anchor:
+            return ""
+        return (
+            "<长期病例背景>\n"
+            "核心主诉锚点：{}\n"
+            "策略边界：允许近期事件和当前主诉按实际进展自然演变，不因锚点阻止新主题、"
+            "阶段推进、好转或反复；仅在长期治疗方向明显偏离时用它维持可解释联系，"
+            "不要求每轮回扣或提及。\n"
+            "</长期病例背景>"
+        ).format(anchor)
+
     def _get_patient_dynamic_state_raw_text(self, patient_agent: Any) -> str:
         intervention_state = getattr(patient_agent, "status", {}).get("intervention", {})
         cached = intervention_state.get("last_generate_chat_prompt", {}) if isinstance(intervention_state, dict) else {}
@@ -4009,6 +4065,10 @@ class InterventionManager:
         raw_state = self._get_patient_dynamic_state_raw_text(patient_agent)
         if not raw_state:
             return ""
+        # This summarizer is also reused by non-CBT environment tasks. Keep the
+        # root anchor out of the shared result; judge call sites add it back
+        # explicitly as strategy context.
+        raw_state = self._strip_root_complaint_anchor_layer(raw_state)
 
         runtime_policy = policy if isinstance(policy, dict) else self.get_dialog_judge_runtime_policy()
         prompt_file = str(runtime_policy.get("patient_state_prompt_file", "") or "").strip()
@@ -4057,6 +4117,19 @@ class InterventionManager:
                 )
             )
         return raw_state
+
+    @staticmethod
+    def _strip_root_complaint_anchor_layer(raw_state: str) -> str:
+        text = str(raw_state or "")
+        start_marker = "=== 长期病例背景 ==="
+        end_marker = "=== 当前主诉节点层 ==="
+        start_idx = text.find(start_marker)
+        if start_idx < 0:
+            return text
+        end_idx = text.find(end_marker, start_idx + len(start_marker))
+        if end_idx < 0:
+            return text[:start_idx].rstrip()
+        return "{}{}".format(text[:start_idx], text[end_idx:]).strip()
 
     def _normalize_dialog_judge_output(self, payload: Any) -> Dict[str, Any]:
         raw = payload if isinstance(payload, dict) else {}

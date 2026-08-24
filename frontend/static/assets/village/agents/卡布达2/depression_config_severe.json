@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达2",
   "complaint_graph": {
     "initial_stage_id": "severe_comparison_self_erasure",
+    "root_complaint_anchor": "长期被拿来与他人比较后，卡布达越来越以比较结果评价自己；他认为自己的努力常被他人的表现遮蔽，并倾向减少在熟人面前出现。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

@@ -36,6 +36,18 @@ DEFAULT_0813_REPORTS_DIR = Path("results/experiment_data/reports")
 DEFAULT_0813_OUTPUT_DIR = Path("docs/experiment_evaluation/0813_kbd2_cross_condition")
 DEFAULT_0814_REPORTS_DIR = Path("results/experiment_data/reports")
 DEFAULT_0814_OUTPUT_DIR = Path("docs/experiment_evaluation/0814_kbd2_cross_condition")
+DEFAULT_0818_REPORTS_DIR = Path("results/0818-g1-2-4-5-6-11/experiment_data/reports")
+DEFAULT_0818_OUTPUT_DIR = Path("docs/experiment_evaluation/0818_kbd2_cross_condition")
+DEFAULT_0819_REPORTS_DIR = Path("results/0819-g1-2-4-5-6-9-11/experiment_data/reports")
+DEFAULT_0819_OUTPUT_DIR = Path("docs/experiment_evaluation/0819_kbd2_cross_condition")
+DEFAULT_0820_REPORTS_DIR = Path("results/0820-g1-2-4-5-6-9-11/experiment_data/reports")
+DEFAULT_0820_OUTPUT_DIR = Path("docs/experiment_evaluation/0820_kbd2_cross_condition")
+DEFAULT_0821_REPORTS_DIR = Path("results/0821-g1-2-4-5-6-9-11/experiment_data/reports")
+DEFAULT_0821_OUTPUT_DIR = Path("docs/experiment_evaluation/0821_kbd2_cross_condition")
+DEFAULT_0822_REPORTS_DIR = Path("results/0822-g1-2-4-5-6-11/experiment_data/reports")
+DEFAULT_0822_OUTPUT_DIR = Path("docs/experiment_evaluation/0822_kbd2_cross_condition")
+DEFAULT_0823_REPORTS_DIR = Path("results/0823-g1-2-4-5-6-9-11/experiment_data/reports")
+DEFAULT_0823_OUTPUT_DIR = Path("docs/experiment_evaluation/0823_kbd2_cross_condition")
 
 SCALES = ["PHQ-9", "BDI-II"]
 TIMEPOINTS = ["T0", "session_4", "session_8", "session_12", "session_16", "session_20"]
@@ -51,6 +63,12 @@ PERSONA_ORDER = ["KBD1", "KBD2", "KBD3", "KBD5", "KBD6", "KBD7"]
 GROUP_ORDER = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G9"]
 GROUP_ORDER_0813 = ["G1", "G4", "G10", "G11", "G12"]
 GROUP_ORDER_0814 = ["G1", "G2", "G4", "G5", "G11"]
+GROUP_ORDER_0818 = ["G1", "G2", "G4", "G5", "G6", "G11"]
+GROUP_ORDER_0819 = ["G1", "G2", "G4", "G5", "G6", "G9", "G11"]
+GROUP_ORDER_0820 = ["G1", "G2", "G4", "G5", "G6", "G9", "G11"]
+GROUP_ORDER_0821 = ["G1", "G2", "G4", "G5", "G6", "G9", "G11"]
+GROUP_ORDER_0822 = ["G1", "G2", "G4", "G5", "G6", "G11"]
+GROUP_ORDER_0823 = ["G1", "G2", "G4", "G5", "G6", "G9", "G11"]
 TRAJECTORY_0813_TIMEPOINTS = ["T0", "session_4", "session_8", "session_12"]
 TRAJECTORY_0813_TICKS = ["T0", "S4", "S8", "S12"]
 SCALE_LIMITS = {"PHQ-9": (0, 27), "BDI-II": (0, 63)}
@@ -74,6 +92,12 @@ FIGURE_FILES = {
     "kbd2-trajectories": "figure_02_kbd2_cross_condition_scale_trajectory.png",
     "0813-kbd2-trajectories": "figure_01_0813_kbd2_cross_condition_scale_trajectory.png",
     "0814-kbd2-trajectories": "figure_01_0814_kbd2_cross_condition_scale_trajectory.png",
+    "0818-kbd2-trajectories": "figure_01_0818_kbd2_cross_condition_scale_trajectory.png",
+    "0819-kbd2-trajectories": "figure_01_0819_kbd2_cross_condition_scale_trajectory.png",
+    "0820-kbd2-trajectories": "figure_01_0820_kbd2_cross_condition_scale_trajectory.png",
+    "0821-kbd2-trajectories": "figure_01_0821_kbd2_cross_condition_scale_trajectory.png",
+    "0822-kbd2-trajectories": "figure_01_0822_kbd2_cross_condition_scale_trajectory.png",
+    "0823-kbd2-trajectories": "figure_01_0823_kbd2_cross_condition_scale_trajectory.png",
 }
 
 
@@ -297,7 +321,10 @@ def _mean_ci(values: np.ndarray) -> tuple[float, float, float]:
 
 
 def _load_kbd2_trajectory_records(
-    reports_dir: Path, experiment_date: str, groups: Sequence[str]
+    reports_dir: Path,
+    experiment_date: str,
+    groups: Sequence[str],
+    expected_outer_runs: int | dict[str, int],
 ) -> list[Any]:
     """Load completed KBD2 repeat summaries for one dated trajectory figure."""
     paths = sorted(reports_dir.glob(f"**/repeat-*{experiment_date}-*_summary.json"))
@@ -316,11 +343,24 @@ def _load_kbd2_trajectory_records(
         if record.kbd == "KBD2" and record.group in groups
     ]
     counts = {group: sum(record.group == group for record in selected) for group in groups}
-    invalid = {group: count for group, count in counts.items() if count != 2}
+    expected_counts = {
+        group: (
+            expected_outer_runs
+            if isinstance(expected_outer_runs, int)
+            else expected_outer_runs[group]
+        )
+        for group in groups
+    }
+    invalid = {
+        group: count for group, count in counts.items() if count != expected_counts[group]
+    }
     if invalid:
-        detail = ", ".join(f"{group}={count}" for group, count in invalid.items())
+        detail = ", ".join(
+            f"{group}={count}（期望 {expected_counts[group]}）"
+            for group, count in invalid.items()
+        )
         raise ValueError(
-            f"{experiment_date} 每个实验条件应有 2 次独立 outer runs，实际为: {detail}"
+            f"{experiment_date} 各实验条件的独立 outer run 数不符合预期: {detail}"
         )
     return selected
 
@@ -389,7 +429,7 @@ def _render_kbd2_trajectory(
             ax.text(
                 0.985,
                 0.91,
-                "n=2",
+                f"n={len(group_records)}",
                 transform=ax.transAxes,
                 ha="right",
                 va="top",
@@ -413,7 +453,7 @@ def _render_kbd2_trajectory(
     fig.text(
         0.5,
         0.018,
-        "细线表示独立 outer run；粗线与阴影表示每组 2 次 outer runs 的均值及 t 分布95%置信区间。"
+        "细线表示独立 outer run；粗线与阴影表示各组 outer runs 的均值及 t 分布95%置信区间。"
         f"每个 frozen snapshot 的10次量表生成仅用于估计该节点均值；{experiment_date}实验当前仅有 T0–S12 节点。",
         ha="center",
         fontsize=9.5,
@@ -553,6 +593,18 @@ def run(
     output_0813_dir: Path = DEFAULT_0813_OUTPUT_DIR,
     reports_0814_dir: Path = DEFAULT_0814_REPORTS_DIR,
     output_0814_dir: Path = DEFAULT_0814_OUTPUT_DIR,
+    reports_0818_dir: Path = DEFAULT_0818_REPORTS_DIR,
+    output_0818_dir: Path = DEFAULT_0818_OUTPUT_DIR,
+    reports_0819_dir: Path = DEFAULT_0819_REPORTS_DIR,
+    output_0819_dir: Path = DEFAULT_0819_OUTPUT_DIR,
+    reports_0820_dir: Path = DEFAULT_0820_REPORTS_DIR,
+    output_0820_dir: Path = DEFAULT_0820_OUTPUT_DIR,
+    reports_0821_dir: Path = DEFAULT_0821_REPORTS_DIR,
+    output_0821_dir: Path = DEFAULT_0821_OUTPUT_DIR,
+    reports_0822_dir: Path = DEFAULT_0822_REPORTS_DIR,
+    output_0822_dir: Path = DEFAULT_0822_OUTPUT_DIR,
+    reports_0823_dir: Path = DEFAULT_0823_REPORTS_DIR,
+    output_0823_dir: Path = DEFAULT_0823_OUTPUT_DIR,
 ) -> list[Path]:
     requested = list(dict.fromkeys(figures))
     unknown = sorted(set(requested) - set(FIGURE_FILES))
@@ -601,22 +653,72 @@ def run(
             reports_0813_dir,
             output_0813_dir,
             GROUP_ORDER_0813,
+            2,
         ),
         "0814-kbd2-trajectories": (
             "0814",
             reports_0814_dir,
             output_0814_dir,
             GROUP_ORDER_0814,
+            2,
+        ),
+        "0818-kbd2-trajectories": (
+            "0818",
+            reports_0818_dir,
+            output_0818_dir,
+            GROUP_ORDER_0818,
+            3,
+        ),
+        "0819-kbd2-trajectories": (
+            "0819",
+            reports_0819_dir,
+            output_0819_dir,
+            GROUP_ORDER_0819,
+            3,
+        ),
+        "0820-kbd2-trajectories": (
+            "0820",
+            reports_0820_dir,
+            output_0820_dir,
+            GROUP_ORDER_0820,
+            3,
+        ),
+        "0821-kbd2-trajectories": (
+            "0821",
+            reports_0821_dir,
+            output_0821_dir,
+            GROUP_ORDER_0821,
+            3,
+        ),
+        "0822-kbd2-trajectories": (
+            "0822",
+            reports_0822_dir,
+            output_0822_dir,
+            GROUP_ORDER_0822,
+            {"G1": 3, "G2": 3, "G4": 2, "G5": 3, "G6": 3, "G11": 3},
+        ),
+        "0823-kbd2-trajectories": (
+            "0823",
+            reports_0823_dir,
+            output_0823_dir,
+            GROUP_ORDER_0823,
+            3,
         ),
     }
     needs_standard_output = any(figure not in trajectory_specs for figure in requested)
     if needs_standard_output:
         output_dir.mkdir(parents=True, exist_ok=True)
     trajectory_records: dict[str, list[Any]] = {}
-    for figure, (experiment_date, reports_dir, figure_dir, groups) in trajectory_specs.items():
+    for figure, (
+        experiment_date,
+        reports_dir,
+        figure_dir,
+        groups,
+        outer_runs_per_group,
+    ) in trajectory_specs.items():
         if figure in requested:
             trajectory_records[figure] = _load_kbd2_trajectory_records(
-                reports_dir, experiment_date, groups
+                reports_dir, experiment_date, groups, outer_runs_per_group
             )
             figure_dir.mkdir(parents=True, exist_ok=True)
 
@@ -645,8 +747,14 @@ def run(
             path,
         ),
     }
-    for figure, (experiment_date, _, _, groups) in trajectory_specs.items():
-        renderers[figure] = lambda path, figure=figure, experiment_date=experiment_date, groups=groups: _render_kbd2_trajectory(
+    for figure, (
+        experiment_date,
+        _,
+        _,
+        groups,
+        outer_runs_per_group,
+    ) in trajectory_specs.items():
+        renderers[figure] = lambda path, figure=figure, experiment_date=experiment_date, groups=groups, outer_runs_per_group=outer_runs_per_group: _render_kbd2_trajectory(
             trajectory_records[figure], experiment_date, groups, path
         )
     outputs = []
@@ -661,14 +769,20 @@ def run(
         "selected_figures": requested,
         "png_files": [path.name for path in outputs],
     }
-    for figure, (experiment_date, reports_dir, _, groups) in trajectory_specs.items():
+    for figure, (
+        experiment_date,
+        reports_dir,
+        _,
+        groups,
+        outer_runs_per_group,
+    ) in trajectory_specs.items():
         if figure not in requested:
             continue
         manifest[f"{experiment_date}_reports_dir"] = str(reports_dir)
         manifest[f"{experiment_date}_trajectory"] = {
             "timepoints": TRAJECTORY_0813_TIMEPOINTS,
             "groups": list(groups),
-            "outer_runs_per_group": 2,
+            "outer_runs_per_group": outer_runs_per_group,
             "followup": "not available; not plotted",
         }
     if needs_standard_output:
@@ -700,6 +814,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--0814-out-dir", type=Path, default=DEFAULT_0814_OUTPUT_DIR
     )
     parser.add_argument(
+        "--0818-reports-dir", type=Path, default=DEFAULT_0818_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0818-out-dir", type=Path, default=DEFAULT_0818_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--0819-reports-dir", type=Path, default=DEFAULT_0819_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0819-out-dir", type=Path, default=DEFAULT_0819_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--0820-reports-dir", type=Path, default=DEFAULT_0820_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0820-out-dir", type=Path, default=DEFAULT_0820_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--0821-reports-dir", type=Path, default=DEFAULT_0821_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0821-out-dir", type=Path, default=DEFAULT_0821_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--0822-reports-dir", type=Path, default=DEFAULT_0822_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0822-out-dir", type=Path, default=DEFAULT_0822_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--0823-reports-dir", type=Path, default=DEFAULT_0823_REPORTS_DIR
+    )
+    parser.add_argument(
+        "--0823-out-dir", type=Path, default=DEFAULT_0823_OUTPUT_DIR
+    )
+    parser.add_argument(
         "--figure",
         action="append",
         choices=sorted(FIGURE_FILES),
@@ -717,6 +867,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_0813_dir=args.__dict__["0813_out_dir"],
         reports_0814_dir=args.__dict__["0814_reports_dir"],
         output_0814_dir=args.__dict__["0814_out_dir"],
+        reports_0818_dir=args.__dict__["0818_reports_dir"],
+        output_0818_dir=args.__dict__["0818_out_dir"],
+        reports_0819_dir=args.__dict__["0819_reports_dir"],
+        output_0819_dir=args.__dict__["0819_out_dir"],
+        reports_0820_dir=args.__dict__["0820_reports_dir"],
+        output_0820_dir=args.__dict__["0820_out_dir"],
+        reports_0821_dir=args.__dict__["0821_reports_dir"],
+        output_0821_dir=args.__dict__["0821_out_dir"],
+        reports_0822_dir=args.__dict__["0822_reports_dir"],
+        output_0822_dir=args.__dict__["0822_out_dir"],
+        reports_0823_dir=args.__dict__["0823_reports_dir"],
+        output_0823_dir=args.__dict__["0823_out_dir"],
     )
     print(f"已生成 {len(outputs)} 张指定图：")
     for output in outputs:

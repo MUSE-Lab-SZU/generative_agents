@@ -40,7 +40,7 @@ CLEANUP_COMPLETED_ARTIFACTS=true
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-SIM_TARGET_STEP=72
+SIM_TARGET_STEP=120
 SIM_STRIDE=720
 SIM_MAX_PARALLEL=1
 SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1}"
@@ -48,7 +48,7 @@ SIM_LOG="results/batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
 EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-EVAL_LABELS="T0,session_4,session_8,session_12"
+EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20"
 # 同一 agent × 时间点 × 量表的固定完整复评次数（不是独立患者样本数）
 EVAL_REPEAT=10
 EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
@@ -59,7 +59,7 @@ EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 FOLLOWUP_ENABLED=false
 FOLLOWUP_STEPS=120
 FOLLOWUP_INTERVAL=30
-FOLLOWUP_SOURCE_LABEL="session_12"
+FOLLOWUP_SOURCE_LABEL="session_20"
 FOLLOWUP_MAX_PARALLEL=1
 
 # ============================================================
@@ -87,7 +87,7 @@ usage() {
       --followup-steps N     回访继续运行步数，默认 120
       --followup-interval N  回访 snapshot 间隔，默认 30
       --followup-source-label LABEL
-                             原仿真作为回访起点的 staged label，默认 session_12
+                             原仿真作为回访起点的 staged label，默认 session_20
       --followup-max-parallel N
                              同一轮内 follow-up condition 并行数，默认 1
       --keep-raw-artifacts   完整复评后仍保留 job、逐题 trace 和 experiment_data 阶段快照副本

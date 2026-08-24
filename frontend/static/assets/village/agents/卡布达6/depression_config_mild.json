@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达6",
   "complaint_graph": {
     "initial_stage_id": "mild_design_rejection_self_doubt",
+    "root_complaint_anchor": "连续退稿后，卡布达将作品未获接受理解为自己创作能力不足；他因此怀疑自己的作品不值得认可，并担心再次提交仍会被否定。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

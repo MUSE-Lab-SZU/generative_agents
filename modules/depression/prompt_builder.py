@@ -17,15 +17,51 @@ class DynamicPromptBuilder:
     EMOTION_DEFAULTS: Dict[str, str] = (
         PROMPT_CONFIG.get("emotion_defaults", {}) if isinstance(PROMPT_CONFIG.get("emotion_defaults", {}), dict) else {}
     )
+    DOMAIN_STATE_CONFIG: Dict[str, Any] = (
+        PROMPT_CONFIG.get("domain_state", {})
+        if isinstance(PROMPT_CONFIG.get("domain_state", {}), dict)
+        else {}
+    )
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        domain_state_enabled: bool = True,
+    ):
         self.config = config if isinstance(config, dict) else {}
         self.include_graph_window = bool(self.config.get("include_graph_window", True))
         self.include_emotion_layer = bool(self.config.get("include_emotion_layer", True))
+        self.domain_state_enabled = bool(domain_state_enabled)
+
+    @classmethod
+    def render_domain_description(cls, domain: str, value: Any) -> str:
+        """Return the exact natural-language band used in the patient prompt."""
+        key = str(domain or "").strip()
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+            return ""
+        descriptions = cls.DOMAIN_STATE_CONFIG.get("descriptions", {})
+        if not isinstance(descriptions, dict):
+            return ""
+        band_texts = descriptions.get(key, [])
+        if not isinstance(band_texts, list) or len(band_texts) != 5:
+            return ""
+        band_index = (
+            0
+            if value <= 20
+            else 1
+            if value <= 40
+            else 2
+            if value <= 60
+            else 3
+            if value <= 80
+            else 4
+        )
+        return str(band_texts[band_index] or "").strip()
 
     def build_prompt(
         self,
         base_prompt: str,
+        root_complaint_anchor: str,
         current_stage: Dict[str, Any],
         graph_snapshot: Dict[str, Any],
         session_context: Dict[str, Any],
@@ -33,10 +69,11 @@ class DynamicPromptBuilder:
         emotion: Optional[Dict[str, Any]] = None,
     ) -> str:
         # 层次顺序很重要：
-        # 基础人格 -> 当前主诉节点 -> 当前会话 -> 瞬时情绪。
+        # 基础人格 -> 长期病例背景 -> 当前主诉节点 -> 当前会话 -> 瞬时情绪。
         # 它体现的是“稳定人设在前，当前轮波动在后”的约束方向。
         layers = [
             self._build_base_layer(base_prompt),
+            self._build_root_complaint_anchor_layer(root_complaint_anchor),
             self._build_stage_layer(current_stage, graph_snapshot),
             self._build_context_layer(session_context),
         ]
@@ -73,9 +110,7 @@ class DynamicPromptBuilder:
 
     def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        # graph_snapshot 仍保留在调用接口中供其他内部模块使用，但患者发言
-        # prompt 只读取 current_stage，不能看到候选分支或 next_candidates。
-        del graph_snapshot
+        graph_snapshot = graph_snapshot if isinstance(graph_snapshot, dict) else {}
 
         # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
         label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
@@ -92,6 +127,9 @@ class DynamicPromptBuilder:
                     {"summary": summary},
                 )
             )
+        domain_state_section = self._build_domain_state_section(graph_snapshot)
+        if domain_state_section:
+            optional_sections.append(domain_state_section)
         if core_belief:
             optional_sections.append(
                 self._render_block(
@@ -134,6 +172,54 @@ class DynamicPromptBuilder:
                     "graph_window_section": "",
                 },
             ).strip()
+        )
+
+    def _build_root_complaint_anchor_layer(self, root_complaint_anchor: str) -> str:
+        anchor = str(root_complaint_anchor or "").strip()
+        if not anchor:
+            return ""
+        return self._with_trailing_newline(
+            render_prompt_section(
+                "depression/dynamic_prompt_layers",
+                "root_complaint_anchor_layer",
+                {"root_complaint_anchor": anchor},
+            ).strip()
+        )
+
+    def _build_domain_state_section(self, graph_snapshot: Dict[str, Any]) -> str:
+        if not self.domain_state_enabled:
+            return ""
+        domain_state = (
+            graph_snapshot.get("domain_state", {})
+            if isinstance(graph_snapshot.get("domain_state", {}), dict)
+            else {}
+        )
+        domains = (
+            domain_state.get("domains", {})
+            if isinstance(domain_state.get("domains", {}), dict)
+            else {}
+        )
+        config = self.DOMAIN_STATE_CONFIG
+        order = config.get("order", []) if isinstance(config.get("order", []), list) else []
+        labels = config.get("labels", {}) if isinstance(config.get("labels", {}), dict) else {}
+        lines: List[str] = []
+        for domain in order:
+            key = str(domain or "").strip()
+            state = domains.get(key, {})
+            if not isinstance(state, dict):
+                continue
+            value = state.get("value")
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                continue
+            description = self.render_domain_description(key, value)
+            label = str(labels.get(key, key) or key).strip()
+            if description:
+                lines.append("- {}：{}".format(label, description))
+        if not lines:
+            return ""
+        return self._render_block(
+            "dynamic_stage_domain_state_section",
+            {"domain_lines": "\n".join(lines)},
         )
 
     def _build_context_layer(self, session_context: Dict[str, Any]) -> str:

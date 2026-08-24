@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达6",
   "complaint_graph": {
     "initial_stage_id": "severe_design_identity_collapse",
+    "root_complaint_anchor": "连续退稿后，卡布达将作品受挫与自身创作能力和职业价值紧密联系；他认为自己的创作难以被需要，并开始怀疑是否继续从事设计。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

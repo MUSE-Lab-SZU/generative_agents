@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达4",
   "complaint_graph": {
     "initial_stage_id": "mild_kitchen_mistake_self_doubt",
+    "root_complaint_anchor": "一次后厨出餐失误后，卡布达将忙乱中的错误理解为自己不够稳定、难以胜任；他因此开始怀疑自己的工作能力，并担心再次在同事面前出错。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

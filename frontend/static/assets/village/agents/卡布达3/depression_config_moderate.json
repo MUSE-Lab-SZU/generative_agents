@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达3",
   "complaint_graph": {
     "initial_stage_id": "moderate_social_shame_withdrawal",
+    "root_complaint_anchor": "一次社交误会后，卡布达将他人的沉默和眼神理解为排斥；他因此认为别人会觉得自己很糟糕，并担心关系已经断裂。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

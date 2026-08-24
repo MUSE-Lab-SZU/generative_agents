@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达4",
   "complaint_graph": {
     "initial_stage_id": "moderate_kitchen_failure_shame",
+    "root_complaint_anchor": "一次后厨失误导致停班后，卡布达将这次事件理解为自己在忙乱中无法胜任工作；他因此怀疑自己不适合留在后厨，并担心再次受到否定。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

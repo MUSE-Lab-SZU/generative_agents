@@ -219,7 +219,57 @@ def choose_agent(snapshot: Mapping[str, Any], requested_agent: str | None) -> st
     return candidates[0]
 
 
-def graph_features(snapshot: Mapping[str, Any], agent: str) -> dict[str, Any]:
+def configured_stage(
+    state: Mapping[str, Any],
+    current_id: str,
+    checkpoint: Path,
+) -> dict[str, Any]:
+    """Load a stage omitted from an early snapshot's ``runtime_stages``.
+
+    T0 snapshots can already point at the configured initial stage while their
+    runtime stage cache is still empty.  The archived ``config_reference`` uses
+    the original container path, so remap its ``experiment_data`` suffix to the
+    current archive before looking up the stage definition.
+    """
+    reference = state.get("config_reference", {})
+    if not isinstance(reference, Mapping):
+        return {}
+    raw_path = str(reference.get("config_path", "") or "").strip()
+    if not raw_path:
+        return {}
+
+    referenced_path = Path(raw_path)
+    candidates = [referenced_path]
+    if "experiment_data" in referenced_path.parts and checkpoint.parent.name == "checkpoints":
+        suffix_start = referenced_path.parts.index("experiment_data")
+        archive_root = checkpoint.parent.parent
+        candidates.append(archive_root.joinpath(*referenced_path.parts[suffix_start:]))
+
+    seen: set[Path] = set()
+    for config_path in candidates:
+        if config_path in seen or not config_path.is_file():
+            continue
+        seen.add(config_path)
+        config = load_json(config_path)
+        complaint_graph = config.get("complaint_graph", {})
+        stages = complaint_graph.get("stages", []) if isinstance(complaint_graph, Mapping) else []
+        if not isinstance(stages, list):
+            continue
+        stage = next(
+            (
+                item
+                for item in stages
+                if isinstance(item, Mapping)
+                and str(item.get("id", "") or "") == current_id
+            ),
+            {},
+        )
+        if stage:
+            return dict(stage)
+    return {}
+
+
+def graph_features(snapshot: Mapping[str, Any], agent: str, checkpoint: Path) -> dict[str, Any]:
     agent_payload = (snapshot.get("agents", {}) or {}).get(agent, {})
     state = agent_payload.get("depression_dynamic_state", {}) if isinstance(agent_payload, Mapping) else {}
     manager = state.get("complaint_graph_manager", {}) if isinstance(state, Mapping) else {}
@@ -233,7 +283,9 @@ def graph_features(snapshot: Mapping[str, Any], agent: str) -> dict[str, Any]:
         (stage for stage in stages if isinstance(stage, Mapping) and str(stage.get("id", "") or "") == current_id),
         {},
     )
-    if not current_id or not isinstance(current_stage, Mapping):
+    if current_id and not current_stage:
+        current_stage = configured_stage(state, current_id, checkpoint)
+    if not current_id or not current_stage:
         raise AnalysisError("角色 {} 的快照无法定位当前主诉节点".format(agent))
 
     history = manager.get("stage_history", [])
@@ -282,7 +334,7 @@ def build_rows(condition: Mapping[str, Any], agent_arg: str | None, checkpoint: 
         snapshot_path = resolve_snapshot_path(checkpoint, evaluation)
         snapshot = load_json(snapshot_path)
         agent = choose_agent(snapshot, agent_arg)
-        graph = graph_features(snapshot, agent)
+        graph = graph_features(snapshot, agent, checkpoint)
         common = common_row_fields(condition, evaluation, agent, snapshot_path, graph)
         scales = evaluation.get("scales", {})
         if not isinstance(scales, Mapping):

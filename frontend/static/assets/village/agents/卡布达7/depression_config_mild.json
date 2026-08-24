@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达7",
   "complaint_graph": {
     "initial_stage_id": "mild_shop_review_self_doubt",
+    "root_complaint_anchor": "差评和退货增多后，卡布达将顾客反馈理解为自己不够细心；他因此怀疑自己的经营能力，并担心继续让顾客失望。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

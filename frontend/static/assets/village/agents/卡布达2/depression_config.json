@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达2",
   "complaint_graph": {
     "initial_stage_id": "moderate_comparison_low_worth",
+    "root_complaint_anchor": "卡布达长期被家人和熟人与他人比较，并逐渐将比较结果理解为自己不如别人、缺乏价值；他因此担心在熟人面前被评价或被看见。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

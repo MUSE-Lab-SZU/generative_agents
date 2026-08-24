@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "job_loss_equals_self_failure",
+    "root_complaint_anchor": "卡布达在被辞退后，将失业理解为自身能力和价值的整体失败；他因此认为自己不值得认可，并担心他人询问近况或作出评价。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

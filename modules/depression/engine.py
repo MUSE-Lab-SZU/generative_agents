@@ -43,6 +43,7 @@ class DepressionSimulationEngine:
         self,
         config: Optional[Union[Dict[str, Any], str]] = None,
         clock_provider: Optional[Callable[[], datetime]] = None,
+        domain_state_enabled: Optional[bool] = None,
     ):
         """解析配置并初始化主诉图、上下文、记忆、情绪和 prompt 子系统。"""
         resolved = self._resolve_config(config)
@@ -51,6 +52,12 @@ class DepressionSimulationEngine:
         self.agent_dir = str(resolved.get("_agent_dir", "") or "")
 
         self.enabled = bool(resolved.get("enabled", True))
+        # This switch belongs to the global runtime config, not the persona file.
+        # Missing means enabled so existing experiment configs keep their behavior.
+        self._domain_state_enabled_override = domain_state_enabled
+        self.domain_state_enabled = (
+            True if domain_state_enabled is None else bool(domain_state_enabled)
+        )
         self.base_prompt = ""
         self.interaction_count = 0
         self.last_emotion: Dict[str, Any] = {}
@@ -62,7 +69,11 @@ class DepressionSimulationEngine:
         self.last_update_time = self._now()
 
         agent_name = self._infer_agent_name(resolved)
-        self.graph_manager = ComplaintGraphManager(resolved, now_provider=self._clock_provider)
+        self.graph_manager = ComplaintGraphManager(
+            resolved,
+            now_provider=self._clock_provider,
+            domain_state_enabled=self.domain_state_enabled,
+        )
         self.context_builder = SessionContextBuilder(self_name=agent_name)
         # Deprecated compatibility alias. New code must use ``context_builder``.
         # Keep until external scripts/checkpoints have completed one audited
@@ -70,7 +81,10 @@ class DepressionSimulationEngine:
         self.context_analyzer = self.context_builder
         self.memory_system = TraumaMemorySystem(resolved.get("memory", {}))
         self.emotion_inferencer = EmotionInferencer(resolved.get("emotion", {}))
-        self.prompt_builder = DynamicPromptBuilder(resolved.get("prompt", {}))
+        self.prompt_builder = DynamicPromptBuilder(
+            resolved.get("prompt", {}),
+            domain_state_enabled=self.domain_state_enabled,
+        )
 
     def _now(self) -> datetime:
         """返回当前引擎时间，时间源异常或返回值非法时回退到模拟时钟。"""
@@ -127,6 +141,7 @@ class DepressionSimulationEngine:
         )
         return self.prompt_builder.build_prompt(
             base_prompt=self.base_prompt,
+            root_complaint_anchor=self.graph_manager.root_complaint_anchor,
             current_stage=current_stage,
             graph_snapshot=graph_snapshot,
             session_context=session_context,
@@ -210,14 +225,6 @@ class DepressionSimulationEngine:
             llm_cfg=roadmap_llm_cfg,
         )
         graph_snapshot = self.graph_manager.commit_turn(evaluation)
-        if callable(roadmap_completion_func):
-            graph_snapshot = self.graph_manager.ensure_graph_window(
-                session_context=session_context,
-                conversation_content=conversation_content,
-                completion_func=roadmap_completion_func,
-                llm_cfg=roadmap_llm_cfg,
-                record_evaluation=False,
-            )
         current_stage = self.graph_manager.get_current_stage()
 
         memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
@@ -268,6 +275,25 @@ class DepressionSimulationEngine:
             "last_update": self.last_update_time.isoformat(),
         }
 
+    def finalize_domain_window(
+        self,
+        patient_dialogue: str,
+        window_id: str = "",
+        window_context: Optional[Dict[str, Any]] = None,
+        completion_func: Optional[Callable[[str], str]] = None,
+    ) -> Dict[str, Any]:
+        """Run the sole long-term domain write at a completed dialogue window."""
+        if not self.enabled or not self.domain_state_enabled:
+            return {"enabled": False, "domain_updates": [], "applied_changes": []}
+        result = self.graph_manager.finalize_domain_window(
+            patient_dialogue=patient_dialogue,
+            completion_func=completion_func,
+            window_id=window_id,
+            window_context=window_context,
+        )
+        self.last_update_time = self._now()
+        return copy.deepcopy(result)
+
     def initialize_graph_window(
         self,
         location: str = "",
@@ -276,7 +302,7 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """启动或恢复时用 LLM 补足当前主诉节点的候选分支，不改变当前 stage。"""
+        """兼容旧启动入口；evidence-first 模式下不再预生成候选分支。"""
         if not self.enabled:
             return self._disabled_runtime()
         if not callable(roadmap_completion_func):
@@ -381,6 +407,7 @@ class DepressionSimulationEngine:
         """返回当前引擎状态概览，供调试、存档或前端展示使用。"""
         return {
             "enabled": self.enabled,
+            "root_complaint_anchor": self.graph_manager.root_complaint_anchor,
             "current_stage": self.graph_manager.get_current_stage(),
             "graph": self.graph_manager.get_graph_snapshot(),
             "state_duration_minutes": self.graph_manager.get_state_duration(),
@@ -396,6 +423,7 @@ class DepressionSimulationEngine:
         payload = {
             "config_reference": copy.deepcopy(config_reference),
             "enabled": bool(self.enabled),
+            "domain_state_enabled": bool(self.domain_state_enabled),
             "interaction_count": int(self.interaction_count),
             "last_update_time": self.last_update_time.isoformat(),
             "last_emotion": copy.deepcopy(self.last_emotion),
@@ -424,6 +452,11 @@ class DepressionSimulationEngine:
         self.config_path = str(refreshed.get("_config_path", "") or "")
         self.agent_dir = str(refreshed.get("_agent_dir", "") or "")
         self.enabled = bool(payload.get("enabled", refreshed.get("enabled", True)))
+        self.domain_state_enabled = (
+            bool(payload.get("domain_state_enabled", True))
+            if self._domain_state_enabled_override is None
+            else bool(self._domain_state_enabled_override)
+        )
         self.base_prompt = str(payload.get("base_prompt", self.base_prompt or "") or "")
         try:
             self.interaction_count = int(payload.get("interaction_count", 0) or 0)
@@ -450,6 +483,7 @@ class DepressionSimulationEngine:
             graph_payload,
             now_provider=self._clock_provider,
             base_config=base_graph_config,
+            domain_state_enabled=self.domain_state_enabled,
         )
 
         self.context_builder = SessionContextBuilder(self_name=self._infer_agent_name(refreshed))
@@ -469,7 +503,10 @@ class DepressionSimulationEngine:
             ]
 
         self.emotion_inferencer = EmotionInferencer(refreshed.get("emotion", {}))
-        self.prompt_builder = DynamicPromptBuilder(refreshed.get("prompt", {}))
+        self.prompt_builder = DynamicPromptBuilder(
+            refreshed.get("prompt", {}),
+            domain_state_enabled=self.domain_state_enabled,
+        )
 
     @classmethod
     def from_dict(

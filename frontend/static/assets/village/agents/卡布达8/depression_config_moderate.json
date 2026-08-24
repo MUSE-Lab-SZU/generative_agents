@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达8",
   "complaint_graph": {
     "initial_stage_id": "moderate_injury_low_worth",
+    "root_complaint_anchor": "旧伤复发并被迫停训后，卡布达将无法训练理解为自身价值和被认可基础的丧失；他因此认为自己没有值得肯定的地方，并对未来失去把握。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

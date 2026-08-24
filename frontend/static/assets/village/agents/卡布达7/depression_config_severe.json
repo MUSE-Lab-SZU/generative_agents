@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达7",
   "complaint_graph": {
     "initial_stage_id": "severe_shop_total_failure",
+    "root_complaint_anchor": "差评和退货增多后，卡布达将经营问题主要归因于自身能力不足；他认为自己难以把小店经营好，并担心持续给顾客和身边人添麻烦。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

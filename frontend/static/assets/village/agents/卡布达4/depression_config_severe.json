@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达4",
   "complaint_graph": {
     "initial_stage_id": "severe_kitchen_total_collapse",
+    "root_complaint_anchor": "一次后厨失误并停班后，卡布达将事件视为自己难以承担工作责任的证据；他认为自己在熟悉环境中也不够可靠，并担心同事不再信任他。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达8",
   "complaint_graph": {
     "initial_stage_id": "severe_injury_identity_collapse",
+    "root_complaint_anchor": "旧伤复发并停训后，卡布达将训练中断与自身身份和价值紧密联系；他认为跑步之外缺少可证明自己的部分，并对未来方向感到不确定。",
+    "initial_domain_state": {
+      "mood_anhedonia": 15,
+      "sleep": 20,
+      "appetite": 20,
+      "energy": 15,
+      "attention": 20,
+      "function": 20,
+      "avoidance": 15
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

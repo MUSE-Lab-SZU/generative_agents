@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "mild_job_loss_self_doubt",
+    "root_complaint_anchor": "卡布达被辞退后，开始将失业理解为自己能力不足；他因此怀疑自己不够好，并担心他人询问近况时作出负面评价。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,

@@ -1218,13 +1218,13 @@ def validate_minimal_session_eval_completion(
         validation_errors.append("session_eval_not_complete")
     else:
         if not evidence_turn_id:
-            validation_errors.append("evidence_turn_id_empty")
+            validation_errors.append("evidence_warning:evidence_turn_id_empty")
         elif not evidence_turn_valid:
-            validation_errors.append("evidence_turn_id_invalid")
+            validation_errors.append("evidence_warning:evidence_turn_id_invalid")
         if acknowledgement_only:
-            validation_errors.append("acknowledgement_only")
+            validation_errors.append("evidence_warning:acknowledgement_only")
         if evidence_too_short:
-            validation_errors.append("evidence_turn_too_short")
+            validation_errors.append("evidence_warning:evidence_turn_too_short")
         if normalized_risk == "high":
             validation_errors.append("risk_high")
         elif normalized_risk != "none":
@@ -1236,7 +1236,9 @@ def validate_minimal_session_eval_completion(
         "acknowledgement_only": acknowledgement_only,
         "evidence_too_short": evidence_too_short,
         "validation_errors": validation_errors,
-        "valid_for_advance": not validation_errors,
+        "valid_for_advance": not any(
+            not item.startswith("evidence_warning:") for item in validation_errors
+        ),
     }
 
 
@@ -1358,11 +1360,15 @@ def apply_legacy_stage_transition_adapter(
     high_risk_seen = bool(tracker_state.get("high_risk_seen", False))
     evidence_turn_id = _safe_text(evaluator_result.get("evidence_turn_id"))
     evidence = resolve_evidence_turn(evidence_turn_id, patient_turns)
-    evidence_valid = bool(
-        evidence
-        and not is_acknowledgement_only(evidence)
-        and not is_evidence_too_short(evidence)
-    )
+    evidence_warnings: List[str] = []
+    if not evidence_turn_id:
+        evidence_warnings.append("evidence_warning:evidence_turn_id_empty")
+    elif not evidence:
+        evidence_warnings.append("evidence_warning:evidence_turn_id_invalid")
+    elif is_acknowledgement_only(evidence):
+        evidence_warnings.append("evidence_warning:acknowledgement_only")
+    elif is_evidence_too_short(evidence):
+        evidence_warnings.append("evidence_warning:evidence_turn_too_short")
     actual_version = _safe_text(controller_version)
     expected_version = _safe_text(expected_controller_version)
 
@@ -1410,7 +1416,7 @@ def apply_legacy_stage_transition_adapter(
     if reasons or recommended == "hold":
         if recommended == "hold" and not reasons:
             reasons.append("recommended_hold")
-        output["reason"] = "|".join(_dedupe(reasons))
+        output["reason"] = "|".join(_dedupe(reasons + evidence_warnings))
         return output
 
     side_step = progress_state.get("side_step")
@@ -1429,19 +1435,15 @@ def apply_legacy_stage_transition_adapter(
     if recommended == "stay":
         output["effective_action"] = "stay"
         if side_active:
-            if not evidence_valid:
-                reasons.append("side_step_resolution_evidence_invalid")
+            return_to = _safe_text(side_step.get("return_to_subgoal_id"))
+            if return_to not in progress_state.get("subgoals", {}):
+                reasons.append("side_step_return_target_invalid")
                 output["effective_action"] = "hold"
             else:
-                return_to = _safe_text(side_step.get("return_to_subgoal_id"))
-                if return_to not in progress_state.get("subgoals", {}):
-                    reasons.append("side_step_return_target_invalid")
-                    output["effective_action"] = "hold"
-                else:
-                    progress_state["active_subgoal_id"] = return_to
-                    side_step.clear()
-                    side_step.update(copy_side_step_default())
-                    reasons.append("side_step_resolved")
+                progress_state["active_subgoal_id"] = return_to
+                side_step.clear()
+                side_step.update(copy_side_step_default())
+                reasons.append("side_step_resolved")
         elif soft_active:
             target = _safe_text(soft_step_back.get("target_subgoal_id"))
             return_to = _safe_text(
@@ -1450,7 +1452,6 @@ def apply_legacy_stage_transition_adapter(
             if (
                 subgoal_id == target
                 and progress == "complete"
-                and evidence_valid
                 and return_to in progress_state.get("subgoals", {})
             ):
                 progress_state["active_subgoal_id"] = return_to
@@ -1467,8 +1468,6 @@ def apply_legacy_stage_transition_adapter(
             reasons.append("temporary_work_active")
         elif subgoal_id != active_id:
             reasons.append("subgoal_not_active")
-        elif not evidence_valid:
-            reasons.append("evidence_turn_invalid")
         else:
             subgoals = progress_state.get("subgoals", {})
             configured = stage_item.get("subgoals", [])
@@ -1507,8 +1506,6 @@ def apply_legacy_stage_transition_adapter(
         ) or _safe_text(evaluator_result.get("reason"))
         if side_active or soft_active:
             reasons.append("temporary_work_conflict")
-        elif not evidence_valid:
-            reasons.append("evidence_turn_invalid")
         elif not reason:
             reasons.append("side_step_reason_empty")
         else:
@@ -1541,8 +1538,6 @@ def apply_legacy_stage_transition_adapter(
             reasons.append("nested_soft_step_back_not_allowed")
         elif subgoal_id not in eligible_targets:
             reasons.append("soft_step_back_target_not_allowed")
-        elif not evidence_valid:
-            reasons.append("evidence_turn_invalid")
         elif not reason:
             reasons.append("soft_step_back_reason_empty")
         else:
@@ -1566,8 +1561,6 @@ def apply_legacy_stage_transition_adapter(
         )
         if not all_complete:
             reasons.append("required_subgoals_incomplete")
-        if not evidence_valid:
-            reasons.append("evidence_turn_invalid")
         if side_active:
             reasons.append("side_step_active")
         if soft_active:
@@ -1619,7 +1612,7 @@ def apply_legacy_stage_transition_adapter(
 
     if output["effective_action"] == "hold" and not reasons:
         reasons.append("transition_guard_failed")
-    output["reason"] = "|".join(_dedupe(reasons))
+    output["reason"] = "|".join(_dedupe(reasons + evidence_warnings))
     return output
 
 

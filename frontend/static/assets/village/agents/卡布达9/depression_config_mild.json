@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达9",
   "complaint_graph": {
     "initial_stage_id": "mild_archive_error_self_doubt",
+    "root_complaint_anchor": "一次归档出错后，卡布达将记录失误理解为自己不够细心；他因此怀疑自己的工作可靠性，并担心辜负他人的托付。",
+    "initial_domain_state": {
+      "mood_anhedonia": 65,
+      "sleep": 65,
+      "appetite": 70,
+      "energy": 70,
+      "attention": 70,
+      "function": 75,
+      "avoidance": 70
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
