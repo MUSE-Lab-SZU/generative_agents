@@ -29,7 +29,7 @@
         "id": "job_loss_equals_self_failure",
         "label": "把失业理解成自己彻底失败",
         "summary": "被辞退不再只是事件，而是整个人不行的证明。",
-        "core_belief": "连工作都保不住，说明我这个人本身就没有价值。",
+        "core_belief": "如果我不能胜任工作，就说明我能力不足、没有多少价值。",
         "narrative_focus": ["失业", "羞耻", "怕被问近况", "不想见人", "失败"],
         "speaking_style": {
           "tempo": "slow",

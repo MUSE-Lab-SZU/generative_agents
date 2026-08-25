@@ -159,6 +159,15 @@ class ComplaintGraphManager:
         if initial_stage_id not in self.stage_catalog:
             initial_stage_id = next(iter(self.stage_catalog.keys()))
         self.initial_stage_id = initial_stage_id
+        configured_core_belief = self._normalize_core_belief(
+            graph_config.get("core_belief", "")
+        )
+        initial_core_belief = self._normalize_core_belief(
+            self.stage_catalog.get(self.initial_stage_id, {}).get("core_belief", "")
+        )
+        self._core_belief = configured_core_belief or initial_core_belief
+        for stage in self.stage_catalog.values():
+            stage["core_belief"] = self._core_belief
         configured_root_anchor = self._normalize_root_complaint_anchor(
             graph_config.get("root_complaint_anchor", "")
         )
@@ -361,6 +370,16 @@ class ComplaintGraphManager:
         """Return the immutable long-term case background fixed at initialization."""
         return self._root_complaint_anchor
 
+    @property
+    def core_belief(self) -> str:
+        """Return the immutable case-level belief fixed at initialization."""
+        return self._core_belief
+
+    @classmethod
+    def _normalize_core_belief(cls, value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return cls._clip_text(text, limit=220)
+
     @classmethod
     def _normalize_root_complaint_anchor(cls, value: Any) -> str:
         """Keep the anchor compact without importing stage symptom/detail fields."""
@@ -395,6 +414,7 @@ class ComplaintGraphManager:
         stages = [copy.deepcopy(item) for item in self.stage_catalog.values()]
         return {
             "mode": "complaint_graph",
+            "core_belief": self.core_belief,
             "current_stage_id": str(current_stage.get("id", "")),
             "current_stage_label": str(current_stage.get("label", "")),
             "current_stage": current_stage,
@@ -700,6 +720,7 @@ class ComplaintGraphManager:
             "domain_state_enabled": bool(self.domain_state_enabled),
             "initial_stage_id": self.initial_stage_id,
             "root_complaint_anchor": self.root_complaint_anchor,
+            "core_belief": self.core_belief,
             "current_stage_id": self.get_current_stage_id(),
             "runtime_stages": runtime_stages,
             "planned_graph": [str(item) for item in self.planned_graph],
@@ -733,6 +754,35 @@ class ComplaintGraphManager:
         if isinstance(runtime_stages, list):
             stage_catalog = list(stage_catalog if isinstance(stage_catalog, list) else [])
             stage_catalog.extend([copy.deepcopy(item) for item in runtime_stages if isinstance(item, dict)])
+        initial_stage_id = str(
+            payload.get(
+                "initial_stage_id",
+                payload.get(
+                    "current_stage_id",
+                    payload_cfg.get("initial_stage_id", base_cfg.get("initial_stage_id", "")),
+                ),
+            )
+            or ""
+        )
+
+        def _initial_belief(stages: Any) -> str:
+            items = list(stages.values()) if isinstance(stages, dict) else stages
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("id", "") or "").strip() != initial_stage_id:
+                    continue
+                return cls._normalize_core_belief(item.get("core_belief", ""))
+            return ""
+
+        checkpoint_core_belief = cls._normalize_core_belief(payload.get("core_belief", ""))
+        payload_config_core_belief = cls._normalize_core_belief(
+            payload_cfg.get("core_belief", "")
+        ) or _initial_belief(payload_cfg.get("stages", []))
+        runtime_core_belief = _initial_belief(runtime_stages)
+        base_core_belief = cls._normalize_core_belief(
+            base_cfg.get("core_belief", "")
+        ) or _initial_belief(base_cfg.get("stages", []))
         cfg = {
             "planner": copy.deepcopy(payload_cfg.get("planner", base_cfg.get("planner", {}))),
             # The checkpoint value wins over the current persona file so an
@@ -747,21 +797,22 @@ class ComplaintGraphManager:
                 )
                 or ""
             ),
+            # New checkpoints persist the case-level value explicitly. Legacy
+            # checkpoints fall back to their saved initial stage before the
+            # currently installed persona file, so resume does not adopt a
+            # dynamically rewritten descendant belief.
+            "core_belief": (
+                checkpoint_core_belief
+                or payload_config_core_belief
+                or runtime_core_belief
+                or base_core_belief
+            ),
             "initial_domain_state": copy.deepcopy(
                 payload_cfg.get(
                     "initial_domain_state", base_cfg.get("initial_domain_state", {})
                 )
             ),
-            "initial_stage_id": str(
-                payload.get(
-                    "initial_stage_id",
-                    payload.get(
-                        "current_stage_id",
-                        payload_cfg.get("initial_stage_id", base_cfg.get("initial_stage_id", "")),
-                    ),
-                )
-                or ""
-            ),
+            "initial_stage_id": initial_stage_id,
             "stages": copy.deepcopy(stage_catalog) if isinstance(stage_catalog, list) else [],
         }
         resolved_domain_state_enabled = (
@@ -2072,7 +2123,7 @@ class ComplaintGraphManager:
                 detail = copy.deepcopy(payload.get("stage", {}))
             elif isinstance(payload.get("stage_update"), dict):
                 detail = copy.deepcopy(payload.get("stage_update", {}))
-            elif any(key in payload for key in ["id", "label", "summary", "core_belief"]):
+            elif any(key in payload for key in ["id", "label", "summary", "narrative_focus"]):
                 detail = copy.deepcopy(payload)
             else:
                 updates = self._to_list(payload.get("stage_updates", []))
@@ -2089,7 +2140,7 @@ class ComplaintGraphManager:
             merged["id"] = seed_id
 
         # 这些字段有运行时消费者或属于既有 I/O 形状，但单轮 verified_change
-        # 通常不足以证明其稳定变化。保留字段、精确继承，禁止 detail 自由改写。
+        # 不负责改写。保留字段、精确继承，禁止 detail 自由改写。
         stable_defaults = {
             "speaking_style": {},
             "emotion_vector": {},
@@ -2100,12 +2151,9 @@ class ComplaintGraphManager:
         for field_name, default_value in stable_defaults.items():
             merged[field_name] = copy.deepcopy(parent.get(field_name, default_value))
 
-        parent_core_belief = str(parent.get("core_belief", "") or "").strip()
-        proposed_core_belief = detail.get("core_belief")
-        if isinstance(proposed_core_belief, str) and proposed_core_belief.strip():
-            merged["core_belief"] = proposed_core_belief.strip()
-        else:
-            merged["core_belief"] = parent_core_belief
+        # core_belief 是病例级稳定值。即使旧 planner 或脏数据仍输出该键，
+        # candidate 也只镜像初始化时锁定的值；动态认知变化由 label/summary 表达。
+        merged["core_belief"] = self.core_belief
         return self._sanitize_stage(merged, source="llm")
 
     def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
@@ -2415,7 +2463,11 @@ class ComplaintGraphManager:
         label = str(payload.get("label", "") or "").strip() or "未命名主诉节点"
         stage_id = str(payload.get("id", "") or "").strip() or self._make_stage_id(label)
         summary = str(payload.get("summary", payload.get("description", label)) or label).strip()
-        core_belief = str(payload.get("core_belief", "") or "").strip()
+        core_belief = (
+            self.core_belief
+            if hasattr(self, "_core_belief")
+            else str(payload.get("core_belief", "") or "").strip()
+        )
         speaking_style = payload.get("speaking_style", {}) if isinstance(payload.get("speaking_style", {}), dict) else {}
         emotion_vector = payload.get("emotion_vector", {}) if isinstance(payload.get("emotion_vector", {}), dict) else {}
         relation_modifiers = payload.get("relation_modifiers", {}) if isinstance(payload.get("relation_modifiers", {}), dict) else {}

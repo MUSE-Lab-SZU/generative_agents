@@ -29,7 +29,7 @@
         "id": "moderate_job_loss_equals_self_failure",
         "label": "把失业理解成自己失败",
         "summary": "被辞退不再只是工作事件，而是证明自己不行的重要证据；近两周睡眠、精力和胃口都被牵住。",
-        "core_belief": "连工作都保不住，说明我可能真的没有什么价值。",
+        "core_belief": "如果我不能胜任工作，就说明我能力不足、没有多少价值。",
         "narrative_focus": ["失业", "羞耻", "睡眠变差", "没什么胃口", "不想见人", "失败感"],
         "speaking_style": {
           "tempo": "slow",

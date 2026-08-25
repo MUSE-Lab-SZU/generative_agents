@@ -32,7 +32,6 @@ mode = "branch_detail"：
     "id": "沿用 candidate_seed.id",
     "label": "沿用或轻微润色 candidate_seed.label",
     "summary": "完整描述父节点主轴与本轮新增变化的共存状态",
-    "core_belief": "患者当前最主要的深层自我判断",
     "narrative_focus": ["当前主诉焦点1", "当前主诉焦点2"],
     "next_candidates": [],
     "is_terminal_stage": false
@@ -67,10 +66,11 @@ mode = "branch_detail"：
    不得在 detail 阶段再次扩大、转向或病理化候选。
    next_candidates 固定为空数组。
 
-7. core_belief 应保持纵向连续，但不要求逐字不变。
-   如果 verified_change 显示患者对自身价值、能力、关系位置或原有核心判断出现强化、怀疑、松动、条件化表达或替代解释，可以在证据范围内小幅调整。
-   如果本轮只是症状、身体感受、具体事件或行为变化，与核心自我判断无关，则继承 current_stage.core_belief。
-   不得因为治疗方向而自动把负性信念改成积极信念。
+7. current_stage.core_belief 是初始化时确定的病例级稳定核心认知，只作为理解主诉变化的固定参照。
+   planner 不得输出、改写或重新生成 core_belief，也不得另造一套核心信念。
+   患者对稳定 core_belief 的强化、怀疑、松动、条件化表达或新理解，都必须写入 label 和 summary。
+   尤其 summary 可以描述患者当前与该稳定 core_belief 的关系，但不得把动态关系误写成新的 core_belief。
+   不得因为治疗方向而自动宣称负性信念已经转为积极信念。
 
 8. speaking_style、emotion_vector、relation_modifiers、advance_signals、hold_signals 由程序从 current_stage 继承，不要输出或修改。
    id 只需生成稳定、可读的基础 id，唯一性冲突由程序处理。
