@@ -1,9 +1,19 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达",
   "complaint_graph": {
     "initial_stage_id": "job_loss_equals_self_failure",
+    "root_complaint_anchor": "卡布达在被辞退后，将失业理解为自身能力和价值的整体失败；他因此认为自己不值得认可，并担心他人询问近况或作出评价。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
@@ -19,7 +29,7 @@
         "id": "job_loss_equals_self_failure",
         "label": "把失业理解成自己彻底失败",
         "summary": "被辞退不再只是事件，而是整个人不行的证明。",
-        "core_belief": "连工作都保不住，说明我这个人本身就没有价值。",
+        "core_belief": "如果我不能胜任工作，就说明我能力不足、没有多少价值。",
         "narrative_focus": ["失业", "羞耻", "怕被问近况", "不想见人", "失败"],
         "speaking_style": {
           "tempo": "slow",
