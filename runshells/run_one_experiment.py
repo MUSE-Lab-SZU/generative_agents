@@ -187,7 +187,12 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     )
 
 
-def run_cmd(cmd: list[str], *, dry_run: bool, timeout: Optional[int] = None) -> None:
+def run_cmd(
+    cmd: list[str],
+    *,
+    dry_run: bool,
+    timeout: Optional[int] = None,
+) -> None:
     print(f"[RUN] {' '.join(cmd)}")
     if dry_run:
         return
@@ -247,6 +252,89 @@ def detect_assets_root(name: str) -> str:
     maze = data.get("maze")
     maze_path = str(maze.get("path", "") or "") if isinstance(maze, dict) else ""
     return "counsel_room" if "counsel_room" in maze_path else "village"
+
+
+def load_run_runtime_config(name: str) -> dict:
+    checkpoint_dir = CHECKPOINTS_ROOT / name
+    snapshots = sorted(checkpoint_dir.glob("simulate-*.json"))
+    if not snapshots:
+        return {}
+    try:
+        payload = json.loads(snapshots[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def api_cost_tracking_args(
+    *,
+    run_name: str,
+    phase: str,
+    scale_name: str,
+    experiment_data_root: Path = EXPERIMENT_DATA_ROOT,
+    evaluation_id: str = "",
+) -> list[str]:
+    """Build public API-cost tracking arguments shared by evaluation workers."""
+    args = [
+        "--run-name",
+        run_name,
+        "--phase",
+        phase,
+        "--experiment-data-root",
+        str(experiment_data_root),
+        "--scale-name",
+        scale_name,
+    ]
+    if evaluation_id:
+        args.extend(["--evaluation-id", evaluation_id])
+    return args
+
+
+def score_worker_tracking_args(
+    *,
+    run_name: str,
+    phase: str,
+    scale_name: str,
+    runtime_config: Optional[dict] = None,
+    experiment_data_root: Path = EXPERIMENT_DATA_ROOT,
+    evaluation_id: str = "",
+) -> list[str]:
+    """Build public scoring/runtime arguments inherited from forced_llm."""
+    source_config = runtime_config if isinstance(runtime_config, dict) else load_run_runtime_config(run_name)
+    intervention = source_config.get("intervention", {}) if isinstance(source_config, dict) else {}
+    forced_llm = intervention.get("forced_llm", {}) if isinstance(intervention, dict) else {}
+    forced_llm = forced_llm if isinstance(forced_llm, dict) else {}
+    args = api_cost_tracking_args(
+        run_name=run_name,
+        phase=phase,
+        scale_name=scale_name,
+        experiment_data_root=experiment_data_root,
+        evaluation_id=evaluation_id,
+    )
+    model = str(forced_llm.get("model", "") or "").strip()
+    base_url = str(forced_llm.get("base_url", "") or "").strip()
+    if model:
+        args.extend(["--model", model])
+    if base_url:
+        args.extend(["--base-url", base_url])
+    if "thinking" in forced_llm and forced_llm.get("thinking") is not None:
+        args.extend(
+            [
+                "--thinking-json",
+                json.dumps(
+                    forced_llm.get("thinking"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+    reasoning_effort = forced_llm.get(
+        "reasoning_effort", forced_llm.get("reasoning-effort")
+    )
+    if reasoning_effort is not None and str(reasoning_effort).strip():
+        args.extend(["--reasoning-effort", str(reasoning_effort)])
+    return args
 
 
 def ensure_checkpoint_state(name: str, *, resume: bool, dry_run: bool) -> None:
@@ -363,8 +451,7 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
         answers_path = scales_dir / f"{scale_name}_post_answered.jsonl"
         scored_path = scales_dir / f"{scale_name}_post_scored.json"
 
-        run_cmd_with_retry(
-            [
+        answer_cmd = [
                 WORKER_PYTHON,
                 str(SCALE_WORKER_SCRIPT),
                 "--cp-name", name,
@@ -372,19 +459,38 @@ def run_post_scales(name: str, agent_name: str, *, dry_run: bool) -> None:
                 "--agent", agent_name,
                 "--question-file", cfg["question_file"],
                 "--output", str(answers_path),
-            ],
+            ]
+        answer_cmd.extend(
+            api_cost_tracking_args(
+                run_name=name,
+                phase="simulation",
+                scale_name=scale_name,
+                evaluation_id=f"simulation:POST:{name}",
+            )
+        )
+        run_cmd_with_retry(
+            answer_cmd,
             dry_run=dry_run,
             timeout=POST_EVAL_TIMEOUT_SECONDS,
         )
 
-        run_cmd_with_retry(
-            [
+        score_cmd = [
                 WORKER_PYTHON,
                 str(SCORE_WORKER_SCRIPT),
                 "--answers", str(answers_path),
                 "--scoring-prompt", str(scoring_prompt),
                 "--output", str(scored_path),
-            ],
+            ]
+        score_cmd.extend(
+            score_worker_tracking_args(
+                run_name=name,
+                phase="simulation",
+                scale_name=scale_name,
+                evaluation_id=f"simulation:POST:{name}",
+            )
+        )
+        run_cmd_with_retry(
+            score_cmd,
             dry_run=dry_run,
             timeout=POST_EVAL_TIMEOUT_SECONDS,
         )
@@ -410,8 +516,7 @@ def run_post_30q(name: str, agent_name: str, *, dry_run: bool) -> None:
     answers_path = scales_dir / "30Q_post_answered.jsonl"
     scored_path = scales_dir / "30Q_post_scored.json"
 
-    run_cmd_with_retry(
-        [
+    answer_cmd = [
             WORKER_PYTHON,
             str(SCALE_WORKER_SCRIPT),
             "--cp-name", name,
@@ -419,19 +524,38 @@ def run_post_30q(name: str, agent_name: str, *, dry_run: bool) -> None:
             "--agent", agent_name,
             "--question-file", "30Q.jsonl",
             "--output", str(answers_path),
-        ],
+        ]
+    answer_cmd.extend(
+        api_cost_tracking_args(
+            run_name=name,
+            phase="simulation",
+            scale_name="30Q",
+            evaluation_id=f"simulation:POST:{name}",
+        )
+    )
+    run_cmd_with_retry(
+        answer_cmd,
         dry_run=dry_run,
         timeout=1800,
     )
 
-    run_cmd_with_retry(
-        [
+    score_cmd = [
             WORKER_PYTHON,
             str(SCORE_WORKER_SCRIPT),
             "--answers", str(answers_path),
             "--scoring-prompt", str(THIRTY_Q_PROMPT),
             "--output", str(scored_path),
-        ],
+        ]
+    score_cmd.extend(
+        score_worker_tracking_args(
+            run_name=name,
+            phase="simulation",
+            scale_name="30Q",
+            evaluation_id=f"simulation:POST:{name}",
+        )
+    )
+    run_cmd_with_retry(
+        score_cmd,
         dry_run=dry_run,
         timeout=300,
     )

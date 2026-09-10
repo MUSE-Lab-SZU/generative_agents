@@ -3,11 +3,13 @@
 import json
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 from modules.model.endpoint_pool import next_endpoint, resolve_endpoint_urls
+from modules.model.api_cost import record_call_event
 
 
 DEFAULT_OLLAMA_REQUEST_TIMEOUT_SECONDS = 600
@@ -119,9 +121,25 @@ def extract_prompt_cache_usage(response):
     hit_tokens = _nonnegative_int(hit_raw)
     miss_tokens = _nonnegative_int(miss_raw)
     cache_input_tokens = hit_tokens + miss_tokens
+    completion_tokens = _nonnegative_int(_usage_value("completion_tokens"))
+    completion_details = _mapping_or_model_dump(
+        _usage_value("completion_tokens_details")
+    )
+    reasoning_raw = completion_details.get("reasoning_tokens")
+    reasoning_tokens = (
+        min(_nonnegative_int(reasoning_raw), completion_tokens)
+        if reasoning_raw is not None
+        else None
+    )
     return {
         "prompt_tokens": _nonnegative_int(_usage_value("prompt_tokens"), cache_input_tokens),
-        "completion_tokens": _nonnegative_int(_usage_value("completion_tokens")),
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "visible_output_tokens": (
+            completion_tokens - reasoning_tokens
+            if reasoning_tokens is not None
+            else None
+        ),
         "total_tokens": _nonnegative_int(_usage_value("total_tokens")),
         "prompt_cache_hit_tokens": hit_tokens,
         "prompt_cache_miss_tokens": miss_tokens,
@@ -140,9 +158,35 @@ def record_prompt_cache_usage(
     provider,
     model,
     base_url,
+    request_started_at=None,
+    response_received_at=None,
+    request_options=None,
 ):
     """Log one cache observation plus per-process totals for its call type."""
     usage = extract_prompt_cache_usage(response)
+    received_at = response_received_at or datetime.now(timezone.utc)
+    try:
+        cost_event = record_call_event(
+            response=response,
+            usage=usage,
+            caller=caller,
+            provider=provider,
+            requested_model=model,
+            base_url=sanitize_endpoint_for_log(base_url),
+            request_started_at=request_started_at or received_at,
+            response_received_at=received_at,
+            status="success" if usage is not None else "missing_usage",
+            request_options=request_options,
+        )
+    except Exception as exc:
+        cost_event = None
+        print(
+            "[API_COST_RECORD_ERROR] caller={} error={}".format(
+                _safe_exception_text(caller),
+                _safe_exception_text(exc),
+            ),
+            flush=True,
+        )
     if usage is None:
         return None
 
@@ -156,17 +200,36 @@ def record_prompt_cache_usage(
         {
             "requests": 0,
             "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "visible_output_tokens": 0,
+            "missing_reasoning_detail_calls": 0,
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
+            "cost_cny": 0.0,
         },
     )
     aggregate["requests"] += 1
     for field in (
         "prompt_tokens",
+        "completion_tokens",
         "prompt_cache_hit_tokens",
         "prompt_cache_miss_tokens",
     ):
         aggregate[field] += int(usage.get(field, 0) or 0)
+    if usage.get("reasoning_tokens") is None:
+        aggregate["missing_reasoning_detail_calls"] += 1
+    else:
+        aggregate["reasoning_tokens"] += int(usage.get("reasoning_tokens", 0) or 0)
+        aggregate["visible_output_tokens"] += int(
+            usage.get("visible_output_tokens", 0) or 0
+        )
+    if cost_event is not None:
+        aggregate["cost_cny"] = round(
+            float(aggregate.get("cost_cny", 0) or 0)
+            + float(cost_event.get("cost_cny", 0) or 0),
+            9,
+        )
     aggregate_cache_tokens = (
         aggregate["prompt_cache_hit_tokens"]
         + aggregate["prompt_cache_miss_tokens"]
@@ -187,7 +250,10 @@ def record_prompt_cache_usage(
         "endpoint": sanitize_endpoint_for_log(base_url),
         "request": usage,
         "process_cumulative": cumulative,
+        "request_options": dict(request_options or {}),
     }
+    if cost_event is not None:
+        log_payload["accounting"] = cost_event
     print(
         "[LLM_PROMPT_CACHE] {}".format(
             json.dumps(
@@ -200,6 +266,41 @@ def record_prompt_cache_usage(
         flush=True,
     )
     return log_payload
+
+
+def record_deepseek_call_failure(
+    *,
+    caller,
+    provider,
+    model,
+    base_url,
+    request_started_at,
+    response_received_at=None,
+    error_category="",
+):
+    """Persist a failed DeepSeek request without assuming billable usage."""
+    try:
+        return record_call_event(
+            response=None,
+            usage=None,
+            caller=caller,
+            provider=provider,
+            requested_model=model,
+            base_url=sanitize_endpoint_for_log(base_url),
+            request_started_at=request_started_at,
+            response_received_at=response_received_at or datetime.now(timezone.utc),
+            status="failed",
+            error_category=error_category,
+        )
+    except Exception as exc:
+        print(
+            "[API_COST_RECORD_ERROR] caller={} error={}".format(
+                _safe_exception_text(caller),
+                _safe_exception_text(exc),
+            ),
+            flush=True,
+        )
+        return None
 
 
 def _exception_message(exc):
@@ -411,6 +512,14 @@ class LLMModel:
         self._summary = {"total": [0, 0, 0]}
         self._default_retry = config.get("retry", DEFAULT_LLM_RETRY)
         self._request_timeout_seconds = resolve_ollama_timeout_seconds(config)
+        self._thinking = config.get("thinking")
+        self._reasoning_effort = config.get(
+            "reasoning_effort", config.get("reasoning-effort")
+        )
+        caller_overrides = config.get("caller_overrides", {})
+        self._caller_overrides = (
+            caller_overrides if isinstance(caller_overrides, dict) else {}
+        )
 
         self._handle = self.setup(config)
         self._enabled = True
@@ -501,6 +610,29 @@ class LLMModel:
     def meta_responses(self):
         return self._meta_responses
 
+    def _reasoning_options_for_caller(self, caller):
+        """Resolve request-level thinking controls without changing model routing."""
+        thinking = self._thinking
+        reasoning_effort = self._reasoning_effort
+        override = self._caller_overrides.get(str(caller or ""), {})
+        if isinstance(override, dict):
+            if "thinking" in override:
+                thinking = override.get("thinking")
+            if "reasoning_effort" in override or "reasoning-effort" in override:
+                reasoning_effort = override.get(
+                    "reasoning_effort", override.get("reasoning-effort")
+                )
+
+        normalized_thinking = thinking
+        if isinstance(normalized_thinking, str):
+            normalized_thinking = {"type": normalized_thinking}
+        thinking_type = ""
+        if isinstance(normalized_thinking, dict):
+            thinking_type = str(normalized_thinking.get("type", "") or "").lower()
+        if thinking_type == "disabled":
+            reasoning_effort = None
+        return normalized_thinking, reasoning_effort
+
 
 class OpenAILLMModel(LLMModel):
     def setup(self, config):
@@ -519,15 +651,43 @@ class OpenAILLMModel(LLMModel):
         prompt = prepare_prompt_for_model(prompt, self._model)
         messages = [{"role": "user", "content": prompt}]
         self._active_base_url = next_endpoint(self._endpoint_config, self._endpoint_urls)
-        response = self._handle[self._active_base_url].chat.completions.create(
-            model=self._model, messages=messages, temperature=temperature
-        )
+        request_kwargs = {}
+        thinking, reasoning_effort = self._reasoning_options_for_caller(caller)
+        if thinking is not None:
+            request_kwargs["extra_body"] = {"thinking": thinking}
+        if reasoning_effort is not None:
+            request_kwargs["reasoning_effort"] = reasoning_effort
+        request_started_at = datetime.now(timezone.utc)
+        try:
+            response = self._handle[self._active_base_url].chat.completions.create(
+                model=self._model,
+                messages=messages,
+                temperature=temperature,
+                **request_kwargs,
+            )
+        except Exception as exc:
+            record_deepseek_call_failure(
+                caller=caller,
+                provider=self._provider,
+                model=self._model,
+                base_url=self._active_base_url,
+                request_started_at=request_started_at,
+                error_category=classify_call_exception(exc),
+            )
+            raise
+        response_received_at = datetime.now(timezone.utc)
         record_prompt_cache_usage(
             response,
             caller=caller,
             provider=self._provider,
             model=self._model,
             base_url=self._active_base_url,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            request_options={
+                "thinking": thinking,
+                "reasoning_effort": reasoning_effort,
+            },
         )
         if len(response.choices) > 0:
             return strip_qwen_think_tags(response.choices[0].message.content)

@@ -31,12 +31,14 @@ from modules.cbt_minimal_controller import (
     PATIENT_STATE_DEFAULT,
     PROGRESSIVE_D_CONTROLLER_VERSION,
     PROGRESSIVE_D_PATIENT_STATE_DEFAULT,
+    SESSION_TASK_PLANNER_CLOSE,
     STAGE_ADAPTER_ACTIONS,
     compact_patient_state_text,
     compact_progressive_d_patient_state_text,
     compact_prior_progress_text,
     compact_progressive_d_subgoal_progress_text,
     compact_route_text,
+    compact_session_task_plan_text,
     copy_soft_step_back_default,
     eligible_soft_step_back_targets,
     generate_session_end,
@@ -46,15 +48,20 @@ from modules.cbt_minimal_controller import (
     load_strategy_map,
     load_term_glossary,
     merge_progressive_d_batch_progress,
+    merge_progressive_d_planner_updates,
     normalize_minimal_judge_output,
     normalize_minimal_session_eval,
+    normalize_progressive_d_judge_output,
+    normalize_response_strategy_selector_output,
     normalize_patient_state,
     normalize_progressive_d_control_eval,
     normalize_progressive_d_patient_state,
+    normalize_session_task_planner_output,
     progressive_d_completion_audit,
     recent_dialogue,
     route_strategies,
     safe_judge_fallback,
+    safe_strategy_selector_fallback,
     split_utterances,
     tagged_dialogue,
 )
@@ -67,8 +74,11 @@ from modules.intervention_consult_record import (
     build_dedup_key,
     build_full_record,
     build_pair_key,
+    conversation_content_chars,
     flatten_record_for_injection,
     project_whitelist,
+    render_current_session_prompt_conversation,
+    split_recent_exchanges,
     to_conversation_text,
     validate_consult_history_record,
     validate_full_record,
@@ -78,6 +88,11 @@ from modules.model import create_llm_model
 from modules.resident_chat_scheduler import ResidentChatScheduler
 from modules.session_prompt_injection_manager import SessionPromptInjectionManager
 from modules.storage.index import LlamaIndex
+
+
+PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE = (
+    "data/prompts/intervention/dialog_judge_termination_rules_progressive_d.txt"
+)
 
 
 @dataclass
@@ -140,6 +155,10 @@ class InterventionManager:
         self._cbt_stage_subgoals_cache: Optional[Dict[str, Any]] = None
         self._cbt_stage_subgoals_cache_path = ""
         self._consult_history_indexes: Dict[str, Any] = {}
+        # Runtime-only rolling summaries.  They are deliberately not stored under
+        # intervention_state and therefore never become agent long-term memory or
+        # checkpointed consultation history.
+        self._current_session_prompt_context_cache: Dict[str, Dict[str, Any]] = {}
 
         # 全局运行时状态（随 config 落盘）
         self.state = config.setdefault(
@@ -664,7 +683,13 @@ class InterventionManager:
                                     step_time=self._resolve_trace_step_time(),
                                     normalized_eval_payload={
                                         "control_source": (
-                                            "batch_control_adapter"
+                                            str(
+                                                latest_record.get(
+                                                    "evaluation_source",
+                                                    "",
+                                                )
+                                                or "batch_control_adapter"
+                                            )
                                             if self._is_progressive_d_v3_configured()
                                             else "subgoal_adapter"
                                         ),
@@ -1163,6 +1188,263 @@ class InterventionManager:
             )
         return ""
 
+    def get_current_session_context_runtime_policy(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw = intervention_cfg.get("current_session_context", {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        recent_exchanges = self._safe_int(raw.get("recent_exchange_count", 5), 5)
+        summary_max_chars = self._safe_int(raw.get("summary_max_chars", 300), 300)
+        return {
+            "enabled": self._safe_bool(raw.get("enabled", False), False),
+            "recent_exchange_count": max(1, recent_exchanges),
+            "summary_route": str(raw.get("summary_route", "forced_llm") or "forced_llm").strip().lower(),
+            "summary_prompt_file": str(
+                raw.get("summary_prompt_file", "data/prompts/summarize_chats.txt")
+                or "data/prompts/summarize_chats.txt"
+            ).strip(),
+            "summary_retry": max(1, self._safe_int(raw.get("summary_retry", 2), 2)),
+            "summary_max_chars": max(80, summary_max_chars),
+        }
+
+    def get_consultation_time_runtime_policy(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw = intervention_cfg.get("consultation_time", {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        try:
+            chars_per_minute = float(raw.get("chars_per_minute", 180) or 180)
+        except Exception:
+            chars_per_minute = 180.0
+        if chars_per_minute <= 0:
+            chars_per_minute = 180.0
+        target_duration_minutes = self._safe_int(
+            raw.get("target_duration_minutes", 60),
+            60,
+        )
+        if target_duration_minutes < 1:
+            target_duration_minutes = 60
+        earliest_closing_check_minutes = self._safe_int(
+            raw.get("earliest_closing_check_minutes", 40),
+            40,
+        )
+        if earliest_closing_check_minutes < 1:
+            earliest_closing_check_minutes = 40
+        return {
+            "enabled": self._safe_bool(raw.get("enabled", False), False),
+            "chars_per_minute": chars_per_minute,
+            "target_duration_minutes": target_duration_minutes,
+            "earliest_closing_check_minutes": earliest_closing_check_minutes,
+        }
+
+    @staticmethod
+    def _bounded_summary_fallback(previous_summary: str, new_dialogue: str, max_chars: int) -> str:
+        combined = "；".join(
+            text
+            for text in (
+                str(previous_summary or "").strip(),
+                str(new_dialogue or "").strip(),
+            )
+            if text
+        )
+        if len(combined) <= max_chars:
+            return combined
+        head_chars = max(1, (max_chars - 1) // 2)
+        tail_chars = max(1, max_chars - head_chars - 1)
+        return "{}…{}".format(combined[:head_chars], combined[-tail_chars:])
+
+    def _summarize_current_session_earlier_dialogue(
+        self,
+        doctor: Any,
+        previous_summary: str,
+        new_older_chats: Any,
+        policy: Dict[str, Any],
+    ) -> str:
+        new_dialogue = to_conversation_text(new_older_chats or [])
+        if not new_dialogue:
+            return str(previous_summary or "").strip()
+        if str(previous_summary or "").strip():
+            summary_input = (
+                "已有较早对话摘要：\n{}\n\n"
+                "本次新移入较早区间的对话：\n{}\n\n"
+                "请把两者合并为一段连贯的普通语义摘要。"
+            ).format(str(previous_summary or "").strip(), new_dialogue)
+        else:
+            summary_input = new_dialogue
+        max_chars = int(policy.get("summary_max_chars", 300) or 300)
+        try:
+            prompt_tpl = self._load_prompt_txt_or_raise(
+                str(policy.get("summary_prompt_file", "") or "")
+            )
+            prompt_text = self._render_prompt_template(
+                prompt_tpl,
+                {"conversation": summary_input},
+            )
+            if str(policy.get("summary_route", "forced_llm") or "forced_llm") == "think_llm":
+                summary = self._call_think_llm_text(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("summary_retry", 2) or 2),
+                    doctor_agent=doctor,
+                    caller="current_session_context_summary",
+                )
+            else:
+                summary = self._call_forced_llm_text(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("summary_retry", 2) or 2),
+                    caller="current_session_context_summary",
+                )
+            summary = self._strip_text_code_fence(summary).strip()
+            if not summary:
+                raise ConsultRecordError(
+                    reason="current_session_summary_empty",
+                    retryable=False,
+                )
+            return summary[:max_chars]
+        except Exception as exc:
+            self._log_highlight(
+                "[CURRENT_SESSION_CONTEXT_SUMMARY_FALLBACK] reason={}".format(
+                    str(exc)
+                )
+            )
+            return self._bounded_summary_fallback(
+                previous_summary,
+                new_dialogue,
+                max_chars,
+            )
+
+    def get_current_session_prompt_context(
+        self,
+        speaker: Any,
+        other: Any,
+        chats: Any,
+        forced: bool,
+    ) -> Dict[str, Any]:
+        """Build the bounded current-session view shared by patient, doctor and judge."""
+        items = list(chats) if isinstance(chats, (list, tuple)) else []
+        base_now = utils.get_timer().get_date()
+        if not isinstance(base_now, datetime.datetime):
+            base_now = self._parse_dt(str(base_now or "")) or self._now()
+        full_chars = conversation_content_chars(items)
+        meeting = self.resolve_meeting_context(speaker, other, forced=forced)
+        meeting_kind = (
+            str(meeting.get("meeting_kind", "") or "").strip()
+            if isinstance(meeting, dict)
+            else ""
+        )
+        doctor, patient = self._resolve_doctor_patient_pair(speaker, other)
+        is_doctor_consult = bool(
+            forced
+            and doctor
+            and patient
+            and meeting_kind in {"", "doctor_consult"}
+        )
+        if not is_doctor_consult:
+            return {
+                "conversation": to_conversation_text(items) or "[对话尚未开始]",
+                "current_time": base_now.strftime("%H:%M"),
+                "elapsed_minutes": 0,
+                "full_transcript_chars": full_chars,
+                "earlier_summary": "",
+                "recent_chats": items,
+            }
+        time_policy = self.get_consultation_time_runtime_policy()
+        elapsed_minutes = 0
+        progress_text = ""
+        dynamic_now = base_now
+        if bool(time_policy.get("enabled", False)):
+            chars_per_minute = float(time_policy.get("chars_per_minute", 180.0) or 180.0)
+            if full_chars > 0:
+                elapsed_minutes = max(1, int((full_chars / chars_per_minute) + 0.5))
+            # The simulation clock does not advance inside the synchronous chat
+            # loop.  Treat its current value as consultation start and advance it
+            # only by spoken transcript characters (no model latency or pauses).
+            dynamic_now = base_now + datetime.timedelta(
+                minutes=elapsed_minutes
+            )
+            progress_text = (
+                "现在时间：{}\n"
+                "当前咨询对话已进行约 {} 分钟（仅按完整当前 Session transcript 字数估算，"
+                "不含额外思考或停顿时间）。"
+            ).format(dynamic_now.strftime("%H:%M"), elapsed_minutes)
+
+        context_policy = self.get_current_session_context_runtime_policy()
+        if not bool(forced) or not bool(context_policy.get("enabled", False)):
+            conversation = to_conversation_text(items) or "[对话尚未开始]"
+            if progress_text:
+                conversation = "<当前咨询进度>\n{}\n</当前咨询进度>\n\n{}".format(
+                    progress_text,
+                    conversation,
+                )
+            return {
+                "conversation": conversation,
+                "current_time": dynamic_now.strftime("%H:%M"),
+                "elapsed_minutes": elapsed_minutes,
+                "full_transcript_chars": full_chars,
+                "earlier_summary": "",
+                "recent_chats": items,
+            }
+
+        older_chats, recent_chats = split_recent_exchanges(
+            items,
+            int(context_policy.get("recent_exchange_count", 5) or 5),
+        )
+        meeting_id = str((meeting or {}).get("meeting_id", "") or "") if isinstance(meeting, dict) else ""
+        pair_key = build_pair_key(
+            str(getattr(doctor, "name", "") or getattr(speaker, "name", "") or ""),
+            str(getattr(patient, "name", "") or getattr(other, "name", "") or ""),
+        )
+        cache_key = meeting_id or pair_key
+        cached = self._current_session_prompt_context_cache.get(cache_key, {})
+        summarized_count = self._safe_int(cached.get("summarized_utterance_count", 0), 0)
+        if summarized_count < 0 or summarized_count > len(older_chats):
+            cached = {}
+            summarized_count = 0
+        earlier_summary = str(cached.get("summary", "") or "").strip()
+        if len(older_chats) > summarized_count:
+            earlier_summary = self._summarize_current_session_earlier_dialogue(
+                doctor=doctor or speaker,
+                previous_summary=earlier_summary,
+                new_older_chats=older_chats[summarized_count:],
+                policy=context_policy,
+            )
+            summarized_count = len(older_chats)
+            self._current_session_prompt_context_cache[cache_key] = {
+                "summary": earlier_summary,
+                "summarized_utterance_count": summarized_count,
+            }
+
+        conversation = render_current_session_prompt_conversation(
+            recent_chats=recent_chats,
+            earlier_summary=earlier_summary,
+            progress_text=progress_text,
+        )
+        self._log_highlight(
+            "[CURRENT_SESSION_CONTEXT] meeting_id={} full_utterances={} older_utterances={} recent_utterances={} full_chars={} summary_chars={} elapsed_minutes={}".format(
+                meeting_id or "<none>",
+                len(items),
+                len(older_chats),
+                len(recent_chats),
+                full_chars,
+                len(earlier_summary),
+                elapsed_minutes,
+            )
+        )
+        return {
+            "conversation": conversation,
+            "current_time": dynamic_now.strftime("%H:%M"),
+            "elapsed_minutes": elapsed_minutes,
+            "full_transcript_chars": full_chars,
+            "earlier_summary": earlier_summary,
+            "recent_chats": recent_chats,
+            "older_utterance_count": len(older_chats),
+            "meeting_id": meeting_id,
+        }
+
+    def clear_current_session_prompt_context(self, meeting_id: str = "") -> None:
+        key = str(meeting_id or "").strip()
+        if key:
+            self._current_session_prompt_context_cache.pop(key, None)
+
     def get_doctor_consult_record_injection(self, speaker: Any, other: Any, forced: bool) -> str:
         if not self.enabled:
             return ""
@@ -1542,6 +1824,15 @@ class InterventionManager:
         except Exception:
             runtime_cfg["temperature"] = 0.5
 
+        for key in (
+            "thinking",
+            "reasoning_effort",
+            "reasoning-effort",
+            "caller_overrides",
+        ):
+            if key in forced_llm:
+                runtime_cfg[key] = copy.deepcopy(forced_llm.get(key))
+
         return runtime_cfg
 
     def get_decide_chat_terminate_runtime_policy(self) -> Dict[str, Any]:
@@ -1833,6 +2124,47 @@ class InterventionManager:
             self._cbt_strategy_map_cache_path = path
         return self._cbt_strategy_map_cache
 
+    def get_response_strategy_selector_runtime_policy(self) -> Dict[str, Any]:
+        """Return the local selector policy layered on the existing router."""
+
+        defaults = {
+            "enabled": True,
+            "prompt_file": (
+                "data/prompts/intervention/response_strategy_selector.txt"
+            ),
+            "retry": 2,
+            "route": "think_llm",
+        }
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        router_cfg = intervention_cfg.get("strategy_router", {}) or {}
+        selector_cfg = (
+            router_cfg.get("response_strategy_selector", {})
+            if isinstance(router_cfg, dict)
+            else {}
+        ) or {}
+        if not isinstance(selector_cfg, dict):
+            selector_cfg = {}
+        return {
+            "enabled": self._safe_bool(
+                selector_cfg.get("enabled", defaults["enabled"]),
+                defaults["enabled"],
+            ),
+            "prompt_file": str(
+                selector_cfg.get("prompt_file", defaults["prompt_file"])
+                or defaults["prompt_file"]
+            ).strip(),
+            "retry": max(
+                1,
+                self._safe_int(
+                    selector_cfg.get("retry", defaults["retry"]),
+                    defaults["retry"],
+                ),
+            ),
+            # The selector is deliberately pinned to the doctor's local think
+            # runtime; no forced/DeepSeek route is supported here.
+            "route": defaults["route"],
+        }
+
     def get_progressive_d_runtime_policy(self) -> Dict[str, Any]:
         """Return the native D policy, with a strict fallback for old D configs."""
 
@@ -1841,11 +2173,14 @@ class InterventionManager:
         native = isinstance(raw, dict)
         if native:
             state_tracker = raw.get("state_tracker", {}) or {}
+            session_task_planner = raw.get("session_task_planner", {}) or {}
             judge = raw.get("judge", {}) or {}
             control_eval = raw.get("control_eval", {}) or {}
             transitions = raw.get("transitions", {}) or {}
             if not isinstance(state_tracker, dict):
                 state_tracker = {}
+            if not isinstance(session_task_planner, dict):
+                session_task_planner = {}
             if not isinstance(judge, dict):
                 judge = {}
             if not isinstance(control_eval, dict):
@@ -1883,6 +2218,10 @@ class InterventionManager:
                 "controller_version": str(
                     raw.get("controller_version", "") or ""
                 ).strip(),
+                "completion_threshold_ratio": self._safe_ratio(
+                    raw.get("completion_threshold_ratio", 0.60),
+                    0.60,
+                ),
                 "state_tracker_prompt_file": str(
                     state_tracker.get(
                         "prompt_file",
@@ -1898,6 +2237,27 @@ class InterventionManager:
                     1,
                     self._safe_int(state_tracker.get("recent_utterances", 8), 8),
                 ),
+                "session_task_planner_enabled": self._safe_bool(
+                    session_task_planner.get("enabled", True),
+                    True,
+                ),
+                "session_task_planner_prompt_file": str(
+                    session_task_planner.get(
+                        "prompt_file",
+                        (
+                            "data/prompts/intervention/"
+                            "session_task_planner_progressive_d.txt"
+                        ),
+                    )
+                    or (
+                        "data/prompts/intervention/"
+                        "session_task_planner_progressive_d.txt"
+                    )
+                ).strip(),
+                "session_task_planner_retry": max(
+                    1,
+                    self._safe_int(session_task_planner.get("retry", 2), 2),
+                ),
                 "judge_prompt_file": str(
                     judge.get(
                         "prompt_file",
@@ -1905,7 +2265,20 @@ class InterventionManager:
                     )
                     or "data/prompts/intervention/dialog_judge_progressive_d.txt"
                 ).strip(),
+                "termination_rules_prompt_file": str(
+                    judge.get(
+                        "termination_rules_prompt_file",
+                        PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE,
+                    )
+                    or PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE
+                ).strip(),
                 "judge_retry": max(1, self._safe_int(judge.get("retry", 2), 2)),
+                # The Session Task Planner maintains this same progress state
+                # each turn, so the batch evaluator remains optional.
+                "control_eval_enabled": self._safe_bool(
+                    control_eval.get("enabled", False),
+                    False,
+                ),
                 "control_route": route,
                 "control_prompt_file": str(
                     control_eval.get(
@@ -1956,6 +2329,7 @@ class InterventionManager:
             "enabled": enabled,
             "source": "legacy_progressive_d_config",
             "controller_version": adapter_version,
+            "completion_threshold_ratio": 0.60,
             "state_tracker_prompt_file": str(
                 (intervention_cfg.get("state_tracker", {}) or {}).get(
                     "progressive_d_prompt_file",
@@ -1980,6 +2354,11 @@ class InterventionManager:
                     8,
                 ),
             ),
+            "session_task_planner_enabled": True,
+            "session_task_planner_prompt_file": (
+                "data/prompts/intervention/session_task_planner_progressive_d.txt"
+            ),
+            "session_task_planner_retry": 2,
             "judge_prompt_file": str(
                 (intervention_cfg.get("dialog_judge", {}) or {}).get(
                     "progressive_d_prompt_file",
@@ -1987,6 +2366,9 @@ class InterventionManager:
                 )
                 or "data/prompts/intervention/dialog_judge_progressive_d.txt"
             ).strip(),
+            "termination_rules_prompt_file": (
+                PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE
+            ),
             "judge_retry": max(
                 1,
                 self._safe_int(
@@ -1994,6 +2376,7 @@ class InterventionManager:
                     2,
                 ),
             ),
+            "control_eval_enabled": True,
             "control_route": str(shadow.get("route", "forced_llm") or "forced_llm").strip().lower(),
             "control_prompt_file": str(
                 shadow.get(
@@ -2129,8 +2512,9 @@ class InterventionManager:
         legacy_session: str,
         payload: Dict[str, Any],
         evaluator_valid: bool = True,
+        use_existing_progress: bool = False,
     ) -> Dict[str, Any]:
-        """Merge one D batch and derive the calibrated graded completion audit."""
+        """Merge one D batch, or audit Planner-maintained progress, after a meeting."""
 
         result: Dict[str, Any] = {
             "recommended_action": str(
@@ -2178,7 +2562,17 @@ class InterventionManager:
             result["reason"] = "duplicate_meeting"
             return result
         candidate = copy.deepcopy(progress_state)
-        if evaluator_valid:
+        if use_existing_progress:
+            meeting_ids = candidate.setdefault(
+                "meeting_ids_in_current_prompt",
+                [],
+            )
+            if not isinstance(meeting_ids, list):
+                meeting_ids = []
+                candidate["meeting_ids_in_current_prompt"] = meeting_ids
+            meeting_ids.append(meeting_id_text)
+            candidate["meetings_in_current_prompt"] = len(meeting_ids)
+        elif evaluator_valid:
             try:
                 merge_progressive_d_batch_progress(
                     candidate,
@@ -2203,6 +2597,9 @@ class InterventionManager:
         audit = progressive_d_completion_audit(
             candidate,
             high_risk_seen=bool(tracker.get("high_risk_seen", False)),
+            threshold_ratio=float(
+                stage_policy.get("completion_threshold_ratio", 0.60) or 0.60
+            ),
         )
         result.update(copy.deepcopy(audit))
         prompt_state = (
@@ -2339,21 +2736,230 @@ class InterventionManager:
         ] = candidate
         return result
 
-    def _compact_subgoal_progress_for_judge(
+    def _plan_progressive_d_session_task(
         self,
+        *,
+        doctor: Any,
+        patient: Any,
         pair_key: str,
+        meeting_id: str,
         current_session: str,
-    ) -> str:
+        session_prompt_text: str,
+        latest_patient_reply: str,
+        conversation_prompt_text: str,
+        elapsed_minutes: int,
+        turn_no: int,
+    ) -> tuple[Dict[str, Any], str]:
+        """Run the local per-turn planner and persist only monotonic new progress."""
+
+        policy = self.get_progressive_d_runtime_policy()
         progress_state, stage_item = self._progressive_d_progress_state_for_pair(
             pair_key,
             current_session,
         )
-        glossary = self._minimal_term_glossary()
-        return compact_progressive_d_subgoal_progress_text(
-            stage_item,
-            progress_state,
-            glossary.get("macro_stages", {}),
+        configured_ids = [
+            str(item.get("id", "") or "")
+            for item in stage_item.get("subgoals", [])
+            if isinstance(item, dict) and str(item.get("id", "") or "")
+        ]
+        stored = progress_state.get("subgoals", {})
+        all_complete = bool(configured_ids) and all(
+            isinstance(stored, Mapping)
+            and isinstance(stored.get(subgoal_id), Mapping)
+            and str(stored[subgoal_id].get("status", "") or "") == "complete"
+            for subgoal_id in configured_ids
         )
+        fallback_next = (
+            SESSION_TASK_PLANNER_CLOSE
+            if all_complete
+            else str(progress_state.get("active_subgoal_id", "") or "")
+        )
+        if (
+            fallback_next not in configured_ids
+            and fallback_next != SESSION_TASK_PLANNER_CLOSE
+        ):
+            fallback_next = (
+                configured_ids[0]
+                if configured_ids
+                else SESSION_TASK_PLANNER_CLOSE
+            )
+        normalized: Dict[str, Any] = {
+            "subgoal_updates": [],
+            "next_subgoal_id": fallback_next,
+        }
+        fallback = copy.deepcopy(normalized)
+        prompt_text = ""
+        raw: Any = {}
+        error = ""
+
+        if bool(policy.get("session_task_planner_enabled", True)):
+            try:
+                prompt_text = load_prompt_template(
+                    str(policy.get("session_task_planner_prompt_file", "") or ""),
+                    {
+                        "CURRENT_SESSION_PROMPT": str(session_prompt_text or ""),
+                        "SUBGOAL_PROGRESS": compact_progressive_d_subgoal_progress_text(
+                            stage_item,
+                            progress_state,
+                            self._minimal_term_glossary().get("macro_stages", {}),
+                        ),
+                        "LATEST_PATIENT_REPLY": str(latest_patient_reply or ""),
+                        "DIALOGUE_HISTORY": (
+                            str(conversation_prompt_text or "").strip()
+                            or "[对话尚未开始]"
+                        ),
+                        "ELAPSED_MINUTES": str(max(0, int(elapsed_minutes or 0))),
+                        "TURN_NO": str(int(turn_no or 1)),
+                    },
+                    required_placeholders=(
+                        "CURRENT_SESSION_PROMPT",
+                        "SUBGOAL_PROGRESS",
+                        "LATEST_PATIENT_REPLY",
+                        "DIALOGUE_HISTORY",
+                        "ELAPSED_MINUTES",
+                        "TURN_NO",
+                    ),
+                )
+                raw = self._call_think_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("session_task_planner_retry", 2) or 2),
+                    doctor_agent=doctor,
+                    caller="cbt_session_task_planner",
+                )
+                normalized = normalize_session_task_planner_output(
+                    raw,
+                    configured_ids,
+                )
+                normalized["subgoal_updates"] = merge_progressive_d_planner_updates(
+                    progress_state,
+                    stage_item,
+                    normalized.get("subgoal_updates", []),
+                    meeting_id,
+                )
+            except Exception as exc:
+                error = str(exc)
+                normalized = fallback
+
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="session_task_planner_llm",
+            prompt_text=prompt_text,
+            output={
+                "raw_output": copy.deepcopy(raw),
+                "normalized_output": copy.deepcopy(normalized),
+            },
+            turn_no=int(turn_no or -1),
+            meta={
+                "source": (
+                    "progressive_d_session_task_planner_disabled"
+                    if not bool(policy.get("session_task_planner_enabled", True))
+                    else (
+                        "progressive_d_session_task_planner"
+                        if not error
+                        else "progressive_d_session_task_planner_error"
+                    )
+                ),
+                "route": "think_llm",
+                "caller": "cbt_session_task_planner",
+                "error": error,
+            },
+        )
+        return normalized, compact_session_task_plan_text(normalized, stage_item)
+
+    def _select_response_strategy(
+        self,
+        *,
+        doctor: Any,
+        patient: Any,
+        route: Mapping[str, Any],
+        latest_patient_reply: str,
+        patient_state_text: str,
+        dialogue_history: str,
+        next_subgoal_id: str,
+        turn_goal: str,
+        turn_no: int,
+    ) -> Dict[str, str]:
+        """Select one router-approved strategy pair via the local think LLM."""
+
+        policy = self.get_response_strategy_selector_runtime_policy()
+        fallback = safe_strategy_selector_fallback(
+            route.get("allowed_primary_strategies", []),
+            route.get("allowed_micro_skills", []),
+        )
+        prompt_text = ""
+        raw: Any = {}
+        error = ""
+        normalized = copy.deepcopy(fallback)
+        if bool(policy.get("enabled", True)):
+            try:
+                prompt_text = load_prompt_template(
+                    str(policy.get("prompt_file", "") or ""),
+                    {
+                        "LATEST_PATIENT_REPLY": str(latest_patient_reply or ""),
+                        "PATIENT_STATE": str(patient_state_text or ""),
+                        "DIALOGUE_HISTORY": str(dialogue_history or "").strip()
+                        or "[对话尚未开始]",
+                        "NEXT_SUBGOAL_ID": str(next_subgoal_id or "").strip()
+                        or "[当前流程未提供]",
+                        "TURN_GOAL": str(turn_goal or ""),
+                        "CANDIDATE_STRATEGIES": compact_route_text(
+                            route,
+                            self._minimal_term_glossary(),
+                        ),
+                    },
+                    required_placeholders=(
+                        "LATEST_PATIENT_REPLY",
+                        "PATIENT_STATE",
+                        "DIALOGUE_HISTORY",
+                        "NEXT_SUBGOAL_ID",
+                        "TURN_GOAL",
+                        "CANDIDATE_STRATEGIES",
+                    ),
+                )
+                raw = self._call_think_llm_json(
+                    prompt_text=prompt_text,
+                    retry=int(policy.get("retry", 2) or 2),
+                    doctor_agent=doctor,
+                    caller="cbt_response_strategy_selector",
+                )
+                normalized = normalize_response_strategy_selector_output(
+                    raw,
+                    route,
+                )
+                if normalized == fallback and raw != fallback:
+                    error = "selector_output_invalid_or_outside_candidates"
+            except Exception as exc:
+                error = str(exc)
+
+        self.append_forced_prompt_trace_record(
+            speaker=doctor,
+            other=patient,
+            role="response_strategy_selector_llm",
+            prompt_text=prompt_text,
+            output={
+                "raw_output": copy.deepcopy(raw),
+                "normalized_output": copy.deepcopy(normalized),
+                "router": copy.deepcopy(dict(route)),
+            },
+            turn_no=int(turn_no or -1),
+            meta={
+                "source": (
+                    "response_strategy_selector_disabled"
+                    if not bool(policy.get("enabled", True))
+                    else (
+                        "response_strategy_selector"
+                        if not error
+                        else "response_strategy_selector_fallback"
+                    )
+                ),
+                "route": "think_llm",
+                "caller": "cbt_response_strategy_selector",
+                "error": error,
+                "next_subgoal_id": str(next_subgoal_id or ""),
+            },
+        )
+        return normalized
 
     def _compact_prior_control_progress_for_judge(
         self,
@@ -2576,6 +3182,106 @@ class InterventionManager:
         )
         return normalized
 
+    def _evaluate_progressive_d_control_from_planner_progress(
+        self,
+        doctor: Any,
+        patient: Any,
+        meeting_id: str,
+        policy: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Run the unchanged completion audit over Planner-maintained progress."""
+
+        pair_key = build_pair_key(
+            str(getattr(doctor, "name", "") or ""),
+            str(getattr(patient, "name", "") or ""),
+        )
+        current_session = self._resolve_session_prompt_current_session(
+            str(getattr(doctor, "name", "") or ""),
+            str(getattr(patient, "name", "") or ""),
+        )
+        stage_map = self._minimal_stage_subgoals(
+            str(policy.get("stage_subgoals_file", "") or "")
+        )
+        stage_item = stage_map.get(current_session)
+        if not isinstance(stage_item, dict):
+            raise ValueError(
+                f"no static subgoal mapping for fixed outline: {current_session}"
+            )
+        progress_state, _ = self._progressive_d_progress_state_for_pair(
+            pair_key,
+            current_session,
+        )
+        stored_subgoals = progress_state.get("subgoals", {})
+        if not isinstance(stored_subgoals, Mapping):
+            raise ValueError("Planner-maintained subgoal progress is invalid")
+        configured_ids = [
+            str(item.get("id", "") or "")
+            for item in stage_item.get("subgoals", [])
+            if isinstance(item, Mapping)
+        ]
+        normalized = normalize_progressive_d_control_eval(
+            {
+                "subgoals": [
+                    {
+                        "subgoal_id": subgoal_id,
+                        "progress": str(
+                            stored_subgoals[subgoal_id].get("status", "none")
+                            or "none"
+                        ),
+                        "blocking_factor": str(
+                            stored_subgoals[subgoal_id].get(
+                                "blocking_factor",
+                                "",
+                            )
+                            or ""
+                        ),
+                    }
+                    for subgoal_id in configured_ids
+                ],
+                "recommended_action": "stay",
+                "target_subgoal_id": "",
+                "reason": "control_eval_disabled_use_planner_progress",
+            },
+            configured_subgoal_ids=configured_ids,
+            allowed_soft_targets=(),
+        )
+        adapter = self._apply_progressive_d_control_result(
+            pair_key=pair_key,
+            meeting_id=str(meeting_id or ""),
+            legacy_session=current_session,
+            payload=normalized,
+            use_existing_progress=True,
+        )
+        record = {
+            "meeting_id": str(meeting_id or ""),
+            "legacy_session": current_session,
+            "macro_stage": str(stage_item.get("macro_stage", "") or ""),
+            "subgoals": copy.deepcopy(normalized["subgoals"]),
+            "recommended_action": "stay",
+            "target_subgoal_id": "",
+            "reason": normalized["reason"],
+            "valid": True,
+            "error": "",
+            "evaluation_source": "planner_progress_state",
+            "llm_called": False,
+            "transition_adapter": copy.deepcopy(adapter),
+            "cbt_controller_version": PROGRESSIVE_D_CONTROLLER_VERSION,
+            "updated_at": self._fmt_dt(self._now()),
+        }
+        self._ensure_progressive_d_state_schema()
+        control = self.state.setdefault("progressive_d_control_state", {})
+        control.setdefault("latest_by_pair", {})[pair_key] = copy.deepcopy(record)
+        history = control.setdefault("history_by_pair", {}).setdefault(pair_key, [])
+        if isinstance(history, list):
+            history.append(copy.deepcopy(record))
+        self._log_highlight(
+            "[PROGRESSIVE_D_CONTROL_EVAL_SKIPPED] meeting_id={} pair_key={} source=planner_progress_state".format(
+                str(meeting_id or ""),
+                pair_key,
+            )
+        )
+        return copy.deepcopy(record)
+
     def evaluate_progressive_d_control_after_chat(
         self,
         doctor: Any,
@@ -2590,6 +3296,13 @@ class InterventionManager:
         policy = self.get_progressive_d_runtime_policy()
         if not bool(policy.get("enabled", False)):
             return None
+        if not bool(policy.get("control_eval_enabled", False)):
+            return self._evaluate_progressive_d_control_from_planner_progress(
+                doctor=doctor,
+                patient=patient,
+                meeting_id=meeting_id,
+                policy=policy,
+            )
         pair_key = build_pair_key(
             str(getattr(doctor, "name", "") or ""),
             str(getattr(patient, "name", "") or ""),
@@ -2801,6 +3514,10 @@ class InterventionManager:
     def build_doctor_reply_guidance(self, judge: Any) -> str:
         if not isinstance(judge, dict):
             return ""
+        empathic_lead = (
+            "回应顺序：先用一句话简短复述患者刚表达的内容或情绪并表示理解，"
+            "再执行本轮策略；复述必须具体，避免空泛套话。"
+        )
         root_strategy_context = str(
             judge.get("_root_complaint_strategy_context", "") or ""
         ).strip()
@@ -2808,7 +3525,7 @@ class InterventionManager:
             guidance = str(judge.get("advice", "") or "").strip()
             if root_strategy_context:
                 guidance = "{}\n{}".format(guidance, root_strategy_context).strip()
-            return guidance
+            return "{}\n{}".format(empathic_lead, guidance) if guidance else ""
         glossary = self._minimal_term_glossary()
         primary = self._doctor_guidance_term(
             str(judge.get("primary_strategy", "") or ""),
@@ -2826,17 +3543,35 @@ class InterventionManager:
             str(judge.get("turn_goal", "") or ""),
         ).strip()
         if self._is_progressive_d_v3_configured():
-            internal = str(
-                judge.get("_patient_internal_state", "") or ""
+            observation = str(
+                judge.get("_patient_observation_state", "") or ""
             ).strip()
-            if internal:
-                guidance += (
-                    "\n已知患者材料：{}\n回应边界：围绕一个明确材料缺口推进；"
-                    "不要重复泛问感受、身体感觉或已经核对过的安全问题。"
-                ).format(internal)
-        if root_strategy_context:
+            if observation or root_strategy_context:
+                guidance += "\n" + self._build_progressive_d_shared_patient_summary(
+                    root_strategy_context,
+                    observation,
+                )
+            guidance += (
+                "\n回应边界：围绕一个明确材料缺口推进；"
+                "不要重复泛问感受、身体感觉或已经核对过的安全问题。"
+            )
+        elif root_strategy_context:
             guidance += "\n" + root_strategy_context
-        return guidance
+        return empathic_lead + "\n" + guidance
+
+    @staticmethod
+    def _build_progressive_d_shared_patient_summary(
+        root_strategy_context: str,
+        patient_observation_state: str,
+    ) -> str:
+        background = str(root_strategy_context or "").strip()
+        if not background:
+            background = "<长期病例背景>\n暂不可用\n</长期病例背景>"
+        observation = str(patient_observation_state or "").strip() or "暂不可用"
+        return (
+            "<患者状态摘要>\n{}\n\n患者当前观察状态：\n{}\n"
+            "</患者状态摘要>"
+        ).format(background, observation)
 
     @staticmethod
     def _doctor_guidance_term(term_id: str, terms: Any) -> str:
@@ -2925,6 +3660,13 @@ class InterventionManager:
                 progressive_d_policy.get("judge_retry", policy["retry"])
                 or policy["retry"]
             )
+            policy["termination_rules_prompt_file"] = str(
+                progressive_d_policy.get(
+                    "termination_rules_prompt_file",
+                    PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE,
+                )
+                or PROGRESSIVE_D_TERMINATION_RULES_PROMPT_FILE
+            )
         else:
             policy["subgoal_progress_enabled"] = False
         self._log_highlight(
@@ -3008,9 +3750,11 @@ class InterventionManager:
             "retrieve_top_k": 3,
             "gate_prompt_file": "data/prompts/intervention/consult_history_gate.txt",
             "gate_retry": 2,
-            "summary_route": "forced_llm",
+            "summary_route": "think_llm",
             "summary_prompt_file": "data/prompts/intervention/consult_history_summary.txt",
             "summary_retry": 2,
+            "hit_transcript_max_chars": 1200,
+            "summary_max_chars": 800,
             "source": "defaults",
         }
         raw_cfg = self.consult_history_cfg if isinstance(self.consult_history_cfg, dict) else {}
@@ -3033,6 +3777,16 @@ class InterventionManager:
         policy["summary_prompt_file"] = summary_prompt_file or default_policy["summary_prompt_file"]
         summary_retry = self._safe_int(raw_cfg.get("summary_retry", default_policy["summary_retry"]), default_policy["summary_retry"])
         policy["summary_retry"] = summary_retry if summary_retry >= 1 else default_policy["summary_retry"]
+        hit_transcript_max_chars = self._safe_int(
+            raw_cfg.get("hit_transcript_max_chars", default_policy["hit_transcript_max_chars"]),
+            default_policy["hit_transcript_max_chars"],
+        )
+        policy["hit_transcript_max_chars"] = max(200, hit_transcript_max_chars)
+        summary_max_chars = self._safe_int(
+            raw_cfg.get("summary_max_chars", default_policy["summary_max_chars"]),
+            default_policy["summary_max_chars"],
+        )
+        policy["summary_max_chars"] = max(80, summary_max_chars)
         self._log_highlight(
             "[CONSULT_HISTORY_POLICY] source={} enabled={} top_k={} gate_retry={} summary_route={} summary_retry={} gate_prompt_file={} summary_prompt_file={}".format(
                 policy["source"],
@@ -3046,6 +3800,23 @@ class InterventionManager:
             )
         )
         return policy
+
+    def get_consultation_memory_summary_policy(self) -> Dict[str, Any]:
+        intervention_cfg = self.config.get("intervention", {}) or {}
+        raw = intervention_cfg.get("consultation_memory_summary", {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        max_chars = self._safe_int(raw.get("max_chars", 800), 800)
+        return {
+            "prompt_file": str(
+                raw.get(
+                    "prompt_file",
+                    "data/prompts/intervention/consultation_memory_summary.txt",
+                )
+                or "data/prompts/intervention/consultation_memory_summary.txt"
+            ).strip(),
+            "max_chars": max(200, max_chars),
+        }
 
     def evaluate_session_after_chat(
         self,
@@ -3308,6 +4079,7 @@ class InterventionManager:
         forced: bool,
         turn_no: int,
         session_prompt_text: str = "",
+        max_turns: int = 0,
     ) -> Dict[str, Any]:
         default_output = {
             "valid": False,
@@ -3345,6 +4117,32 @@ class InterventionManager:
             pair_key=pair_key,
             current_session=current_session,
         )
+        prompt_context = self.get_current_session_prompt_context(
+            speaker=doctor,
+            other=patient,
+            chats=chats,
+            forced=True,
+        )
+        context_features_enabled = bool(
+            self.get_current_session_context_runtime_policy().get("enabled", False)
+            or self.get_consultation_time_runtime_policy().get("enabled", False)
+        )
+        conversation_prompt_text = ""
+        if context_features_enabled:
+            conversation_prompt_text = str(
+                (prompt_context or {}).get("conversation", "")
+                if isinstance(prompt_context, dict)
+                else ""
+            ).strip()
+        elapsed_minutes = self._safe_int(
+            (prompt_context or {}).get("elapsed_minutes", 0)
+            if isinstance(prompt_context, dict)
+            else 0,
+            0,
+        )
+        latest_patient_reply = self._extract_latest_patient_utterance(
+            chats or [], patient.name
+        )
         if self.get_cbt_controller_mode() == "minimal":
             return self._judge_forced_dialog_minimal(
                 doctor=doctor,
@@ -3355,6 +4153,9 @@ class InterventionManager:
                 pair_key=pair_key,
                 current_session=current_session,
                 policy=policy,
+                conversation_prompt_text=conversation_prompt_text,
+                elapsed_minutes=elapsed_minutes,
+                max_turns=max_turns,
             )
         if not bool(policy.get("force_forced_llm", True)):
             self._log_highlight(
@@ -3389,9 +4190,13 @@ class InterventionManager:
                 prompt_tpl,
                 {
                     "patient_state": patient_state_text,
-                    "conversation": to_conversation_text(chats or []),
+                    "conversation": conversation_prompt_text
+                    or to_conversation_text(chats or []),
                     "session_prompt": str(session_prompt_text or ""),
                     "prev_session_eval_reason": str(prev_session_eval_reason or ""),
+                    "latest_patient_reply": str(latest_patient_reply or ""),
+                    "elapsed_minutes": str(elapsed_minutes),
+                    "turn_no": str(int(turn_no or 1)),
                 },
             )
             raw = self._call_forced_llm_json(
@@ -3458,6 +4263,9 @@ class InterventionManager:
         pair_key: str,
         current_session: str,
         policy: Dict[str, Any],
+        conversation_prompt_text: str = "",
+        elapsed_minutes: int = 0,
+        max_turns: int = 0,
     ) -> Dict[str, Any]:
         meeting_id, _, _ = self._resolve_trace_session_context(doctor, patient)
         progressive_d_v3 = self._is_progressive_d_v3_configured()
@@ -3571,44 +4379,126 @@ class InterventionManager:
             chats or [], patient.name
         )
         root_strategy_context = self._build_root_complaint_strategy_context(patient)
-        subgoal_progress_text = ""
-        if bool(policy.get("subgoal_progress_enabled", False)):
+        session_task_plan = {
+            "subgoal_updates": [],
+            "next_subgoal_id": "",
+        }
+        session_task_plan_text = ""
+        termination_check_enabled = False
+        subgoal_progress_threshold_reached = False
+        completion_threshold_ratio = float(
+            policy.get("completion_threshold_ratio", 0.60) or 0.60
+        )
+        consultation_time_policy = self.get_consultation_time_runtime_policy()
+        target_duration_minutes = int(
+            consultation_time_policy.get("target_duration_minutes", 60) or 60
+        )
+        earliest_closing_check_minutes = int(
+            consultation_time_policy.get(
+                "earliest_closing_check_minutes",
+                40,
+            )
+            or 40
+        )
+        if progressive_d_v3 and bool(policy.get("subgoal_progress_enabled", False)):
             try:
-                subgoal_progress_text = self._compact_subgoal_progress_for_judge(
-                    pair_key,
-                    current_session,
+                session_task_plan, session_task_plan_text = self._plan_progressive_d_session_task(
+                    doctor=doctor,
+                    patient=patient,
+                    pair_key=pair_key,
+                    meeting_id=meeting_id,
+                    current_session=current_session,
+                    session_prompt_text=session_prompt_text,
+                    latest_patient_reply=latest_patient_reply,
+                    conversation_prompt_text=(
+                        str(conversation_prompt_text or "").strip()
+                        or to_conversation_text(chats or [])
+                    ),
+                    elapsed_minutes=elapsed_minutes,
+                    turn_no=turn_no,
                 )
             except Exception as exc:
                 error = "{}; {}".format(error, str(exc)).strip("; ")
-                subgoal_progress_text = ""
+                session_task_plan_text = (
+                    "本轮新增小目标进展：\n- 无\n"
+                    "当前任务建议暂不可用；Judge 依据患者最新状态和临床规则决策。"
+                )
+            try:
+                current_subgoal_progress, _ = self._progressive_d_progress_state_for_pair(
+                    pair_key,
+                    current_session,
+                )
+                progress_audit = progressive_d_completion_audit(
+                    current_subgoal_progress,
+                    high_risk_seen=False,
+                    threshold_ratio=completion_threshold_ratio,
+                )
+                subgoal_progress_threshold_reached = bool(
+                    progress_audit.get("completion_reason") == "score_threshold"
+                )
+            except Exception as exc:
+                error = "{}; {}".format(error, str(exc)).strip("; ")
+            termination_check_enabled = bool(
+                subgoal_progress_threshold_reached
+                or max(0, int(elapsed_minutes or 0))
+                >= earliest_closing_check_minutes
+            )
+        dialogue_history = (
+            str(conversation_prompt_text or "").strip()
+            or (
+                to_conversation_text(chats or [])
+                if progressive_d_v3
+                else recent_dialogue(chats or [], 8)
+            )
+        )
+        patient_state_text = (
+            compact_progressive_d_patient_state_text(patient_state)
+            if progressive_d_v3
+            else "{}{}".format(
+                compact_patient_state_text(patient_state),
+                "\n" + root_strategy_context
+                if root_strategy_context
+                else "",
+            )
+        )
         try:
             required_placeholders = [
                 "CURRENT_SESSION_PROMPT",
                 "DIALOGUE_HISTORY",
                 "PATIENT_STATE",
-                "CANDIDATE_STRATEGIES",
             ]
             if progressive_d_v3:
-                required_placeholders.append("TURN_NO")
+                required_placeholders.extend([
+                    "SESSION_TASK_PLAN",
+                    "LATEST_PATIENT_REPLY",
+                    "ELAPSED_MINUTES",
+                    "TURN_NO",
+                    "TARGET_DURATION_MINUTES",
+                    "MAX_TURNS",
+                    "TERMINATION_RULES",
+                ])
             else:
                 required_placeholders.extend(
-                    ["LATEST_PATIENT_REPLY", "PRIOR_PROGRESS"]
+                    [
+                        "LATEST_PATIENT_REPLY",
+                        "PRIOR_PROGRESS",
+                        "ELAPSED_MINUTES",
+                    ]
                 )
-            if bool(policy.get("subgoal_progress_enabled", False)):
-                required_placeholders.append("SUBGOAL_PROGRESS")
             if progressive_d_v3:
-                required_placeholders.append("PATIENT_INTERNAL_STATE")
+                required_placeholders.append("LONG_TERM_CASE_BACKGROUND")
+            termination_rules_text = ""
+            if progressive_d_v3 and termination_check_enabled:
+                termination_rules_text = self._load_prompt_txt_or_raise(
+                    str(policy.get("termination_rules_prompt_file", "") or "")
+                ).strip()
             prompt_text = load_prompt_template(
                 str(policy.get("prompt_file", "") or ""),
                 {
                     "CURRENT_SESSION_PROMPT": str(session_prompt_text or ""),
-                    "SUBGOAL_PROGRESS": str(subgoal_progress_text or ""),
+                    "SESSION_TASK_PLAN": str(session_task_plan_text or ""),
                     "LATEST_PATIENT_REPLY": str(latest_patient_reply or ""),
-                    "DIALOGUE_HISTORY": (
-                        to_conversation_text(chats or [])
-                        if progressive_d_v3
-                        else recent_dialogue(chats or [], 8)
-                    ),
+                    "DIALOGUE_HISTORY": dialogue_history,
                     "PRIOR_PROGRESS": (
                         ""
                         if progressive_d_v3
@@ -3618,31 +4508,20 @@ class InterventionManager:
                             progress_state,
                         )
                     ),
-                    "PATIENT_STATE": "{}{}".format(
+                    "PATIENT_STATE": patient_state_text,
+                    "LONG_TERM_CASE_BACKGROUND": (
                         (
-                            compact_progressive_d_patient_state_text(patient_state)
-                            if progressive_d_v3
-                            else compact_patient_state_text(patient_state)
-                        ),
-                        (
-                            "\n" + root_strategy_context
-                            if root_strategy_context and not progressive_d_v3
-                            else ""
-                        ),
-                    ),
-                    "PATIENT_INTERNAL_STATE": (
-                        "{}{}".format(
-                            self._compact_progressive_d_patient_internal_state(patient),
-                            "\n" + root_strategy_context if root_strategy_context else "",
+                            root_strategy_context
+                            or "<长期病例背景>\n暂不可用\n</长期病例背景>"
                         )
                         if progressive_d_v3
                         else ""
                     ),
-                    "CANDIDATE_STRATEGIES": compact_route_text(
-                        route,
-                        self._minimal_term_glossary(),
-                    ),
+                    "ELAPSED_MINUTES": str(max(0, int(elapsed_minutes or 0))),
                     "TURN_NO": str(int(turn_no or 1)),
+                    "TARGET_DURATION_MINUTES": str(target_duration_minutes),
+                    "MAX_TURNS": str(max(0, int(max_turns or 0))),
+                    "TERMINATION_RULES": termination_rules_text,
                 },
                 required_placeholders=required_placeholders,
             )
@@ -3651,23 +4530,16 @@ class InterventionManager:
                 retry=int(policy.get("retry", 2) or 2),
                 caller="cbt_minimal_dialog_judge",
             )
-            normalized = normalize_minimal_judge_output(raw, route)
+            if progressive_d_v3:
+                normalized = normalize_progressive_d_judge_output(
+                    raw,
+                    termination_check_enabled=termination_check_enabled,
+                )
+            else:
+                normalized = normalize_minimal_judge_output(raw)
         except Exception as exc:
             error = "{}; {}".format(error, str(exc)).strip("; ")
-            normalized = safe_judge_fallback(
-                route.get("allowed_primary_strategies", []),
-                route.get("allowed_micro_skills", []),
-            )
-        output = copy.deepcopy(normalized)
-        output["valid"] = True
-        if root_strategy_context:
-            output["_root_complaint_strategy_context"] = root_strategy_context
-        if progressive_d_v3:
-            output["_patient_internal_state"] = (
-                self._compact_progressive_d_patient_internal_state(patient)
-            )
-            if str(normalized.get("primary_strategy", "") or "") == "safety_check":
-                self._mark_progressive_d_safety_check_requested(pair_key)
+            normalized = safe_judge_fallback()
         self.append_forced_prompt_trace_record(
             speaker=doctor,
             other=patient,
@@ -3676,14 +4548,44 @@ class InterventionManager:
             output={
                 "raw_output": copy.deepcopy(raw),
                 "normalized_output": copy.deepcopy(normalized),
-                "router": copy.deepcopy(route),
             },
             turn_no=int(turn_no or -1),
             meta={
                 "source": "minimal_dialog_judge" if not error else "minimal_dialog_judge_fallback",
                 "error": error,
+                "termination_check_enabled": bool(termination_check_enabled),
+                "subgoal_progress_threshold_reached": bool(
+                    subgoal_progress_threshold_reached
+                ),
+                "completion_threshold_ratio": completion_threshold_ratio,
             },
         )
+        selected_strategy = self._select_response_strategy(
+            doctor=doctor,
+            patient=patient,
+            route=route,
+            latest_patient_reply=latest_patient_reply,
+            patient_state_text=patient_state_text,
+            dialogue_history=dialogue_history,
+            next_subgoal_id=str(
+                session_task_plan.get("next_subgoal_id", "")
+                if isinstance(session_task_plan, dict)
+                else ""
+            ),
+            turn_goal=str(normalized.get("turn_goal", "") or ""),
+            turn_no=turn_no,
+        )
+        output = copy.deepcopy(normalized)
+        output.update(selected_strategy)
+        output["valid"] = True
+        if root_strategy_context:
+            output["_root_complaint_strategy_context"] = root_strategy_context
+        if progressive_d_v3:
+            output["_patient_observation_state"] = (
+                compact_progressive_d_patient_state_text(patient_state)
+            )
+            if str(selected_strategy.get("primary_strategy", "") or "") == "safety_check":
+                self._mark_progressive_d_safety_check_requested(pair_key)
         return output
 
     def should_route_forced_llm(self, speaker: Any, other: Any, forced: bool = False) -> bool:
@@ -3907,6 +4809,15 @@ class InterventionManager:
         except Exception:
             return int(default)
 
+    def _safe_ratio(self, value: Any, default: float) -> float:
+        if isinstance(value, bool):
+            return float(default)
+        try:
+            ratio = float(value)
+        except Exception:
+            return float(default)
+        return ratio if 0.0 < ratio <= 1.0 else float(default)
+
     def _get_root_complaint_anchor(self, patient_agent: Any) -> str:
         """Read the checkpointed case anchor without consulting current_stage."""
         engine = getattr(patient_agent, "depression_dynamic", None)
@@ -4011,34 +4922,6 @@ class InterventionManager:
             if active:
                 lines.append(line)
         return "\n".join(lines).strip()
-
-    def _compact_progressive_d_patient_internal_state(
-        self,
-        patient_agent: Any,
-    ) -> str:
-        """Project auditable labelled facts without another LLM call."""
-
-        raw = self._get_progressive_d_patient_state_text(patient_agent)
-        if not raw:
-            return "患者内部状态暂不可用；请只根据当前固定会谈提纲与已有对话推进。"
-        labels = (
-            "节点概述：",
-            "核心信念：",
-            "当前最容易围绕这些问题组织表达：",
-            "这轮说话姿态：",
-            "当前瞬时情绪标签：",
-            "情绪强度：",
-            "暴露程度：",
-            "防御水平：",
-        )
-        selected: List[str] = []
-        for line in raw.splitlines():
-            text = line.strip().lstrip("- ").strip()
-            if any(text.startswith(label) for label in labels):
-                selected.append(text)
-        if not selected:
-            return "患者内部状态已有记录，但缺少可压缩的结构化标签。"
-        return "；".join(selected)
 
     def _strip_text_code_fence(self, text: str) -> str:
         raw = str(text or "").strip()
@@ -4851,7 +5734,9 @@ class InterventionManager:
             "doctor": 0,
             "consult_history": 0,
             "judge_llm": 0,
+            "response_strategy_selector_llm": 0,
             "state_tracker_llm": 0,
+            "session_task_planner_llm": 0,
             "session_eval_llm": 0,
             "subgoal_shadow_eval_llm": 0,
             "control_eval_llm": 0,
@@ -4927,7 +5812,13 @@ class InterventionManager:
                 "- doctor_count: `{}`".format(counts["doctor"]),
                 "- consult_history_count: `{}`".format(counts["consult_history"]),
                 "- judge_count: `{}`".format(counts["judge_llm"]),
+                "- response_strategy_selector_count: `{}`".format(
+                    counts["response_strategy_selector_llm"]
+                ),
                 "- state_tracker_count: `{}`".format(counts["state_tracker_llm"]),
+                "- session_task_planner_count: `{}`".format(
+                    counts["session_task_planner_llm"]
+                ),
                 "- session_eval_count: `{}`".format(counts["session_eval_llm"]),
                 "- subgoal_eval_count: `{}`".format(
                     counts["subgoal_shadow_eval_llm"]
@@ -7945,15 +8836,52 @@ class InterventionManager:
         )
         return results
 
-    def _render_consult_history_hits_for_prompt(self, hits: List[Dict[str, Any]]) -> str:
+    @staticmethod
+    def _bounded_prompt_excerpt(text: Any, max_chars: int) -> str:
+        value = str(text or "").strip()
+        if max_chars <= 0 or len(value) <= max_chars:
+            return value
+        head_chars = max(1, (max_chars - 1) // 2)
+        tail_chars = max(1, max_chars - head_chars - 1)
+        return "{}…{}".format(value[:head_chars], value[-tail_chars:])
+
+    def _render_consult_history_hits_for_prompt(
+        self,
+        hits: List[Dict[str, Any]],
+        transcript_max_chars: int = 1200,
+    ) -> str:
         blocks: List[str] = []
         for idx, item in enumerate(hits or [], start=1):
             record = item.get("record", {}) if isinstance(item, dict) else {}
             if not isinstance(record, dict):
                 continue
             participants = record.get("participants", {}) if isinstance(record.get("participants", {}), dict) else {}
+            chat_summary = record.get("chat_summary", "")
+            chat_summary = chat_summary.strip() if isinstance(chat_summary, str) else ""
+            if chat_summary:
+                history_content = (
+                    "content_source=consultation_summary\n"
+                    "consultation_summary=\n{}"
+                ).format(chat_summary)
+            else:
+                transcript = record.get("transcript", "")
+                transcript = transcript.strip() if isinstance(transcript, str) else ""
+                transcript_excerpt = self._bounded_prompt_excerpt(
+                    transcript,
+                    max(0, int(transcript_max_chars or 0)),
+                )
+                if transcript_excerpt:
+                    history_content = (
+                        "content_source=transcript_fallback\n"
+                        "fallback_transcript_excerpt=\n{}"
+                    ).format(transcript_excerpt)
+                else:
+                    history_content = (
+                        "content_source=unavailable\n"
+                        "consultation_summary_or_transcript=[不可用]"
+                    )
             blocks.append(
-                "[命中记录 {}]\nrecord_id={}\nmeeting_id={}\npair_key={}\ndoctor={}\npatient={}\nsession_started_at={}\nscore={}\nchat_summary={}\ntranscript=\n{}".format(
+                "[命中记录 {}]\nrecord_id={}\nmeeting_id={}\npair_key={}\ndoctor={}\npatient={}\nsession_started_at={}\nscore={}\n{}".format(
                     idx,
                     str(record.get("record_id", "") or "").strip(),
                     str(record.get("meeting_id", "") or "").strip(),
@@ -7962,8 +8890,7 @@ class InterventionManager:
                     str(participants.get("patient", "") or "").strip(),
                     str(record.get("session_started_at", "") or "").strip(),
                     str(item.get("score", 0.0)),
-                    str(record.get("chat_summary", "") or "").strip(),
-                    str(record.get("transcript", "") or "").strip(),
+                    history_content,
                 )
             )
         return "\n\n".join(blocks).strip()
@@ -7980,12 +8907,22 @@ class InterventionManager:
                 score = float(score or 0.0)
             except Exception:
                 score = 0.0
+            chat_summary = record.get("chat_summary", "")
+            chat_summary = chat_summary.strip() if isinstance(chat_summary, str) else ""
+            transcript = record.get("transcript", "")
+            transcript = transcript.strip() if isinstance(transcript, str) else ""
+            content_source = (
+                "consultation_summary"
+                if chat_summary
+                else ("transcript_fallback" if transcript else "unavailable")
+            )
             trace_hits.append(
                 {
                     "rank": idx,
                     "record_id": str(record.get("record_id", "") or item_dict.get("record_id", "") or "").strip(),
                     "session_started_at": str(record.get("session_started_at", "") or "").strip(),
-                    "chat_summary": str(record.get("chat_summary", "") or "").strip(),
+                    "chat_summary": chat_summary,
+                    "history_content_source": content_source,
                     "score": score,
                 }
             )
@@ -8002,6 +8939,17 @@ class InterventionManager:
         policy: Dict[str, Any],
     ) -> Dict[str, Any]:
         prompt_tpl = self._load_prompt_txt_or_raise(str(policy.get("summary_prompt_file", "") or ""))
+        current_context = self.get_current_session_prompt_context(
+            speaker,
+            other,
+            chats,
+            forced=True,
+        )
+        current_conversation = (
+            str(current_context.get("conversation", "") or "").strip()
+            if isinstance(current_context, dict)
+            else ""
+        )
         prompt_text = self._render_prompt_template(
             prompt_tpl,
             {
@@ -8009,11 +8957,16 @@ class InterventionManager:
                 "other": str(getattr(other, "name", "") or ""),
                 "pair_key": str(pair_key or ""),
                 "query": str(query or "").strip(),
-                "conversation": to_conversation_text(chats or []),
-                "consult_history_hits": self._render_consult_history_hits_for_prompt(hits),
+                "conversation": current_conversation or to_conversation_text(chats or []),
+                "consult_history_hits": self._render_consult_history_hits_for_prompt(
+                    hits,
+                    transcript_max_chars=int(
+                        policy.get("hit_transcript_max_chars", 1200) or 0
+                    ),
+                ),
             },
         )
-        route = str(policy.get("summary_route", "forced_llm") or "forced_llm").strip().lower()
+        route = str(policy.get("summary_route", "think_llm") or "think_llm").strip().lower()
         retry = int(policy.get("summary_retry", 2) or 2)
         if route == "think_llm":
             text = self._call_think_llm_text(
@@ -8028,7 +8981,10 @@ class InterventionManager:
                 retry=retry,
                 caller="consult_history_summary_forced_llm",
             )
-        text = str(text or "").strip()
+        text = self._bounded_prompt_excerpt(
+            text,
+            int(policy.get("summary_max_chars", 800) or 800),
+        )
         memory_block = ""
         if text:
             memory_block = "<consult_history_memory>\n{}\n</consult_history_memory>".format(text)

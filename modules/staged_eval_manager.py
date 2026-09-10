@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List
 
 from runshells.artifact_digest import canonical_json_sha256, file_sha256
+from runshells.scale_protocol import LONG_SCALE_NAMES, SCALE_SPECS, SHORT_SCALE_NAMES
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -23,8 +24,8 @@ QUESTIONS_ROOT = os.path.join(
 )
 DEFAULT_WORKER_SCRIPT = "runshells/run_staged_eval_worker.py"
 SCALE_QUESTION_FILES = {
-    "PHQ-9": "PHQ-9-v2.jsonl",
-    "BDI-II": "BDI-II-v2.jsonl",
+    scale_name: str(scale_spec["question_file"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
 }
 SNAPSHOT_BUNDLE_SCHEMA_VERSION = 1
 SNAPSHOT_STORAGE_DIRNAME = "snapshot_storage"
@@ -291,7 +292,12 @@ class StagedEvalManager:
         trigger_dir = self._build_trigger_dir(trigger_label)
         worker_paths = self._build_worker_paths(trigger_dir)
         worker_cfg = self._worker_cfg()
-        scale_question_files = self._resolve_scale_question_files()
+        scales = self._scales_for_trigger(
+            trigger_label,
+            runtime_config,
+            extra_metadata=extra_metadata,
+        )
+        scale_question_files = self._resolve_scale_question_files(scales)
 
         snapshot_bundle = None
         storage_source_root = os.path.join(self.checkpoints_folder, "storage")
@@ -318,6 +324,7 @@ class StagedEvalManager:
             target_agent=target_agent,
             trigger_dir=trigger_dir,
             worker_result_path=worker_paths["result"],
+            scales=scales,
             scale_question_files=scale_question_files,
             worker_cfg=worker_cfg,
             storage_source_root=storage_source_root,
@@ -535,10 +542,20 @@ class StagedEvalManager:
             self._cfg().get("max_completed_sessions", 0),
             0,
         )
-        if max_completed_sessions > 0 and completed_conversation_count > max_completed_sessions:
+        if (
+            max_completed_sessions > 0
+            and completed_conversation_count > max_completed_sessions
+            and not self._is_target_pair_completed(runtime_config)
+        ):
             return None
 
-        if completed_conversation_count % interval != 0:
+        # Keep regular intermediate nodes on the configured interval, but do
+        # not lose the actual treatment endpoint when its final session is
+        # not an exact interval multiple.
+        if (
+            completed_conversation_count % interval != 0
+            and not self._is_target_pair_completed(runtime_config)
+        ):
             return None
 
         trigger_label = f"session_{completed_conversation_count}"
@@ -760,6 +777,46 @@ class StagedEvalManager:
             return []
         return [str(item or "").strip() for item in scales if str(item or "").strip()]
 
+    def _scales_for_trigger(
+        self,
+        trigger_label: str,
+        runtime_config: Dict[str, Any],
+        *,
+        extra_metadata: Dict[str, Any] | None = None,
+    ) -> List[str]:
+        if not bool(self._cfg().get("use_short_scales_for_intermediate_eval", False)):
+            return self._scales()
+        if trigger_label == "T0" or self._is_final_trigger(
+            trigger_label,
+            runtime_config,
+            extra_metadata=extra_metadata,
+        ):
+            return list(LONG_SCALE_NAMES)
+        return list(SHORT_SCALE_NAMES)
+
+    def _is_final_trigger(
+        self,
+        trigger_label: str,
+        runtime_config: Dict[str, Any],
+        *,
+        extra_metadata: Dict[str, Any] | None = None,
+    ) -> bool:
+        if trigger_label in {"T4", "POST"}:
+            return True
+        if self._is_target_pair_completed(runtime_config):
+            return True
+        completed_session_count = self._compute_completed_session_count(runtime_config)
+        max_completed_sessions = self._safe_int(
+            self._cfg().get("max_completed_sessions", 0),
+            0,
+        )
+        if max_completed_sessions > 0 and completed_session_count == max_completed_sessions:
+            return True
+        metadata = extra_metadata if isinstance(extra_metadata, dict) else {}
+        trigger_index = self._safe_int(metadata.get("step_interval_trigger_index", 0), 0)
+        max_triggers = self._safe_int(self._step_interval_cfg().get("max_triggers", 0), 0)
+        return max_triggers > 0 and trigger_index == max_triggers
+
     def _doctor_name(self, runtime_config: Dict[str, Any]) -> str:
         intervention_cfg = runtime_config.get("intervention", {}) or {}
         return str(intervention_cfg.get("doctor", "") or "").strip()
@@ -776,9 +833,9 @@ class StagedEvalManager:
             "result": os.path.join(trigger_dir, "worker_result.json"),
         }
 
-    def _resolve_scale_question_files(self) -> Dict[str, str]:
+    def _resolve_scale_question_files(self, scales: List[str] | None = None) -> Dict[str, str]:
         question_files: Dict[str, str] = {}
-        for scale_name in self._scales():
+        for scale_name in self._scales() if scales is None else scales:
             question_file = SCALE_QUESTION_FILES.get(scale_name)
             if not question_file:
                 raise ValueError(f"unsupported scale: {scale_name}")
@@ -800,6 +857,7 @@ class StagedEvalManager:
         target_agent: str,
         trigger_dir: str,
         worker_result_path: str,
+        scales: List[str],
         scale_question_files: Dict[str, str],
         worker_cfg: Dict[str, Any],
         storage_source_root: str,
@@ -807,13 +865,19 @@ class StagedEvalManager:
     ) -> Dict[str, Any]:
         payload = {
             "run_name": self.run_name,
+            "api_cost": {
+                "run_name": self.run_name,
+                "phase": "simulation",
+                "experiment_data_root": os.path.join(BASE_DIR, "results", "experiment_data"),
+                "evaluation_id": "simulation:staged:{}:{}".format(self.run_name, trigger_label),
+            },
             "trigger_label": trigger_label,
             "completed_session_count": int(completed_session_count),
             "step_no": int(step_no),
             "sim_time": str(sim_time or ""),
             "snapshot_name": str(snapshot_name or ""),
             "target_agent": target_agent,
-            "scales": list(self._scales()),
+            "scales": list(scales),
             "scale_question_files": copy.deepcopy(scale_question_files),
             "runtime_config": copy.deepcopy(runtime_config),
             "conversation": copy.deepcopy(conversation or {}),

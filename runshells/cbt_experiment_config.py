@@ -402,11 +402,29 @@ def _validate_resource_paths(
                     "intervention.strategy_router.term_glossary_file",
                     ("intervention", "strategy_router", "term_glossary_file"),
                 ),
+                (
+                    "intervention.strategy_router.response_strategy_selector.prompt_file",
+                    (
+                        "intervention",
+                        "strategy_router",
+                        "response_strategy_selector",
+                        "prompt_file",
+                    ),
+                ),
             ]
         )
     if native_progressive_d:
         common_paths.extend(
             [
+                (
+                    "intervention.progressive_d.session_task_planner.prompt_file",
+                    (
+                        "intervention",
+                        "progressive_d",
+                        "session_task_planner",
+                        "prompt_file",
+                    ),
+                ),
                 (
                     "intervention.progressive_d.control_eval.prompt_file",
                     (
@@ -451,6 +469,23 @@ def _validate_resource_paths(
             and not str(raw_path or "").strip()
         ):
             raw_path = "data/intervention/cbt_term_glossary.json"
+        if (
+            field
+            == "intervention.strategy_router.response_strategy_selector.prompt_file"
+            and not str(raw_path or "").strip()
+        ):
+            raw_path = (
+                "data/prompts/intervention/response_strategy_selector.txt"
+            )
+        if (
+            field
+            == "intervention.progressive_d.session_task_planner.prompt_file"
+            and not str(raw_path or "").strip()
+        ):
+            raw_path = (
+                "data/prompts/intervention/"
+                "session_task_planner_progressive_d.txt"
+            )
         resolved_path = _resolve_resource(project_root, raw_path, field)
         if resolved_path.suffix.lower() == ".json":
             try:

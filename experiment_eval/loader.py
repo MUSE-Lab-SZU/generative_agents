@@ -27,6 +27,14 @@ from .statistics import category_metrics, descriptive_statistics, item_statistic
 
 DEFAULT_TOLERANCE = 1e-8
 
+# These are intentionally kept here instead of importing the runnable
+# ``runshells`` module: archived reports must remain loadable when only the
+# analysis package is installed.  The names mirror runshells.scale_protocol.
+INTERMEDIATE_SHORT_SCALE_NAMES = {
+    "总体抑郁水平及干扰程度量表",
+    "总体焦虑水平及干扰程度量表",
+}
+
 
 def read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
@@ -273,7 +281,7 @@ def _explicit_pairing(payload: dict[str, Any]) -> tuple[bool, str]:
     return False, "No explicit metadata declaration of cross-timepoint pairing"
 
 
-def _require_protocol(payload: dict[str, Any], path: Path) -> tuple[int, bool, str]:
+def _require_protocol(payload: dict[str, Any], path: Path) -> tuple[int, int | None, bool, str]:
     version = str(payload.get("aggregation_method_version") or "")
     if version != EXPECTED_AGGREGATION_METHOD_VERSION:
         raise ValueError(
@@ -286,6 +294,13 @@ def _require_protocol(payload: dict[str, Any], path: Path) -> tuple[int, bool, s
     expected = protocol.get("expected_repeats")
     if not isinstance(expected, int) or expected < 2:
         raise ValueError(f"{path}: evaluation_protocol.expected_repeats must be an integer >= 2")
+    intermediate_expected = protocol.get("intermediate_scale_repeats")
+    if intermediate_expected is not None and (
+        not isinstance(intermediate_expected, int) or intermediate_expected < 2
+    ):
+        raise ValueError(
+            f"{path}: evaluation_protocol.intermediate_scale_repeats must be an integer >= 2"
+        )
     if protocol.get("strict_complete_k") is not True:
         raise ValueError(f"{path}: evaluation_protocol.strict_complete_k must be true")
     primary = str(protocol.get("primary_score") or "")
@@ -294,7 +309,7 @@ def _require_protocol(payload: dict[str, Any], path: Path) -> tuple[int, bool, s
             f"{path}: evaluation_protocol.primary_score must be {EXPECTED_PRIMARY_SCORE!r}, got {primary!r}"
         )
     paired, evidence = _explicit_pairing(payload)
-    return expected, paired, evidence
+    return expected, intermediate_expected, paired, evidence
 
 
 def _assert_close(path: Path, context: str, field: str, actual: Any, expected: Any, tolerance: float) -> None:
@@ -313,14 +328,24 @@ def _assert_close(path: Path, context: str, field: str, actual: Any, expected: A
 def _summarize_scale(
     path: Path,
     context: str,
+    scale_name: str,
     scale_payload: dict[str, Any],
     protocol_expected: int,
+    intermediate_protocol_expected: int | None,
     tolerance: float,
 ) -> dict[str, Any]:
     expected = scale_payload.get("expected_repeats")
     valid = scale_payload.get("valid_repeats")
-    if expected != protocol_expected:
-        raise ValueError(f"{path}: {context}.expected_repeats={expected!r}, protocol requires {protocol_expected}")
+    expected_for_scale = (
+        intermediate_protocol_expected
+        if scale_name in INTERMEDIATE_SHORT_SCALE_NAMES and intermediate_protocol_expected is not None
+        else protocol_expected
+    )
+    if expected != expected_for_scale:
+        raise ValueError(
+            f"{path}: {context}.expected_repeats={expected!r}, "
+            f"protocol requires {expected_for_scale}"
+        )
     if valid != expected:
         raise ValueError(f"{path}: {context}.valid_repeats={valid!r} must equal expected_repeats={expected!r}")
     if scale_payload.get("aggregation_status") != "complete":
@@ -443,7 +468,7 @@ def load_records(
 
     for path in paths:
         payload = read_json(path)
-        protocol_expected, paired, pairing_evidence = _require_protocol(payload, path)
+        protocol_expected, intermediate_protocol_expected, paired, pairing_evidence = _require_protocol(payload, path)
         batch_name = str(payload.get("batch_name") or path.stem.removesuffix("_summary"))
         if batch_name in seen_batch_paths and seen_batch_paths[batch_name] != path:
             raise ValueError(
@@ -495,7 +520,15 @@ def load_records(
                         continue
                     scale_name = str(scale)
                     context = f"{condition_name}/{label}/{scale_name}"
-                    stats = _summarize_scale(path, context, scale_payload, protocol_expected, tolerance)
+                    stats = _summarize_scale(
+                        path,
+                        context,
+                        scale_name,
+                        scale_payload,
+                        protocol_expected,
+                        intermediate_protocol_expected,
+                        tolerance,
+                    )
                     stats["completed_session_count"] = evaluation.get("completed_session_count")
                     stats["sim_time"] = evaluation.get("sim_time")
                     series.setdefault(scale_name, {})[label] = stats

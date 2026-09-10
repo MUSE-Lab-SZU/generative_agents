@@ -48,6 +48,7 @@ from scale_protocol import (
     extract_item_scores as extract_protocol_item_scores,
     render_validation_number,
 )
+from run_one_experiment import api_cost_tracking_args
 
 
 # ============================================================
@@ -890,6 +891,11 @@ def run_task(task_payload: dict[str, Any]) -> dict[str, Any]:
             result["status"] = "skipped_existing"
         else:
             run_name, snapshot_name, snapshot_path = ensure_t0_checkpoint(cfg, task)
+            evaluation_id = "{}:{}:r{:02d}:T0".format(
+                cfg.batch_name,
+                condition.name,
+                task.repeat_idx,
+            )
             result["run_name"] = run_name
             result["snapshot"] = snapshot_name
             result["snapshot_path"] = str(snapshot_path)
@@ -912,8 +918,7 @@ def run_task(task_payload: dict[str, Any]) -> dict[str, Any]:
                         if path.exists():
                             path.unlink()
                 if not answers_path.is_file():
-                    run_cmd(
-                        [
+                    answer_cmd = [
                             sys.executable,
                             str(SCALE_WORKER_SCRIPT),
                             "--cp-name",
@@ -926,14 +931,24 @@ def run_task(task_payload: dict[str, Any]) -> dict[str, Any]:
                             resolve_scale_question_file(scale_cfg),
                             "--output",
                             str(answers_path),
-                        ],
+                        ]
+                    answer_cmd.extend(
+                        api_cost_tracking_args(
+                            run_name=run_name,
+                            phase="repeat_evaluation",
+                            scale_name=scale_name,
+                            experiment_data_root=EXPERIMENT_DATA_ROOT,
+                            evaluation_id=evaluation_id,
+                        )
+                    )
+                    run_cmd(
+                        answer_cmd,
                         timeout=3600,
                     )
                 if not scored_path.is_file():
                     if not scoring_prompt.is_file():
                         raise FileNotFoundError(f"评分提示词不存在: {scoring_prompt}")
-                    run_cmd(
-                        [
+                    score_cmd = [
                             sys.executable,
                             str(SCORE_WORKER_SCRIPT),
                             "--answers",
@@ -942,7 +957,18 @@ def run_task(task_payload: dict[str, Any]) -> dict[str, Any]:
                             str(scoring_prompt),
                             "--output",
                             str(scored_path),
-                        ],
+                        ]
+                    score_cmd.extend(
+                        api_cost_tracking_args(
+                            run_name=run_name,
+                            phase="repeat_evaluation",
+                            scale_name=scale_name,
+                            experiment_data_root=EXPERIMENT_DATA_ROOT,
+                            evaluation_id=evaluation_id,
+                        )
+                    )
+                    run_cmd(
+                        score_cmd,
                         timeout=1800,
                     )
 

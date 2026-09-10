@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SCALE_AGENT_DIR = os.path.join(BASE_DIR, "customization", "depression_scale_agent")
@@ -29,6 +30,7 @@ if "gradio" not in sys.modules:
     sys.modules["gradio"] = types.ModuleType("gradio")
 
 from app import ChatSession, iter_jsonl, resolve_question
+from modules.model.api_cost import configure_tracking, rebuild_summary
 
 
 def main():
@@ -38,47 +40,77 @@ def main():
     parser.add_argument("--agent", required=True, help="agent 名称")
     parser.add_argument("--question-file", required=True, help="题目文件名 (如 PHQ-9.jsonl)")
     parser.add_argument("--output", required=True, help="输出 answered.jsonl 路径")
+    parser.add_argument("--run-name", default="", help="源独立实验 run_name")
+    parser.add_argument(
+        "--phase",
+        choices=("simulation", "repeat_evaluation"),
+        default="simulation",
+        help="API 成本归属阶段",
+    )
+    parser.add_argument("--experiment-data-root", default="", help="成本账本所在 experiment_data")
+    parser.add_argument("--evaluation-id", default="", help="一次双量表复评的稳定标识")
+    parser.add_argument("--scale-name", default="", help="当前量表名称")
     args = parser.parse_args()
 
-    question_path = os.path.join(SCALE_QUESTIONS_DIR, args.question_file)
-    if not os.path.exists(question_path):
-        print(f"[ERROR] 题目文件不存在: {question_path}")
-        sys.exit(1)
-
-    questions = list(iter_jsonl(question_path))
-    print(f"[INFO] 加载 {len(questions)} 道题目 from {args.question_file}")
+    cost_root = args.experiment_data_root or os.getenv("GA_API_COST_EXPERIMENT_DATA_ROOT", "")
+    tracked_run = args.run_name or os.getenv("GA_API_COST_RUN_NAME", "")
+    tracked_root = cost_root or os.path.join(BASE_DIR, "results", "experiment_data")
+    if tracked_run:
+        configure_tracking(
+            tracked_run,
+            args.phase,
+            experiment_data_root=tracked_root,
+            evaluation_id=args.evaluation_id,
+            scale_name=args.scale_name or Path(args.question_file).stem,
+            rebuild=False,
+        )
 
     try:
-        session = ChatSession(args.cp_name, snapshot_file=args.snapshot)
-    except Exception as e:
-        print(f"[ERROR] ChatSession 初始化失败: {e}")
-        sys.exit(1)
+        question_path = os.path.join(SCALE_QUESTIONS_DIR, args.question_file)
+        if not os.path.exists(question_path):
+            print(f"[ERROR] 题目文件不存在: {question_path}")
+            sys.exit(1)
 
-    try:
-        session.set_agent(args.agent)
-    except Exception as e:
-        print(f"[ERROR] set_agent 失败: {e}")
-        sys.exit(1)
+        questions = list(iter_jsonl(question_path))
+        print(f"[INFO] 加载 {len(questions)} 道题目 from {args.question_file}")
 
-    answers = []
-    for idx, item in enumerate(questions):
-        question = resolve_question(item)
         try:
-            reply = session.answer_without_memory(question)
-            record = dict(item) if isinstance(item, dict) else {"id": idx + 1, "question": question}
-            record["answer"] = reply
-            answers.append(record)
-            print(f"[Q{idx+1}/{len(questions)}] done")
+            session = ChatSession(args.cp_name, snapshot_file=args.snapshot)
         except Exception as e:
-            print(f"[Q{idx+1}/{len(questions)}] ERROR: {e}")
-            record = dict(item) if isinstance(item, dict) else {"id": idx + 1, "question": question}
-            record["answer"] = f"[ERROR] {e}"
-            answers.append(record)
+            print(f"[ERROR] ChatSession 初始化失败: {e}")
+            sys.exit(1)
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        for a in answers:
-            f.write(json.dumps(a, ensure_ascii=False) + "\n")
-    print(f"[DONE] {len(answers)} answers saved to {args.output}")
+        try:
+            session.set_agent(args.agent)
+        except Exception as e:
+            print(f"[ERROR] set_agent 失败: {e}")
+            sys.exit(1)
+
+        answers = []
+        for idx, item in enumerate(questions):
+            question = resolve_question(item)
+            try:
+                reply = session.answer_without_memory(question)
+                record = dict(item) if isinstance(item, dict) else {"id": idx + 1, "question": question}
+                record["answer"] = reply
+                answers.append(record)
+                print(f"[Q{idx+1}/{len(questions)}] done")
+            except Exception as e:
+                print(f"[Q{idx+1}/{len(questions)}] ERROR: {e}")
+                record = dict(item) if isinstance(item, dict) else {"id": idx + 1, "question": question}
+                record["answer"] = f"[ERROR] {e}"
+                answers.append(record)
+
+        with open(args.output, "w", encoding="utf-8") as f:
+            for a in answers:
+                f.write(json.dumps(a, ensure_ascii=False) + "\n")
+        print(f"[DONE] {len(answers)} answers saved to {args.output}")
+    finally:
+        if tracked_run:
+            try:
+                rebuild_summary(tracked_run, experiment_data_root=tracked_root)
+            except Exception as exc:
+                print(f"[API_COST_SUMMARY_ERROR] {exc}", flush=True)
 
 
 if __name__ == "__main__":

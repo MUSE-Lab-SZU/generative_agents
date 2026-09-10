@@ -563,8 +563,18 @@ class Scratch:
 
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
-    def prompt_decide_chat_terminate(self, agent, other, chats):
-        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
+    def prompt_decide_chat_terminate(
+        self,
+        agent,
+        other,
+        chats,
+        conversation_prompt_text="",
+        current_time_override="",
+    ):
+        del current_time_override
+        conversation = str(conversation_prompt_text or "").strip()
+        if not conversation:
+            conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
             conversation or "[对话尚未开始]"
         )
@@ -710,6 +720,8 @@ class Scratch:
         chat_history_target_name=None,
         memory_source="local",
         external_memory_context="",
+        conversation_prompt_text="",
+        current_time_override="",
     ):
         def _normalize_prompt_text(text):
             return " ".join(str(text or "").split())
@@ -807,7 +819,9 @@ class Scratch:
                 f"{agent.name} {agent.get_event().get_describe(False)} 时，看到 {other.name} {other.get_event().get_describe(False)}。"
             )
 
-        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
+        conversation = str(conversation_prompt_text or "").strip()
+        if not conversation:
+            conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
             conversation or "[对话尚未开始]"
         )
@@ -832,7 +846,8 @@ class Scratch:
                 "consult_history_memory": consult_history_memory or "",
                 "memory": memory,
                 "address": f"{address[-2]}，{address[-1]}",
-                "current_time": utils.get_timer().get_date("%H:%M"),
+                "current_time": str(current_time_override or "").strip()
+                or utils.get_timer().get_date("%H:%M"),
                 "previous_context": prev_context,
                 "current_context": curr_context,
                 "another": other.name,
@@ -854,8 +869,18 @@ class Scratch:
             "failsafe": "嗯",
         }
 
-    def prompt_generate_chat_check_repeat(self, agent, chats, content):
-        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
+    def prompt_generate_chat_check_repeat(
+        self,
+        agent,
+        chats,
+        content,
+        conversation_prompt_text="",
+        current_time_override="",
+    ):
+        del current_time_override
+        conversation = str(conversation_prompt_text or "").strip()
+        if not conversation:
+            conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (
                 conversation or "[对话尚未开始]"
         )
@@ -876,8 +901,16 @@ class Scratch:
 
         return {"prompt": prompt, "callback": _callback, "failsafe": False}
 
-    def prompt_summarize_chats(self, chats, prompt_file=None):
-        conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
+    def prompt_summarize_chats(
+        self,
+        chats,
+        prompt_file=None,
+        max_chars=None,
+        conversation_text="",
+    ):
+        conversation = str(conversation_text or "").strip()
+        if not conversation:
+            conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
 
         prompt_data = {
             "conversation": conversation,
@@ -891,7 +924,23 @@ class Scratch:
             )
 
         def _callback(response):
-            return response.strip()
+            text = response.strip()
+            if max_chars is None:
+                return text
+            try:
+                limit = max(1, int(max_chars))
+            except (TypeError, ValueError):
+                return text
+            if len(text) <= limit:
+                return text
+            clipped = text[:limit]
+            # Prefer a complete semantic unit near the cap.  If the model ignored
+            # the hard prompt limit entirely, retain a bounded, visibly truncated
+            # value rather than letting one session grow downstream prompts.
+            boundary = max(clipped.rfind(mark) for mark in "。！？；\n")
+            if boundary >= int(limit * 0.7):
+                return clipped[: boundary + 1].rstrip()
+            return clipped[:-1].rstrip() + "…"
 
         if len(chats) > 1:
             failsafe = "{} 和 {} 之间的普通对话".format(chats[0][0], chats[1][0])

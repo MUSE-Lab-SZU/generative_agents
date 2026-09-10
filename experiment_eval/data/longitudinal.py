@@ -40,6 +40,12 @@ ALIASES = {
     "score": "item_score",
     "value": "item_score",
 }
+MAX_ITEM_SCORES = {
+    "PHQ-9": 3.0,
+    "BDI-II": 3.0,
+    "总体抑郁水平及干扰程度量表": 4.0,
+    "总体焦虑水平及干扰程度量表": 4.0,
+}
 
 
 def _read_json(path: Path) -> pd.DataFrame:
@@ -92,8 +98,12 @@ def normalize_long_data(frame: pd.DataFrame) -> pd.DataFrame:
     if (normalized["item"] % 1 != 0).any() or (normalized["item"] < 1).any():
         raise ValueError("Long data item values must be positive integers")
     normalized["item"] = normalized["item"].astype(int)
-    if ((normalized["item_score"] < 0) | (normalized["item_score"] > 3)).any():
-        raise ValueError("PHQ-9/BDI-II item_score values must be within 0–3")
+    maximums = normalized["scale"].map(MAX_ITEM_SCORES).fillna(3.0)
+    invalid_scores = (normalized["item_score"] < 0) | (
+        normalized["item_score"] > maximums
+    )
+    if invalid_scores.any():
+        raise ValueError("item_score values exceed the configured range for their scale")
     key = ["run", "group", "timepoint", "scale", "item"]
     duplicates = normalized.duplicated(key, keep=False)
     if duplicates.any():

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "pricing_version": "2026-08-31",
+  "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "currency": "CNY",
+  "unit_tokens": 1000000,
+  "timezone": "Asia/Shanghai",
+  "peak_windows": {
+    "weekdays": [1, 2, 3, 4, 5],
+    "intervals": [
+      ["09:00", "12:00"],
+      ["14:00", "18:00"]
+    ]
+  },
+  "models": {
+    "deepseek-v4-flash": {
+      "peak": {
+        "prompt_cache_hit": 0.10,
+        "prompt_cache_miss": 3.0,
+        "completion": 9.0
+      },
+      "off_peak": {
+        "prompt_cache_hit": 0.05,
+        "prompt_cache_miss": 1.5,
+        "completion": 4.5
+      }
+    }
+  }
+}

@@ -51,12 +51,18 @@ from run_one_experiment import (
     run_cmd,
     run_external_memory_audit,
     run_post_scales,
+    score_worker_tracking_args,
 )
 from kabuda_variant_runtime import (
+    KABUDA_VARIANTS,
+    RUNTIME_AGENT_NAME,
+    TOWN_PERSONA_VARIANTS,
     VARIANT_SELECTOR_ALIASES as KABUDA_VARIANT_SELECTOR_ALIASES,
     VARIANT_SHORT_NAMES,
+    VARIANT_SUPPORTED_SEVERITIES,
     VARIANTS,
     prepare_kabuda_variant_runtime,
+    runtime_agent_name_for_variant,
 )
 from cbt_experiment_config import (
     CONTROLLERS,
@@ -74,6 +80,8 @@ from cbt_experiment_config import (
     validate_resolved_controller_config,
 )
 from scale_protocol import (
+    LONG_SCALE_NAMES,
+    SCALE_SPECS,
     extract_direct_answer_score,
     extract_item_scores as extract_protocol_item_scores,
     render_validation_number,
@@ -215,10 +223,23 @@ ALL_CONDITIONS = [
         group=group,
         severity=severity,
     )
-    for variant in VARIANTS
+    for variant in KABUDA_VARIANTS
     for group in GROUPS
     for severity in SEVERITIES
 ]
+
+TOWN_PERSONA_CONDITIONS = [
+    BatchCondition(
+        name=f"Counsel-{VARIANT_SHORT_NAMES[variant]}-{group.upper()}-MOD",
+        variant=variant,
+        group=group,
+        severity="moderate",
+    )
+    for variant in TOWN_PERSONA_VARIANTS
+    for group in GROUPS
+]
+
+SELECTABLE_CONDITIONS = [*ALL_CONDITIONS, *TOWN_PERSONA_CONDITIONS]
 
 
 def _make_counsel_condition(variant: str, severity: str) -> BatchCondition:
@@ -331,6 +352,8 @@ def _available_condition_selector_examples() -> str:
     return ", ".join([
         "Counsel-KBD2-G1-MILD",
         "Counsel-KBD9-ALL-MOD",
+        "Counsel-LRN-G1-MOD",
+        "Counsel-LRN-ALL-MOD",
         "Counsel-ALL-G1-MILD",
         "Counsel-G1-MILD",
     ])
@@ -341,7 +364,10 @@ def resolve_condition_selector(condition_name: str | None) -> list[BatchConditio
         return list(ALL_CONDITIONS)
 
     normalized_name = str(condition_name or "").strip()
-    matched = [condition for condition in ALL_CONDITIONS if condition.name == normalized_name]
+    matched = [
+        condition for condition in SELECTABLE_CONDITIONS
+        if condition.name == normalized_name
+    ]
     if matched:
         return matched
 
@@ -369,9 +395,23 @@ def resolve_condition_selector(condition_name: str | None) -> list[BatchConditio
             target_variant = None if variant_token in WILDCARD_TOKENS else VARIANT_SELECTOR_ALIASES[variant_token]
             target_group = None if group_token in WILDCARD_TOKENS else GROUP_SELECTOR_ALIASES[group_token]
             target_severity = None if severity_token in WILDCARD_TOKENS else SEVERITY_SELECTOR_ALIASES[severity_token]
+            if (
+                target_variant is not None
+                and target_severity is not None
+                and target_severity not in VARIANT_SUPPORTED_SEVERITIES[target_variant]
+            ):
+                raise ValueError(
+                    f"人设 {VARIANT_SHORT_NAMES[target_variant]} 仅提供 MOD 配置，"
+                    f"不能使用 {severity_token}"
+                )
+            condition_pool = (
+                ALL_CONDITIONS
+                if target_variant is None
+                else SELECTABLE_CONDITIONS
+            )
             return [
                 condition
-                for condition in ALL_CONDITIONS
+                for condition in condition_pool
                 if (target_variant is None or condition.variant == target_variant)
                 and (target_group is None or condition.group == target_group)
                 and (target_severity is None or condition.severity == target_severity)
@@ -431,7 +471,7 @@ def resolve_counsel_room_conditions(
 
             try:
                 variants = (
-                    VARIANTS
+                    KABUDA_VARIANTS
                     if variant_token in WILDCARD_TOKENS
                     else [VARIANT_SELECTOR_ALIASES[variant_token]]
                 )
@@ -468,6 +508,34 @@ def resolve_conditions_for_mode(
     if cfg.counsel_room:
         return resolve_counsel_room_conditions(selector)
     return resolve_conditions(selector)
+
+
+def _replace_exact_agent_name(value: Any, old_name: str, new_name: str) -> Any:
+    """Replace identity references without rewriting prose or resource paths."""
+    if old_name == new_name:
+        return copy.deepcopy(value)
+    if isinstance(value, dict):
+        return {
+            (new_name if key == old_name else key): _replace_exact_agent_name(
+                item, old_name, new_name
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_exact_agent_name(item, old_name, new_name)
+            for item in value
+        ]
+    if isinstance(value, str) and value == old_name:
+        return new_name
+    return copy.deepcopy(value)
+
+
+def condition_target_agent(condition: BatchCondition, cfg: RuntimeConfig) -> str:
+    """Use the selected persona name unless the caller explicitly overrides --agent."""
+    if cfg.agent != SCALE_AGENT:
+        return cfg.agent
+    return runtime_agent_name_for_variant(condition.variant)
 
 
 def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
@@ -552,7 +620,8 @@ def print_effective_config(cfg: RuntimeConfig) -> None:
     print(f"  步间隔:       {cfg.stride}")
     print(f"  verbose:      {cfg.verbose}")
     print(f"  log:          {cfg.log_file or '(空)'}")
-    print(f"  评估角色:     {cfg.agent}")
+    target_agents = sorted({condition_target_agent(item, cfg) for item in cfg.conditions})
+    print(f"  评估角色:     {', '.join(target_agents)}")
     print(f"  仅做汇总:     {cfg.summary_only}")
     print(f"  咨询室模式:   {cfg.counsel_room}")
     print(f"  条件数:       {len(cfg.conditions)}")
@@ -1079,11 +1148,21 @@ def build_condition_runtime_config_payload(
         dry_run=cfg.dry_run,
         agent_source_subdir=agent_source_subdir,
     )
+    runtime_agent_name = variant_runtime.runtime_agent_name
+    resolved_merged = _replace_exact_agent_name(
+        merged,
+        RUNTIME_AGENT_NAME,
+        runtime_agent_name,
+    )
+    resolved_agent_roster = [
+        runtime_agent_name if name == RUNTIME_AGENT_NAME else name
+        for name in agent_roster
+    ]
     payload: dict[str, Any] = {
         "stride": cfg.stride,
         "time": {"start": cfg.start},
         "maze": {"path": f"{assets_root}/maze.json"},
-        "agent_base": copy.deepcopy(merged.get("agent", {})),
+        "agent_base": copy.deepcopy(resolved_merged.get("agent", {})),
         "agents": {},
     }
     if embedding_base_url:
@@ -1095,25 +1174,33 @@ def build_condition_runtime_config_payload(
         )
         if isinstance(embedding_config, dict):
             embedding_config["base_url"] = embedding_base_url
-    intervention_config = copy.deepcopy(merged.get("intervention", {}))
-    staged_eval_config = copy.deepcopy(merged.get("staged_eval", {}))
-    checkpointing_config = copy.deepcopy(merged.get("checkpointing", {}))
+    intervention_config = copy.deepcopy(resolved_merged.get("intervention", {}))
+    staged_eval_config = copy.deepcopy(resolved_merged.get("staged_eval", {}))
+    checkpointing_config = copy.deepcopy(resolved_merged.get("checkpointing", {}))
     if intervention_config:
         payload["intervention"] = intervention_config
         memory_injection_config = payload["intervention"].setdefault("memory_injection", {})
         if isinstance(memory_injection_config, dict):
             memory_injection_config["content_file"] = variant_runtime.memory_injection_config_path
+            if runtime_agent_name != RUNTIME_AGENT_NAME:
+                rules = memory_injection_config.get("rules", {})
+                if isinstance(rules, dict):
+                    init_rule = rules.get("init_kabuda_depression_stress", {})
+                    if isinstance(init_rule, dict):
+                        init_rule["source"] = (
+                            f"初始化规则注入_{runtime_agent_name}抑郁压力事件"
+                        )
     if staged_eval_config:
         payload["staged_eval"] = staged_eval_config
     if checkpointing_config:
         payload["checkpointing"] = checkpointing_config
-    for agent_name in agent_roster:
+    for agent_name in resolved_agent_roster:
         payload["agents"][agent_name] = {
             "config_path": f"{assets_root}/agents/{agent_name.replace(' ', '_')}/agent.json",
         }
-    payload["agents"].setdefault("卡布达", {})
-    payload["agents"]["卡布达"]["config_path"] = str(variant_runtime.agent_config_path)
-    payload["agents"]["卡布达"]["depression_config_path"] = str(variant_runtime.depression_config_path)
+    payload["agents"].setdefault(runtime_agent_name, {})
+    payload["agents"][runtime_agent_name]["config_path"] = str(variant_runtime.agent_config_path)
+    payload["agents"][runtime_agent_name]["depression_config_path"] = str(variant_runtime.depression_config_path)
     validate_resolved_controller_config(
         payload,
         cfg.cbt_controller,
@@ -1371,13 +1458,13 @@ def extract_reported_scale_total(scored_result: dict) -> float | None:
 
 
 SCALE_ITEM_SCORE_KEYS = {
-    "PHQ-9": "phq9_scores",
-    "BDI-II": "bdi_ii_scores",
+    scale_name: str(scale_spec["item_score_key"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
 }
 
 SCALE_ITEM_COUNTS = {
-    "PHQ-9": 9,
-    "BDI-II": 21,
+    scale_name: int(scale_spec["item_count"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
 }
 
 
@@ -1404,7 +1491,11 @@ def bdi_ii_severity(total: int | float) -> str:
 
 
 def expected_scale_severity(scale_name: str, total: int | float) -> str:
-    return phq9_severity(total) if scale_name == "PHQ-9" else bdi_ii_severity(total)
+    if scale_name == "PHQ-9":
+        return phq9_severity(total)
+    if scale_name == "BDI-II":
+        return bdi_ii_severity(total)
+    return "未设置分级"
 
 
 def extract_scale_total(scored_result: dict, scale_name: str | None = None) -> float | None:
@@ -1433,6 +1524,7 @@ def extract_item_scores(scored_result: dict, scale_name: str) -> list[int] | Non
         scored_result,
         item_key,
         expected_count=expected_count,
+        max_score=int(SCALE_SPECS.get(scale_name, {}).get("max_item_score", 3)),
     )
 
 
@@ -1465,7 +1557,9 @@ def build_scale_score_validation(results: list[dict]) -> dict:
     for result in results:
         for evaluation in result.get("evaluations", []):
             trigger_label = str(evaluation.get("trigger_label", "") or "—")
-            for scale_name in SCALES:
+            for scale_name in (evaluation.get("scales", {}) or {}):
+                if scale_name not in SCALE_SPECS:
+                    continue
                 scored_path = score_file_for_evaluation(result, evaluation, scale_name)
                 scored_result = load_optional_json_file(scored_path) if scored_path.is_file() else None
                 if not scored_result:
@@ -1502,7 +1596,10 @@ def build_scale_score_validation(results: list[dict]) -> dict:
                         continue
                     if item_id < 1 or item_id > len(item_scores):
                         continue
-                    answer_score, status = extract_direct_answer_score(str(answer_row.get("answer", "") or ""))
+                    answer_score, status = extract_direct_answer_score(
+                        str(answer_row.get("answer", "") or ""),
+                        max_score=int(SCALE_SPECS[scale_name]["max_item_score"]),
+                    )
                     if status != "direct" or answer_score is None:
                         continue
                     llm_score = item_scores[item_id - 1]
@@ -1587,6 +1684,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             "variant": condition.variant,
             "variant_short_name": VARIANT_SHORT_NAMES[condition.variant],
             "variant_source_agent_name": variant_runtime.source_agent_name,
+            "variant_runtime_agent_name": variant_runtime.runtime_agent_name,
             "variant_source_agent_dir": str(variant_runtime.source_agent_dir),
             "variant_agent_config_file": str(variant_runtime.agent_config_path),
             "variant_depression_config_file": str(variant_runtime.depression_config_path),
@@ -1598,7 +1696,7 @@ def write_batch_metadata(run_name: str, condition: BatchCondition, cfg: RuntimeC
             "stride": cfg.stride,
             "verbose": cfg.verbose,
             "log_file": cfg.log_file,
-            "scale_agent": cfg.agent,
+            "scale_agent": condition_target_agent(condition, cfg),
             "mode": "counsel_room" if cfg.counsel_room else "village",
             "group_overlay_file": (
                 COUNSEL_ROOM_OVERLAY.name
@@ -1742,6 +1840,7 @@ def run_condition(
         if cfg.dry_run
         else load_json_file(runtime_config_path)
     )
+    target_agent = condition_target_agent(condition, cfg)
     checkpoint_exists = condition_checkpoint_exists(run_name)
     resume_requested = should_resume_condition(cfg, condition, state)
 
@@ -1787,6 +1886,7 @@ def run_condition(
     print(f"  controller:   {manifest['controller_identity']}")
     print(f"  version:      {manifest['controller_version']}")
     print(f"  variant:      {condition.variant}")
+    print(f"  target agent: {target_agent}")
     print(f"  group:        {condition.group}")
     print(f"  severity:     {condition.severity}")
     print(f"  resume:       {resume_requested}")
@@ -1957,7 +2057,7 @@ def run_condition(
                 context=f"量表评估 {run_name}",
                 dry_run=cfg.dry_run,
             )
-            run_post_scales(run_name, cfg.agent, dry_run=cfg.dry_run)
+            run_post_scales(run_name, target_agent, dry_run=cfg.dry_run)
             update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="post_scale")
         if cfg.run_compress:
             ensure_free_disk_space(
@@ -1968,10 +2068,10 @@ def run_condition(
             run_compress(run_name, cfg)
             update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="compress")
         if cfg.run_agent_memory_vis:
-            if agent_memory_visualization_not_applicable(runtime_config_path, cfg.agent):
+            if agent_memory_visualization_not_applicable(runtime_config_path, target_agent):
                 print(
                     "[SKIP] 角色记忆可视化不适用于当前条件："
-                    f"agent={cfg.agent} 的 event/thought/chat 本地记忆写入已被配置屏蔽"
+                    f"agent={target_agent} 的 event/thought/chat 本地记忆写入已被配置屏蔽"
                 )
                 update_condition_state(
                     cfg,
@@ -1985,7 +2085,7 @@ def run_condition(
                     context=f"角色记忆可视化 {run_name}",
                     dry_run=cfg.dry_run,
                 )
-                run_agent_memory_visualization(run_name, cfg.agent, dry_run=cfg.dry_run)
+                run_agent_memory_visualization(run_name, target_agent, dry_run=cfg.dry_run)
                 update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="agent_memory_vis")
         if cfg.run_external_memory_audit:
             ensure_free_disk_space(
@@ -1994,7 +2094,7 @@ def run_condition(
                 dry_run=cfg.dry_run,
             )
             try:
-                run_external_memory_audit(run_name, cfg.agent, dry_run=cfg.dry_run)
+                run_external_memory_audit(run_name, target_agent, dry_run=cfg.dry_run)
                 update_condition_state(cfg, condition, run_name=run_name, last_completed_phase="external_memory_audit")
             except Exception as exc:
                 warning = f"external_memory_audit failed but was treated as optional: {exc}"
@@ -2036,23 +2136,39 @@ def ensure_staged_eval_scores(run_dir: Path, *, dry_run: bool) -> None:
         return
 
     for trigger_dir in sorted(path for path in staged_root.iterdir() if path.is_dir()):
-        for scale_name, scale_cfg in SCALES.items():
+        available_scale_names = {
+            path.name.removesuffix("_answered.jsonl")
+            for path in trigger_dir.glob("*_answered.jsonl")
+        }
+        for scale_name in sorted(available_scale_names):
+            scale_cfg = SCALE_SPECS.get(scale_name)
+            if not isinstance(scale_cfg, dict):
+                continue
             answers_path = trigger_dir / f"{scale_name}_answered.jsonl"
             scored_path = trigger_dir / f"{scale_name}_scored.json"
             if not answers_path.exists() or scored_path.exists():
                 continue
             scoring_prompt = SCALE_SCORING_DIR / scale_cfg["scoring_prompt"]
+            score_cmd = [
+                WORKER_PYTHON,
+                str(SCORE_WORKER_SCRIPT),
+                "--answers",
+                str(answers_path),
+                "--scoring-prompt",
+                str(scoring_prompt),
+                "--output",
+                str(scored_path),
+            ]
+            score_cmd.extend(
+                score_worker_tracking_args(
+                    run_name=run_dir.name,
+                    phase="simulation",
+                    scale_name=scale_name,
+                    evaluation_id=f"simulation:{trigger_dir.name}:{run_dir.name}",
+                )
+            )
             run_cmd(
-                [
-                    WORKER_PYTHON,
-                    str(SCORE_WORKER_SCRIPT),
-                    "--answers",
-                    str(answers_path),
-                    "--scoring-prompt",
-                    str(scoring_prompt),
-                    "--output",
-                    str(scored_path),
-                ],
+                score_cmd,
                 dry_run=dry_run,
                 timeout=POST_EVAL_TIMEOUT_SECONDS,
             )
@@ -2108,7 +2224,12 @@ def append_post_entry(evaluations: list[dict], run_dir: Path) -> None:
 
 
 def apply_trajectory_deltas(evaluations: list[dict]) -> None:
-    for scale_name in SCALES:
+    scale_names = {
+        str(scale_name)
+        for evaluation in evaluations
+        for scale_name in (evaluation.get("scales", {}) or {})
+    }
+    for scale_name in scale_names:
         baseline = next(
             (
                 float(evaluation.get("scales", {}).get(scale_name, {}).get("total_score"))
@@ -2120,7 +2241,9 @@ def apply_trajectory_deltas(evaluations: list[dict]) -> None:
         )
         previous = None
         for evaluation in evaluations:
-            scale_payload = evaluation["scales"].setdefault(scale_name, {})
+            scale_payload = (evaluation.get("scales", {}) or {}).get(scale_name)
+            if not isinstance(scale_payload, dict):
+                continue
             total_score = scale_payload.get("total_score")
             if total_score is None:
                 scale_payload["delta_from_previous"] = None
@@ -2136,6 +2259,35 @@ def apply_trajectory_deltas(evaluations: list[dict]) -> None:
             previous = float(total_score)
 
 
+def apply_boundary_scale_policy(evaluations: list[dict]) -> None:
+    """Make the first and last staged nodes authoritative long-scale nodes.
+
+    Capture jobs are created online and may not know which snapshot will be
+    the run's last actual staged node.  Report generation happens after the
+    run and can enforce the intended PHQ-9/BDI-II boundary contract exactly.
+    """
+    staged = [
+        evaluation
+        for evaluation in evaluations
+        if str(evaluation.get("source", "") or "")
+        in {"staged_eval", "staged_eval_snapshot", "synthesized_staged_eval"}
+    ]
+    if not staged:
+        return
+    for evaluation in (staged[0], staged[-1]):
+        trigger_dir = Path(str(evaluation.get("metadata_path", "") or "")).parent
+        scales_payload = {}
+        for scale_name in LONG_SCALE_NAMES:
+            scored_path = trigger_dir / f"{scale_name}_scored.json"
+            scored_result = load_json_file(scored_path) if scored_path.exists() else {}
+            scales_payload[scale_name] = build_scale_snapshot(
+                scored_result,
+                scored_path if scored_path.exists() else None,
+                scale_name,
+            )
+        evaluation["scales"] = scales_payload
+
+
 def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | None:
     if not run_dir.is_dir():
         return None
@@ -2149,8 +2301,14 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
             if not metadata_path.exists():
                 continue
             metadata = load_json_file(metadata_path)
+            job = load_optional_json_file(trigger_dir / "job.json") or {}
+            scale_names = job.get("scales")
+            if not isinstance(scale_names, list) or not scale_names:
+                scale_names = list(SCALES)
             scales_payload = {}
-            for scale_name in SCALES:
+            for scale_name in scale_names:
+                if scale_name not in SCALE_SPECS:
+                    continue
                 scored_path = trigger_dir / f"{scale_name}_scored.json"
                 scored_result = load_json_file(scored_path) if scored_path.exists() else {}
                 scales_payload[scale_name] = build_scale_snapshot(
@@ -2178,6 +2336,7 @@ def load_condition_result(run_dir: Path, condition: BatchCondition) -> dict | No
 
     append_post_entry(evaluations, run_dir)
     evaluations.sort(key=lambda item: trigger_sort_key(item.get("trigger_label", ""), int(item.get("completed_session_count", 0) or 0)))
+    apply_boundary_scale_policy(evaluations)
     apply_trajectory_deltas(evaluations)
 
     final_deltas = {}

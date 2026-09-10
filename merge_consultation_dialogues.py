@@ -141,26 +141,31 @@ def build_session_index_by_meeting(simulate_data: Any) -> dict[str, str]:
     if not isinstance(simulate_data, dict):
         raise TypeError("simulate json root must be an object")
 
-    session_eval_state = (
-        (simulate_data.get("intervention_state") or {})
-        .get("session_eval_state", {})
-    )
-    history_by_pair = session_eval_state.get("history_by_pair") if isinstance(session_eval_state, dict) else {}
-
+    intervention_state = simulate_data.get("intervention_state") or {}
     by_meeting: dict[str, str] = {}
-    if not isinstance(history_by_pair, dict):
+    if not isinstance(intervention_state, dict):
         return by_meeting
 
-    for history in history_by_pair.values():
-        if not isinstance(history, list):
+    # Prefer the legacy/general session_eval index, then fill Progressive D
+    # meetings from its compatible local/LLM control history.
+    for state_name, session_key in (
+        ("session_eval_state", "session_id"),
+        ("progressive_d_control_state", "legacy_session"),
+    ):
+        state = intervention_state.get(state_name) or {}
+        histories = state.get("history_by_pair") if isinstance(state, dict) else {}
+        if not isinstance(histories, dict):
             continue
-        for item in history:
-            if not isinstance(item, dict):
+        for history in histories.values():
+            if not isinstance(history, list):
                 continue
-            meeting_id = str(item.get("meeting_id") or "").strip()
-            session_id = str(item.get("session_id") or "").strip()
-            if meeting_id and session_id and meeting_id not in by_meeting:
-                by_meeting[meeting_id] = session_id
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                meeting_id = str(item.get("meeting_id") or "").strip()
+                session_id = str(item.get(session_key) or "").strip()
+                if meeting_id and session_id and meeting_id not in by_meeting:
+                    by_meeting[meeting_id] = session_id
     return by_meeting
 
 

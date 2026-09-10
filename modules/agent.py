@@ -18,6 +18,8 @@ from modules.external_memory_bridge import ExternalMemoryBridge
 
 _LOCAL_ONLY_COMPLETION_HINTS = frozenset(
     {
+        "generate_chat_check_repeat",
+        "poignancy_chat",
         "summarize_relation",
         "summarize_chats",
     }
@@ -239,6 +241,7 @@ class Agent:
         ), "Can not find func prompt_{} from scratch".format(func_hint)
         prompt_kwargs = dict(kwargs)
         forced_prompt_trace = prompt_kwargs.pop("_forced_prompt_trace", None)
+        explicit_local_only = bool(prompt_kwargs.pop("_force_local", False))
         depression_chat_ctx = None
         if func_hint == "generate_chat":
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
@@ -308,10 +311,21 @@ class Agent:
             output = None
             responses = []
 
-            local_only_completion = func_hint in _LOCAL_ONLY_COMPLETION_HINTS
+            local_only_completion = (
+                explicit_local_only or func_hint in _LOCAL_ONLY_COMPLETION_HINTS
+            )
             should_try_forced = False
             if local_only_completion:
-                route_reason = "hardcoded_local_only"
+                route_reason = (
+                    "explicit_local_only"
+                    if explicit_local_only
+                    else "hardcoded_local_only"
+                )
+            elif (
+                isinstance(self._chat_route_ctx, dict)
+                and not self._chat_route_ctx.get("allow_forced_llm", True)
+            ):
+                route_reason = "forced_route_window_closed"
             elif self.intervention and isinstance(self._chat_route_ctx, dict):
                 forced_flag = bool(self._chat_route_ctx.get("forced", False))
                 peer_agent = self._chat_route_ctx.get("peer_agent")
@@ -688,9 +702,172 @@ class Agent:
         self.action = memory.Action(event, start=start, duration=duration)
         plan, _ = self.schedule.current_plan()
         if len(plan["decompose"]) > 0:
+            forced_consult = False
+            peer = None
+            if isinstance(self._chat_route_ctx, dict):
+                peer = self._chat_route_ctx.get("peer_agent")
+                forced_consult = bool(
+                    self._chat_route_ctx.get("forced", False)
+                    and peer is not None
+                    and self._should_use_consultation_memory_summary(
+                        peer,
+                        forced=True,
+                    )
+                )
+            if forced_consult:
+                revised = self._deterministic_forced_consult_schedule_revise(
+                    self.action,
+                    self.schedule,
+                )
+                if revised is not None:
+                    plan["decompose"] = revised
+                    self.logger.info(
+                        "[SCHEDULE_REVISE_ROUTE] agent={} route=deterministic meeting_kind=doctor_consult segments={}".format(
+                            self.name,
+                            len(revised),
+                        )
+                    )
+                    return
+                self.logger.info(
+                    "[SCHEDULE_REVISE_ROUTE] agent={} route=think_llm reason=deterministic_validation_failed meeting_kind=doctor_consult".format(
+                        self.name
+                    )
+                )
+                plan["decompose"] = self.completion(
+                    "schedule_revise",
+                    self.action,
+                    self.schedule,
+                    _force_local=True,
+                )
+                return
             plan["decompose"] = self.completion(
                 "schedule_revise", self.action, self.schedule
             )
+
+    def _deterministic_forced_consult_schedule_revise(self, action, schedule):
+        """Insert a consultation into one valid decomposed plan without an LLM."""
+        try:
+            plan, _ = schedule.current_plan()
+            decompose = plan.get("decompose", [])
+            if not isinstance(decompose, list) or not decompose:
+                return None
+            parent_start = int(plan["start"])
+            parent_duration = int(plan["duration"])
+            parent_end = parent_start + parent_duration
+            if parent_duration <= 0:
+                return None
+
+            action_start = int(utils.daily_duration(action.start))
+            action_duration = int(action.duration)
+            action_end = action_start + action_duration
+            if (
+                action_duration < 0
+                or action_start < parent_start
+                or action_start > parent_end
+                or action_end > parent_end
+            ):
+                return None
+
+            normalized = []
+            expected_start = parent_start
+            for item in decompose:
+                if not isinstance(item, dict):
+                    return None
+                item_start = int(item["start"])
+                item_duration = int(item["duration"])
+                item_end = item_start + item_duration
+                if (
+                    item_duration <= 0
+                    or item_start != expected_start
+                    or item_start < parent_start
+                    or item_end > parent_end
+                ):
+                    return None
+                normalized.append(
+                    {
+                        "describe": str(item.get("describe", "") or ""),
+                        "start": item_start,
+                        "duration": item_duration,
+                    }
+                )
+                expected_start = item_end
+            if expected_start != parent_end:
+                return None
+
+            if action_duration == 0:
+                return [
+                    {
+                        "idx": idx,
+                        "describe": item["describe"],
+                        "start": item["start"],
+                        "duration": item["duration"],
+                    }
+                    for idx, item in enumerate(normalized)
+                ]
+
+            revised = []
+
+            def append_segment(describe, segment_start, segment_duration):
+                if segment_duration <= 0:
+                    return
+                revised.append(
+                    {
+                        "idx": len(revised),
+                        "describe": str(describe or ""),
+                        "start": int(segment_start),
+                        "duration": int(segment_duration),
+                    }
+                )
+
+            remaining = []
+            for item in normalized:
+                item_end = item["start"] + item["duration"]
+                if item_end <= action_start:
+                    append_segment(
+                        item["describe"], item["start"], item["duration"]
+                    )
+                    continue
+                if item["start"] < action_start:
+                    append_segment(
+                        item["describe"],
+                        item["start"],
+                        action_start - item["start"],
+                    )
+                    remaining.append(
+                        (item["describe"], item_end - action_start)
+                    )
+                else:
+                    remaining.append((item["describe"], item["duration"]))
+
+            append_segment(
+                action.event.get_describe(False),
+                action_start,
+                action_duration,
+            )
+            cursor = action_end
+            for describe, remaining_duration in remaining:
+                if cursor >= parent_end:
+                    break
+                fitted = min(int(remaining_duration), parent_end - cursor)
+                append_segment(describe, cursor, fitted)
+                cursor += fitted
+
+            if not revised:
+                return None
+            for index, item in enumerate(revised):
+                if item["idx"] != index or item["duration"] <= 0:
+                    return None
+                if index > 0:
+                    previous = revised[index - 1]
+                    if previous["start"] + previous["duration"] != item["start"]:
+                        return None
+            if revised[0]["start"] != parent_start:
+                return None
+            if revised[-1]["start"] + revised[-1]["duration"] != parent_end:
+                return None
+            return revised
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return None
 
     def percept(self):
         scope = self.maze.get_scope(self.coord, self.percept_config)
@@ -1236,14 +1413,23 @@ class Agent:
                 "forced": True,
                 "peer_name": getattr(other, "name", ""),
                 "peer_agent": other,
+                "allow_forced_llm": True,
             }
             if hasattr(other, "_chat_route_ctx"):
                 other._chat_route_ctx = {
                     "forced": True,
                     "peer_name": getattr(self, "name", ""),
                     "peer_agent": self,
+                    "allow_forced_llm": True,
                 }
         return prev_self_ctx, prev_other_ctx
+
+    def _close_forced_llm_route_window(self, other):
+        """Keep meeting identity available while ending generation-time routing."""
+        for agent in (self, other):
+            context = getattr(agent, "_chat_route_ctx", None)
+            if isinstance(context, dict) and context.get("forced", False):
+                context["allow_forced_llm"] = False
 
     def _restore_chat_route_ctx(self, other, prev_self_ctx, prev_other_ctx):
         self._chat_route_ctx = prev_self_ctx
@@ -1430,6 +1616,57 @@ class Agent:
         if not isinstance(lock, dict):
             return False
         return bool(lock.get("enabled", False))
+
+    def _current_session_prompt_kwargs(self, other, chats, forced=False):
+        if (
+            not bool(forced)
+            or not self.intervention
+            or not hasattr(self.intervention, "get_current_session_prompt_context")
+        ):
+            return {}
+        try:
+            context = self.intervention.get_current_session_prompt_context(
+                speaker=self,
+                other=other,
+                chats=chats,
+                forced=True,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "[CURRENT_SESSION_CONTEXT_FAIL] agent={} other={} error={}".format(
+                    self.name,
+                    getattr(other, "name", ""),
+                    str(exc),
+                )
+            )
+            return {}
+        if not isinstance(context, dict):
+            return {}
+        return {
+            "conversation_prompt_text": str(context.get("conversation", "") or ""),
+            "current_time_override": str(context.get("current_time", "") or ""),
+        }
+
+    def _should_use_consultation_memory_summary(self, other, forced=False):
+        if (
+            not bool(forced)
+            or not self.intervention
+            or not hasattr(self.intervention, "resolve_meeting_context")
+        ):
+            return False
+        try:
+            meeting = self.intervention.resolve_meeting_context(
+                self,
+                other,
+                forced=True,
+            )
+        except Exception:
+            return False
+        return bool(
+            isinstance(meeting, dict)
+            and str(meeting.get("meeting_kind", "") or "").strip()
+            == "doctor_consult"
+        )
 
     def _chat_with(self, other, focus, forced=False):
         trace_scope = "INTERVENTION" if forced else "CHAT_CORE"
@@ -1724,6 +1961,7 @@ class Agent:
                     forced=forced,
                     turn_no=turn_no,
                     session_prompt_text=judge_session_prompt_injection,
+                    max_turns=max_cap_turn,
                 )
                 judge_valid = True if (isinstance(judge, dict) and judge.get("valid") is True) else False
                 terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
@@ -1742,6 +1980,11 @@ class Agent:
                     "primary_strategy": str((judge or {}).get("primary_strategy", "") or ""),
                     "micro_skill": str((judge or {}).get("micro_skill", "") or ""),
                     "turn_goal": str((judge or {}).get("turn_goal", "") or ""),
+                    "strategy_source": (
+                        "response_strategy_selector"
+                        if str((judge or {}).get("primary_strategy", "") or "")
+                        else ""
+                    ),
                 }
                 self.logger.info(
                     "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
@@ -1771,7 +2014,11 @@ class Agent:
                 # 对于发起对话的Agent，从第2轮对话开始，检查是否出现“复读”现象
                 if repeat_detection_enabled:
                     end = self.completion(
-                        "generate_chat_check_repeat", self, chats, text
+                        "generate_chat_check_repeat",
+                        self,
+                        chats,
+                        text,
+                        **self._current_session_prompt_kwargs(other, chats, forced),
                     )
                     repeat_end = bool(end)
                 else:
@@ -1817,7 +2064,11 @@ class Agent:
                     terminate_end = False
                     if terminate_check_enabled_this_turn:
                         end = self.completion(
-                            "decide_chat_terminate", self, other, chats
+                            "decide_chat_terminate",
+                            self,
+                            other,
+                            chats,
+                            **self._current_session_prompt_kwargs(other, chats, forced),
                         )
                         terminate_end = bool(end)
                     else:
@@ -1941,6 +2192,7 @@ class Agent:
                     forced=forced,
                     turn_no=turn_no,
                     session_prompt_text=other_judge_session_prompt_injection,
+                    max_turns=max_cap_turn,
                 )
                 judge_valid = True if (isinstance(judge, dict) and judge.get("valid") is True) else False
                 terminate_flag = True if (isinstance(judge, dict) and judge.get("terminate") is True) else False
@@ -1959,6 +2211,11 @@ class Agent:
                     "primary_strategy": str((judge or {}).get("primary_strategy", "") or ""),
                     "micro_skill": str((judge or {}).get("micro_skill", "") or ""),
                     "turn_goal": str((judge or {}).get("turn_goal", "") or ""),
+                    "strategy_source": (
+                        "response_strategy_selector"
+                        if str((judge or {}).get("primary_strategy", "") or "")
+                        else ""
+                    ),
                 }
                 self.logger.info(
                     "[DIALOG_JUDGE_PRE] turn={} terminate={}".format(
@@ -1988,7 +2245,11 @@ class Agent:
                 # 对于响应对话的Agent，从第2轮开始，检查是否出现“复读”现象
                 if repeat_detection_enabled:
                     end = self.completion(
-                        "generate_chat_check_repeat", other, chats, text
+                        "generate_chat_check_repeat",
+                        other,
+                        chats,
+                        text,
+                        **other._current_session_prompt_kwargs(self, chats, forced),
                     )
                     repeat_end = bool(end)
                 else:
@@ -2068,7 +2329,11 @@ class Agent:
                 terminate_end = False
                 if terminate_check_enabled_this_turn:
                     end = other.completion(
-                        "decide_chat_terminate", other, self, chats
+                        "decide_chat_terminate",
+                        other,
+                        self,
+                        chats,
+                        **other._current_session_prompt_kwargs(self, chats, forced),
                     )
                     terminate_end = bool(end)
                 else:
@@ -2149,9 +2414,60 @@ class Agent:
             )
         )
         summary_prompt_file = None
-        if forced:
+        summary_max_chars = None
+        summary_conversation_text = ""
+        if self._should_use_consultation_memory_summary(other, forced=forced):
             summary_prompt_file = "data/prompts/intervention/consultation_memory_summary.txt"
-        chat_summary = self.completion("summarize_chats", chats, prompt_file=summary_prompt_file)
+            summary_max_chars = 800
+            if self.intervention and hasattr(
+                self.intervention, "get_consultation_memory_summary_policy"
+            ):
+                try:
+                    summary_policy = self.intervention.get_consultation_memory_summary_policy()
+                    if isinstance(summary_policy, dict):
+                        summary_prompt_file = str(
+                            summary_policy.get("prompt_file", summary_prompt_file)
+                            or summary_prompt_file
+                        ).strip()
+                        summary_max_chars = int(
+                            summary_policy.get("max_chars", summary_max_chars)
+                            or summary_max_chars
+                        )
+                except Exception as exc:
+                    self.logger.warning(
+                        "[CONSULTATION_MEMORY_SUMMARY_POLICY_FAIL] agent={} error={}".format(
+                            self.name,
+                            str(exc),
+                        )
+                    )
+            if self.intervention and hasattr(
+                self.intervention, "get_current_session_prompt_context"
+            ):
+                try:
+                    summary_context = self.intervention.get_current_session_prompt_context(
+                        self,
+                        other,
+                        chats,
+                        forced=True,
+                    )
+                    if isinstance(summary_context, dict):
+                        summary_conversation_text = str(
+                            summary_context.get("conversation", "") or ""
+                        ).strip()
+                except Exception as exc:
+                    self.logger.warning(
+                        "[CONSULTATION_MEMORY_SUMMARY_CONTEXT_FAIL] agent={} error={}".format(
+                            self.name,
+                            str(exc),
+                        )
+                    )
+        chat_summary = self.completion(
+            "summarize_chats",
+            chats,
+            prompt_file=summary_prompt_file,
+            max_chars=summary_max_chars,
+            conversation_text=summary_conversation_text,
+        )
         duration = int(sum([len(c[1]) for c in chats]) / 240)
 
         chat_expire = None
@@ -2198,6 +2514,10 @@ class Agent:
         if forced_meeting_id:
             chat_meta_common["meeting_id"] = forced_meeting_id
 
+        # Generation/judge work is complete. Keep the meeting context for
+        # deterministic schedule handling, but do not let persistence and
+        # schedule helpers inherit the forced DeepSeek route.
+        self._close_forced_llm_route_window(other)
         self.schedule_chat(
             chats,
             chat_summary,
@@ -2240,6 +2560,13 @@ class Agent:
                 chat_summary,
                 start,
             )
+            if forced and hasattr(
+                self.intervention,
+                "clear_current_session_prompt_context",
+            ):
+                self.intervention.clear_current_session_prompt_context(
+                    forced_meeting_id
+                )
         # This boundary is shared by doctor, forced-resident and natural chats.
         # Any after-chat reflection above has already contributed detector hints.
         self._finalize_depression_domain_windows(
@@ -2290,6 +2617,11 @@ class Agent:
         forced = bool(
             isinstance(self._chat_route_ctx, dict)
             and self._chat_route_ctx.get("forced", False)
+        )
+        current_session_prompt_kwargs = self._current_session_prompt_kwargs(
+            other,
+            chats,
+            forced,
         )
         if self.intervention:
             try:
@@ -2424,6 +2756,7 @@ class Agent:
                     retrieval_profile=retrieval_profile,
                     memory_source="external",
                     external_memory_context=external_memory_context,
+                    **current_session_prompt_kwargs,
                 )
             self.logger.info(
                 "[EXT_MEMORY_CHAT_ROUTE] agent={} other={} route=local reason={} turn_no={} is_initiator={} query={}".format(
@@ -2448,6 +2781,7 @@ class Agent:
             consult_history_memory=consult_history_memory,
             retrieval_profile=retrieval_profile,
             memory_source="local",
+            **current_session_prompt_kwargs,
         )
 
     def _wait_other(self, other, focus):

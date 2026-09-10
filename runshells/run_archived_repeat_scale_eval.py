@@ -39,10 +39,12 @@ from run_one_experiment import (
     BASE_DIR,
     POST_EVAL_TIMEOUT_SECONDS,
     SCALE_SCORING_DIR,
-    SCALES,
+    SCALES as LONG_SCALE_SPECS,
     SCORE_WORKER_SCRIPT,
     WORKER_PYTHON,
+    score_worker_tracking_args,
 )
+from modules.model.api_cost import rebuild_summary
 from run_batch_experiment import (
     GROUPS,
     SEVERITIES,
@@ -51,9 +53,6 @@ from run_batch_experiment import (
     VARIANT_SHORT_NAMES,
     aggregate_dimension_trajectory,
     aggregate_final_deltas,
-    apply_trajectory_deltas,
-    extract_direct_answer_score,
-    expected_scale_severity,
     format_delta,
     format_number,
     load_json_file,
@@ -67,6 +66,12 @@ from run_batch_experiment import (
     trigger_sort_key,
     write_json_file,
 )
+from scale_protocol import (
+    LONG_SCALE_NAMES,
+    SCALE_SPECS,
+    SHORT_SCALE_NAMES,
+    extract_unambiguous_direct_answer_score,
+)
 from cbt_experiment_config import (
     MANIFEST_FILENAME,
     assert_identity_matches,
@@ -74,20 +79,26 @@ from cbt_experiment_config import (
 )
 
 
-DEFAULT_LABELS = ["T0", "session_4", "session_8", "session_12", "session_16", "T4", "POST"]
+DEFAULT_LABELS = ["auto"]
 REPEAT_OUTPUT_SUBDIR = "repeat_scale_eval"
 STAGED_WORKER_SCRIPT = BASE_DIR / "runshells" / "run_staged_eval_worker.py"
 CHECKPOINT_RESULTS_PREFIX = "/workspace/project/results"
 REPEAT_VLLM_ENV = "GA_REPEAT_USE_VLLM_MODELS"
 SNAPSHOT_BUNDLE_SCHEMA_VERSION = 1
 AGGREGATION_METHOD_VERSION = "fixed_complete_scale_reviewed_v2"
+SCALES = LONG_SCALE_SPECS
+ALL_SCALE_SPECS = SCALE_SPECS
 SCALE_ITEM_SCORE_KEYS = {
-    "PHQ-9": "phq9_scores",
-    "BDI-II": "bdi_ii_scores",
+    scale_name: str(scale_spec["item_score_key"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
 }
 SCALE_ITEM_COUNTS = {
-    "PHQ-9": 9,
-    "BDI-II": 21,
+    scale_name: int(scale_spec["item_count"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
+}
+SCALE_MAX_ITEM_SCORES = {
+    scale_name: int(scale_spec["max_item_score"])
+    for scale_name, scale_spec in SCALE_SPECS.items()
 }
 
 # ============================================================
@@ -103,10 +114,13 @@ ORIGINAL_SUMMARY = None
 # 输出批次名；留空则自动生成，例如 repeat-scale-0630-1530
 NAME = None
 
-# 每个评估点完整重复评估次数
+# PHQ-9/BDI-II（T0、实际末次及其他长量表节点）的完整重复评估次数
 REPEAT = 10
 
-# 评估点；可填字符串 "T0,POST"，也可直接使用 ",".join(DEFAULT_LABELS)
+# 中间两个短量表的完整重复评估次数
+INTERMEDIATE_SCALE_REPEATS = 5
+
+# 评估点；"auto" 按原始 summary 的实际 staged 节点选择，亦可填 "T0,session_2"。
 LABELS = ",".join(DEFAULT_LABELS)
 
 # 只处理指定 condition；留空表示处理原始 summary 中全部 condition
@@ -162,6 +176,7 @@ class RuntimeConfig:
     output_group: str
     cleanup_completed_artifacts: bool = False
     require_controller_manifest: bool = False
+    intermediate_scale_repeats: int = INTERMEDIATE_SCALE_REPEATS
 
 
 @dataclass(frozen=True)
@@ -182,8 +197,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--original-summary", default=ORIGINAL_SUMMARY, help="原始 *_summary.json；默认自动从 reports 目录选择")
     parser.add_argument("--name", default=NAME, help="输出批次名，默认 repeat-scale-<MMdd-HHmm>")
-    parser.add_argument("--repeat", type=int, default=REPEAT, help="每个评估点固定完整重复次数，默认 10")
-    parser.add_argument("--labels", default=LABELS, help="逗号分隔评估点")
+    parser.add_argument("--repeat", type=int, default=REPEAT, help="PHQ-9/BDI-II 节点的固定完整重复次数，默认 10")
+    parser.add_argument(
+        "--intermediate-scale-repeats",
+        type=int,
+        default=INTERMEDIATE_SCALE_REPEATS,
+        help="中间短量表节点的固定完整重复次数，默认 5",
+    )
+    parser.add_argument("--labels", default=LABELS, help="逗号分隔评估点；auto=原始 summary 的实际 staged 节点")
     parser.add_argument("--condition", action="append", default=None, help="只处理指定 condition，可重复传入")
     parser.add_argument("--max-parallel", type=int, default=MAX_PARALLEL, help="并行任务数")
     parser.add_argument("--force", action=argparse.BooleanOptionalAction, default=FORCE, help="覆盖已有重复输出")
@@ -373,6 +394,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         raise FileNotFoundError(f"original summary not found: {original_summary}")
 
     repeat = max(1, int(args.repeat or 1))
+    intermediate_scale_repeats = max(1, int(args.intermediate_scale_repeats or 1))
     max_parallel = max(1, int(args.max_parallel or 1))
     return RuntimeConfig(
         archive_results_root=archive_results_root,
@@ -391,6 +413,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         output_group=str(args.output_group or "").strip().lower(),
         cleanup_completed_artifacts=bool(args.cleanup_completed_artifacts),
         require_controller_manifest=bool(args.require_controller_manifest),
+        intermediate_scale_repeats=intermediate_scale_repeats,
     )
 
 
@@ -456,8 +479,8 @@ def build_repeat_group_severity_matrix(cfg: RuntimeConfig, results: list[dict]) 
 
 def print_effective_config(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> None:
     selected = selected_conditions(cfg, original_summary)
-    task_count = len(selected) * len(cfg.labels) * cfg.repeat
-    score_count = task_count * len(SCALES)
+    tasks = build_tasks(cfg, original_summary)
+    score_count = sum(len(scale_names_for_task(cfg, task)) for task in tasks)
     print("==========================================")
     print(" 存档重复量表评估配置")
     print("==========================================")
@@ -466,8 +489,9 @@ def print_effective_config(cfg: RuntimeConfig, original_summary: dict[str, Any])
     print(f"  output name:     {cfg.name}")
     print(f"  conditions:      {len(selected)}")
     print(f"  labels:          {', '.join(cfg.labels)}")
-    print(f"  repeat:          {cfg.repeat}")
-    print(f"  tasks:           {task_count} answer jobs, {score_count} score jobs")
+    print(f"  long repeats:    {cfg.repeat}")
+    print(f"  intermediate repeats: {cfg.intermediate_scale_repeats}")
+    print(f"  tasks:           {len(tasks)} answer jobs, {score_count} score jobs")
     print(f"  max_parallel:    {cfg.max_parallel}")
     print(f"  force:           {cfg.force}")
     print(f"  resume-partial:  {cfg.resume_partial}")
@@ -1045,23 +1069,28 @@ def evaluation_protocol_metadata(cfg: RuntimeConfig, job: dict[str, Any]) -> dic
     intervention = runtime_config.get("intervention", {}) if isinstance(runtime_config.get("intervention"), dict) else {}
     scale_question_files = job.get("scale_question_files", {}) if isinstance(job.get("scale_question_files"), dict) else {}
     scale_item_ids = job.get("scale_item_ids", {}) if isinstance(job.get("scale_item_ids"), dict) else {}
+    scale_names = [
+        str(scale_name)
+        for scale_name in (job.get("scales", []) or [])
+        if str(scale_name) in ALL_SCALE_SPECS
+    ]
     return {
         "method_version": AGGREGATION_METHOD_VERSION,
-        "expected_repeats": cfg.repeat,
-        "scales": list(SCALES),
-        "scale_order": list(SCALES),
+        "expected_repeats": repeat_count_for_scales(cfg, scale_names),
+        "scales": scale_names,
+        "scale_order": scale_names,
         "scale_question_files": {
-            scale_name: str(scale_question_files.get(scale_name, SCALES[scale_name]["question_file"]))
-            for scale_name in SCALES
+            scale_name: str(scale_question_files.get(scale_name, ALL_SCALE_SPECS[scale_name]["question_file"]))
+            for scale_name in scale_names
         },
         "scale_item_ids": {
             scale_name: list(scale_item_ids[scale_name])
-            for scale_name in SCALES
+            for scale_name in scale_names
             if isinstance(scale_item_ids.get(scale_name), list)
         },
         "scale_scoring_prompts": {
-            scale_name: SCALES[scale_name]["scoring_prompt"]
-            for scale_name in SCALES
+            scale_name: ALL_SCALE_SPECS[scale_name]["scoring_prompt"]
+            for scale_name in scale_names
         },
         "snapshot_name": str(job.get("snapshot_name", "") or ""),
         "target_agent": target_agent,
@@ -1085,6 +1114,140 @@ def condition_evaluation(condition: dict[str, Any], label: str) -> dict[str, Any
         if str(evaluation.get("trigger_label", "")) == label:
             return evaluation
     return None
+
+
+def labels_for_condition(cfg: RuntimeConfig, condition: dict[str, Any]) -> list[str]:
+    counts = {
+        str(evaluation.get("trigger_label", "") or ""): int(
+            evaluation.get("completed_session_count", 0) or 0
+        )
+        for evaluation in condition.get("evaluations", []) or []
+        if isinstance(evaluation, dict)
+    }
+    if cfg.labels == ["auto"]:
+        labels = [
+            str(evaluation.get("trigger_label", "") or "").strip()
+            for evaluation in condition.get("evaluations", []) or []
+            if isinstance(evaluation, dict)
+            and str(evaluation.get("source", "") or "")
+            in {"staged_eval", "staged_eval_snapshot", "synthesized_staged_eval"}
+            and str(evaluation.get("trigger_label", "") or "").strip()
+        ]
+    else:
+        labels = list(cfg.labels)
+    return sorted(
+        set(labels),
+        key=lambda label: trigger_sort_key(str(label), counts.get(str(label), 0)),
+    )
+
+
+def ordered_selected_labels(cfg: RuntimeConfig, condition: dict[str, Any]) -> list[str]:
+    return labels_for_condition(cfg, condition)
+
+
+def use_short_scales(runtime_config: dict[str, Any]) -> bool:
+    staged_eval = runtime_config.get("staged_eval", {}) if isinstance(runtime_config, dict) else {}
+    return bool(
+        isinstance(staged_eval, dict)
+        and staged_eval.get("use_short_scales_for_intermediate_eval", False)
+    )
+
+
+def scale_names_for_label(
+    cfg: RuntimeConfig,
+    condition: dict[str, Any],
+    label: str,
+    runtime_config: dict[str, Any],
+) -> list[str]:
+    if not use_short_scales(runtime_config):
+        return list(LONG_SCALE_NAMES)
+    labels = ordered_selected_labels(cfg, condition)
+    if not labels or label == "T0" or label in {labels[0], labels[-1]}:
+        return list(LONG_SCALE_NAMES)
+    return list(SHORT_SCALE_NAMES)
+
+
+def source_runtime_config_for_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
+    run_name = str(task.condition.get("run_name", "") or "").strip()
+    checkpoint_dir = checkpoints_root(cfg) / run_name
+    if task.label == "POST":
+        snapshot = latest_snapshot_name(checkpoint_dir)
+        payload = load_optional_json(checkpoint_dir / snapshot) or {}
+    else:
+        payload = load_optional_json(
+            checkpoint_dir / "staged_eval" / task.label / "job.json"
+        ) or {}
+        payload = payload.get("runtime_config", {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def scale_names_for_task(cfg: RuntimeConfig, task: RepeatTask) -> list[str]:
+    # The capture job is written while the simulation is still running, so it
+    # cannot always know that the current snapshot will become the last actual
+    # node.  Once the complete label list is available, the boundary-node
+    # policy is authoritative: first/last nodes must use PHQ-9 and BDI-II even
+    # when an older capture job recorded the intermediate short scales.
+    selected_labels = ordered_selected_labels(cfg, task.condition)
+    is_boundary = (
+        not selected_labels
+        or task.label == "T0"
+        or task.label in {selected_labels[0], selected_labels[-1]}
+    )
+    if is_boundary:
+        return list(LONG_SCALE_NAMES)
+    runtime_config = source_runtime_config_for_task(cfg, task)
+    policy_scales = scale_names_for_label(
+        cfg,
+        task.condition,
+        task.label,
+        runtime_config,
+    )
+    if runtime_config and not use_short_scales(runtime_config):
+        return policy_scales
+    if task.label != "POST":
+        run_name = str(task.condition.get("run_name", "") or "").strip()
+        source_job = load_optional_json(
+            checkpoints_root(cfg) / run_name / "staged_eval" / task.label / "job.json"
+        ) or {}
+        source_scales = source_job.get("scales", [])
+        if (
+            isinstance(source_scales, list)
+            and source_scales
+            and all(str(scale_name) in ALL_SCALE_SPECS for scale_name in source_scales)
+        ):
+            return [str(scale_name) for scale_name in source_scales]
+    return policy_scales
+
+
+def configure_job_scales(
+    cfg: RuntimeConfig,
+    task: RepeatTask,
+    job: dict[str, Any],
+) -> list[str]:
+    scale_names = scale_names_for_task(cfg, task)
+    job["scales"] = list(scale_names)
+    job["scale_question_files"] = {
+        scale_name: str(ALL_SCALE_SPECS[scale_name]["question_file"])
+        for scale_name in scale_names
+    }
+    raw_item_ids = job.get("scale_item_ids", {})
+    if isinstance(raw_item_ids, dict):
+        job["scale_item_ids"] = {
+            scale_name: copy.deepcopy(raw_item_ids[scale_name])
+            for scale_name in scale_names
+            if scale_name in raw_item_ids
+        }
+    return scale_names
+
+
+def repeat_count_for_scales(cfg: RuntimeConfig, scale_names: list[str]) -> int:
+    if list(scale_names) == list(SHORT_SCALE_NAMES):
+        return cfg.intermediate_scale_repeats
+    return cfg.repeat
+
+
+def repeat_count_for_task(cfg: RuntimeConfig, task: RepeatTask) -> int:
+    return repeat_count_for_scales(cfg, scale_names_for_task(cfg, task))
 
 
 def canonical_json_sha256(payload: Any) -> str:
@@ -1300,10 +1463,10 @@ def build_post_job(
         "sim_time": "",
         "snapshot_name": snapshot,
         "target_agent": target_agent,
-        "scales": list(SCALES.keys()),
+        "scales": list(LONG_SCALE_NAMES),
         "scale_question_files": {
-            scale_name: scale_cfg["question_file"]
-            for scale_name, scale_cfg in SCALES.items()
+            scale_name: ALL_SCALE_SPECS[scale_name]["question_file"]
+            for scale_name in LONG_SCALE_NAMES
         },
         "runtime_config": runtime_config,
         "conversation": load_conversation(checkpoint_dir),
@@ -1316,10 +1479,19 @@ def build_post_job(
     return job, metadata
 
 
-def score_scale_answers(output_dir: Path, scale_name: str, *, dry_run: bool) -> None:
+def score_scale_answers(
+    cfg: RuntimeConfig,
+    output_dir: Path,
+    scale_name: str,
+    *,
+    run_name: str,
+    runtime_config: dict[str, Any],
+    evaluation_id: str,
+    dry_run: bool,
+) -> None:
     answers_path = output_dir / f"{scale_name}_answered.jsonl"
     scored_path = output_dir / f"{scale_name}_scored.json"
-    scoring_prompt = SCALE_SCORING_DIR / SCALES[scale_name]["scoring_prompt"]
+    scoring_prompt = SCALE_SCORING_DIR / ALL_SCALE_SPECS[scale_name]["scoring_prompt"]
     cmd = [
         WORKER_PYTHON,
         str(SCORE_WORKER_SCRIPT),
@@ -1330,6 +1502,16 @@ def score_scale_answers(output_dir: Path, scale_name: str, *, dry_run: bool) -> 
         "--output",
         str(scored_path),
     ]
+    cmd.extend(
+        score_worker_tracking_args(
+            run_name=run_name,
+            phase="repeat_evaluation",
+            scale_name=scale_name,
+            runtime_config=runtime_config,
+            experiment_data_root=experiment_data_root(cfg),
+            evaluation_id=evaluation_id,
+        )
+    )
     print(f"[RUN] {' '.join(cmd)}")
     if dry_run:
         return
@@ -1375,10 +1557,21 @@ def task_complete(cfg: RuntimeConfig, task: RepeatTask) -> bool:
     answer_spec = completed_answer_spec(output_dir, metadata)
     if not answer_spec:
         return False
+    protocol_scales = (metadata.get("evaluation_protocol", {}) or {}).get("scales")
+    if isinstance(protocol_scales, list) and protocol_scales:
+        scale_names = [str(scale_name) for scale_name in protocol_scales]
+        try:
+            if scale_names != scale_names_for_task(cfg, task):
+                return False
+        except (FileNotFoundError, AttributeError):
+            pass
+    else:
+        raw_scales = answer_spec.get("scales", list(LONG_SCALE_NAMES))
+        scale_names = [str(scale_name) for scale_name in raw_scales]
     return all(
         answer_file_complete(output_dir, answer_spec, scale_name)
         and score_result_complete(output_dir / f"{scale_name}_scored.json", scale_name)
-        for scale_name in SCALES
+        for scale_name in scale_names
     )
 
 
@@ -1391,6 +1584,8 @@ def select_resumable_job(
         return rebuilt_job, False
     existing_job = load_optional_json(job_path)
     if not isinstance(existing_job, dict) or not existing_job:
+        return rebuilt_job, False
+    if existing_job.get("scales") != rebuilt_job.get("scales"):
         return rebuilt_job, False
     return existing_job, True
 
@@ -1423,10 +1618,20 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
         job, source_metadata = build_post_job(cfg, condition, output_dir)
     else:
         job, source_metadata = build_staged_job(cfg, condition, task.label, output_dir)
+    scale_names = configure_job_scales(cfg, task, job)
 
     job_path = output_dir / "job.json"
     active_job, preserve_existing_job = select_resumable_job(cfg, job_path, job)
-    if not cfg.dry_run and not preserve_existing_job:
+    evaluation_id = f"{cfg.name}:{condition_name}:r{task.repeat_idx:02d}:{task.label}"
+    api_cost_context = {
+        "run_name": run_name,
+        "phase": "repeat_evaluation",
+        "experiment_data_root": str(experiment_data_root(cfg)),
+        "evaluation_id": evaluation_id,
+    }
+    api_cost_context_changed = active_job.get("api_cost") != api_cost_context
+    active_job["api_cost"] = api_cost_context
+    if not cfg.dry_run and (not preserve_existing_job or api_cost_context_changed):
         write_json_file(job_path, active_job)
 
     metadata = copy.deepcopy(source_metadata)
@@ -1468,21 +1673,35 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
         cfg,
         output_dir,
         active_job,
-        list(SCALES),
+        scale_names,
         description="job",
     )
 
     if not cfg.dry_run:
-        for scale_name in SCALES:
+        for scale_name in scale_names:
             if not answer_file_complete(output_dir, active_job, scale_name):
                 raise RuntimeError(f"answer worker produced incomplete answers: {output_dir} ({scale_name})")
 
-    for scale_name in SCALES:
+    for scale_name in scale_names:
         scored_path = output_dir / f"{scale_name}_scored.json"
         if cfg.resume_partial and not cfg.force and score_result_complete(scored_path, scale_name):
             print(f"[RESUME] reuse score: {scored_path}")
             continue
-        score_scale_answers(output_dir, scale_name, dry_run=cfg.dry_run)
+        score_scale_answers(
+            cfg,
+            output_dir,
+            scale_name,
+            run_name=run_name,
+            runtime_config=(
+                active_job.get("runtime_config", {})
+                if isinstance(active_job.get("runtime_config", {}), dict)
+                else {}
+            ),
+            evaluation_id=(
+                evaluation_id
+            ),
+            dry_run=cfg.dry_run,
+        )
         if not cfg.dry_run and not score_result_complete(scored_path, scale_name):
             raise RuntimeError(f"score worker produced invalid item scores: {scored_path}")
 
@@ -1502,17 +1721,19 @@ def run_repeat_task(cfg: RuntimeConfig, task: RepeatTask) -> dict[str, Any]:
 
 
 def build_tasks(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> list[RepeatTask]:
-    return [
-        RepeatTask(condition=condition, label=label, repeat_idx=repeat_idx)
-        for condition in selected_conditions(cfg, original_summary)
-        for label in cfg.labels
-        for repeat_idx in range(1, cfg.repeat + 1)
-    ]
+    tasks: list[RepeatTask] = []
+    for condition in selected_conditions(cfg, original_summary):
+        for label in labels_for_condition(cfg, condition):
+            prototype = RepeatTask(condition=condition, label=label, repeat_idx=1)
+            for repeat_idx in range(1, repeat_count_for_task(cfg, prototype) + 1):
+                tasks.append(RepeatTask(condition=condition, label=label, repeat_idx=repeat_idx))
+    return tasks
 
 
 def run_tasks(cfg: RuntimeConfig, original_summary: dict[str, Any]) -> list[dict[str, Any]]:
     tasks = build_tasks(cfg, original_summary)
-    print(f"[PLAN] {len(tasks)} answer jobs, {len(tasks) * len(SCALES)} score jobs")
+    score_count = sum(len(scale_names_for_task(cfg, task)) for task in tasks)
+    print(f"[PLAN] {len(tasks)} answer jobs, {score_count} score jobs")
     if cfg.dry_run:
         results = []
         for task in tasks:
@@ -1730,9 +1951,16 @@ def summarize_scale_repeats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def load_repeat_rows(cfg: RuntimeConfig, condition_name: str, label: str, scale_name: str) -> list[dict[str, Any]]:
+def load_repeat_rows(
+    cfg: RuntimeConfig,
+    condition_name: str,
+    label: str,
+    scale_name: str,
+    expected_repeats: int | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for repeat_idx in range(1, cfg.repeat + 1):
+    expected_repeats = cfg.repeat if expected_repeats is None else expected_repeats
+    for repeat_idx in range(1, expected_repeats + 1):
         output_dir = repeat_label_dir(cfg, condition_name, repeat_idx, label)
         scored_path = output_dir / f"{scale_name}_scored.json"
         answers_path = output_dir / f"{scale_name}_answered.jsonl"
@@ -1803,11 +2031,33 @@ def expected_item_count(scale_name: str) -> int:
     return SCALE_ITEM_COUNTS[scale_name]
 
 
-def normalize_score(value: Any) -> int | None:
+def expected_scale_severity(scale_name: str, total: int | float) -> str:
+    if scale_name == "PHQ-9":
+        if total <= 4:
+            return "无抑郁"
+        if total <= 9:
+            return "轻度抑郁"
+        if total <= 14:
+            return "中度抑郁"
+        if total <= 19:
+            return "中重度抑郁"
+        return "重度抑郁"
+    if scale_name == "BDI-II":
+        if total <= 13:
+            return "无抑郁"
+        if total <= 19:
+            return "轻度抑郁"
+        if total <= 28:
+            return "中度抑郁"
+        return "重度抑郁"
+    return "未设置分级"
+
+
+def normalize_score(value: Any, scale_name: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     score = value
-    if score < 0 or score > 3:
+    if score < 0 or score > SCALE_MAX_ITEM_SCORES[scale_name]:
         return None
     return score
 
@@ -1821,7 +2071,8 @@ def parse_scored_item_id(item_label: Any, scale_name: str) -> int | None:
         identifier_pattern = r"BDI(?:-II)?\s*(?:第\s*)?([0-9]+)"
         valid_ids = set(range(1, 22))
     else:
-        return None
+        identifier_pattern = rf"{re.escape(scale_name)}\s*(?:第\s*)?([0-9]+)"
+        valid_ids = set(range(1, expected_item_count(scale_name) + 1))
     identifiers = [int(value) for value in re.findall(identifier_pattern, text)]
     prefix_match = re.match(rf"^{identifier_pattern}", text)
     if not prefix_match or len(identifiers) != 1 or identifiers[0] not in valid_ids:
@@ -1829,25 +2080,11 @@ def parse_scored_item_id(item_label: Any, scale_name: str) -> int | None:
     return identifiers[0]
 
 
-def extract_unambiguous_answer_score(answer: str) -> tuple[int | None, str]:
-    answer_score, status = extract_direct_answer_score(answer)
-    if status != "direct" or answer_score is None:
-        return answer_score, status
-
-    score_values = {"0": 0, "1": 1, "2": 2, "3": 3, "零": 0, "一": 1, "二": 2, "两": 2, "三": 3}
-    explicit_tokens = re.findall(
-        r"(?:选|选择)\s*(?:了)?\s*([0-3零一二两三])|([0-3零一二两三])\s*分",
-        str(answer or ""),
+def extract_unambiguous_answer_score(answer: str, scale_name: str) -> tuple[int | None, str]:
+    return extract_unambiguous_direct_answer_score(
+        answer,
+        max_score=SCALE_MAX_ITEM_SCORES[scale_name],
     )
-    explicit_scores = {
-        score_values[token]
-        for groups in explicit_tokens
-        for token in groups
-        if token
-    }
-    if len(explicit_scores) > 1:
-        return None, "ambiguous"
-    return answer_score, status
 
 
 def extract_scored_item_records(scored: dict[str, Any] | None, scale_name: str) -> dict[int, dict[str, Any]]:
@@ -1865,7 +2102,7 @@ def extract_scored_item_records(scored: dict[str, Any] | None, scale_name: str) 
         item_id = parse_scored_item_id(item.get("item"), scale_name)
         if item_id != index or item_id in records:
             return {}
-        score = normalize_score(item.get("score"))
+        score = normalize_score(item.get("score"), scale_name)
         if score is None:
             return {}
         records[item_id] = {
@@ -1898,7 +2135,7 @@ def build_reviewed_item_scores(
         if item_id < 1 or item_id > expected_count:
             continue
         answer_text = str(row.get("answer", "") or "")
-        answer_score, status = extract_unambiguous_answer_score(answer_text)
+        answer_score, status = extract_unambiguous_answer_score(answer_text, scale_name)
         if status != "direct" or answer_score is None:
             continue
         direct_answer_count += 1
@@ -1928,24 +2165,75 @@ def build_reviewed_item_scores(
     }
 
 
-def metadata_for_label(cfg: RuntimeConfig, condition_name: str, label: str) -> dict[str, Any]:
-    for repeat_idx in range(1, cfg.repeat + 1):
+def metadata_for_label(
+    cfg: RuntimeConfig,
+    condition_name: str,
+    label: str,
+    expected_repeats: int,
+) -> dict[str, Any]:
+    for repeat_idx in range(1, expected_repeats + 1):
         metadata = load_optional_json(repeat_label_dir(cfg, condition_name, repeat_idx, label) / "metadata.json")
         if metadata:
             return metadata
     return {"trigger_label": label, "completed_session_count": 0, "sim_time": "", "snapshot_name": ""}
 
 
+def apply_trajectory_deltas(evaluations: list[dict[str, Any]]) -> None:
+    scale_names = {
+        str(scale_name)
+        for evaluation in evaluations
+        for scale_name in (evaluation.get("scales", {}) or {})
+    }
+    for scale_name in scale_names:
+        baseline = next(
+            (
+                float(scale_payload.get("total_score"))
+                for evaluation in evaluations
+                if str(evaluation.get("trigger_label", "") or "").strip().upper() == "T0"
+                for scale_payload in [(evaluation.get("scales", {}) or {}).get(scale_name, {})]
+                if isinstance(scale_payload, dict) and scale_payload.get("total_score") is not None
+            ),
+            None,
+        )
+        previous = None
+        for evaluation in evaluations:
+            scale_payload = (evaluation.get("scales", {}) or {}).get(scale_name)
+            if not isinstance(scale_payload, dict):
+                continue
+            total_score = scale_payload.get("total_score")
+            if total_score is None:
+                scale_payload["delta_from_previous"] = None
+                scale_payload["delta_from_baseline"] = None
+                continue
+            scale_payload["delta_from_previous"] = (
+                0.0 if previous is None else float(total_score) - previous
+            )
+            scale_payload["delta_from_baseline"] = (
+                float(total_score) - baseline if baseline is not None else None
+            )
+            previous = float(total_score)
+
+
 def build_condition_result(cfg: RuntimeConfig, condition: dict[str, Any]) -> dict[str, Any] | None:
     condition_name = str(condition.get("condition_name", ""))
     evaluations: list[dict[str, Any]] = []
-    for label in cfg.labels:
-        metadata = metadata_for_label(cfg, condition_name, label)
+    for label in labels_for_condition(cfg, condition):
+        prototype = RepeatTask(condition=condition, label=label, repeat_idx=1)
+        expected_repeats = repeat_count_for_task(cfg, prototype)
+        metadata = metadata_for_label(cfg, condition_name, label, expected_repeats)
+        protocol = metadata.get("evaluation_protocol", {})
+        scale_names = protocol.get("scales") if isinstance(protocol, dict) else None
+        if not isinstance(scale_names, list) or not scale_names:
+            scale_names = scale_names_for_task(
+                cfg,
+                prototype,
+            )
+        expected_repeats = repeat_count_for_scales(cfg, [str(scale_name) for scale_name in scale_names])
         scales_payload = {
             scale_name: summarize_scale_repeats(
-                load_repeat_rows(cfg, condition_name, label, scale_name),
+                load_repeat_rows(cfg, condition_name, label, scale_name, expected_repeats),
             )
-            for scale_name in SCALES
+            for scale_name in scale_names
         }
         evaluations.append(
             {
@@ -2177,9 +2465,18 @@ def calculate_icc_one_way(matrix: list[list[float]]) -> dict[str, Any]:
 
 def build_reliability_analysis(results: list[dict[str, Any]], labels: list[str], repeat: int) -> dict[str, Any]:
     by_scale: dict[str, Any] = {}
-    for scale_name in SCALES:
+    for scale_name in ALL_SCALE_SPECS:
         label_payload: dict[str, Any] = {}
         for label in labels:
+            expected_counts = {
+                int((item.get("scales", {}) or {}).get(scale_name, {}).get("expected_repeats", repeat) or repeat)
+                for result in results
+                for item in result.get("evaluations", []) or []
+                if str(item.get("trigger_label", "") or "") == label
+                and isinstance((item.get("scales", {}) or {}).get(scale_name), dict)
+            }
+            has_unequal_expected_repeats = len(expected_counts) > 1
+            expected_repeats = next(iter(expected_counts)) if len(expected_counts) == 1 else repeat
             matrix: list[list[float]] = []
             target_names: list[str] = []
             excluded_targets: list[str] = []
@@ -2200,19 +2497,22 @@ def build_reliability_analysis(results: list[dict[str, Any]], labels: list[str],
                     for row in rows or []
                     if row.get("status") == "ok" and row.get("total_score") is not None
                 ]
-                if scale_payload.get("aggregation_status") == "complete" and len(scores) == repeat:
+                if scale_payload.get("aggregation_status") == "complete" and len(scores) == expected_repeats:
                     matrix.append(scores)
                     target_names.append(condition_name)
                 else:
                     excluded_targets.append(condition_name)
             item = calculate_icc_one_way(matrix)
+            item["complete_repeats_required"] = expected_repeats
+            if has_unequal_expected_repeats:
+                item["reason"] = "unequal_expected_repeats"
             item["targets"] = target_names
             item["excluded_targets"] = excluded_targets
             label_payload[label] = item
         by_scale[scale_name] = label_payload
     return {
         "unit": "condition/persona target within each scale and trigger label",
-        "complete_repeats_required": repeat,
+        "complete_repeats_required": "per scale/trigger label; see each item",
         "by_scale": by_scale,
     }
 
@@ -2256,6 +2556,17 @@ def build_summary_payload(
         result = build_condition_result(cfg, condition)
         if result is not None:
             results.append(result)
+    observed_scale_names = {
+        str(scale_name)
+        for result in results
+        for evaluation in result.get("evaluations", []) or []
+        for scale_name in (evaluation.get("scales", {}) or {})
+    }
+    report_scale_names = [
+        scale_name
+        for scale_name in ALL_SCALE_SPECS
+        if scale_name in observed_scale_names
+    ]
     sensitivity_analysis = build_sensitivity_analysis(cfg, results)
     reliability_analysis = build_reliability_analysis(results, ordered_trigger_labels(results), cfg.repeat)
     completion = build_report_completion(results)
@@ -2265,8 +2576,9 @@ def build_summary_payload(
         "aggregation_method_version": AGGREGATION_METHOD_VERSION,
         "evaluation_protocol": {
             "expected_repeats": cfg.repeat,
-            "scales": list(SCALES),
-            "scale_order": list(SCALES),
+            "intermediate_scale_repeats": cfg.intermediate_scale_repeats,
+            "scales": report_scale_names,
+            "scale_order": report_scale_names,
             "strict_complete_k": True,
             "primary_score": "mean_of_complete_reviewed_scale_totals",
             "within_repeat_review": "direct_unambiguous_answer_score_overrides_llm_item_score",
@@ -2383,7 +2695,7 @@ def render_original_diff_markdown(diff: dict[str, Any]) -> list[str]:
     lines.append("### 差异概览\n")
     lines.append("| 量表 | 条目数 | 平均绝对差 | 最大绝对差 | 程度变化数 | 有失败/缺失重复的条目数 |")
     lines.append("|------|--------|------------|------------|------------|--------------------------|")
-    for scale_name in SCALES:
+    for scale_name in ALL_SCALE_SPECS:
         item = summary.get(scale_name, {}) if isinstance(summary, dict) else {}
         lines.append(
             "| {scale} | {count} | {mad} | {maxd} | {sev} | {missing} |".format(
@@ -2594,7 +2906,7 @@ def render_reliability_markdown(payload: dict[str, Any]) -> list[str]:
     lines.append("| 量表 | 评估点 | 目标数 | K | ICC(1,1) | ICC(1,K) | 不可计算原因 | 排除目标 |")
     lines.append("|------|--------|--------|---|----------|----------|--------------|----------|")
     by_scale = payload.get("by_scale", {}) if isinstance(payload, dict) else {}
-    for scale_name in SCALES:
+    for scale_name in ALL_SCALE_SPECS:
         for label, item in (by_scale.get(scale_name, {}) or {}).items():
             lines.append(
                 "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
@@ -2653,7 +2965,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             if ready_for_final
             else "> **状态：未完成。此文件仅用于续跑诊断，不是最终报告；请使用相同 `--name` 重新运行。**\n"
         ),
-        "> 本汇总只统计 PHQ-9 / BDI-II。每次以 LLM 条目分为底稿，用患者明确且无歧义的 0–3 分回答覆盖冲突条目；主分数是固定 K 次复核后完整量表总分的均值。重复测量不是独立患者样本。\n",
+        "> 本汇总按评估节点保存其实际使用的量表。PHQ-9 / BDI-II 条目为 0–3 分，两个总体水平及干扰程度简表条目为 0–4 分；每次以 LLM 条目分为底稿，并用患者明确且无歧义的直接评分覆盖冲突条目。主分数是固定 K 次复核后完整量表总分的均值；重复测量不是独立患者样本。\n",
         "## 汇总范围\n",
         f"- 完成状态：`{completion.get('status', 'unknown')}`",
         f"- 完整量表目标：{completion.get('complete_scale_targets', '—')} / {completion.get('total_scale_targets', '—')}",
@@ -2806,8 +3118,9 @@ def _build_cleanup_candidates(
 
     for condition in selected_conditions(cfg, original_summary):
         condition_name = str(condition.get("condition_name", "") or "")
-        for repeat_idx in range(1, cfg.repeat + 1):
-            for label in cfg.labels:
+        for label in labels_for_condition(cfg, condition):
+            prototype = RepeatTask(condition=condition, label=label, repeat_idx=1)
+            for repeat_idx in range(1, repeat_count_for_task(cfg, prototype) + 1):
                 label_dir = repeat_label_dir(
                     cfg,
                     condition_name,
@@ -2996,38 +3309,51 @@ def main() -> None:
         raise ValueError(f"original summary must be JSON object: {cfg.original_summary}")
 
     print_effective_config(cfg, original_summary)
-    prepare_generation_manifests(cfg, original_summary)
-    warnings: list[str] = []
-    if not cfg.report_only:
-        task_results = run_tasks(cfg, original_summary)
-        for item in task_results:
-            if item.get("status") == "error":
-                warnings.append(
-                    "{condition} {label} r{repeat:02d}: {error}".format(
-                        condition=item.get("condition_name", "—"),
-                        label=item.get("label", "—"),
-                        repeat=int(item.get("repeat", 0) or 0),
-                        error=item.get("error", ""),
-                    )
-                )
-    else:
-        print("[INFO] report-only: 跳过 worker 调用，只汇总已有重复结果")
-
-    payload = build_summary_payload(cfg, original_summary, warnings)
-    json_path, md_path = write_report_outputs(cfg, payload)
-    require_complete_report(cfg, payload, md_path)
+    cost_run_names = sorted(
+        {
+            str(condition.get("run_name", "") or "").strip()
+            for condition in selected_conditions(cfg, original_summary)
+            if str(condition.get("run_name", "") or "").strip()
+        }
+    )
+    for run_name in cost_run_names:
+        rebuild_summary(run_name, experiment_data_root=experiment_data_root(cfg))
     try:
-        cleanup_completed_artifacts(
-            cfg,
-            original_summary,
-            payload,
-            json_path,
-            md_path,
-        )
-    except Exception as exc:
-        # Cleanup is operational housekeeping and must not invalidate a
-        # scientifically complete report.
-        print(f"[WARN] 正式报告已完成，但复评底稿清理失败：{exc}")
+        prepare_generation_manifests(cfg, original_summary)
+        warnings: list[str] = []
+        if not cfg.report_only:
+            task_results = run_tasks(cfg, original_summary)
+            for item in task_results:
+                if item.get("status") == "error":
+                    warnings.append(
+                        "{condition} {label} r{repeat:02d}: {error}".format(
+                            condition=item.get("condition_name", "—"),
+                            label=item.get("label", "—"),
+                            repeat=int(item.get("repeat", 0) or 0),
+                            error=item.get("error", ""),
+                        )
+                    )
+        else:
+            print("[INFO] report-only: 跳过 worker 调用，只汇总已有重复结果")
+
+        payload = build_summary_payload(cfg, original_summary, warnings)
+        json_path, md_path = write_report_outputs(cfg, payload)
+        require_complete_report(cfg, payload, md_path)
+        try:
+            cleanup_completed_artifacts(
+                cfg,
+                original_summary,
+                payload,
+                json_path,
+                md_path,
+            )
+        except Exception as exc:
+            # Cleanup is operational housekeeping and must not invalidate a
+            # scientifically complete report.
+            print(f"[WARN] 正式报告已完成，但复评底稿清理失败：{exc}")
+    finally:
+        for run_name in cost_run_names:
+            rebuild_summary(run_name, experiment_data_root=experiment_data_root(cfg))
     print(f"\n[Done] 存档重复评估报告: {md_path}")
 
 

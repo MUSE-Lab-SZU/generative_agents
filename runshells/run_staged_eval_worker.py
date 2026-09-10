@@ -22,6 +22,8 @@ if BASE_DIR not in sys.path:
 if "gradio" not in sys.modules:
     sys.modules["gradio"] = types.ModuleType("gradio")
 
+from modules.model.api_cost import configure_tracking, rebuild_summary
+
 
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -97,7 +99,34 @@ def _load_scale_chat_components():
     return ChatSession, iter_jsonl, resolve_question
 
 
-def _evaluate(job: Dict[str, Any], tmp_storage_root: str) -> Dict[str, Any]:
+def _api_cost_context(job: Dict[str, Any]) -> Dict[str, str] | None:
+    raw_context = job.get("api_cost")
+    if raw_context is None:
+        return None
+    if not isinstance(raw_context, dict):
+        raise ValueError("api_cost must be an object when provided")
+    context = {
+        "run_name": str(raw_context.get("run_name", "") or "").strip(),
+        "phase": str(raw_context.get("phase", "") or "").strip(),
+        "experiment_data_root": str(raw_context.get("experiment_data_root", "") or "").strip(),
+        "evaluation_id": str(raw_context.get("evaluation_id", "") or "").strip(),
+    }
+    missing = [
+        field
+        for field in ("run_name", "phase", "experiment_data_root", "evaluation_id")
+        if not context[field]
+    ]
+    if missing:
+        raise ValueError("api_cost missing required fields: {}".format(", ".join(missing)))
+    return context
+
+
+def _evaluate(
+    job: Dict[str, Any],
+    tmp_storage_root: str,
+    *,
+    api_cost: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
     ChatSession, iter_jsonl, resolve_question = _load_scale_chat_components()
     runtime_config = copy.deepcopy(job.get("runtime_config", {})) if isinstance(job.get("runtime_config", {}), dict) else {}
     runtime_config["storage_root_override"] = tmp_storage_root
@@ -135,6 +164,15 @@ def _evaluate(job: Dict[str, Any], tmp_storage_root: str) -> Dict[str, Any]:
     scale_summaries: Dict[str, Any] = {}
     external_memory_read = False
     for scale_name in scales:
+        if api_cost is not None:
+            configure_tracking(
+                api_cost["run_name"],
+                api_cost["phase"],
+                experiment_data_root=api_cost["experiment_data_root"],
+                evaluation_id=api_cost["evaluation_id"],
+                scale_name=str(scale_name),
+                rebuild=False,
+            )
         question_file = str(scale_question_files.get(scale_name, "") or "").strip()
         if not question_file:
             raise ValueError("missing question file for scale: {}".format(scale_name))
@@ -198,6 +236,7 @@ def main() -> int:
 
     job_path = os.path.abspath(str(args.job or "").strip())
     job = _load_json(job_path)
+    api_cost = _api_cost_context(job)
 
     worker_result_path = os.path.abspath(
         str(job.get("worker_result_path", "") or os.path.join(os.path.dirname(job_path), "worker_result.json")).strip()
@@ -225,7 +264,7 @@ def main() -> int:
         result["tmp_root"] = tmp_root
         result["tmp_storage_path"] = tmp_storage_root
 
-        eval_result = _evaluate(job, tmp_storage_root)
+        eval_result = _evaluate(job, tmp_storage_root, api_cost=api_cost)
         result["status"] = "ok"
         result["external_memory_read"] = bool(eval_result.get("external_memory_read", False))
         result["scale_summaries"] = eval_result.get("scale_summaries", {})
@@ -243,6 +282,17 @@ def main() -> int:
                 result["cleanup_error"] = str(exc)
         elif not cleanup_tmp_storage and tmp_root:
             result["cleanup_error"] = "cleanup_disabled"
+
+        if api_cost is not None:
+            try:
+                rebuild_summary(
+                    api_cost["run_name"],
+                    experiment_data_root=api_cost["experiment_data_root"],
+                )
+            except Exception as exc:
+                # Usage persistence must never make an otherwise successful
+                # evaluation fail, matching the LLM-layer ledger policy.
+                print("[API_COST_SUMMARY_ERROR] {}".format(exc), flush=True)
 
         _write_json(worker_result_path, result)
 

@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-08-25
+> 更新时间：2026-09-10
 
 ## 关键测试结果速查
 
@@ -28,6 +28,38 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+- 2026-09-10：根据 Progressive D forced prompt trace 收紧轮内控制：`terminate=true` 的代码门禁仅为动态终止检查已开启；Planner 的“准备收尾”保留为非强制节奏建议，并在第 50 轮后明显转向巩固、总结与安排下一步，第 55 轮起原则上建议收尾。未开启检查时 Judge Prompt 不再保留提前终止提示或 `true` 示例。Session Task Planner Prompt 同时明确只允许由患者最新回复触发 `none → partial/completed` 或 `partial → completed`，禁止重复输出同级状态和已完成目标。Progressive D 常规完成门迁入 `intervention.progressive_d.completion_threshold_ratio` 并设为 60%，由逐轮终止检查和会后 Session 推进共用；40 分钟时间门、3 场会谈 40% 兜底及整体架构不变。
+- 2026-09-10：`runshells/backfill_0908_session12_long_scales.py` 新增 `--max-condition-parallel`（默认 4），可在每个 condition 内既有量表任务并行之外并发补跑多个 condition；单项失败会汇总报错但不取消其他补跑，使用相同命令即可断点续跑。
+- 2026-09-09：统一 72-step 批次的阶段评估与量表边界协议：G2、G10–G12 的 step 间隔由 24 改为 12，使最终节点对齐 `session_12`；报告生成和归档复评均以实际首末 staged 节点为准，强制使用 PHQ-9 / BDI-II 长量表，中间节点保留短量表及“长量表 10 次／中间短量表 5 次”的完整复评口径，分析加载器同步识别双重复次数。新增 `runshells/backfill_0908_session12_long_scales.py`，可补跑 0908 批次的 `session_12` 长量表、重建报告，并仅在严格核验 step=72 最终冻结快照后将旧 G2 的 `session_6` 无损别名为 `session_12`；`docs/town_method/` 七篇文档同步更新。
+- 2026-09-08：调整 Progressive D 的会谈收尾控制：Planner 继续维护任务进度，Judge 独立判断临床闭环；仅当小目标完成度达到阈值或已到最早收尾检查时间（默认 40 分钟）时，才向 Judge 注入详细终止规则并要求输出 `terminate`。此前只输出 `turn_goal`，仅在明确需立即结束的异常情形允许额外输出 `terminate=true`；同时新增默认 60 分钟目标时长、最大轮数节奏信号及终止检查状态 trace，避免时间、轮数或 Planner 单一建议直接决定结束。
+- 2026-09-08：批处理续跑默认目标由 96 step 调整为 72 step，回访起点由 `session_16` 调整为 `session_12`，以匹配新的阶段性复评接力节点。
+- 2026-09-08：同步方法文档与续跑工作流的现行口径：`docs/town_method/` 七篇文档按 `b141add` 重新核对实验条件、动态人设、Progressive D 会谈控制与摘要、长短量表复评、DeepSeek 成本账本及结果解读边界；续跑脚本默认目标改为 96 step、回访起点改为 `session_16`，模型路由配置默认跟随 `--config`，并补齐新人设仅 MOD、G10–G12 仅 Legacy 的大小写无关校验；完成复评后默认清理 job、逐题 trace 和阶段快照副本，可用 `--keep-raw-artifacts` 保留，并新增回归测试覆盖上述行为。
+- 2026-09-08：在 Minimal/Progressive 的 Judge 后新增本地 vLLM `Response Strategy Selector`，将轮内决策拆为“Judge 仅输出 `turn_goal/terminate`”与“Selector 仅从 Router 候选中输出 `primary_strategy/micro_skill`”；Selector 结合患者最新回复、Tracker 观察状态、有界对话及 Progressive D 的 Planner `next_subgoal_id`，其路由固定为本地 `think_llm`、不新增 DeepSeek 调用。无效输出安全回退到受控候选，forced prompt trace 分别记录 Judge 与 Selector，并在主配置、资源路径校验、文档和回归测试中同步该契约。
+- 2026-09-08：新增临时运维脚本 `runshells/tmp_watch_0907_session12_then_repeat_eval.py`，监控 0907 三项指定仿真在 `session_12` 前各阶段快照完整后接力复评；默认只读扫描，`--execute` 才会精确终止对应 `start.py --name` 进程，并以长量表 10 次／中间短量表 5 次、控制器清单校验、断点续跑和默认清理策略运行归档复评。
+- 2026-09-07：加密阶段评估节点并优化短量表复评：两套主配置将会谈/虚拟会谈评估间隔由 4 调整为 2，G2 与 G10–G12 的步数触发标签同步对齐；即使实际治疗终点不落在间隔倍数上也会冻结末次长量表节点。归档重复复评默认按原始 summary 的实际 staged 节点自动选择，PHQ-9 / BDI-II 节点默认重复 10 次、中间短量表重复 5 次；短量表所有题目均有无歧义直接分数时跳过 ExpertLLM，否则以直接分数覆盖对应 LLM 条目评分并保留来源审计。
+- 2026-09-07：收紧 Progressive D 的常规会谈终止门槛，并增强负面居民聊天操控：除安全处置或患者明确要求停止外，Judge 只有在 Session Task Planner 输出“准备收尾”后才可评估 `terminate=true`，仍须满足完整治疗闭环；G11 负面支持提示改为更冷淡、失配、撤回投入的熟人回应，同时保留反辱骂、反自伤推动等安全边界。
+- 2026-09-07：将 Progressive D 的逐轮小目标管理从 Judge 最小拆分为本地 vLLM `Session Task Planner`：Planner 读取完整 Session Prompt、全部小目标状态、患者最新回复、较早摘要 + 近期原文和软时间信号，只输出本轮增量 `subgoal_updates` 与非强制 `next_subgoal_id`；小目标仍复用原单调持久化结构。Judge 改为四字段输出，只把 Planner 文字版建议与患者状态、临床推进/风险/终止规则综合使用；`"准备收尾"` 仅是节奏信号，最终 `terminate` 仍由 Judge 决定。
+- 2026-09-07：历史会谈摘要默认改走本地 `think.llm`，检索命中优先输入会后 `chat_summary`；仅摘要缺失的单条记录读取受限 transcript 片段，保留显式 `forced_llm` 兼容路由。
+- 2026-09-07：收紧 Progressive D 的患者状态摘要与 forced DeepSeek 辅助调用：Judge/医生只接收长期病例背景和 Tracker 观察状态，患者内部动态状态仍仅供 Patient Agent 与本地 Tracker 使用；聊天重要性、复读检测和会后日程修订不再误走 forced DeepSeek，日程优先确定性调整并仅回退本地 vLLM。DeepSeek thinking 改为默认 high、低复杂度 caller 单独关闭，并在 API 成本账本中拆分 reasoning 与可见输出 token/成本。`compress.py` 回放/报告则优先读取 checkpoint 中保存的运行时角色 `config_path`，静态地图人设仅作回退，保证批量生成或地图外的人设能被正确压缩与展示。
+- 2026-09-04：林若宁、顾晨、陈屿、唐婉、周远航、苏晴岚、赵明远、许芳华八个新人设现支持咨询室模式（仍仅提供 MOD 配置）：批量条件解析与“批量仿真→重复复评”入口移除村庄模式限制，运行时保留新人设身份及严重度配置，并复用卡布达咨询室的坐标、空间树和当前场景模板。八个人设的基础 `chat_iter` 同步设为 4，新增回归测试覆盖咨询室运行时配置与空间叠加。
+- 2026-09-04：调整会谈内滚动上下文的摘要模型路由：`data/config.json` 与智算中心版均将 `current_session_context.summary_route` 从 `forced_llm` 切换为 `think_llm`，使会谈上下文压缩改走角色思考模型；当时咨询历史摘要的 `forced_llm` 路由保持不变。
+- 2026-09-04：阶段量表评估改为“首尾完整、中间短量表”模式：两套运行配置新增 `staged_eval.use_short_scales_for_intermediate_eval`（默认开启），`T0` 与最终触发点继续使用 PHQ-9 / BDI-II，中间阶段改用新增的 5 题、0–4 分“总体抑郁水平及干扰程度量表”与“总体焦虑水平及干扰程度量表”。量表协议、快照任务、批量收集、归档重复复评、评分校验和纵向轨迹均支持节点级量表集合与 0–4 分范围，避免在短量表节点伪造完整量表占位；新增题目与评分提示词纳入版本控制。批量→复评脚本默认实验长度调整为 96 step，评估至 `session_16`，回访也以 `session_16` 为来源。
+- 2026-09-04：收紧强制会谈的会后记忆摘要适用范围，并校准终止判定窗口：仅 `doctor_consult` 医患咨询生成高密度咨询记忆摘要，强制居民聊天不再套用该治疗摘要；两套运行配置将该摘要的配置上限调整为 1000 字。强制会谈全局安全上限维持 60 轮，终止检测尾窗由 12 轮扩至 54 轮，使终止判定自第 7 轮起可用，并由回归测试覆盖配置同步与会议类型路由。
+- 2026-09-04：优化强制咨询的会后摘要与历史记忆上下文：新增高密度治疗摘要模板，会后记忆上限为 800 字、当前会谈滚动摘要上限为 600 字；摘要聚焦核心事件、情绪—思维—行为、干预与反应、行动/实验、阻抗及后续计划。历史检索 prompt 对单条 transcript 截断至 1200 字、聚合记忆截断至 800 字，并复用当前会谈的有界上下文；完整原始对话仍无损保存在咨询记录中。
+- 2026-09-04：重构 Legacy、Minimal 与 Progressive D 会谈 Judge 的推进和终止口径：将最新患者回复、滚动对话上下文和已过去分钟数纳入判断，分钟数仅作软节奏信号；不再按小目标或固定轮次机械推进/结束，要求在够用探索后完成至少一次实质干预、获取患者反馈并形成总结与下一步安排。强制会谈的全局安全轮次上限统一由 18 提至 60，角色覆写改为继承该统一上限。
+- 2026-09-04：CBT 固定疗程由 10 场扩展为 12 场，新增 `session3.3-B` 问题解决与 `session4.3` 复发预防环节；同步重构各场 Prompt、小目标和策略映射，形成“每场完整咨询、早期行为激活、中期认知/行为/问题解决并行、后期技能整合与结束”的连续路径。医生回复统一先具体共情复述再执行策略，Legacy judge 也按当前任务选择可行替代而非机械追逐预设技术。
+- 2026-09-04：Progressive D 默认关闭会后 `control_eval` 小目标重复 LLM 调用；会后改为对逐轮累计的 `partial/complete` 状态执行本地完成审计与提纲推进（该逐轮状态自 2026-09-07 起由 Session Task Planner 维护），采用 80% 完成阈值及 3 场会谈兜底规则。保留 `progressive_d.control_eval.enabled` 可重新启用 forced LLM 批量评估作对照，过程记录同步标注实际状态来源。
+- 2026-09-03：强制医生咨询新增会谈内滚动上下文与动态时间提示：默认保留最近 5 个完整 exchange（及未配对尾句）原文，将较早内容以受限长度摘要合并，并按 transcript 字数估算当前咨询已进行时间；患者/医生生成、复读与终止判定、各类会谈 judge 共用同一视图。上下文仅存于管理器运行时缓存、会谈结束即清除，不写入长期记忆或 checkpoint；居民聊天和自然聊天不受影响。
+- 2026-09-03：Progressive D 的会谈 judge 新增 `subgoal_updates`，可根据患者本轮新增材料对多个小目标写入 `partial/completed`；程序严格校验 ID、字段与状态，仅接受单调提升并记录 meeting ID，不增加会谈计数或直接推进固定治疗提纲，旧版四字段 judge 输出继续兼容。
+- 2026-09-03：重整 Progressive D judge 的小目标节奏：默认按配置顺序优先处理尚无进展项，但允许患者自然带出后续目标并行记录；`partial` 后可继续其他目标，避免反复深挖或因少数目标进展而过早结束会谈。小目标进度文本新增有序编号，相关输入/合并逻辑与回归测试同步更新。
+- 2026-09-03：补全阶段评估、POST/30Q、T0 重复评估和存档复评的 DeepSeek 成本归属：答题与评分 worker 共用同一 run、阶段、量表和 evaluation ID，上下文写入复评任务并在 worker 完成后重建汇总；成本汇总新增“存在评分但缺少强制量表答题调用”的完整性告警。
+- 2026-09-03：新增 `runshells/backfill_api_cost_from_logs.py`，可从保留 worker 日志中仅回填无账本标记的强制量表答题缓存记录；工具默认 dry-run，按源文件哈希和行号幂等去重，要求显式记录带时区的推断请求时间及峰/谷价假设，并在事件中保留“token 已记录、时间和价格档位为推断”的 provenance。
+- 2026-09-02：新增林若宁、顾晨、陈屿、唐婉、周远航、苏晴岚、赵明远、许芳华八个中度抑郁人设及专属初始化压力记忆；批量/端到端入口支持 LRN/GC/CY/TW/ZYH/SQL/ZMY/XFH 选择器，并将角色配置、干预目标、阶段量表与后处理统一替换为人物真实姓名。新人设仅支持村庄模式和 MOD；`ALL` 仍只展开 KBD1–KBD9，避免旧命令无意扩大实验矩阵。
+- 2026-09-01：新增 DeepSeek 按独立实验归属的 API 成本账本：调用事件写入 `results/experiment_data/api_cost/<run>/calls.jsonl`，并生成按仿真/重复量表评估阶段、调用模块和量表单元汇总的 `summary.json`；基于版本化价目表区分工作日峰谷时段、缓存命中/未命中与输出 token 成本，并标记失败、缺失用量、未知价格和异常账本行。
+- 2026-09-01：仿真入口、阶段/POST 评分与存档复评统一传递运行名、模型端点及 `thinking`/`reasoning_effort`，评分子进程继承实际 `forced_llm` 配置；成功与失败的 DeepSeek 请求均纳入成本记录，复评结束时重建汇总，归档裁剪/备份同步保留对应账本。
+- 2026-09-01：将 Progressive D judge 与会后小目标评估的固定规则、终止规则和输出约束前置于运行时上下文，以稳定 DeepSeek 提示词前缀并提高缓存复用；补充成本计价、并发写入、异常恢复、归档保留与提示顺序的回归测试。
+- 2026-08-28：按需重绘新增 0825 长程轨迹图，纳入 KBD2 的 G1/G2/G4/G5/G9 与 KBD3-G1，统一展示 T0–session_20；重绘规格改为显式维护“行标签 → persona、group”映射，并将该映射写入 manifest，避免下游将所有行默认解析为 KBD2 条件。
+- 2026-08-28：同步更新 `docs/town_method/` 方法文档集至当前工作区口径，补充 120-step、T0–session_20 冻结复评、固定病例级 `core_belief` 的分析边界，以及 0825 定向轨迹的样本校验、图表解释和维护入口。
 - 2026-08-25：主诉图 `core_belief` 改为初始化时锁定的病例级稳定核心信念；planner 不再生成或修改该字段，患者对信念的强化、怀疑或松动统一写入节点 `label/summary`，程序在 candidate、commit 与 checkpoint 恢复时回填固定值，并兼容旧 checkpoint 和既有 stage schema。
 - 2026-08-25：同步重整九个卡布达人设的静态生活背景与各严重度主诉配置，移除 `agent.json` 中预置的症状进展、治疗尝试和近期事件，将动态抑郁表现交由主诉图与运行态生成；病例级核心信念按人设/严重度保持一致的稳定基线。
 - 2026-08-25：按需重绘新增 0824 KBD2 五条件轨迹图，支持完整 T0–session_20 时间轴及按批次配置的不同 outer-run 数量（G5 为 2 次、其余为 3 次），同时让既有短程图继续沿用 T0–S12 节点。
@@ -322,7 +354,7 @@ data/config.json
     ├── consult_history
     │   ├── enabled -> true（当前主线医患对话建议开启）
     │   ├── retrieve_top_k -> 3
-    │   └── summary_route -> forced_llm
+    │   └── summary_route -> think_llm（可显式设为 forced_llm 兼容旧配置）
     ├── consult_record.enabled -> false（咨询记录模块，感觉没什么用暂时关闭了）
     ├── depression_dynamic
     │   ├── enabled -> true（当前主线建议开启）
@@ -604,7 +636,7 @@ start.py 直接输出的仿真数据：
 - `forced_llm`：强制干预对话模型；当前为 `deepseek-v4-flash`，需在 `.env` 配置 `DEEPSEEK_API_KEY`
 - `dialog_judge`：会话中判断 LLM；当前保持 `enabled=true` 且 `force_forced_llm=true`
 - `session_eval`：会话后评估 LLM；当前 `route=forced_llm`，`history_recent_n=3`
-- `consult_history`：医患历史摘要模块；通过 gate 判断是否检索历史对话，再把检索命中的完整对话总结成 `consult_history_memory` 注入当前回复
+- `consult_history`：医患历史摘要模块；通过 gate 判断是否检索历史对话，优先汇总命中会谈保存的 `chat_summary`（缺失时才读取受限 transcript 片段）并注入 `consult_history_memory`
 - `consult_record`：咨询记录生成；当前主线为 `enabled=false`，要看 SOAP 记录时再开启
 - `depression_dynamic`：动态抑郁人设主链路；当前主线建议保持 `enabled=true`
   - `normal_chain_enabled=true`
@@ -714,7 +746,7 @@ flowchart TD
 | ------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                             | 给 judge 用的 `patient_state_summary`     |
 | 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                               | `terminate`、`advice`                     |
-| 医患历史摘要 `consult_history`        | gate 默认走 `forced_llm`；summary 由 `summary_route` 决定         | 最新一轮对方发言、当前对话历史、命中的历史完整对话记录                                                                | `consult_history_memory`                  |
+| 医患历史摘要 `consult_history`        | gate 与默认 summary 均走本地 `think.llm`；可显式设为 `forced_llm` 兼容旧配置 | 最新一轮对方发言、当前对话历史、Top-K 命中的 `chat_summary`（仅缺失项附受限 transcript 片段） | `consult_history_memory`                  |
 | 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
 | 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                              | 患者自然语言回复                          |
 | 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                             | 是否出现复读，用于提前结束                |

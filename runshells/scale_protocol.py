@@ -1,10 +1,52 @@
-"""Shared PHQ-9/BDI-II parsing primitives used by evaluation CLIs."""
+"""Shared scale protocol metadata and parsing primitives used by evaluation CLIs."""
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
 from typing import Any
+
+
+OVERALL_DEPRESSION_SCALE = "总体抑郁水平及干扰程度量表"
+OVERALL_ANXIETY_SCALE = "总体焦虑水平及干扰程度量表"
+
+LONG_SCALE_NAMES = ("PHQ-9", "BDI-II")
+SHORT_SCALE_NAMES = (OVERALL_DEPRESSION_SCALE, OVERALL_ANXIETY_SCALE)
+
+SCALE_SPECS = {
+    "PHQ-9": {
+        "question_file": "PHQ-9-v2.jsonl",
+        "scoring_prompt": "PHQ-9评估提示词.md",
+        "item_score_key": "phq9_scores",
+        "item_count": 9,
+        "max_item_score": 3,
+        "score_range": (0.0, 27.0),
+    },
+    "BDI-II": {
+        "question_file": "BDI-II-v2.jsonl",
+        "scoring_prompt": "BDI-II评估提示词.md",
+        "item_score_key": "bdi_ii_scores",
+        "item_count": 21,
+        "max_item_score": 3,
+        "score_range": (0.0, 63.0),
+    },
+    OVERALL_DEPRESSION_SCALE: {
+        "question_file": f"{OVERALL_DEPRESSION_SCALE}.jsonl",
+        "scoring_prompt": f"{OVERALL_DEPRESSION_SCALE}评估提示词.md",
+        "item_score_key": "overall_depression_interference_scores",
+        "item_count": 5,
+        "max_item_score": 4,
+        "score_range": (0.0, 20.0),
+    },
+    OVERALL_ANXIETY_SCALE: {
+        "question_file": f"{OVERALL_ANXIETY_SCALE}.jsonl",
+        "scoring_prompt": f"{OVERALL_ANXIETY_SCALE}评估提示词.md",
+        "item_score_key": "overall_anxiety_interference_scores",
+        "item_count": 5,
+        "max_item_score": 4,
+        "score_range": (0.0, 20.0),
+    },
+}
 
 
 CN_SCORE_VALUES = {
@@ -42,17 +84,27 @@ def has_ambiguous_score_context(text: str, start: int, end: int) -> bool:
     return any(marker in context for marker in AMBIGUITY_MARKERS)
 
 
-def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
+def extract_direct_answer_score(answer: str, *, max_score: int = 3) -> tuple[int | None, str]:
     """Return ``(score, status)`` where status is direct/ambiguous/none."""
 
+    if max_score not in {3, 4}:
+        raise ValueError("max_score must be 3 or 4")
     normalized_answer = str(answer or "")
+    score_class = "0-3零一二两三" if max_score == 3 else "0-4零一二两三四"
+    patterns = tuple(
+        pattern.replace("0-3零一二两三", score_class)
+        for pattern in DIRECT_SCORE_PATTERNS
+    )
+    score_values = dict(CN_SCORE_VALUES)
+    if max_score == 4:
+        score_values.update({"4": 4, "四": 4})
     hits: list[tuple[int, int, int]] = []
-    for pattern in DIRECT_SCORE_PATTERNS:
+    for pattern in patterns:
         for match in re.finditer(pattern, normalized_answer):
             context = normalized_answer[max(0, match.start() - 6) : match.end() + 6]
             if any(marker in context for marker in NEGATED_SELECTION_MARKERS):
                 continue
-            score = CN_SCORE_VALUES.get(match.group(1))
+            score = score_values.get(match.group(1))
             if score is not None:
                 hits.append((match.start(), match.end(), score))
     if not hits:
@@ -68,11 +120,42 @@ def extract_direct_answer_score(answer: str) -> tuple[int | None, str]:
     return first_score, "direct"
 
 
+def extract_unambiguous_direct_answer_score(
+    answer: str,
+    *,
+    max_score: int = 3,
+) -> tuple[int | None, str]:
+    """Accept a direct score only when all explicit selections agree."""
+
+    answer_score, status = extract_direct_answer_score(answer, max_score=max_score)
+    if status != "direct" or answer_score is None:
+        return None, status
+
+    score_values = dict(CN_SCORE_VALUES)
+    if max_score == 4:
+        score_values.update({"4": 4, "四": 4})
+    score_class = "0-3零一二两三" if max_score == 3 else "0-4零一二两三四"
+    explicit_tokens = re.findall(
+        rf"(?:选|选择)\s*(?:了)?\s*([{score_class}])|([{score_class}])\s*分",
+        str(answer or ""),
+    )
+    explicit_scores = {
+        score_values[token]
+        for groups in explicit_tokens
+        for token in groups
+        if token
+    }
+    if len(explicit_scores) > 1:
+        return None, "ambiguous"
+    return answer_score, status
+
+
 def extract_item_scores(
     scored_result: Mapping[str, Any] | None,
     item_key: str | None,
     *,
     expected_count: int | None = None,
+    max_score: int = 3,
 ) -> list[int] | None:
     if not item_key or not isinstance(scored_result, Mapping):
         return None
@@ -83,7 +166,7 @@ def extract_item_scores(
     scores: list[int] = []
     for item in items:
         score = item.get("score") if isinstance(item, Mapping) else None
-        if not isinstance(score, int) or score < 0 or score > 3:
+        if not isinstance(score, int) or score < 0 or score > max_score:
             return None
         scores.append(score)
     if expected_count is not None and len(scores) != expected_count:

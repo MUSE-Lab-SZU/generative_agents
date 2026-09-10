@@ -2,8 +2,8 @@ import os
 import json
 import argparse
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from modules.maze import Maze
 from replay_protocol import FILE_MARKDOWN, FILE_MOVEMENT, FRAMES_PER_STEP
 from simulation_roster import resolve_run_context as _shared_resolve_run_context
 
@@ -17,6 +17,63 @@ def _assets_base(assets_root):
 
 def _resolve_run_context(checkpoints_folder, assets_root_override=None):
     return _shared_resolve_run_context(checkpoints_folder, assets_root_override)
+
+
+def _static_agent_json_path(assets_root, agent_name):
+    return Path(_assets_base(assets_root)) / "agents" / agent_name / "agent.json"
+
+
+def _resolve_config_path(config_path):
+    """Return an existing agent config path, including frontend-static relative paths."""
+    raw_path = str(config_path or "").strip()
+    if not raw_path:
+        return None
+
+    path = Path(raw_path)
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(Path("frontend/static") / path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_persona_json_paths(checkpoints_folder, assets_root, roster):
+    """Resolve each persona's runtime config, falling back to static assets.
+
+    Batch experiments may create a persona outside the selected map's static
+    `agents/` directory.  The first checkpoint preserves that runtime
+    `config_path`, which is therefore the authoritative source for compress.
+    """
+    checkpoints_path = Path(checkpoints_folder)
+    try:
+        snapshots = sorted(checkpoints_path.glob("simulate-*.json"))
+    except OSError:
+        snapshots = []
+
+    snapshot_agents = {}
+    if snapshots:
+        try:
+            payload = json.loads(snapshots[0].read_text(encoding="utf-8"))
+            agents = payload.get("agents", {})
+            if isinstance(agents, dict):
+                snapshot_agents = agents
+        except (OSError, ValueError):
+            pass
+
+    resolved = {}
+    for agent_name in roster:
+        agent_data = snapshot_agents.get(agent_name, {})
+        runtime_path = (
+            _resolve_config_path(agent_data.get("config_path"))
+            if isinstance(agent_data, dict)
+            else None
+        )
+        resolved[agent_name] = runtime_path or _static_agent_json_path(
+            assets_root, agent_name
+        )
+    return resolved
 
 file_markdown = FILE_MARKDOWN
 file_movement = FILE_MOVEMENT
@@ -115,13 +172,20 @@ def get_depression_runtime_snapshot(agent_data):
     return snapshot
 
 
+def _load_maze(json_data):
+    """Keep persona/report utilities importable without simulation-only dependencies."""
+    from modules.maze import Maze
+
+    return Maze(json_data, None)
+
+
 # 插入第0帧数据（Agent的初始状态）
-def insert_frame0(init_pos, movement, agent_name, assets_root):
+def insert_frame0(init_pos, movement, agent_name, persona_json_paths):
     key = "0"
     if key not in movement.keys():
         movement[key] = dict()
 
-    json_path = f"{_assets_base(assets_root)}/agents/{agent_name}/agent.json"
+    json_path = persona_json_paths[agent_name]
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
         address = json_data["spatial"]["address"]["living_area"]
@@ -140,7 +204,13 @@ def insert_frame0(init_pos, movement, agent_name, assets_root):
 
 
 # 从所有存档文件中提取数据（用于回放）
-def generate_movement(checkpoints_folder, compressed_folder, compressed_file, assets_root):
+def generate_movement(
+    checkpoints_folder,
+    compressed_folder,
+    compressed_file,
+    assets_root,
+    persona_json_paths,
+):
     movement_file = os.path.join(compressed_folder, compressed_file)
 
     conversation_file = "conversation.json"
@@ -177,7 +247,7 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file, as
     json_path = f"{_assets_base(assets_root)}/maze.json"
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
-        maze = Maze(json_data, None)
+        maze = _load_maze(json_data)
 
     for file_name in json_files:
         # 依次读取所有存档文件
@@ -197,7 +267,12 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file, as
             for agent_name, agent_data in agents.items():
                 # 插入第0帧
                 if agent_name not in persona_init_pos:
-                    insert_frame0(persona_init_pos, all_movement, agent_name, assets_root)
+                    insert_frame0(
+                        persona_init_pos,
+                        all_movement,
+                        agent_name,
+                        persona_json_paths,
+                    )
 
                 source_coord = last_location.get(agent_name, all_movement["0"][agent_name])["movement"]
                 target_coord = agent_data["coord"]
@@ -275,7 +350,14 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file, as
 
 
 # 生成Markdown文档
-def generate_report(checkpoints_folder, compressed_folder, compressed_file, assets_root, roster):
+def generate_report(
+    checkpoints_folder,
+    compressed_folder,
+    compressed_file,
+    assets_root,
+    roster,
+    persona_json_paths,
+):
     last_state = dict()
 
     conversation_file = "conversation.json"
@@ -287,7 +369,7 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file, asse
     def extract_description():
         markdown_content = "# 基础人设\n\n"
         for agent_name in roster:
-            json_path = f"{_assets_base(assets_root)}/agents/{agent_name}/agent.json"
+            json_path = persona_json_paths[agent_name]
             with open(json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
                 markdown_content += f"## {agent_name}\n\n"
@@ -377,18 +459,20 @@ def generate_report(checkpoints_folder, compressed_folder, compressed_file, asse
         compressed_file.write(all_markdown_content)
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--name", type=str, default="", help="the name of the simulation")
-parser.add_argument(
-    "--assets-root",
-    choices=("village", "counsel_room"),
-    default=None,
-    help="assets 子目录；默认从存档 maze.path 自动检测。",
-)
-args = parser.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=str, default="", help="the name of the simulation")
+    parser.add_argument(
+        "--assets-root",
+        choices=("village", "counsel_room"),
+        default=None,
+        help="assets 子目录；默认从存档 maze.path 自动检测。",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
+    args = parse_args()
     name = args.name
     if len(name) < 1:
         name = input("Please enter a simulation name: ")
@@ -401,6 +485,22 @@ if __name__ == "__main__":
     os.makedirs(compressed_folder, exist_ok=True)
 
     assets_root, roster = _resolve_run_context(checkpoints_folder, args.assets_root)
+    persona_json_paths = resolve_persona_json_paths(
+        checkpoints_folder, assets_root, roster
+    )
     print(f"[compress] assets_root={assets_root} roster={roster}")
-    generate_report(checkpoints_folder, compressed_folder, file_markdown, assets_root, roster)
-    generate_movement(checkpoints_folder, compressed_folder, file_movement, assets_root)
+    generate_report(
+        checkpoints_folder,
+        compressed_folder,
+        file_markdown,
+        assets_root,
+        roster,
+        persona_json_paths,
+    )
+    generate_movement(
+        checkpoints_folder,
+        compressed_folder,
+        file_movement,
+        assets_root,
+        persona_json_paths,
+    )

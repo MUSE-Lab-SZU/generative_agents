@@ -12,8 +12,18 @@ from typing import Any
 EXPECTED_AGGREGATION_METHOD_VERSION = "fixed_complete_scale_reviewed_v2"
 EXPECTED_PRIMARY_SCORE = "mean_of_complete_reviewed_scale_totals"
 EXPERIMENT_EVAL_METRICS_SCHEMA_VERSION = "experiment_eval_metrics_v2"
-SCALE_ORDER = ["PHQ-9", "BDI-II"]
-SCALE_RANGES = {"PHQ-9": (0.0, 27.0), "BDI-II": (0.0, 63.0)}
+SCALE_ORDER = [
+    "PHQ-9",
+    "BDI-II",
+    "总体抑郁水平及干扰程度量表",
+    "总体焦虑水平及干扰程度量表",
+]
+SCALE_RANGES = {
+    "PHQ-9": (0.0, 27.0),
+    "BDI-II": (0.0, 63.0),
+    "总体抑郁水平及干扰程度量表": (0.0, 20.0),
+    "总体焦虑水平及干扰程度量表": (0.0, 20.0),
+}
 DEFAULT_LABEL_ORDER = [
     "T0",
     "session_4",
@@ -88,7 +98,12 @@ def as_float(value: Any) -> float | None:
 
 
 def slugify(value: str) -> str:
-    known = {"PHQ-9": "phq9", "BDI-II": "bdi2"}
+    known = {
+        "PHQ-9": "phq9",
+        "BDI-II": "bdi2",
+        "总体抑郁水平及干扰程度量表": "overall_depression_interference",
+        "总体焦虑水平及干扰程度量表": "overall_anxiety_interference",
+    }
     if value in known:
         return known[value]
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()

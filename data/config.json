@@ -128,16 +128,24 @@
     "progressive_d": {
       "enabled": false,
       "controller_version": "progressive_d_v3_1_calibrated_batch_control",
+      "completion_threshold_ratio": 0.6,
       "state_tracker": {
         "prompt_file": "data/prompts/intervention/state_tracker_progressive_d.txt",
         "retry": 3,
         "recent_utterances": 8
       },
+      "session_task_planner": {
+        "enabled": true,
+        "prompt_file": "data/prompts/intervention/session_task_planner_progressive_d.txt",
+        "retry": 3
+      },
       "judge": {
         "prompt_file": "data/prompts/intervention/dialog_judge_progressive_d.txt",
+        "termination_rules_prompt_file": "data/prompts/intervention/dialog_judge_termination_rules_progressive_d.txt",
         "retry": 3
       },
       "control_eval": {
+        "enabled": false,
         "route": "forced_llm",
         "prompt_file": "data/prompts/intervention/control_eval_progressive_d.txt",
         "stage_subgoals_file": "data/intervention/cbt_stage_subgoals.json",
@@ -263,8 +271,10 @@
         "session3.1",
         "session3.2",
         "session3.3-A",
+        "session3.3-B",
         "session4.1",
         "session4.2",
+        "session4.3",
         "session4.4"
       ],
       "scope": "forced_chat_only",
@@ -280,19 +290,18 @@
       "defaults": {
         "enabled": false,
         "forced_only": true,
-        "forced_chat_iter": 18,
+        "forced_chat_iter": 60,
         "repeat_break_threshold": 1,
         "repeat_detection_enabled": false,
         "forced_chat_min_turns": -1,
         "forced_chat_max_turns": -1,
         "terminate_detection_tail_window_enabled": true,
-        "terminate_detection_tail_window_turns": 12
+        "terminate_detection_tail_window_turns": 54
       },
       "agent_overrides": {
         "卡布达": {
           "enabled": true,
           "forced_only": true,
-          "forced_chat_iter": 18,
           "repeat_break_threshold": 100,
           "forced_chat_min_turns": 2,
           "forced_chat_max_turns": -1
@@ -300,7 +309,6 @@
         "金龟次郎": {
           "enabled": true,
           "forced_only": true,
-          "forced_chat_iter": 18,
           "repeat_break_threshold": 100,
           "forced_chat_min_turns": 2,
           "forced_chat_max_turns": -1
@@ -308,7 +316,6 @@
         "蜻蜓队长": {
           "enabled": true,
           "forced_only": true,
-          "forced_chat_iter": 18,
           "repeat_break_threshold": 100,
           "forced_chat_min_turns": 2,
           "forced_chat_max_turns": -1
@@ -323,6 +330,37 @@
       "api_key_env": "DEEPSEEK_API_KEY",
       "retry": 5,
       "temperature": 0.5,
+      "thinking": {
+        "type": "enabled"
+      },
+      "reasoning_effort": "high",
+      "caller_overrides": {
+        "decide_chat_terminate_forced": {
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "consult_record_generate": {
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "environment_task_outcome": {
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "consult_history_summary_forced_llm": {
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "current_session_context_summary": {
+          "thinking": {
+            "type": "disabled"
+          }
+        }
+      },
       "decide_chat_terminate_retry": 5,
       "decide_chat_terminate_force_forced_llm": true
     },
@@ -343,7 +381,12 @@
     },
     "strategy_router": {
       "strategy_map_file": "data/intervention/cbt_strategy_map.json",
-      "term_glossary_file": "data/intervention/cbt_term_glossary.json"
+      "term_glossary_file": "data/intervention/cbt_term_glossary.json",
+      "response_strategy_selector": {
+        "enabled": true,
+        "prompt_file": "data/prompts/intervention/response_strategy_selector.txt",
+        "retry": 3
+      }
     },
     "session_eval": {
       "enabled": true,
@@ -370,9 +413,29 @@
       "retrieve_top_k": 3,
       "gate_prompt_file": "data/prompts/intervention/consult_history_gate.txt",
       "gate_retry": 2,
-      "summary_route": "forced_llm",
+      "summary_route": "think_llm",
       "summary_prompt_file": "data/prompts/intervention/consult_history_summary.txt",
-      "summary_retry": 2
+      "summary_retry": 2,
+      "hit_transcript_max_chars": 1200,
+      "summary_max_chars": 800
+    },
+    "consultation_memory_summary": {
+      "prompt_file": "data/prompts/intervention/consultation_memory_summary.txt",
+      "max_chars": 1000
+    },
+    "current_session_context": {
+      "enabled": true,
+      "recent_exchange_count": 5,
+      "summary_route": "think_llm",
+      "summary_prompt_file": "data/prompts/intervention/current_session_context_summary.txt",
+      "summary_retry": 2,
+      "summary_max_chars": 600
+    },
+    "consultation_time": {
+      "enabled": true,
+      "chars_per_minute": 180,
+      "target_duration_minutes": 60,
+      "earliest_closing_check_minutes": 40
     },
     "depression_dynamic": {
       "enabled": true,
@@ -485,14 +548,15 @@
   "staged_eval": {
     "enabled": true,
     "execution_mode": "capture_only",
+    "use_short_scales_for_intermediate_eval": true,
     "target_agent": "卡布达",
     "include_t0": true,
-    "session_interval": 4,
+    "session_interval": 2,
     "max_completed_sessions": 1000,
     "step_interval": {
       "enabled": false,
       "every_steps": 24,
-      "virtual_session_interval": 4,
+      "virtual_session_interval": 2,
       "label_prefix": "session",
       "max_triggers": 0
     },

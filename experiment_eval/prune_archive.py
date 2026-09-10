@@ -427,7 +427,6 @@ def _add_curated_run(
                 else "simulation checkpoint timeline"
             ),
         )
-
     for name in CURATED_RUN_FILES:
         _add_first_existing(
             builder,
@@ -564,6 +563,34 @@ def _add_curated_run(
         )
 
 
+def _add_api_cost_files(
+    builder: _PlanBuilder,
+    layout: ArchiveLayout,
+    run_name: str,
+) -> None:
+    cost_dir = layout.experiment_container / "api_cost" / run_name
+    if not cost_dir.exists():
+        # Historical experiments predate persistent usage and cannot be backfilled.
+        return
+    calls_path = cost_dir / "calls.jsonl"
+    summary_path = cost_dir / "summary.json"
+    missing = [path.name for path in (calls_path, summary_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Incomplete API cost ledger for {run_name}: {', '.join(missing)}"
+        )
+    summary = _read_json(summary_path)
+    if str(summary.get("run_name", "") or "") != run_name:
+        raise ValueError(f"API cost summary run_name mismatch: {summary_path}")
+    for path in (calls_path, summary_path):
+        builder.add_file(
+            path,
+            destination_root="experiment",
+            source_target=layout.experiment_target,
+            reason="per-run DeepSeek API cost ledger",
+        )
+
+
 def _select_complete_reports_by_prefix(
     report_paths: list[Path],
     prefixes: tuple[str, ...],
@@ -672,7 +699,7 @@ def build_plan(
         path.name
         for path in layout.experiment_container.iterdir()
         if path.is_dir()
-        and path.name not in {"reports", "batch_state", "repeat_scale_eval"}
+        and path.name not in {"reports", "batch_state", "repeat_scale_eval", "api_cost"}
         and (
             (path / "cbt_condition_manifest.json").is_file()
             or (path / "trial_meta.json").is_file()
@@ -750,6 +777,7 @@ def build_plan(
     for run_name in all_run_names:
         if run_name in report_only_run_names:
             continue
+        _add_api_cost_files(builder, layout, run_name)
         if run_name in rescue_runs:
             checkpoint_run = layout.checkpoint_container / run_name
             experiment_run = layout.experiment_container / run_name
@@ -1072,6 +1100,23 @@ def validate_retained_layout(
         raise ValueError("Retained reports changed the stable experiment record set")
     if source_labels != retained_labels or source_scales != retained_scales:
         raise ValueError("Retained reports changed labels or scales")
+
+    cost_run_names = expected_run_names or {record.run_name for record in source_records}
+    for run_name in cost_run_names:
+        source_cost_dir = source.experiment_container / "api_cost" / run_name
+        if not source_cost_dir.exists():
+            continue
+        retained_cost_dir = retained.experiment_container / "api_cost" / run_name
+        for filename in ("calls.jsonl", "summary.json"):
+            source_path = source_cost_dir / filename
+            retained_path = retained_cost_dir / filename
+            if not source_path.is_file() or not retained_path.is_file():
+                raise ValueError(f"Retained layout lost API cost file: {run_name}/{filename}")
+            if _sha256(source_path) != _sha256(retained_path):
+                raise ValueError(f"Retained API cost file changed: {run_name}/{filename}")
+        retained_summary = _read_json(retained_cost_dir / "summary.json")
+        if str(retained_summary.get("run_name", "") or "") != run_name:
+            raise ValueError(f"Retained API cost summary run_name mismatch: {run_name}")
 
     source_process, source_stages = extract_process_metrics(
         source_records,

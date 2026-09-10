@@ -9,7 +9,9 @@
 #
 # 说明:
 #   外层 --repeat-count 表示独立仿真轮数。每轮仿真成功后固定执行
-#   EVAL_REPEAT 次完整 PHQ-9 / BDI-II 复评；启用回访时，原仿真复评与
+#   长量表节点执行 EVAL_REPEAT 次、短量表中间节点执行
+#   EVAL_INTERMEDIATE_SCALE_REPEATS 次完整复评；量表组合由 staged_eval 快照决定。
+#   启用回访时，原仿真复评与
 #   无干预回访并行，回访完成后再做独立的回访复评。
 #   每轮的存档、报告和日志均以 -01、-02 … 后缀区分。
 #   默认村庄模式；咨询室模式加 --counsel-room（自动使用 G4 并透传模式参数）。
@@ -28,6 +30,8 @@ EXP_DATE="${EXP_DATE:-0718}"
 GROUP="${GROUP:-G9}"
 KBD="${KBD:-KBD6}"
 SEVERITY="${SEVERITY:-SEV}"
+KBD="${KBD^^}"
+SEVERITY="${SEVERITY^^}"
 COUNSEL_ROOM=false
 CBT_CONTROLLER="progressive"
 CBT_CONTROLLER_EXPLICIT=false
@@ -40,7 +44,7 @@ CLEANUP_COMPLETED_ARTIFACTS=true
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-SIM_TARGET_STEP=120
+SIM_TARGET_STEP=72
 SIM_STRIDE=720
 SIM_MAX_PARALLEL=1
 SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1}"
@@ -48,9 +52,11 @@ SIM_LOG="results/batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
 EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20"
-# 同一 agent × 时间点 × 量表的固定完整复评次数（不是独立患者样本数）
+EVAL_LABELS="auto"
+# T0 / 实际末次 PHQ-9、BDI-II 的固定完整复评次数（不是独立患者样本数）
 EVAL_REPEAT=10
+# 中间两个短量表的固定完整复评次数
+EVAL_INTERMEDIATE_SCALE_REPEATS=5
 EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
 EVAL_MAX_PARALLEL=6
 EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
@@ -59,7 +65,7 @@ EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 FOLLOWUP_ENABLED=false
 FOLLOWUP_STEPS=120
 FOLLOWUP_INTERVAL=30
-FOLLOWUP_SOURCE_LABEL="session_20"
+FOLLOWUP_SOURCE_LABEL="session_12"
 FOLLOWUP_MAX_PARALLEL=1
 
 # ============================================================
@@ -87,7 +93,7 @@ usage() {
       --followup-steps N     回访继续运行步数，默认 120
       --followup-interval N  回访 snapshot 间隔，默认 30
       --followup-source-label LABEL
-                             原仿真作为回访起点的 staged label，默认 session_20
+                             原仿真作为回访起点的 staged label，默认 session_12
       --followup-max-parallel N
                              同一轮内 follow-up condition 并行数，默认 1
       --keep-raw-artifacts   完整复评后仍保留 job、逐题 trace 和 experiment_data 阶段快照副本
@@ -98,6 +104,11 @@ usage() {
   bash runshells/run_batch_then_repeat_eval.sh --repeat-count 3
   bash runshells/run_batch_then_repeat_eval.sh -n 6 -j 2
   bash runshells/run_batch_then_repeat_eval.sh --counsel-room -n 2 -j 2
+  KBD=LRN SEVERITY=MOD bash runshells/run_batch_then_repeat_eval.sh -n 3
+
+新人设代码（仅支持 SEVERITY=MOD）:
+  LRN=林若宁  GC=顾晨  CY=陈屿  TW=唐婉
+  ZYH=周远航  SQL=苏晴岚  ZMY=赵明远  XFH=许芳华
 EOF
 }
 
@@ -186,6 +197,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$KBD" in
+  LRN|GC|CY|TW|ZYH|SQL|ZMY|XFH)
+    if [[ "$SEVERITY" != "MOD" ]]; then
+      echo "错误: 新人设 $KBD 仅提供中度配置，请设置 SEVERITY=MOD。" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 # G10/G11/G12 不运行 CBT 强制会谈，overlay 会关闭 intervention.enabled，
 # 因而只能使用 legacy controller identity；minimal/progressive 会被入口校验拒绝。
@@ -311,6 +331,7 @@ run_repeat_eval() {
     --original-summary "$source_summary"
     --labels "$labels"
     --repeat "$EVAL_REPEAT"
+    --intermediate-scale-repeats "$EVAL_INTERMEDIATE_SCALE_REPEATS"
     --name "$eval_name"
     --max-parallel "$EVAL_MAX_PARALLEL"
     --require-controller-manifest
@@ -382,14 +403,14 @@ run_one_repeat() {
         "$FOLLOWUP_STEPS" "$FOLLOWUP_INTERVAL" "$FOLLOWUP_MAX_PARALLEL"
     fi
     echo "[DRY-RUN] 原仿真 repeat eval 将读取 generation summary/manifest，但本次不执行:"
-    printf '  [parallel] python runshells/run_archived_repeat_scale_eval.py --archive-results-root %q --condition %q --original-summary %q --labels %q --repeat %q --name %q --max-parallel %q --require-controller-manifest%s\n' \
+    printf '  [parallel] python runshells/run_archived_repeat_scale_eval.py --archive-results-root %q --condition %q --original-summary %q --labels %q --repeat %q --intermediate-scale-repeats %q --name %q --max-parallel %q --require-controller-manifest%s\n' \
       "$EVAL_ARCHIVE_RESULTS_ROOT" "$EVAL_CONDITION" "$run_summary" "$EVAL_LABELS" \
-      "$EVAL_REPEAT" "$run_eval_name" "$EVAL_MAX_PARALLEL" "$cleanup_option"
+      "$EVAL_REPEAT" "$EVAL_INTERMEDIATE_SCALE_REPEATS" "$run_eval_name" "$EVAL_MAX_PARALLEL" "$cleanup_option"
     if [[ "$FOLLOWUP_ENABLED" == true ]]; then
       echo "[DRY-RUN] follow-up 完成后将执行独立回访复评:"
-      printf '  python runshells/run_archived_repeat_scale_eval.py --archive-results-root %q --condition %q --original-summary %q --labels %q --repeat %q --name %q --max-parallel %q --require-controller-manifest%s\n' \
+      printf '  python runshells/run_archived_repeat_scale_eval.py --archive-results-root %q --condition %q --original-summary %q --labels %q --repeat %q --intermediate-scale-repeats %q --name %q --max-parallel %q --require-controller-manifest%s\n' \
         "$EVAL_ARCHIVE_RESULTS_ROOT" "$EVAL_CONDITION" "$run_followup_summary" "$(followup_labels)" \
-        "$EVAL_REPEAT" "$run_followup_eval_name" "$EVAL_MAX_PARALLEL" "$cleanup_option"
+        "$EVAL_REPEAT" "$EVAL_INTERMEDIATE_SCALE_REPEATS" "$run_followup_eval_name" "$EVAL_MAX_PARALLEL" "$cleanup_option"
     fi
     return 0
   fi

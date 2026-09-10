@@ -12,6 +12,7 @@ from modules import utils
 from modules.intervention_manager import InterventionManager
 from modules.simulation_event_recorder import SimulationEventRecorder
 from modules.staged_eval_manager import StagedEvalManager
+from modules.model.api_cost import configure_tracking, rebuild_summary
 from simulation_roster import DEFAULT_VILLAGE_PERSONAS
 
 personas = list(DEFAULT_VILLAGE_PERSONAS)
@@ -561,6 +562,12 @@ if __name__ == "__main__":
             name = input(f"The name '{name}' already exists, please enter a new name: ")
 
     checkpoints_folder = f"{checkpoints_path}/{name}"
+    experiment_data_root = os.path.abspath("results/experiment_data")
+    configure_tracking(
+        name,
+        "simulation",
+        experiment_data_root=experiment_data_root,
+    )
 
     start_time = args.start
     if resume:
@@ -575,11 +582,12 @@ if __name__ == "__main__":
 
     static_root = "frontend/static"
 
-    server = SimulateServer(name, static_root, checkpoints_folder, sim_config, start_step, args.verbose, args.log)
-    _ACTIVE_SERVER = server
-    signal.signal(signal.SIGTERM, _handle_termination)
-    signal.signal(signal.SIGINT, _handle_termination)
     try:
+        server = SimulateServer(name, static_root, checkpoints_folder, sim_config, start_step, args.verbose, args.log)
+        _ACTIVE_SERVER = server
+        signal.signal(signal.SIGTERM, _handle_termination)
+        signal.signal(signal.SIGINT, _handle_termination)
         server.simulate(args.step, args.stride)
     finally:
         _ACTIVE_SERVER = None
+        rebuild_summary(name, experiment_data_root=experiment_data_root)

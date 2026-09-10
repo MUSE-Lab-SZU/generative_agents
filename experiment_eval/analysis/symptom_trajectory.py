@@ -12,7 +12,12 @@ from scipy.stats import t
 from ..data.longitudinal import ordered_timepoints
 
 
-EXPECTED_ITEMS = {"PHQ-9": 9, "BDI-II": 21}
+EXPECTED_ITEMS = {
+    "PHQ-9": 9,
+    "BDI-II": 21,
+    "总体抑郁水平及干扰程度量表": 5,
+    "总体焦虑水平及干扰程度量表": 5,
+}
 
 
 def build_symptom_trajectory_summary(

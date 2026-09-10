@@ -118,6 +118,64 @@ def to_conversation_text(chats: Any) -> str:
     return "\n".join(lines).strip()
 
 
+def conversation_content_chars(chats: Any) -> int:
+    """Count utterance characters without speaker labels or formatting."""
+    total = 0
+    for item in chats if isinstance(chats, (list, tuple)) else []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        total += len(str(item[1] or ""))
+    return total
+
+
+def split_recent_exchanges(chats: Any, recent_exchange_count: int = 5):
+    """Split a dialogue into older turns and about N complete recent exchanges.
+
+    A chat loop contributes two alternating utterances.  When the current loop only
+    has its first utterance, keep that incomplete tail in addition to N completed
+    exchanges so the next speaker always sees the latest message verbatim.
+    """
+    items = list(chats) if isinstance(chats, (list, tuple)) else []
+    try:
+        exchange_count = max(1, int(recent_exchange_count or 5))
+    except Exception:
+        exchange_count = 5
+    incomplete_tail = len(items) % 2
+    recent_utterance_count = exchange_count * 2 + incomplete_tail
+    split_at = max(0, len(items) - recent_utterance_count)
+    # Keep the older section aligned to complete two-utterance exchanges.
+    split_at -= split_at % 2
+    return items[:split_at], items[split_at:]
+
+
+def render_current_session_prompt_conversation(
+    recent_chats: Any,
+    earlier_summary: str = "",
+    progress_text: str = "",
+) -> str:
+    """Render the bounded, prompt-only view of a current consultation."""
+    blocks = []
+    progress = str(progress_text or "").strip()
+    if progress:
+        blocks.append(
+            "<当前咨询进度>\n{}\n</当前咨询进度>".format(progress)
+        )
+    summary = str(earlier_summary or "").strip()
+    if summary:
+        blocks.append(
+            "<较早当前Session对话摘要>\n{}\n</较早当前Session对话摘要>".format(
+                summary
+            )
+        )
+    recent_text = to_conversation_text(recent_chats)
+    blocks.append(
+        "<最近医患exchange原文>\n{}\n</最近医患exchange原文>".format(
+            recent_text or "[对话尚未开始]"
+        )
+    )
+    return "\n\n".join(blocks).strip()
+
+
 def normalize_text(value: Any) -> str:
     text = str(value or "")
     text = re.sub(r"\s+", " ", text).strip()

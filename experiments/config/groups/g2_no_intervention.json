@@ -35,8 +35,8 @@
   "staged_eval": {
     "step_interval": {
       "enabled": true,
-      "every_steps": 24,
-      "virtual_session_interval": 4,
+      "every_steps": 12,
+      "virtual_session_interval": 2,
       "label_prefix": "session",
       "max_triggers": 0
     }

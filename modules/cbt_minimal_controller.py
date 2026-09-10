@@ -87,6 +87,16 @@ PROGRESSIVE_D_SUBGOAL_FIELDS = {
     "progress",
     "blocking_factor",
 }
+SESSION_TASK_PLANNER_UPDATE_FIELDS = {
+    "subgoal_id",
+    "status",
+}
+SESSION_TASK_PLANNER_UPDATE_STATUS = {"partial", "completed"}
+SESSION_TASK_PLANNER_FIELDS = {
+    "subgoal_updates",
+    "next_subgoal_id",
+}
+SESSION_TASK_PLANNER_CLOSE = "准备收尾"
 
 CANONICAL_MICRO_SKILLS = (
     "choice_scaffolding",
@@ -734,7 +744,7 @@ def compact_progressive_d_subgoal_progress_text(
         ),
         "当前固定会谈提纲的全部小目标：",
     ]
-    for item in configured:
+    for index, item in enumerate(configured, start=1):
         if not isinstance(item, Mapping):
             continue
         subgoal_id = _safe_text(item.get("id"))
@@ -749,7 +759,9 @@ def compact_progressive_d_subgoal_progress_text(
             if isinstance(current, Mapping)
             else ""
         )
-        line = "- {}：{}".format(
+        line = "- {}. [{}] {}：{}".format(
+            index,
+            subgoal_id,
             _safe_text(item.get("goal")) or subgoal_id,
             status_labels.get(status, "无进展"),
         )
@@ -767,7 +779,8 @@ def compact_progressive_d_subgoal_progress_text(
                     or 0
                 )
             ),
-            "下一轮可自然处理任一未完成小目标，不受单一活跃小目标限制。",
+            "默认按以上顺序优先推进尚无进展的小目标；这不是硬约束，患者自然涉及后续目标时可同步处理。",
+            "部分完成表示已有足够进展，可以继续推进其他目标；仅在后续确有必要时再自然补充，不要求先完全达标。",
         ]
     )
     return "\n".join(lines)
@@ -937,7 +950,7 @@ def progressive_d_completion_audit(
     progress_state: Mapping[str, Any],
     *,
     high_risk_seen: bool,
-    threshold_ratio: float = 0.80,
+    threshold_ratio: float = 0.60,
     meeting_cap: int = 3,
     meeting_cap_threshold_ratio: float = 0.40,
 ) -> Dict[str, Any]:
@@ -1135,44 +1148,310 @@ def route_strategies(
     }
 
 
-def normalize_minimal_judge_output(payload: Any, route: Mapping[str, Any]) -> Dict[str, Any]:
+def normalize_minimal_judge_output(
+    payload: Any,
+    route: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Validate the Judge's goal/termination decision.
+
+    ``route`` remains an optional ignored argument so callers outside the runtime
+    do not break while the strategy choice moves to the local selector.
+    """
+
     raw = payload if isinstance(payload, dict) else {}
-    allowed_primary = _string_list(route.get("allowed_primary_strategies"))
-    allowed_micro = _string_list(route.get("allowed_micro_skills"))
-    primary = raw.get("primary_strategy")
-    micro = raw.get("micro_skill")
     goal = raw.get("turn_goal")
     terminate = raw.get("terminate")
-    expected_fields = {"primary_strategy", "micro_skill", "turn_goal", "terminate"}
+    expected_fields = {"turn_goal", "terminate"}
     valid = (
         set(raw) == expected_fields
-        and isinstance(primary, str)
-        and primary in allowed_primary
-        and isinstance(micro, str)
-        and micro in allowed_micro
         and isinstance(goal, str)
         and bool(goal.strip())
         and isinstance(terminate, bool)
     )
     if valid:
         return {
-            "primary_strategy": primary,
-            "micro_skill": micro,
             "turn_goal": goal.strip(),
             "terminate": terminate,
         }
-    return safe_judge_fallback(allowed_primary, allowed_micro)
+    return safe_judge_fallback()
 
 
-def safe_judge_fallback(
+def normalize_progressive_d_judge_output(
+    payload: Any,
+    route: Mapping[str, Any] | None = None,
+    termination_check_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Normalize the D Judge output under the dynamic termination contract."""
+
+    if termination_check_enabled:
+        return normalize_minimal_judge_output(payload, route)
+
+    raw = payload if isinstance(payload, dict) else {}
+    goal = raw.get("turn_goal")
+    terminate_present = "terminate" in raw
+    valid = bool(
+        set(raw) in ({"turn_goal"}, {"turn_goal", "terminate"})
+        and isinstance(goal, str)
+        and goal.strip()
+        and (
+            not terminate_present
+            or isinstance(raw.get("terminate"), bool)
+        )
+    )
+    if valid:
+        return {
+            "turn_goal": goal.strip(),
+            "terminate": False,
+        }
+    return safe_judge_fallback()
+
+
+def normalize_response_strategy_selector_output(
+    payload: Any,
+    route: Mapping[str, Any],
+) -> Dict[str, str]:
+    """Validate a selector choice strictly against the router candidates."""
+
+    raw = payload if isinstance(payload, dict) else {}
+    allowed_primary = _string_list(route.get("allowed_primary_strategies"))
+    allowed_micro = _string_list(route.get("allowed_micro_skills"))
+    primary = raw.get("primary_strategy")
+    micro = raw.get("micro_skill")
+    if (
+        set(raw) == {"primary_strategy", "micro_skill"}
+        and isinstance(primary, str)
+        and primary in allowed_primary
+        and isinstance(micro, str)
+        and micro in allowed_micro
+    ):
+        return {
+            "primary_strategy": primary,
+            "micro_skill": micro,
+        }
+    return safe_strategy_selector_fallback(allowed_primary, allowed_micro)
+
+
+def normalize_session_task_planner_output(
+    payload: Any,
+    configured_subgoal_ids: Sequence[str],
+) -> Dict[str, Any]:
+    """Validate the deliberately small per-turn Session Task Planner contract."""
+
+    raw = payload if isinstance(payload, dict) else {}
+    if set(raw) != SESSION_TASK_PLANNER_FIELDS:
+        raise SubgoalProgressValidationError(
+            "Session Task Planner output must contain exactly two fields"
+        )
+
+    raw_updates = raw.get("subgoal_updates")
+    if not isinstance(raw_updates, list):
+        raise SubgoalProgressValidationError(
+            "Session Task Planner subgoal_updates must be a list"
+        )
+    allowed_ids = set(_string_list(configured_subgoal_ids))
+    updates: List[Dict[str, str]] = []
+    seen = set()
+    for item in raw_updates:
+        if (
+            not isinstance(item, dict)
+            or set(item) != SESSION_TASK_PLANNER_UPDATE_FIELDS
+        ):
+            raise SubgoalProgressValidationError(
+                "Session Task Planner update must contain exactly two fields"
+            )
+        subgoal_id = _safe_text(item.get("subgoal_id"))
+        status = _safe_text(item.get("status")).lower()
+        if (
+            subgoal_id not in allowed_ids
+            or subgoal_id in seen
+            or status not in SESSION_TASK_PLANNER_UPDATE_STATUS
+        ):
+            raise SubgoalProgressValidationError(
+                "Session Task Planner subgoal update is invalid"
+            )
+        seen.add(subgoal_id)
+        updates.append({"subgoal_id": subgoal_id, "status": status})
+
+    next_subgoal_id = _safe_text(raw.get("next_subgoal_id"))
+    if (
+        next_subgoal_id not in allowed_ids
+        and next_subgoal_id != SESSION_TASK_PLANNER_CLOSE
+    ):
+        raise SubgoalProgressValidationError(
+            "Session Task Planner next_subgoal_id is invalid"
+        )
+    return {
+        "subgoal_updates": updates,
+        "next_subgoal_id": next_subgoal_id,
+    }
+
+
+def compact_session_task_plan_text(
+    planner_output: Mapping[str, Any],
+    stage_item: Mapping[str, Any],
+) -> str:
+    """Render Planner JSON as concise, non-binding task advice for the Judge."""
+
+    configured = stage_item.get("subgoals", [])
+    goal_by_id = {
+        _safe_text(item.get("id")): _safe_text(item.get("goal"))
+        for item in configured
+        if isinstance(item, Mapping) and _safe_text(item.get("id"))
+    }
+    updates = planner_output.get("subgoal_updates", [])
+    lines = ["本轮新增小目标进展："]
+    if isinstance(updates, list) and updates:
+        status_labels = {"partial": "部分完成", "completed": "完成"}
+        for item in updates:
+            if not isinstance(item, Mapping):
+                continue
+            subgoal_id = _safe_text(item.get("subgoal_id"))
+            lines.append(
+                "- [{}] {}：{}".format(
+                    subgoal_id,
+                    goal_by_id.get(subgoal_id, subgoal_id),
+                    status_labels.get(_safe_text(item.get("status")), "有新增进展"),
+                )
+            )
+    else:
+        lines.append("- 无")
+
+    next_subgoal_id = _safe_text(planner_output.get("next_subgoal_id"))
+    if next_subgoal_id == SESSION_TASK_PLANNER_CLOSE:
+        lines.append(
+            "当前任务建议：准备收尾。这只是任务节奏信号，不构成 terminate=true 的必要条件；"
+            "是否结束仍由 Judge 在终止检查开启后依据临床闭环判断。"
+        )
+    else:
+        lines.append(
+            "当前任务建议：[{}] {}。这是非强制建议，可依据患者最新状态和临床需要调整。".format(
+                next_subgoal_id,
+                goal_by_id.get(next_subgoal_id, next_subgoal_id),
+            )
+        )
+    return "\n".join(lines)
+
+
+def merge_progressive_d_planner_updates(
+    progress_state: Dict[str, Any],
+    stage_item: Mapping[str, Any],
+    updates: Sequence[Mapping[str, Any]],
+    meeting_id: str,
+) -> List[Dict[str, str]]:
+    """Apply only real Planner progress, without counting or advancing a meeting."""
+
+    configured = stage_item.get("subgoals")
+    if not isinstance(configured, list) or not configured:
+        raise SubgoalProgressValidationError(
+            "Progressive D Planner merge requires configured subgoals"
+        )
+    configured_ids = [
+        _safe_text(item.get("id"))
+        for item in configured
+        if isinstance(item, Mapping)
+    ]
+    stored = progress_state.get("subgoals")
+    if not isinstance(stored, dict) or set(stored) != set(configured_ids):
+        raise SubgoalProgressValidationError(
+            "Progressive D persisted subgoals do not match configuration"
+        )
+    meeting_id_text = _safe_text(meeting_id)
+    if not meeting_id_text:
+        raise SubgoalProgressValidationError(
+            "Progressive D Planner merge requires meeting_id"
+        )
+
+    normalized_updates: List[Dict[str, str]] = []
+    seen = set()
+    for item in updates:
+        if not isinstance(item, Mapping):
+            raise SubgoalProgressValidationError(
+                "Progressive D Planner update must be an object"
+            )
+        subgoal_id = _safe_text(item.get("subgoal_id"))
+        status = _safe_text(item.get("status")).lower()
+        if (
+            subgoal_id not in stored
+            or subgoal_id in seen
+            or status not in SESSION_TASK_PLANNER_UPDATE_STATUS
+        ):
+            raise SubgoalProgressValidationError(
+                "Progressive D Planner update is invalid"
+            )
+        seen.add(subgoal_id)
+        normalized_updates.append(
+            {"subgoal_id": subgoal_id, "status": status}
+        )
+
+    applied: List[Dict[str, str]] = []
+    for item in normalized_updates:
+        subgoal_id = item["subgoal_id"]
+        external_status = item["status"]
+        internal_status = (
+            "complete" if external_status == "completed" else "partial"
+        )
+        current = stored[subgoal_id]
+        current_status = _safe_text(current.get("status")).lower() or "none"
+        if (
+            SUBGOAL_PROGRESS_STATUS_RANK[internal_status]
+            <= SUBGOAL_PROGRESS_STATUS_RANK.get(current_status, 0)
+        ):
+            continue
+        current.update(
+            {
+                "status": internal_status,
+                "blocking_factor": "",
+                "last_meeting_id": meeting_id_text,
+            }
+        )
+        current.pop("evidence_turn_id", None)
+        applied.append(dict(item))
+
+    selected = select_active_subgoal(stage_item, progress_state)
+    progress_state["active_subgoal_id"] = selected["id"]
+    return applied
+
+
+def merge_progressive_d_judge_updates(
+    progress_state: Dict[str, Any],
+    stage_item: Mapping[str, Any],
+    updates: Sequence[Mapping[str, Any]],
+    meeting_id: str,
+) -> List[Dict[str, str]]:
+    """Compatibility alias for checkpoints/tests created before Planner split."""
+
+    return merge_progressive_d_planner_updates(
+        progress_state,
+        stage_item,
+        updates,
+        meeting_id,
+    )
+
+
+def safe_strategy_selector_fallback(
     allowed_primary: Sequence[str],
     allowed_micro: Sequence[str],
-) -> Dict[str, Any]:
-    primary = _first_preferred(allowed_primary, SUPPORTIVE_PRIMARY) or "safety_check"
-    micro = _first_preferred(allowed_micro, SUPPORTIVE_MICRO) or "validation"
+) -> Dict[str, str]:
+    primary = _first_preferred(allowed_primary, SUPPORTIVE_PRIMARY)
+    micro = _first_preferred(allowed_micro, SUPPORTIVE_MICRO)
+    if not primary or not micro:
+        raise MinimalControllerConfigError(
+            "Response Strategy Selector requires non-empty router candidates"
+        )
     return {
         "primary_strategy": primary,
         "micro_skill": micro,
+    }
+
+
+def safe_judge_fallback(
+    allowed_primary: Sequence[str] = (),
+    allowed_micro: Sequence[str] = (),
+) -> Dict[str, Any]:
+    # Candidate arguments are accepted for source compatibility only. Strategy
+    # fallback now belongs exclusively to ``safe_strategy_selector_fallback``.
+    _ = allowed_primary, allowed_micro
+    return {
         "turn_goal": "获得患者对当前感受或最小问题线索的进一步表达",
         "terminate": False,
     }

@@ -21,8 +21,11 @@ EXP_DATE="${EXP_DATE:-0718}"
 GROUP="${GROUP:-G9}"
 KBD="${KBD:-KBD6}"
 SEVERITY="${SEVERITY:-SEV}"
+KBD="${KBD^^}"
+SEVERITY="${SEVERITY^^}"
 COUNSEL_ROOM=false
 CBT_CONTROLLER="progressive"
+CBT_CONTROLLER_EXPLICIT=false
 PROGRESSIVE_STAGE="D"
 PROGRESSIVE_STAGE_EXPLICIT=false
 BASE_CONFIG=""
@@ -31,10 +34,12 @@ OUTPUT_TAG=""
 # LLM/BGE endpoint 路由同步到恢复锚点，便于中断后切换轮询端口。
 REFRESH_MODEL_ROUTING=false
 ROUTING_CONFIG="data/config.json"
+ROUTING_CONFIG_EXPLICIT=false
+CLEANUP_COMPLETED_ARTIFACTS=true
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-SIM_TARGET_STEP=120
+SIM_TARGET_STEP=96
 SIM_STRIDE=720
 SIM_MAX_PARALLEL=1
 SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1}"
@@ -43,9 +48,11 @@ SIM_CHECKPOINT_LOG="run_batch_experiment-resume.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
 EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-EVAL_LABELS="T0,session_4,session_8,session_12,session_16,session_20"
-# 同一 agent × 时间点 × 量表的固定完整复评次数（不是独立患者样本数）
+EVAL_LABELS="auto"
+# T0 / 实际末次 PHQ-9、BDI-II 的固定完整复评次数（不是独立患者样本数）
 EVAL_REPEAT=10
+# 中间两个短量表的固定完整复评次数
+EVAL_INTERMEDIATE_SCALE_REPEATS=5
 EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
 EVAL_MAX_PARALLEL=6
 EVAL_LOG="results/resume-repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
@@ -54,7 +61,7 @@ EVAL_LOG="results/resume-repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
 FOLLOWUP_ENABLED=false
 FOLLOWUP_STEPS=120
 FOLLOWUP_INTERVAL=30
-FOLLOWUP_SOURCE_LABEL="session_20"
+FOLLOWUP_SOURCE_LABEL="session_16"
 FOLLOWUP_MAX_PARALLEL=1
 # 回访曾被中断时，严格校验已冻结的 followup_step 节点后从最后一个完整节点续跑。
 FOLLOWUP_RESUME_PARTIAL=true
@@ -93,13 +100,14 @@ usage() {
       --refresh-model-routing
                              使用 routing config 覆盖恢复快照中的 LLM/BGE base_url
                              与 load_balancing；默认关闭，其他运行配置保持不变
-      --routing-config PATH  --refresh-model-routing 的路由来源，默认 data/config.json
+      --routing-config PATH  --refresh-model-routing 的路由来源；默认跟随 --config，
+                             未指定 --config 时使用 data/config.json
       --followup             仿真恢复后并行运行无干预回访与原仿真复评；随后复评回访节点
       --no-followup          不运行回访阶段（默认）
       --followup-steps N     回访继续运行步数，默认 120
       --followup-interval N  回访 snapshot 间隔，默认 30
       --followup-source-label LABEL
-                             原仿真作为回访起点的 staged label，默认 session_20
+                             原仿真作为回访起点的 staged label，默认 session_16
       --followup-max-parallel N
                              同一轮内 follow-up condition 并行数，默认 1
       --followup-resume-partial
@@ -114,6 +122,7 @@ usage() {
                              大量失败比例阈值 0..1，默认 0.5
       --forced-llm-consecutive-meetings N
                              仿真连续异常会谈数，默认 2
+      --keep-raw-artifacts   完整复评后仍保留 job、逐题 trace 和 experiment_data 阶段快照副本
       --dry-run              完整校验并显示恢复锚点/命令，不移动文件、不启动任务
   -h, --help                 显示帮助
 
@@ -154,6 +163,7 @@ while [[ $# -gt 0 ]]; do
     --cbt-controller)
       [[ $# -ge 2 ]] || { echo "错误: $1 需要 legacy|minimal|progressive。" >&2; exit 2; }
       CBT_CONTROLLER="$2"
+      CBT_CONTROLLER_EXPLICIT=true
       shift 2
       ;;
     --progressive-stage)
@@ -179,6 +189,7 @@ while [[ $# -gt 0 ]]; do
     --routing-config)
       [[ $# -ge 2 ]] || { echo "错误: $1 需要配置路径。" >&2; exit 2; }
       ROUTING_CONFIG="$2"
+      ROUTING_CONFIG_EXPLICIT=true
       shift 2
       ;;
     --followup)
@@ -236,6 +247,10 @@ while [[ $# -gt 0 ]]; do
       FORCED_LLM_CONSECUTIVE_SIM_MEETINGS="$2"
       shift 2
       ;;
+    --keep-raw-artifacts)
+      CLEANUP_COMPLETED_ARTIFACTS=false
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -251,6 +266,32 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$ROUTING_CONFIG_EXPLICIT" != true && -n "$BASE_CONFIG" ]]; then
+  ROUTING_CONFIG="$BASE_CONFIG"
+fi
+
+case "$KBD" in
+  LRN|GC|CY|TW|ZYH|SQL|ZMY|XFH)
+    if [[ "$SEVERITY" != "MOD" ]]; then
+      echo "错误: 新人设 $KBD 仅提供中度配置，请设置 SEVERITY=MOD。" >&2
+      exit 2
+    fi
+    ;;
+esac
+
+# 与主跑脚本保持一致：G10/G11/G12 不运行 CBT 强制会谈，只使用 legacy identity。
+if [[ "$COUNSEL_ROOM" != true ]]; then
+  case "$GROUP" in
+    G10|G11|G12)
+      if [[ "$CBT_CONTROLLER_EXPLICIT" == true && "$CBT_CONTROLLER" != "legacy" ]]; then
+        echo "错误: $GROUP 不运行 CBT 强制会谈，只能使用 --cbt-controller legacy。" >&2
+        exit 2
+      fi
+      CBT_CONTROLLER="legacy"
+      ;;
+  esac
+fi
 
 case "$CBT_CONTROLLER" in
   progressive)
@@ -384,8 +425,10 @@ repeat_report_complete() {
     --arg source_summary "$source_summary" \
     --arg requested_labels "$requested_labels" \
     --argjson repeat "$EVAL_REPEAT" \
+    --argjson intermediate_repeat "$EVAL_INTERMEDIATE_SCALE_REPEATS" \
     '.batch_name == $batch_name
       and .repeat == $repeat
+      and ((.evaluation_protocol.intermediate_scale_repeats // -1) == $intermediate_repeat)
       and ((.source_original_summary // "") | endswith($source_summary))
       and ((.labels // []) == ($requested_labels | split(",")))
       and .completion.ready_for_final_report == true
@@ -416,11 +459,15 @@ run_or_resume_repeat_eval() {
     --original-summary "$source_summary"
     --labels "$requested_labels"
     --repeat "$EVAL_REPEAT"
+    --intermediate-scale-repeats "$EVAL_INTERMEDIATE_SCALE_REPEATS"
     --name "$eval_name"
     --max-parallel "$EVAL_MAX_PARALLEL"
     --resume-partial
     --require-controller-manifest
   )
+  if [[ "$CLEANUP_COMPLETED_ARTIFACTS" == true ]]; then
+    eval_cmd+=(--cleanup-completed-artifacts)
+  fi
   if [[ "$DRY_RUN" == true ]]; then
     print_command "${eval_cmd[@]}"
     return 0
@@ -856,6 +903,7 @@ echo " CBT controller:$CBT_CONTROLLER"
 echo " Progressive:   ${PROGRESSIVE_STAGE:-'(none)'}"
 echo " Output tag:    ${OUTPUT_TAG:-'(none)'}"
 echo " Base config:   ${BASE_CONFIG:-data/config.json}"
+echo " 复评底稿清理:  $CLEANUP_COMPLETED_ARTIFACTS"
 echo " 刷新模型路由:  $REFRESH_MODEL_ROUTING"
 if [[ "$REFRESH_MODEL_ROUTING" == true ]]; then
   echo " 路由来源:      $ROUTING_CONFIG"
@@ -875,7 +923,8 @@ else
 fi
 echo " 目标总步数:    $SIM_TARGET_STEP"
 echo " 外层并行数:    $MAX_PARALLEL_REPEATS"
-echo " 量表复评次数:  $EVAL_REPEAT"
+echo " 长量表复评次数:  $EVAL_REPEAT"
+echo " 中间短量表次数:  $EVAL_INTERMEDIATE_SCALE_REPEATS"
 echo " forced_llm检测:$AUTO_DETECT_FORCED_LLM_ROLLBACK"
 if [[ "$AUTO_DETECT_FORCED_LLM_ROLLBACK" == true ]]; then
   echo " 检测阈值:      min_calls=${FORCED_LLM_MIN_CALLS}, failure_ratio=${FORCED_LLM_FAILURE_RATIO}, consecutive=${FORCED_LLM_CONSECUTIVE_SIM_MEETINGS}"
