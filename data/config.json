@@ -325,7 +325,7 @@
     "forced_llm": {
       "enabled": true,
       "provider": "openai",
-      "model": "deepseek-v4-flash",
+      "model": "deepseek-flash",
       "base_url": "https://api.deepseek.com",
       "api_key_env": "DEEPSEEK_API_KEY",
       "retry": 5,

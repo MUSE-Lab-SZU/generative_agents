@@ -50,6 +50,18 @@ def compact_stage(
         "summary": str(stage.get("summary", "") or ""),
         "core_belief": str(stage.get("core_belief", "") or ""),
         "stage_index": normalized_index,
+        **{
+            k: copy.deepcopy(stage[k])
+            for k in (
+                "topic_id",
+                "node_kind",
+                "source_kind",
+                "migration_status",
+                "schema_version",
+                "content_revision",
+            )
+            if k in stage
+        },
     }
 
 
@@ -71,9 +83,16 @@ def build_transition_trace(
             and pointer_before != pointer_after
         )
     )
+    if "final_verdict" in row:
+        changed = bool(row.get("committed") and row.get("version_after", 0) > row.get("version_before", 0))
     return {
         "status": "available",
         "provenance": _normalize_provenance(provenance),
+        **{
+            k: copy.deepcopy(row[k])
+            for k in ("event_id", "trace_id", "graph_state_version", "verdict", "final_verdict", "committed", "version_before", "version_after")
+            if k in row
+        },
         "transition": {
             "timestamp": _serialize_timestamp(row.get("timestamp")),
             "source": str(row.get("source", "") or ""),
@@ -99,7 +118,12 @@ def build_transition_trace(
     }
 
 
-def capture_runtime_chat_trace(patient: Any, patient_text: str) -> Dict[str, Any]:
+def capture_runtime_chat_trace(
+    patient: Any,
+    patient_text: str,
+    message_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+) -> Dict[str, Any]:
     provenance = {"mode": "runtime_capture"}
     text = str(patient_text or "").strip()
     if not text:
@@ -107,6 +131,27 @@ def capture_runtime_chat_trace(patient: Any, patient_text: str) -> Dict[str, Any
     manager = _runtime_graph_manager(patient)
     if manager is None:
         return unavailable_trace("depression_dynamic_unavailable", provenance)
+    event_id = event_id or getattr(patient, "_last_accepted_event_id", None)
+    if event_id and hasattr(manager, "transition_traces"):
+        trace = manager.transition_traces.get(event_id, {})
+        mid = message_id or getattr(patient, "_last_accepted_message_id", None)
+        row = manager.evidence_ledger.get(mid, {})
+        if mid not in trace.get("accepted_refs", []) or row.get("text") != text:
+            return unavailable_trace("accepted_message_id_mismatch", provenance)
+        history_row = next(
+            (r for r in reversed(manager.stage_history) if r.get("event_id") == event_id), None
+        )
+        if history_row:
+            result = build_transition_trace(history_row, manager.stage_catalog, provenance)
+            result.update(message_refs=[mid], trace_id=event_id)
+            if trace.get("pipeline_version") == "v3":
+                result["pipeline_version"] = "v3"
+                result["final_result"] = copy.deepcopy(trace["final_result"])
+                result["stages"] = {key: copy.deepcopy(trace[key]) for key in
+                    ("extraction", "gate", "proposal", "validation")}
+            return result
+    if hasattr(manager, "evidence_ledger"):
+        return unavailable_trace("stable_message_identity_required", provenance)
     history = getattr(manager, "stage_history", None)
     dialogue = getattr(manager, "dialogue_history", None)
     if not isinstance(history, list) or not history:
@@ -143,6 +188,31 @@ def capture_runtime_reflection_trace(patient: Any, meeting_id: str) -> Dict[str,
     manager = _runtime_graph_manager(patient)
     if manager is None:
         return unavailable_trace("depression_dynamic_unavailable", provenance)
+    if hasattr(manager, "transition_traces"):
+        for row in reversed(manager.stage_history):
+            if row.get("source") != "reflection":
+                continue
+            trace = manager.transition_traces.get(row.get("event_id"), {})
+            meta = (
+                trace.get("legacy_evaluation", {})
+                .get("session_context", {})
+                .get("runtime_event", {})
+                .get("metadata", {})
+            )
+            if trace.get("pipeline_version") == "v3":
+                meta = trace.get("event_metadata", {})
+            if meta.get("trigger_context", {}).get("meeting_id") == target_meeting:
+                result = build_transition_trace(row, manager.stage_catalog, provenance)
+                result.update(
+                    message_refs=trace.get("accepted_refs", []), trace_id=row.get("event_id")
+                )
+                if trace.get("pipeline_version") == "v3":
+                    result["pipeline_version"] = "v3"
+                    result["final_result"] = copy.deepcopy(trace["final_result"])
+                    result["stages"] = {key: copy.deepcopy(trace[key]) for key in
+                        ("extraction", "gate", "proposal", "validation")}
+                return result
+        return unavailable_trace("reflection_not_bound_to_meeting", provenance)
     history = getattr(manager, "stage_history", None)
     dialogue = getattr(manager, "dialogue_history", None)
     if not isinstance(history, list) or not history:

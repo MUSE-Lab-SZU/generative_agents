@@ -7,10 +7,24 @@ import difflib
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from threading import RLock
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
+from .evidence import (
+    CLAIM_KINDS,
+    gate_message_refs,
+    update_key,
+    new_id,
+    digest,
+    json_safe,
+    check_id,
+    validate_claim,
+    register_accepted_message,
+    resolve_messages,
+    validate_event_sources,
+)
 from .prompt_builder import DynamicPromptBuilder
 from .prompt_templates import render_prompt
 
@@ -42,6 +56,14 @@ class ComplaintStage:
     next_candidates: List[str] = field(default_factory=list)
     is_terminal_stage: bool = False
     source: str = "config"
+    node_kind: str = "unknown"
+    topic_id: str = ""
+    source_kind: str = "legacy_unknown"
+    accepted_claims: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_refs: List[str] = field(default_factory=list)
+    schema_version: int = 3
+    content_revision: int = 1
+    migration_status: str = "legacy_unverified"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -108,14 +130,15 @@ class ComplaintGraphManager:
     DOMAIN_CHANGE_STEP = 5
     DOMAIN_EVIDENCE_LIMIT = 5
     DOMAIN_WINDOW_CANDIDATE_LIMIT = 60
-    TRANSITION_CANDIDATE_COUNT = 3
+    TRANSITION_CANDIDATE_COUNT = 1
 
     def __init__(
         self,
         config: Optional[Dict[str, Any]] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
-        domain_state_enabled: bool = True,
+        domain_state_enabled: bool = False,
     ):
+        self._commit_lock = RLock()
         config = config if isinstance(config, dict) else {}
         # 支持两种传法：
         # 1. 直接传 complaint_graph 配置本身；
@@ -123,6 +146,17 @@ class ComplaintGraphManager:
         graph_config = self._select_graph_config(config)
 
         self._raw_graph_config = copy.deepcopy(graph_config)
+        self._initialization_config_path = config.get("_config_path") or "inline_config"
+        self._initialization_pointer_prefix = (
+            "/complaint_graph" if "complaint_graph" in config else ""
+        )
+        self.pipeline_version = graph_config.get("pipeline_version", "v3")
+        if self.pipeline_version not in {"v3", "foundation_legacy"}:
+            raise ValueError("INVALID_PIPELINE_VERSION")
+        if self.pipeline_version == "v3" and domain_state_enabled:
+            raise ValueError("V3_DOMAIN_STATE_INCOMPATIBLE")
+        if self.pipeline_version == "foundation_legacy":
+            self.TRANSITION_CANDIDATE_COUNT = 3
         self.domain_state_enabled = bool(domain_state_enabled)
         self.planner: Dict[str, Any] = copy.deepcopy(graph_config.get("planner", {}))
         self.window_size = self._bounded_int(self.planner.get("window_size"), 3, 1, 8)
@@ -140,6 +174,8 @@ class ComplaintGraphManager:
 
         self.stage_catalog: Dict[str, Dict[str, Any]] = {}
         raw_stages = graph_config.get("stages", graph_config.get("stage_catalog", []))
+        if isinstance(raw_stages, dict):
+            raw_stages = list(raw_stages.values())
         if isinstance(raw_stages, list):
             for item in raw_stages:
                 # 每个 stage 都先经过 sanitize，再进入 catalog。
@@ -188,6 +224,1600 @@ class ComplaintGraphManager:
         self.stage_start_time = self._now()
 
         self.reset()
+        self._initialize_v3(graph_config)
+        if not graph_config.get("_restoring_v3"):
+            for node in self.stage_catalog.values():
+                self._validate_snapshot(node)
+            self.resolve_active_claims()
+
+    V3_FIELDS = (
+        "graph_state_version",
+        "case_id",
+        "origin_namespace",
+        "topic_registry",
+        "frozen_initialization",
+        "evidence_ledger",
+        "session_records",
+        "generation_snapshots",
+        "pending_events",
+        "processed_event_results",
+        "consumed_updates",
+        "transition_traces",
+    )
+
+    def _initialize_v3(self, config):
+        self.graph_state_version = 0
+        self.case_id = new_id("case")
+        self.origin_namespace = new_id("origin")
+        self.topic_registry = copy.deepcopy(config.get("topic_registry", {}))
+        initialization_config = config.get("_initialization_config", config)
+        self.frozen_initialization = {
+            "config": copy.deepcopy(initialization_config),
+            "config_fingerprint": digest(initialization_config),
+        }
+        for key in self.V3_FIELDS[5:]:
+            setattr(self, key, {})
+        self._legacy_errors = []
+        for node in self.stage_catalog.values():
+            topic = node.get("topic_id") or "topic_" + digest(node["id"])[:24]
+            node["topic_id"] = topic
+            self.topic_registry.setdefault(
+                topic, {"neutral_name": "初始主诉", "origin_node_id": node["id"]}
+            )
+            if config.get("_restoring_v3"):
+                # Restored refs are validated after the saved ledger is loaded.
+                continue
+            raw_stages = initialization_config.get(
+                "stages", initialization_config.get("stage_catalog", [])
+            )
+            raw_stages = list(raw_stages.values()) if isinstance(raw_stages, dict) else raw_stages
+            raw = next(
+                (
+                    x
+                    for x in raw_stages
+                    if isinstance(x, dict)
+                    and (x.get("id") or self._make_stage_id(x.get("label", "未命名主诉节点")))
+                    == node["id"]
+                ),
+                {},
+            )
+            if (
+                not raw
+                and node["id"] == self.initial_stage_id
+                and not config.get("_legacy_restore")
+            ):
+                raw = copy.deepcopy(node)
+            claims = copy.deepcopy(raw.get("accepted_claims", []))
+            if not claims and raw and node["id"] == self.initial_stage_id:
+                claims = [{"kind": "unknown", "text": raw.get("summary", node["summary"])}]
+            if claims:
+                ref = new_id("config")
+                self.evidence_ledger[ref] = dict(
+                    evidence_id=ref,
+                    record_kind="persona_fragment",
+                    case_id=self.case_id,
+                    config_fingerprint=digest(initialization_config),
+                    config_path=self._initialization_config_path,
+                    json_pointer=self._initialization_pointer_prefix
+                    + "/stages/"
+                    + str(raw_stages.index(raw) if raw in raw_stages else 0),
+                    raw_fragment=copy.deepcopy(raw),
+                    captured_at=self._now().isoformat(),
+                )
+                for c in claims:
+                    c.setdefault("claim_id", new_id("claim"))
+                    c.setdefault("revision", 1)
+                    c.setdefault("topic_id", topic)
+                    c.setdefault("subject", "patient")
+                    c.setdefault("assertion_status", "unknown")
+                    c.setdefault("actuality", "unknown")
+                    c.setdefault(
+                        "time",
+                        dict(
+                            reported_time_text="",
+                            effective_start=None,
+                            effective_end=None,
+                            precision="unknown",
+                        ),
+                    )
+                    c.update(acceptance_basis="configured", evidence_refs=[ref])
+                    c.setdefault("accepted_at", self._now().isoformat())
+                    c.setdefault("accepted_version", 0)
+                    c.setdefault("supersedes", None)
+                node.update(
+                    accepted_claims=claims,
+                    source_kind="persona_initialization",
+                    migration_status=(
+                        "legacy_config_opaque"
+                        if any(c["kind"] == "unknown" for c in claims)
+                        else "native_v3"
+                    ),
+                )
+            node["evidence_refs"] = sorted({r for c in claims for r in c["evidence_refs"]})
+            kinds = {c["kind"] for c in claims if c["kind"] != "unknown"}
+            node["node_kind"] = (
+                next(iter(kinds)) if len(kinds) == 1 else ("mixed" if kinds else "unknown")
+            )
+
+    def _v3_envelope(self):
+        return dict(
+            graph_schema_version=3,
+            pipeline_version=self.pipeline_version,
+            stage_catalog_snapshot=copy.deepcopy(self.stage_catalog),
+            **{key: copy.deepcopy(getattr(self, key)) for key in self.V3_FIELDS},
+        )
+
+    def _restore_v3(self, payload):
+        self.pipeline_version = payload.get("pipeline_version", "foundation_legacy")
+        if self.pipeline_version == "phase1_legacy_transition":
+            self.pipeline_version = "foundation_legacy"
+        if self.pipeline_version not in {'v3','foundation_legacy'}:
+            raise ValueError('INVALID_PIPELINE_VERSION')
+        self.stage_catalog = copy.deepcopy(payload["stage_catalog_snapshot"])
+        self._core_belief = payload["core_belief"]
+        self._root_complaint_anchor = payload["root_complaint_anchor"]
+        required = {f.name for f in fields(ComplaintStage)}
+        for key, node in self.stage_catalog.items():
+            if not isinstance(node, dict) or not required <= node.keys() or node["id"] != key:
+                raise ValueError("INVALID_V3_NODE_RECORD")
+            self._sanitize_stage(node)  # Validate enums; do not truncate saved display content.
+            if node["core_belief"] != self._core_belief:
+                raise ValueError("CORE_BELIEF_MIRROR_CONFLICT")
+        for key in self.V3_FIELDS:
+            if key not in payload:
+                raise ValueError("MISSING_V3_FIELD:" + key)
+            setattr(self, key, copy.deepcopy(payload[key]))
+        self.origin_namespace = new_id("origin")
+        path = payload["planned_graph"]
+        index = payload["stage_index"]
+        if (
+            not path
+            or any(x not in self.stage_catalog for x in path)
+            or not 0 <= index < len(path)
+            or len(set(path[: index + 1])) != index + 1
+        ):
+            raise ValueError("INVALID_COMMITTED_PATH")
+        if path[index] != payload["current_stage_id"]:
+            raise ValueError("INVALID_CURRENT_NODE")
+        self.planned_graph, self.stage_index = list(path), index
+        for key, row in self.evidence_ledger.items():
+            if row.get("evidence_id") != key or row.get("case_id") != self.case_id:
+                raise ValueError("INVALID_LEDGER_RECORD")
+            if row.get("record_kind") == "message":
+                resolve_messages(self.evidence_ledger, [key], self.case_id, patient_only=False)
+                session = self.session_records.get(row.get("session_instance_id"), {})
+                if key not in session.get("message_refs", []):
+                    raise ValueError("MISSING_MESSAGE_SESSION_REF")
+                snapshot = row.get("generation_snapshot_ref")
+                if snapshot and (
+                    snapshot not in self.generation_snapshots
+                    or self.generation_snapshots[snapshot].get("generation_attempt_id")
+                    != row.get("generation_attempt_id")
+                ):
+                    raise ValueError("INVALID_GENERATION_SNAPSHOT")
+        for session_id, session in self.session_records.items():
+            if len(set(session["message_refs"])) != len(session["message_refs"]):
+                raise ValueError("DUPLICATE_SESSION_REF")
+            for ordinal, row in enumerate(
+                resolve_messages(
+                    self.evidence_ledger, session["message_refs"], self.case_id, patient_only=False
+                ),
+                start=1,
+            ):
+                if row.get("ordinal") != ordinal:
+                    raise ValueError("INVALID_MESSAGE_ORDINAL")
+                if row["session_instance_id"] != session_id:
+                    raise ValueError("INVALID_SESSION_REF")
+        revisions = {}
+        for node in self.stage_catalog.values():
+            self._validate_snapshot(node)
+            for claim in node["accepted_claims"]:
+                key = (claim["claim_id"], claim["revision"])
+                if key in revisions and revisions[key] != claim:
+                    raise ValueError("CLAIM_REVISION_CONFLICT")
+                revisions[key] = claim
+        for eid, event in self.pending_events.items():
+            if (
+                event.get("metadata", {}).get("event_id") != eid
+                or event.get("base_node_id") not in self.stage_catalog
+            ):
+                raise ValueError("INVALID_PENDING_EVENT")
+            if eid in self.processed_event_results:
+                raise ValueError("PENDING_EVENT_ALREADY_PROCESSED")
+            validate_event_sources(self, event)
+        if set(self.processed_event_results) != set(self.transition_traces):
+            raise ValueError("MISSING_EVENT_RESULT_OR_TRACE")
+        for eid, trace in self.transition_traces.items():
+            resolve_messages(self.evidence_ledger, trace.get("accepted_refs", []), self.case_id)
+            if (
+                trace.get("event_id") != eid
+                or trace.get("final_result") != self.processed_event_results[eid]
+            ):
+                raise ValueError("EVENT_RESULT_TRACE_CONFLICT")
+            if trace.get("pipeline_version") == "v3":
+                for o in trace.get("extraction", {}).get("normalized", {}).get("observations", []):
+                    gate_message_refs(self, o["supporting_message_ids"], trace["accepted_refs"])
+                    if o["event_id"] != eid:
+                        raise ValueError("OBSERVATION_EVENT_CONFLICT")
+                validation = trace.get("validation", {})
+                if validation.get("status") == "ok":
+                    v = validation["normalized"]
+                    p = trace["proposal"]["normalized"]
+                    if (v["input_hash"] != digest(validation["input"]) or
+                        v["proposal_id"] != p["proposal_id"] or validation["input"]["proposal"] != p):
+                        raise ValueError("VALIDATION_BINDING_CONFLICT")
+                for ref in trace.get("base_claim_refs", []):
+                    heads = self.resolve_active_claims(trace["base_node_id"])["active_claims"]
+                    if ref not in [{"claim_id":c["claim_id"],"revision":c["revision"]} for c in heads]:
+                        raise ValueError("TRACE_BASE_CLAIM_CONFLICT")
+            snapshot_ref = trace.get("generation_snapshot_ref")
+            if snapshot_ref and snapshot_ref not in self.generation_snapshots:
+                raise ValueError("DANGLING_TRACE_SNAPSHOT")
+        for ref, snapshot in self.generation_snapshots.items():
+            if snapshot.get("generation_snapshot_ref") != ref:
+                raise ValueError("GENERATION_SNAPSHOT_ID_CONFLICT")
+            baseline = self.resolve_active_claims(snapshot.get("stage_id"))["active_claims"]
+            allowed = {(c["claim_id"], c["revision"]) for c in baseline}
+            if any(
+                (c["claim_id"], c["revision"]) not in allowed
+                for c in snapshot.get("claim_refs", [])
+            ):
+                raise ValueError("DANGLING_GENERATION_CLAIM_REF")
+            for init_ref in snapshot.get("initialization_refs", []):
+                if self.evidence_ledger.get(init_ref, {}).get("record_kind") != "persona_fragment":
+                    raise ValueError("DANGLING_INITIALIZATION_REF")
+
+    def _validate_snapshot(self, node):
+        seen = set()
+        for raw in node["accepted_claims"]:
+            c = validate_claim(raw)
+            if c["claim_id"] in seen:
+                raise ValueError("MULTIPLE_CLAIM_HEADS")
+            seen.add(c["claim_id"])
+            if c["topic_id"] not in self.topic_registry:
+                raise ValueError("INVALID_CLAIM_TOPIC")
+            for ref in c["evidence_refs"]:
+                row = self.evidence_ledger.get(ref, {})
+                if row.get("case_id") != self.case_id:
+                    raise ValueError("DANGLING_CLAIM_EVIDENCE")
+                if c["acceptance_basis"] == "configured":
+                    if row.get("record_kind") != "persona_fragment":
+                        raise ValueError("INVALID_CONFIG_EVIDENCE")
+                else:
+                    resolve_messages(self.evidence_ledger, [ref], self.case_id)
+        if node["topic_id"] not in self.topic_registry:
+            raise ValueError("INVALID_NODE_TOPIC")
+        if sorted(node["evidence_refs"]) != sorted(
+            {r for c in node["accepted_claims"] for r in c["evidence_refs"]}
+        ):
+            raise ValueError("INVALID_NODE_EVIDENCE_UNION")
+
+    def resolve_active_claims(self, base_node_id=None):
+        target = base_node_id or self.get_current_stage_id()
+        committed = self.planned_graph[: self.stage_index + 1]
+        if target not in committed:
+            raise ValueError("UNCOMMITTED_BASE_NODE")
+        heads, revisions = {}, {}
+        for node_id in committed[: committed.index(target) + 1]:
+            node = self.stage_catalog[node_id]
+            self._validate_snapshot(node)
+            next_heads = {}
+            for c in node["accepted_claims"]:
+                cid, rev = c["claim_id"], c["revision"]
+                key = (cid, rev)
+                if key in revisions and revisions[key] != c:
+                    raise ValueError("CLAIM_REVISION_CONFLICT")
+                old = heads.get(cid)
+                if old and rev != old["revision"]:
+                    if (
+                        rev != old["revision"] + 1
+                        or c.get("supersedes") != {"claim_id": cid, "revision": old["revision"]}
+                        or any(c[k] != old[k] for k in ("subject", "kind"))
+                        or old["kind"] == "unknown"
+                    ):
+                        raise ValueError("BROKEN_SUPERSEDES_CHAIN")
+                elif not old and (rev != 1 or c.get("supersedes") is not None):
+                    raise ValueError("BROKEN_SUPERSEDES_CHAIN")
+                revisions[key] = copy.deepcopy(c)
+                next_heads[cid] = copy.deepcopy(c)
+            if set(heads) - set(next_heads):
+                raise ValueError("CLAIM_DELETION_NOT_ALLOWED")
+            heads = next_heads
+        return {
+            "active_claims": [c for c in heads.values() if c["kind"] != "unknown"],
+            "initialization_background": [c for c in heads.values() if c["kind"] == "unknown"],
+        }
+
+    def resolve_claim_revision(self, claim_id, revision, purpose="current"):
+        active = self.resolve_active_claims()
+        for c in active["active_claims"]:
+            if (c["claim_id"], c["revision"]) == (claim_id, revision):
+                return c
+        if purpose == "history_audit":
+            for nid in self.planned_graph[: self.stage_index + 1]:
+                for c in self.stage_catalog[nid]["accepted_claims"]:
+                    if (c["claim_id"], c["revision"]) == (claim_id, revision):
+                        return copy.deepcopy(c)
+        raise ValueError("NON_ACTIVE_CLAIM_REVISION")
+
+    def update_display(self, node_id, **changes):
+        with self._commit_lock:
+            return self._update_display(node_id, **changes)
+
+    def _update_display(self, node_id, **changes):
+        if not set(changes) <= {"label", "summary", "narrative_focus"}:
+            raise ValueError("NOT_DISPLAY_ONLY")
+        node = self.stage_catalog[node_id]
+        node.update(copy.deepcopy(changes))
+        node["content_revision"] += 1
+
+    def start_session(self, session_id=None):
+        sid = check_id(session_id or new_id("session"))
+        self.session_records.setdefault(
+            sid, {"message_refs": [], "origin_namespace": self.origin_namespace}
+        )
+        return sid
+
+    def register_accepted_message(
+        self,
+        text,
+        speaker_id,
+        session_instance_id,
+        speaker_role="patient",
+        message_id=None,
+        **metadata,
+    ):
+        if session_instance_id not in self.session_records:
+            raise ValueError("INVALID_SESSION")
+        sid = session_instance_id
+        mid = message_id or new_id("message")
+        if mid in self.evidence_ledger:
+            old = self.evidence_ledger[mid]
+            if any(
+                old.get(k) != v
+                for k, v in dict(
+                    text=text,
+                    speaker_id=speaker_id,
+                    speaker_role=speaker_role,
+                    session_instance_id=sid,
+                ).items()
+            ):
+                raise ValueError("MESSAGE_ID_CONFLICT")
+            for key in ("generation_attempt_id", "generation_snapshot_ref", "meeting_id"):
+                if key in metadata and metadata[key] != old.get(key):
+                    raise ValueError("MESSAGE_ID_CONFLICT")
+            resolve_messages(self.evidence_ledger, [mid], self.case_id, patient_only=False)
+            return mid
+        record = dict(
+            message_id=mid,
+            case_id=self.case_id,
+            origin_namespace=self.origin_namespace,
+            session_instance_id=sid,
+            speaker_id=speaker_id,
+            speaker_role=speaker_role,
+            text=text,
+            accepted_at=self._now().isoformat(),
+            ordinal=len(self.session_records[sid]["message_refs"]) + 1,
+            acceptance_status="accepted",
+            source_kind="patient_utterance" if speaker_role == "patient" else "context_only",
+            generation_attempt_id=metadata.get("generation_attempt_id"),
+            generation_snapshot_ref=metadata.get("generation_snapshot_ref"),
+            meeting_id=metadata.get("meeting_id"),
+        )
+        snapshot = record["generation_snapshot_ref"]
+        if snapshot and snapshot not in self.generation_snapshots:
+            raise ValueError("INVALID_GENERATION_SNAPSHOT")
+        register_accepted_message(self.evidence_ledger, record)
+        self.session_records[sid]["message_refs"].append(mid)
+        return mid
+
+    def evaluate_turn(
+        self,
+        session_context,
+        conversation_content,
+        counterpart_utterance="",
+        completion_func=None,
+        llm_cfg=None,
+    ):
+        if self.pipeline_version == "v3":
+            return self._evaluate_observation_turn(session_context, conversation_content,
+                counterpart_utterance, completion_func, llm_cfg)
+        context = copy.deepcopy(session_context or {})
+        event = context.setdefault("runtime_event", {})
+        meta = event.setdefault("metadata", {})
+        eid = meta.setdefault("event_id", new_id("event"))
+        if eid in self.processed_event_results:
+            return {"event_id": eid, "cached": True}
+        base = self.get_current_stage_id()
+        version = self.graph_state_version
+        pending = self.pending_events.get(eid)
+        if pending:
+            base, version = pending["base_node_id"], pending["base_state_version"]
+        errors = []
+        calls = []
+        self._legacy_errors = []
+
+        def invoke(prompt):
+            row = {"prompt": prompt, "response": None}
+            calls.append(row)
+            try:
+                row["response"] = completion_func(prompt)
+                if not self._parse_json_object(row["response"]):
+                    errors.append("LEGACY_MODEL_OUTPUT_INVALID")
+                return row["response"]
+            except Exception as exc:
+                row["error"] = str(exc)
+                raise
+
+        try:
+            rows = validate_event_sources(self, event)
+            # Keep the legacy payload schema, but never commit after silently clipping source text.
+            if event.get("source", "chat") == "reflection":
+                over_budget = len(rows) > 6 or any(len(row["text"]) > 360 for row in rows)
+            else:
+                text_limit = self._bounded_int(
+                    (llm_cfg or {}).get("max_text_length"), 1200, 200, 6000
+                )
+                over_budget = (
+                    len(conversation_content) > text_limit
+                    or len(counterpart_utterance) > text_limit
+                )
+            if over_budget:
+                raise ValueError("INPUT_BUDGET_EXCEEDED")
+            if base != self.get_current_stage_id() or version != self.graph_state_version:
+                raise ValueError("STALE_BASE")
+            if event.get("source", "chat") == "chat" and (
+                len(rows) != 1 or rows[0]["text"] != conversation_content
+            ):
+                raise ValueError("ACCEPTED_TEXT_MISMATCH")
+            self.pending_events[eid] = {
+                "source": event.get("source", "chat"),
+                "metadata": copy.deepcopy(meta),
+                "base_node_id": base,
+                "base_state_version": version,
+                "session_context": context,
+                "content": conversation_content,
+                "counterpart_utterance": counterpart_utterance,
+            }
+            if event.get("source") == "reflection":
+                meta["reflection_evidence"] = {
+                    "interaction_background": "会后反思，仅读取授权的正式患者消息",
+                    "patient_key_utterances": [row["text"] for row in rows],
+                    "behavior_or_life_events": [],
+                }
+                conversation_content = "\n".join(row["text"] for row in rows)
+            evaluation = self._evaluate_legacy_turn(
+                context,
+                conversation_content,
+                counterpart_utterance,
+                invoke if callable(completion_func) else None,
+                llm_cfg,
+            )
+            if any("error" in call for call in calls):
+                errors.append("LEGACY_MODEL_ERROR")
+        except Exception as exc:
+            errors.append(str(exc))
+            evaluation = {
+                "action": "hold",
+                "matched": False,
+                "match_reason": str(exc),
+                "session_context": context,
+                "conversation_excerpt": "",
+            }
+        evaluation.update(
+            event_id=eid,
+            base_node_id=base,
+            base_state_version=version,
+            errors=errors,
+            legacy_errors=copy.deepcopy(self._legacy_errors),
+            legacy_calls=calls,
+        )
+        return evaluation
+
+    def commit_turn(self, evaluation):
+        with self._commit_lock:
+            if self.pipeline_version == "v3":
+                keys = ('stage_catalog','topic_registry','planned_graph','stage_index',
+                        'graph_state_version','stage_start_time','consumed_updates',
+                        'stage_history','last_evaluation','transition_traces',
+                        'processed_event_results','pending_events')
+                backup = {k:copy.deepcopy(getattr(self,k)) for k in keys}
+                try:
+                    return self._commit_observation_turn(evaluation)
+                except Exception:
+                    for key,value in backup.items():
+                        setattr(self,key,value)
+                    raise
+            return self._commit_v3_turn(evaluation)
+
+    def _commit_v3_turn(self, evaluation):
+        eid = evaluation.get("event_id")
+        if eid in self.processed_event_results:
+            return copy.deepcopy(self.processed_event_results[eid])
+        if not eid:
+            raise ValueError("ACCEPTED_EVENT_REQUIRED")
+        e = copy.deepcopy(evaluation)
+        errors = e.setdefault("errors", [])
+        event = e.get("session_context", {}).get("runtime_event", {})
+        if not errors:
+            try:
+                validate_event_sources(self, event)
+                if (
+                    e["base_node_id"] != self.get_current_stage_id()
+                    or e["base_state_version"] != self.graph_state_version
+                ):
+                    raise ValueError("STALE_BASE")
+                self.resolve_active_claims()
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            e.update(action="hold", matched=False, match_reason=errors[0])
+        parent = self.get_current_stage()
+        if e.get("action") == "advance" and isinstance(e.get("next_stage"), dict):
+            child = e["next_stage"]
+            for key in (
+                "accepted_claims",
+                "topic_id",
+                "node_kind",
+                "evidence_refs",
+                "speaking_style",
+                "emotion_vector",
+                "relation_modifiers",
+            ):
+                child[key] = copy.deepcopy(parent[key])
+            child.update(
+                source="llm",
+                source_kind="legacy_unknown",
+                migration_status="legacy_transition_unverified",
+                schema_version=3,
+                content_revision=1,
+                is_terminal_stage=False,
+            )
+        before = copy.deepcopy(self.stage_catalog)
+        transaction_keys = (
+            "stage_catalog",
+            "planned_graph",
+            "stage_index",
+            "stage_start_time",
+            "stage_history",
+            "dialogue_history",
+            "last_session_context",
+            "last_evaluation",
+            "pending_domain_window",
+        )
+        backup = {key: copy.deepcopy(getattr(self, key)) for key in transaction_keys}
+        try:
+            self._commit_legacy_turn(e)
+        except Exception:
+            for key, value in backup.items():
+                setattr(self, key, value)
+            raise
+        if self.get_current_stage_id() != parent["id"]:
+            self.graph_state_version += 1
+            # Existing configuration branches are structural legacy transitions too.
+            child = self.stage_catalog[self.get_current_stage_id()]
+            for key in ("accepted_claims", "topic_id", "node_kind", "evidence_refs"):
+                child[key] = copy.deepcopy(parent[key])
+            child.update(
+                source_kind="legacy_unknown", migration_status="legacy_transition_unverified"
+            )
+        for nid in before:
+            if self.stage_catalog[nid] != before[nid]:
+                self.stage_catalog[nid]["content_revision"] = before[nid]["content_revision"] + 1
+        verdict = "insufficient" if errors else self.last_evaluation["action"]
+        pointer = dict(
+            event_id=eid,
+            trace_id=eid,
+            graph_state_version=self.graph_state_version,
+            verdict=verdict,
+        )
+        self.last_evaluation.update(pointer)
+        if self.stage_history:
+            self.stage_history[-1].update(pointer)
+        result = json_safe(self.get_graph_snapshot())
+        result.update(pointer)
+        refs = event.get("metadata", {}).get("message_refs", [])
+        # Invalid refs remain in the gate diagnostic, never masquerade as accepted refs.
+        valid_refs = [
+            r
+            for r in refs
+            if r in self.evidence_ledger
+            and self.evidence_ledger[r].get("source_kind") == "patient_utterance"
+        ]
+        self.transition_traces[eid] = dict(
+            **pointer,
+            pipeline_version=self.pipeline_version,
+            accepted_refs=valid_refs,
+            requested_refs=refs,
+            generation_snapshot_ref=event.get("metadata", {}).get("generation_snapshot_ref"),
+            base_node_id=e.get("base_node_id"),
+            base_state_version=e.get("base_state_version"),
+            base_claim_refs=[
+                {"claim_id": c["claim_id"], "revision": c["revision"]}
+                for c in self.stage_catalog.get(e.get("base_node_id"), parent)["accepted_claims"]
+                if c["kind"] != "unknown"
+            ],
+            schema_version=3,
+            prompt_protocol="legacy_seed_detail_matcher",
+            gate={"errors": errors},
+            legacy_errors=e.get("legacy_errors", []),
+            legacy_evaluation=e,
+            extraction={"status": "skipped", "reason": "phase1_legacy_protocol"},
+            proposal={"status": "skipped", "reason": "phase2_not_enabled"},
+            validation={"status": "skipped", "reason": "phase2_not_enabled"},
+            call_count=len(e.get("legacy_calls", [])),
+            added_claim_count=0,
+            final_result=copy.deepcopy(result),
+        )
+        self.processed_event_results[eid] = copy.deepcopy(result)
+        self.pending_events.pop(eid, None)
+        return result
+
+    DIFF_CHECKS = (
+        "evidence_support",
+        "semantic_novelty",
+        "no_abstract_expansion",
+        "kind_boundary",
+        "subject",
+        "negation_and_contrast",
+        "actuality",
+        "time_scope",
+        "evidence_reuse",
+        "active_revision",
+        "baseline_eligibility",
+    )
+    ADMISSIONS = {
+        "focus_shift": "topic_shift",
+        "appraisal_change": "appraisal_change",
+        "enacted_behavior_change": "behavior_change",
+        "comparable_symptom_function_change": "symptom_function_change",
+        "material_correction": "correction",
+    }
+
+    def _v3_call(self, stage, payload, completion, trace):
+        template = {
+            "extraction": "graph_transition_change",
+            "proposal": "graph_planner",
+            "validation": "graph_transition",
+        }[stage]
+        payload = dict(
+            payload,
+            pipeline_version="v3",
+            prompt_key=template,
+            event_id=trace["event_id"],
+        )
+        prompt = (
+            render_prompt("depression/" + template, {})
+            + "\n输入："
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        if len(prompt) > trace["input_budget_chars"]:
+            raise ValueError("INPUT_BUDGET_EXCEEDED")
+        if not callable(completion) or not self.llm_enabled:
+            raise ValueError("MODEL_UNAVAILABLE")
+        trace["call_count"] += 1
+        trace[stage] = {"status": "error", "input": payload, "prompt_version": "v3.1"}
+        raw = completion(prompt)
+        trace[stage]["raw"] = raw
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(parsed, dict):
+            raise ValueError("MODEL_OBJECT_REQUIRED")
+        return parsed
+
+    def _extract_observations(self, rows, context, completion, trace):
+        raw = self._v3_call(
+            "extraction",
+            {
+                "task": "observation_detection",
+                "source_messages": rows,
+                "context_only": context,
+            },
+            completion,
+            trace,
+        )
+        return self._normalize_observations(raw, rows, trace["event_id"])
+
+    def _propose_minimal_update(
+        self, inputs, batch, active, history, completion, trace
+    ):
+        raw = self._v3_call("proposal", inputs, completion, trace)
+        return self._normalize_proposal(raw, batch, active, history)
+
+    def _validate_commit(self, inputs, proposal, completion, trace):
+        raw = self._v3_call("validation", inputs, completion, trace)
+        return self._normalize_validation_result(raw, proposal)
+
+    def _normalize_observations(self, raw, rows, eid):
+        if set(raw) != {"observations"} or not isinstance(raw["observations"], list):
+            raise ValueError("INVALID_OBSERVATION_SCHEMA")
+        required = {
+            "local_id",
+            "kind",
+            "subject",
+            "reported_content",
+            "assertion_status",
+            "actuality",
+            "reported_time_text",
+            "supporting_message_ids",
+            "relations",
+            "uncertainty_codes",
+        }
+        items = copy.deepcopy(raw["observations"])
+        local = {}
+        for o in items:
+            if not isinstance(o, dict) or set(o) != required:
+                raise ValueError("INVALID_OBSERVATION_SCHEMA")
+            check_id(o["local_id"])
+            if o["local_id"] in local:
+                raise ValueError("DUPLICATE_LOCAL_ID")
+            local[o["local_id"]] = new_id("obs")
+            if (
+                o["kind"] not in CLAIM_KINDS
+                or o["assertion_status"]
+                not in {"affirmed", "denied", "uncertain", "unknown"}
+                or o["actuality"]
+                not in {"occurred", "ongoing", "intended", "hypothetical", "unknown"}
+            ):
+                raise ValueError("INVALID_OBSERVATION_ENUM")
+            if (
+                any(
+                    not isinstance(o[k], str)
+                    for k in ("subject", "reported_content", "reported_time_text")
+                )
+                or not o["reported_content"].strip()
+                or not o["subject"].strip()
+            ):
+                raise ValueError("INVALID_OBSERVATION_TEXT")
+            gate_message_refs(
+                self, o["supporting_message_ids"], [r["message_id"] for r in rows]
+            )
+            if not isinstance(o["relations"], list) or not isinstance(
+                o["uncertainty_codes"], list
+            ):
+                raise ValueError("INVALID_OBSERVATION_RELATIONS")
+        for o in items:
+            for relation in o["relations"]:
+                if (
+                    set(relation) != {"type", "target_local_id"}
+                    or relation["type"]
+                    not in {"contrast", "condition", "comparison", "correction"}
+                    or relation["target_local_id"] not in local
+                ):
+                    raise ValueError("INVALID_OBSERVATION_RELATIONS")
+                relation["target_observation_id"] = local[relation["target_local_id"]]
+            source = self.evidence_ledger[o["supporting_message_ids"][0]]
+            o.update(
+                observation_id=local[o["local_id"]],
+                event_id=eid,
+                observed_at=source["accepted_at"],
+                session_instance_id=source["session_instance_id"],
+            )
+        return dict(
+            observation_batch_id=new_id("batch"),
+            event_id=eid,
+            schema_version=3,
+            extraction_status="ok",
+            observations=items,
+            errors=[],
+        )
+
+    def _historical_observations(self, observations, rows):
+        pairs = {(o["subject"], o["kind"]) for o in observations}
+        order = {ref: i for i, ref in enumerate(self.evidence_ledger)}
+        newest = max(order[r["message_id"]] for r in rows)
+        selected = []
+        for trace in self.transition_traces.values():
+            if trace.get("gate", {}).get("status") != "pass":
+                continue
+            for o in (
+                trace.get("extraction", {})
+                .get("normalized", {})
+                .get("observations", [])
+            ):
+                if (o["subject"], o["kind"]) not in pairs:
+                    continue
+                sources = resolve_messages(
+                    self.evidence_ledger, o["supporting_message_ids"], self.case_id
+                )
+                eligible = all(
+                    s["accepted_at"] <= max(r["accepted_at"] for r in rows)
+                    and order[s["message_id"]] <= newest
+                    for s in sources
+                )
+                selected.append(
+                    dict(
+                        copy.deepcopy(o),
+                        source_messages=sources,
+                        comparison_eligible=eligible,
+                        generation_context=self._generation_source_context(sources),
+                    )
+                )
+        return selected
+
+    def _generation_source_context(self, rows):
+        return [
+            copy.deepcopy(self.generation_snapshots[r["generation_snapshot_ref"]])
+            for r in rows
+            if r.get("generation_snapshot_ref") in self.generation_snapshots
+        ]
+
+    def _normalize_proposal(self, raw, batch, active, history):
+        p = copy.deepcopy(raw)
+        allowed = {
+            "operation",
+            "reason_code",
+            "update_kind",
+            "topic_request",
+            "admission",
+            "selected_observation_ids",
+            "primary_kind",
+            "claim_diffs",
+            "focus_claim_refs",
+        }
+        if not set(p) <= allowed or p.get("operation") not in {"none", "new_node"}:
+            raise ValueError("INVALID_PROPOSAL_SCHEMA")
+        if p["operation"] == "none":
+            if (
+                not isinstance(p.get("reason_code"), str)
+                or not p["reason_code"]
+                or p.get("claim_diffs") != []
+            ):
+                raise ValueError("INVALID_NOOP")
+            return p
+        required = allowed - {"reason_code", "focus_claim_refs"}
+        if not required <= p.keys() or p["primary_kind"] not in CLAIM_KINDS | {"mixed"}:
+            raise ValueError("INVALID_PROPOSAL_SCHEMA")
+        obs = {o["observation_id"]: o for o in batch["observations"]}
+        selected = p["selected_observation_ids"]
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or len(set(selected)) != len(selected)
+            or not set(selected) <= obs.keys()
+        ):
+            raise ValueError("INVALID_SELECTED_OBSERVATIONS")
+        a = p["admission"]
+        if (
+            not isinstance(a, dict)
+            or set(a)
+            != {
+                "basis",
+                "change_statement",
+                "baseline_claim_refs",
+                "baseline_observation_ids",
+                "supporting_observation_ids",
+            }
+            or self.ADMISSIONS.get(a.get("basis")) != p["update_kind"]
+            or not isinstance(a["change_statement"], str)
+            or not a["change_statement"].strip()
+        ):
+            raise ValueError("INVALID_ADMISSION")
+        heads = {(c["claim_id"], c["revision"]): c for c in active}
+
+        def active_ref(ref):
+            if (
+                not isinstance(ref, dict)
+                or set(ref) != {"claim_id", "revision"}
+                or (ref["claim_id"], ref["revision"]) not in heads
+            ):
+                raise ValueError("NON_ACTIVE_CLAIM_REVISION")
+            return heads[(ref["claim_id"], ref["revision"])]
+
+        for ref in a["baseline_claim_refs"]:
+            active_ref(ref)
+        baseline = {o["observation_id"]: o for o in history + batch["observations"]}
+        if not set(a["baseline_observation_ids"]) <= baseline.keys():
+            raise ValueError("INVALID_BASELINE_OBSERVATION")
+        if not a["supporting_observation_ids"] or not set(
+            a["supporting_observation_ids"]
+        ) <= set(selected):
+            raise ValueError("INVALID_ADMISSION_SUPPORT")
+        for bid in a["baseline_observation_ids"]:
+            old = baseline[bid]
+            if old.get("comparison_eligible") is False:
+                raise ValueError("BASELINE_TIME_ORDER")
+            if not any(
+                (old["subject"], old["kind"]) == (obs[s]["subject"], obs[s]["kind"])
+                for s in selected
+            ):
+                raise ValueError("INCOMPARABLE_BASELINE")
+        topic = p["topic_request"]
+        mode = topic.get("mode")
+        if mode in {"current", "existing"}:
+            if mode == "existing" and "topic_id" not in topic:
+                raise ValueError("INVALID_TOPIC")
+            if (
+                set(topic) - {"mode", "topic_id"}
+                or topic.get("topic_id", self.get_current_stage()["topic_id"])
+                not in self.topic_registry
+            ):
+                raise ValueError("INVALID_TOPIC")
+            if (
+                mode == "current"
+                and topic.get("topic_id", self.get_current_stage()["topic_id"])
+                != self.get_current_stage()["topic_id"]
+            ):
+                raise ValueError("INVALID_CURRENT_TOPIC")
+        elif mode == "new_topic":
+            if (
+                set(topic)
+                != {
+                    "mode",
+                    "proposed_name",
+                    "focus_observation_ids",
+                    "existing_topic_mismatch",
+                }
+                or not isinstance(topic["proposed_name"], str)
+                or not isinstance(topic["existing_topic_mismatch"], str)
+                or not topic["proposed_name"].strip()
+                or not topic["existing_topic_mismatch"]
+                or not topic["focus_observation_ids"]
+                or not set(topic["focus_observation_ids"]) <= set(selected)
+                or a["basis"] != "focus_shift"
+            ):
+                raise ValueError("INVALID_NEW_TOPIC")
+        else:
+            raise ValueError("INVALID_TOPIC")
+        diffs = p["claim_diffs"]
+        if not isinstance(diffs, list):
+            raise ValueError("INVALID_DIFFS")
+        ids, replaced = set(), set()
+        for d in diffs:
+            if (
+                not isinstance(d, dict)
+                or not {
+                    "local_id",
+                    "op",
+                    "proposed_claim",
+                    "observation_ids",
+                    "supporting_message_ids",
+                }
+                <= d.keys()
+                or set(d)
+                - {
+                    "local_id",
+                    "op",
+                    "proposed_claim",
+                    "observation_ids",
+                    "supporting_message_ids",
+                    "previous_claim_ref",
+                    "update_relation",
+                }
+            ):
+                raise ValueError("INVALID_DIFF_SCHEMA")
+            check_id(d["local_id"])
+            if d["local_id"] in ids or d["op"] not in {"add", "supersede"}:
+                raise ValueError("INVALID_DIFF_ID_OR_OP")
+            ids.add(d["local_id"])
+            c = d["proposed_claim"]
+            if (
+                set(c)
+                != {
+                    "kind",
+                    "subject",
+                    "text",
+                    "assertion_status",
+                    "actuality",
+                    "reported_time_text",
+                }
+                or c["kind"] not in CLAIM_KINDS
+                or c["assertion_status"]
+                not in {"affirmed", "denied", "uncertain", "unknown"}
+                or c["actuality"]
+                not in {"occurred", "ongoing", "intended", "hypothetical", "unknown"}
+                or any(
+                    not isinstance(c[k], str)
+                    for k in ("subject", "text", "reported_time_text")
+                )
+                or not c["text"].strip()
+            ):
+                raise ValueError("INVALID_PROPOSED_CLAIM")
+            if c["kind"] in {"plan", "interaction_state"} or c["actuality"] in {
+                "intended",
+                "hypothetical",
+            }:
+                raise ValueError("OBSERVATION_ONLY")
+            if not d["observation_ids"] or not set(d["observation_ids"]) <= set(
+                selected
+            ):
+                raise ValueError("INVALID_DIFF_OBSERVATIONS")
+            if not any(
+                (obs[oid]["kind"], obs[oid]["subject"]) == (c["kind"], c["subject"])
+                for oid in d["observation_ids"]
+            ):
+                raise ValueError("CLAIM_OBSERVATION_BOUNDARY")
+            allowed_refs = {
+                r
+                for oid in d["observation_ids"]
+                for r in obs[oid]["supporting_message_ids"]
+            }
+            gate_message_refs(self, d["supporting_message_ids"], allowed_refs)
+            if d["op"] == "supersede":
+                old = active_ref(d.get("previous_claim_ref"))
+                if (
+                    old["claim_id"] in replaced
+                    or any(old[k] != c[k] for k in ("kind", "subject"))
+                    or not d.get("update_relation")
+                ):
+                    raise ValueError("INVALID_SUPERSEDE")
+                replaced.add(old["claim_id"])
+            elif d.get("previous_claim_ref") is not None:
+                raise ValueError("INVALID_ADD_REF")
+        if p["update_kind"] == "topic_shift":
+            if not p.get("focus_claim_refs"):
+                raise ValueError("FOCUS_CLAIMS_REQUIRED")
+            for ref in p["focus_claim_refs"]:
+                if (
+                    isinstance(ref, dict)
+                    and set(ref) == {"local_id"}
+                    and ref["local_id"] in ids
+                ):
+                    continue
+                active_ref(ref)
+        elif not diffs:
+            raise ValueError("EMPTY_UPDATE")
+        kinds = {d["proposed_claim"]["kind"] for d in diffs}
+        if not kinds:
+            kinds = {active_ref(ref)["kind"] for ref in p["focus_claim_refs"]}
+        if p["primary_kind"] not in kinds and not (
+            p["primary_kind"] == "mixed" and len(kinds) > 1
+        ):
+            raise ValueError("INVALID_PRIMARY_KIND")
+        return p
+
+    @staticmethod
+    def _preview_claim_diffs(active, proposal):
+        """Pure full typed preview. Proposed entries have local IDs, never acceptance metadata."""
+        replaced = {
+            d["previous_claim_ref"]["claim_id"]
+            for d in proposal["claim_diffs"]
+            if d.get("previous_claim_ref")
+        }
+        result = [copy.deepcopy(c) for c in active if c["claim_id"] not in replaced]
+        for d in proposal["claim_diffs"]:
+            result.append(
+                dict(
+                    copy.deepcopy(d["proposed_claim"]),
+                    proposal_local_id=d["local_id"],
+                    supporting_message_ids=copy.deepcopy(d["supporting_message_ids"]),
+                )
+            )
+        return result
+
+    def _required_validation_checks(self, p):
+        required = {
+            (d["local_id"], check)
+            for d in p["claim_diffs"]
+            for check in self.DIFF_CHECKS
+        }
+        required.update({(None, "node_admission"), (None, "atomic_update_coherence")})
+        if (
+            p["update_kind"] == "topic_shift"
+            or p["topic_request"]["mode"] == "new_topic"
+        ):
+            required.add((None, "focus_support"))
+        if p["topic_request"]["mode"] == "new_topic":
+            required.add((None, "existing_topic_reuse"))
+        return required
+
+    def _normalize_validation_result(self, raw, p):
+        if (
+            set(raw) != {"verdict", "reason_codes", "checks", "violations"}
+            or raw["verdict"] not in {"commit", "hold", "insufficient"}
+            or not isinstance(raw["reason_codes"], list)
+            or not isinstance(raw["violations"], list)
+        ):
+            raise ValueError("INVALID_VALIDATION_SCHEMA")
+        checks = raw["checks"]
+        if not isinstance(checks, list) or any(
+            not isinstance(c, dict)
+            or not {"diff_id", "check", "status"} <= c.keys()
+            or c["status"] not in {"pass", "fail", "unknown"}
+            for c in checks
+        ):
+            raise ValueError("INVALID_VALIDATION_CHECKS")
+        keys = [(c["diff_id"], c["check"]) for c in checks]
+        if len(set(keys)) != len(keys) or not self._required_validation_checks(
+            p
+        ) <= set(keys):
+            raise ValueError("MISSING_VALIDATION_CHECKS")
+        if any(
+            c["diff_id"] is None and c.get("detail") == "not_applicable" for c in checks
+        ):
+            raise ValueError("ADMISSION_CHECK_NOT_APPLICABLE")
+        if raw["verdict"] == "commit" and (
+            any(c["status"] != "pass" for c in checks) or raw["violations"]
+        ):
+            raise ValueError("CONTRADICTORY_VALIDATION")
+        if any(c["status"] == "unknown" for c in checks):
+            raw = dict(raw, verdict="insufficient")
+        return copy.deepcopy(raw)
+
+    def _evaluate_observation_turn(
+        self,
+        session_context,
+        conversation_content,
+        counterpart_utterance="",
+        completion_func=None,
+        llm_cfg=None,
+    ):
+        context = copy.deepcopy(session_context or {})
+        event = context.setdefault("runtime_event", {})
+        meta = event.setdefault("metadata", {})
+        eid = meta.setdefault("event_id", new_id("event"))
+        if eid in self.processed_event_results:
+            return {"event_id": eid, "cached": True}
+        base, version = self.get_current_stage_id(), self.graph_state_version
+        trace = dict(
+            event_id=eid,
+            pipeline_version="v3",
+            schema_version=3,
+            call_count=0,
+            accepted_refs=[],
+            requested_refs=meta.get("message_refs", []),
+            event_metadata=copy.deepcopy(meta),
+            source=event.get("source", "chat"),
+            base_node_id=base,
+            base_state_version=version,
+            generation_snapshot_ref=None,
+            requested_generation_snapshot_ref=meta.get("generation_snapshot_ref"),
+            gate={"status": "skipped"},
+            errors=[],
+        )
+        for stage in ("extraction", "proposal", "validation"):
+            trace[stage] = {"status": "skipped", "reason": "prior_stage_not_passed"}
+        e = dict(
+            event_id=eid,
+            base_node_id=base,
+            base_state_version=version,
+            session_context=context,
+            trace=trace,
+            action="hold",
+            final_verdict="hold",
+            reason_codes=[],
+            decision_source="code",
+        )
+        stage = "preflight"
+        try:
+            trace["input_budget_chars"] = int(
+                (llm_cfg or {}).get("max_input_chars", 48000)
+            )
+            pending = self.pending_events.get(eid)
+            if pending and (
+                pending["base_node_id"] != base
+                or pending["base_state_version"] != version
+            ):
+                raise ValueError("STALE_BASE")
+            rows = validate_event_sources(self, event)
+            if event.get("source", "chat") == "chat" and (
+                len(rows) != 1 or rows[0]["text"] != conversation_content
+            ):
+                raise ValueError("ACCEPTED_TEXT_MISMATCH")
+            trace["accepted_refs"] = [r["message_id"] for r in rows]
+            trace["generation_snapshot_ref"] = meta.get("generation_snapshot_ref")
+            resolved = self.resolve_active_claims(base)
+            active = resolved["active_claims"]
+            trace["base_claim_refs"] = [
+                {"claim_id": c["claim_id"], "revision": c["revision"]} for c in active
+            ]
+            stage = "extraction"
+            batch = self._extract_observations(
+                rows, counterpart_utterance, completion_func, trace
+            )
+            trace["extraction"].update(status="ok", normalized=batch)
+            trace["gate"] = {"status": "pass", "errors": []}
+            obs = batch["observations"]
+            if not obs:
+                e["reason_codes"] = ["EMPTY_OBSERVATIONS"]
+                return e
+            history = self._historical_observations(obs, rows)
+            from .generation_view import select_relevant_claims
+
+            relevant = select_relevant_claims(
+                "planner",
+                active,
+                obs,
+                context={"topic_id": self.get_current_stage()["topic_id"]},
+            )
+            inputs = dict(
+                mode="propose_minimal_update",
+                observations=obs,
+                source_messages=rows,
+                active_claims=relevant,
+                historical_observations=history,
+                current_topic_id=self.get_current_stage()["topic_id"],
+                topic_registry=self.topic_registry,
+                consumed_updates=list(self.consumed_updates.values()),
+            )
+            stage = "proposal"
+            p = self._propose_minimal_update(
+                inputs, batch, relevant, history, completion_func, trace
+            )
+            p.update(
+                proposal_id=new_id("proposal"),
+                event_id=eid,
+                base_node_id=base,
+                base_state_version=version,
+                observation_batch_id=batch["observation_batch_id"],
+            )
+            trace["proposal"].update(status="ok", normalized=p)
+            trace["admission"] = p.get("admission")
+            trace["selected_observation_ids"] = p.get("selected_observation_ids", [])
+            trace["observation_only_ids"] = [
+                o["observation_id"]
+                for o in obs
+                if o["observation_id"] not in trace["selected_observation_ids"]
+            ]
+            if p["operation"] == "none":
+                e.update(
+                    reason_codes=[p["reason_code"]],
+                    final_verdict=(
+                        "insufficient"
+                        if p["reason_code"]
+                        in {"BASELINE_UNRESOLVED", "REFERENCE_UNRESOLVED"}
+                        else "hold"
+                    ),
+                )
+                return e
+            relevant = select_relevant_claims(
+                "validator",
+                active,
+                obs,
+                p,
+                {"topic_id": self.get_current_stage()["topic_id"]},
+            )
+            evidence = {r for c in relevant for r in c["evidence_refs"]}
+            validation_input = dict(
+                task="commit_validation",
+                proposal=p,
+                active_claims=relevant,
+                active_source_evidence=[
+                    copy.deepcopy(self.evidence_ledger[r]) for r in evidence
+                ],
+                observations=obs,
+                historical_observations=history,
+                source_messages=rows,
+                generation_context_only=self._generation_source_context(rows),
+                topic_registry=self.topic_registry,
+                current_topic_id=self.get_current_stage()["topic_id"],
+                consumed_updates=list(self.consumed_updates.values()),
+                proposed_claims=[
+                    c
+                    for c in self._preview_claim_diffs(active, p)
+                    if "proposal_local_id" in c
+                    or c["claim_id"] in {x["claim_id"] for x in relevant}
+                ],
+            )
+            stage = "validation"
+            v = self._validate_commit(validation_input, p, completion_func, trace)
+            v.update(
+                validation_id=new_id("validation"),
+                proposal_id=p["proposal_id"],
+                input_hash=digest(trace["validation"]["input"]),
+                validator_prompt_version="v3.1",
+            )
+            trace["validation"].update(status="ok", normalized=v)
+            e.update(
+                final_verdict=v["verdict"],
+                reason_codes=v["reason_codes"],
+                decision_source="validator",
+            )
+        except Exception as exc:
+            code = (
+                str(exc) if isinstance(exc, ValueError) else "MODEL_ERROR:" + str(exc)
+            )
+            trace["errors"].append(code)
+            if stage == "extraction":
+                trace["extraction"]["normalized"] = dict(
+                    observation_batch_id=new_id("batch"),
+                    event_id=eid,
+                    schema_version=3,
+                    extraction_status="error",
+                    observations=[],
+                    errors=[code],
+                )
+                trace["gate"] = {"status": "error", "errors": [code]}
+            e.update(
+                final_verdict="hold" if code == "OBSERVATION_ONLY" else "insufficient",
+                reason_codes=[code],
+                decision_source="code",
+            )
+        finally:
+            trace["evaluation_hash"] = digest(
+                {k: v for k, v in trace.items() if k != "evaluation_hash"}
+            )
+        return e
+
+    def _apply_validated_diff(self, p, parent):
+        topic = p["topic_request"]
+        tid = (
+            new_id("topic")
+            if topic["mode"] == "new_topic"
+            else topic.get("topic_id", parent["topic_id"])
+        )
+        claims = copy.deepcopy(parent["accepted_claims"])
+        added, superseded, keys = [], [], []
+        for d in p["claim_diffs"]:
+            oldref = d.get("previous_claim_ref")
+            c = copy.deepcopy(d["proposed_claim"])
+            c["time"] = dict(
+                reported_time_text=c.pop("reported_time_text"),
+                effective_start=None,
+                effective_end=None,
+                precision="unknown",
+            )
+            c.update(
+                claim_id=oldref["claim_id"] if oldref else new_id("claim"),
+                revision=oldref["revision"] + 1 if oldref else 1,
+                topic_id=tid,
+                acceptance_basis="patient_report",
+                evidence_refs=d["supporting_message_ids"],
+                accepted_at=self._now().isoformat(),
+                accepted_version=self.graph_state_version + 1,
+                supersedes=oldref,
+            )
+            c = validate_claim(c)
+            key = update_key(d, p["update_kind"])
+            if key in self.consumed_updates:
+                raise ValueError("EVIDENCE_UPDATE_CONSUMED")
+            keys.append(
+                (
+                    key,
+                    dict(
+                        source_message_ids=sorted(d["supporting_message_ids"]),
+                        previous_claim_ref=oldref,
+                        new_claim_ref={
+                            "claim_id": c["claim_id"],
+                            "revision": c["revision"],
+                        },
+                        kind=c["kind"],
+                        effective_window=c["time"],
+                        update_kind=p["update_kind"],
+                        normalized_diff=d["proposed_claim"],
+                        diff_hash=key,
+                    ),
+                )
+            )
+            if oldref:
+                claims = [x for x in claims if x["claim_id"] != oldref["claim_id"]]
+                superseded.append(oldref)
+            claims.append(c)
+            added.append({"claim_id": c["claim_id"], "revision": c["revision"]})
+        if not p["claim_diffs"]:
+            key = digest(
+                dict(
+                    update_kind=p["update_kind"],
+                    topic_request=p["topic_request"],
+                    focus_claim_refs=p["focus_claim_refs"],
+                    source_message_ids=p.get("_focus_source_message_ids", []),
+                )
+            )
+            if key in self.consumed_updates:
+                raise ValueError("EVIDENCE_UPDATE_CONSUMED")
+            keys.append(
+                (
+                    key,
+                    dict(
+                        update_kind=p["update_kind"],
+                        focus_claim_refs=p["focus_claim_refs"],
+                        source_message_ids=p.get("_focus_source_message_ids", []),
+                        diff_hash=key,
+                    ),
+                )
+            )
+        node = copy.deepcopy(parent)
+        node.update(
+            id=new_id("node"),
+            topic_id=tid,
+            accepted_claims=claims,
+            evidence_refs=sorted({r for c in claims for r in c["evidence_refs"]}),
+            source="llm",
+            source_kind="patient_utterance",
+            migration_status="native_v3",
+            content_revision=1,
+            is_terminal_stage=False,
+            next_candidates=[],
+            node_kind=p["primary_kind"],
+            narrative_focus=[],
+            advance_signals=[],
+            hold_signals=[],
+        )
+        texts = [d["proposed_claim"]["text"] for d in p["claim_diffs"]]
+        if not texts:
+            texts = [
+                c["text"]
+                for c in claims
+                if {"claim_id": c["claim_id"], "revision": c["revision"]}
+                in p["focus_claim_refs"]
+            ]
+        node["summary"] = "；".join(texts)
+        node["label"] = node["summary"][:40]
+        return node, keys, added, superseded
+
+    def _commit_observation_turn(self, evaluation):
+        eid = evaluation.get("event_id")
+        if eid in self.processed_event_results:
+            return copy.deepcopy(self.processed_event_results[eid])
+        check_id(eid)
+        e = copy.deepcopy(evaluation)
+        trace = e.get("trace", {})
+        parent = self.get_current_stage()
+        version = self.graph_state_version
+        p = trace.get("proposal", {}).get("normalized")
+        v = trace.get("validation", {}).get("normalized")
+        verdict, reasons = e.get("final_verdict", "insufficient"), e.get(
+            "reason_codes", []
+        )
+        added, superseded, keys = [], [], []
+        transaction_keys = (
+            "stage_catalog",
+            "topic_registry",
+            "planned_graph",
+            "stage_index",
+            "graph_state_version",
+            "stage_start_time",
+            "consumed_updates",
+        )
+        backup = {k: copy.deepcopy(getattr(self, k)) for k in transaction_keys}
+        try:
+            if trace.get("evaluation_hash") != digest(
+                {k: v for k, v in trace.items() if k != "evaluation_hash"}
+            ):
+                raise ValueError("EVALUATION_BINDING_CONFLICT")
+            if verdict == "commit":
+                if not p or not v or v["verdict"] != "commit":
+                    raise ValueError("VALIDATION_REQUIRED")
+                if (
+                    p["event_id"] != eid
+                    or p["base_node_id"] != parent["id"]
+                    or p["base_state_version"] != version
+                    or trace["event_id"] != eid
+                    or e["base_node_id"] != parent["id"]
+                    or e["base_state_version"] != version
+                ):
+                    raise ValueError("STALE_BASE")
+                if parent["is_terminal_stage"]:
+                    raise ValueError("TERMINAL_STAGE")
+                rows = validate_event_sources(
+                    self, e["session_context"]["runtime_event"]
+                )
+                batch = trace["extraction"]["normalized"]
+                for o in batch["observations"]:
+                    gate_message_refs(
+                        self,
+                        o["supporting_message_ids"],
+                        [r["message_id"] for r in rows],
+                    )
+                active = self.resolve_active_claims()["active_claims"]
+                envelope = {
+                    "proposal_id",
+                    "event_id",
+                    "base_node_id",
+                    "base_state_version",
+                    "observation_batch_id",
+                }
+                self._normalize_proposal(
+                    {k: x for k, x in p.items() if k not in envelope},
+                    batch,
+                    active,
+                    self._historical_observations(batch["observations"], rows),
+                )
+                self._normalize_validation_result(
+                    {
+                        k: x
+                        for k, x in v.items()
+                        if k
+                        not in {
+                            "validation_id",
+                            "proposal_id",
+                            "input_hash",
+                            "validator_prompt_version",
+                        }
+                    },
+                    p,
+                )
+                if (
+                    v["proposal_id"] != p["proposal_id"]
+                    or v["input_hash"] != digest(trace["validation"]["input"])
+                    or trace["validation"]["input"]["proposal"] != p
+                ):
+                    raise ValueError("VALIDATION_BINDING_CONFLICT")
+                commit_proposal = copy.deepcopy(p)
+                commit_proposal["_focus_source_message_ids"] = sorted(
+                    {
+                        r
+                        for o in batch["observations"]
+                        if o["observation_id"] in p["selected_observation_ids"]
+                        for r in o["supporting_message_ids"]
+                    }
+                )
+                node, keys, added, superseded = self._apply_validated_diff(
+                    commit_proposal, parent
+                )
+                if (
+                    node["id"] in self.stage_catalog
+                    or node["id"] in self._visited_stage_ids()
+                ):
+                    raise ValueError("VISITED_TARGET")
+                # All fallible validation precedes replacement; merge the latest display record.
+                catalog = copy.deepcopy(self.stage_catalog)
+                catalog[parent["id"]]["next_candidates"].append(node["id"])
+                catalog[parent["id"]]["content_revision"] += 1
+                catalog[node["id"]] = node
+                topics = copy.deepcopy(self.topic_registry)
+                if p["topic_request"]["mode"] == "new_topic":
+                    topics[node["topic_id"]] = {
+                        "neutral_name": p["topic_request"]["proposed_name"],
+                        "origin_node_id": node["id"],
+                    }
+                self.stage_catalog, self.topic_registry = catalog, topics
+                self.planned_graph = self.planned_graph[: self.stage_index + 1] + [
+                    node["id"]
+                ]
+                self.stage_index += 1
+                self.graph_state_version += 1
+                self.stage_start_time = self._now()
+                self.consumed_updates.update(dict(keys))
+        except Exception as exc:
+            for k, value in backup.items():
+                setattr(self, k, value)
+            verdict = (
+                "hold" if str(exc) == "EVIDENCE_UPDATE_CONSUMED" else "insufficient"
+            )
+            reasons = [str(exc)]
+            added, superseded, keys = [], [], []
+            e["decision_source"] = "code"
+        committed = verdict == "commit"
+        final = dict(
+            result_id=new_id("result"),
+            event_id=eid,
+            proposal_id=p.get("proposal_id") if p else None,
+            validation_id=v.get("validation_id") if v else None,
+            validator_verdict=v.get("verdict") if v else None,
+            final_verdict=verdict,
+            reason_codes=reasons,
+            committed=committed,
+            graph_action="advance" if committed else "hold",
+            from_node_id=parent["id"],
+            to_node_id=self.get_current_stage_id(),
+            version_before=version,
+            version_after=self.graph_state_version,
+            added_claim_refs=added,
+            superseded_claim_refs=superseded,
+            consumed_update_keys=[k for k, _ in keys],
+            committed_at=self._now().isoformat() if committed else None,
+            decision_source=e.get("decision_source", "code"),
+        )
+        trace["final_result"] = final
+        self.transition_traces[eid] = json_safe(trace)
+        self.last_evaluation = dict(
+            final,
+            action=final["graph_action"],
+            event_id=eid,
+            trace_id=eid,
+            verdict=verdict,
+        )
+        self.stage_history.append(
+            dict(
+                self.last_evaluation,
+                timestamp=self._now(),
+                from_stage_id=parent["id"],
+                to_stage_id=self.get_current_stage_id(),
+                source=e.get("session_context", {})
+                .get("runtime_event", {})
+                .get("source", "chat"),
+                pointer_before=self.stage_index - int(committed),
+                pointer_after=self.stage_index,
+                from_stage_label=parent["label"],
+                to_stage_label=self.get_current_stage()["label"],
+            )
+        )
+        result = json_safe(self.get_graph_snapshot())
+        result.update(final, trace_id=eid, verdict=verdict)
+        self.transition_traces[eid]["final_result"] = copy.deepcopy(result)
+        self.processed_event_results[eid] = copy.deepcopy(result)
+        self.pending_events.pop(eid, None)
+        return result
 
     @staticmethod
     def _select_graph_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -341,6 +1971,14 @@ class ComplaintGraphManager:
         return view
 
     def reset(self) -> None:
+        if hasattr(self, "evidence_ledger"):
+            fresh = type(self)(
+                copy.deepcopy(self.frozen_initialization["config"]),
+                self._now_provider,
+                self.domain_state_enabled,
+            )
+            self.__dict__.update(fresh.__dict__)
+            return
         self.planned_graph = self._build_default_graph(self.initial_stage_id)
         self.stage_index = 0
         self.stage_history = []
@@ -414,6 +2052,7 @@ class ComplaintGraphManager:
         stages = [copy.deepcopy(item) for item in self.stage_catalog.values()]
         return {
             "mode": "complaint_graph",
+            "graph_state_version": self.graph_state_version,
             "core_belief": self.core_belief,
             "current_stage_id": str(current_stage.get("id", "")),
             "current_stage_label": str(current_stage.get("label", "")),
@@ -437,7 +2076,7 @@ class ComplaintGraphManager:
     def get_state_duration(self) -> float:
         return (self._now() - self.stage_start_time).total_seconds() / 60.0
 
-    def evaluate_turn(
+    def _evaluate_legacy_turn(
         self,
         session_context: Dict[str, Any],
         conversation_content: str,
@@ -539,7 +2178,7 @@ class ComplaintGraphManager:
         }
         return evaluation
 
-    def commit_turn(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    def _commit_legacy_turn(self, evaluation: Dict[str, Any]) -> Dict[str, Any]:
         """把 evaluation 真正写入状态机。
 
         这里最值得审查的点是：
@@ -547,6 +2186,8 @@ class ComplaintGraphManager:
         - `advance` 只把 transition 最终选中的临时候选写入图。
         """
         evaluation = evaluation if isinstance(evaluation, dict) else {}
+        if not evaluation.get("event_id"):
+            raise ValueError("ACCEPTED_EVENT_REQUIRED")
         current_before = self.get_current_stage()
         action = str(evaluation.get("action", "hold") or "hold").strip().lower()
         if action not in {"hold", "advance"}:
@@ -610,7 +2251,7 @@ class ComplaintGraphManager:
             )
             if can_materialize:
                 normalized = self._sanitize_stage(selected_stage, source="llm")
-                normalized["id"] = target_stage_id[:80]
+                normalized["id"] = target_stage_id
                 normalized["next_candidates"] = []
                 self.stage_catalog[target_stage_id] = normalized
                 self._apply_branch_candidates(current_before.get("id", ""), [target_stage_id])
@@ -696,6 +2337,10 @@ class ComplaintGraphManager:
         return self.get_graph_snapshot()
 
     def to_dict(self) -> Dict[str, Any]:
+        with self._commit_lock:
+            return json_safe(self._serialize_state())
+
+    def _serialize_state(self) -> Dict[str, Any]:
         history_rows: List[Dict[str, Any]] = []
         for row in self.stage_history:
             item = dict(row)
@@ -716,6 +2361,7 @@ class ComplaintGraphManager:
             )
         ]
         return {
+            **self._v3_envelope(),
             "mode": "complaint_graph",
             "domain_state_enabled": bool(self.domain_state_enabled),
             "initial_stage_id": self.initial_stage_id,
@@ -745,6 +2391,8 @@ class ComplaintGraphManager:
         domain_state_enabled: Optional[bool] = None,
     ) -> "ComplaintGraphManager":
         payload = payload if isinstance(payload, dict) else {}
+        if payload.get("graph_schema_version") not in {None, 1, 2, 3}:
+            raise ValueError("UNSUPPORTED_GRAPH_SCHEMA_VERSION")
         payload_cfg = payload.get("config", {}) if isinstance(payload.get("config", {}), dict) else {}
         base_cfg = base_config if isinstance(base_config, dict) else {}
         stage_catalog = base_cfg.get("stages", payload_cfg.get("stages", []))
@@ -754,6 +2402,11 @@ class ComplaintGraphManager:
         if isinstance(runtime_stages, list):
             stage_catalog = list(stage_catalog if isinstance(stage_catalog, list) else [])
             stage_catalog.extend([copy.deepcopy(item) for item in runtime_stages if isinstance(item, dict)])
+        if payload.get("graph_schema_version") == 3:
+            snapshot = payload.get("stage_catalog_snapshot")
+            if not isinstance(snapshot, dict) or not snapshot:
+                raise ValueError("MISSING_CATALOG_SNAPSHOT")
+            stage_catalog = list(snapshot.values())
         initial_stage_id = str(
             payload.get(
                 "initial_stage_id",
@@ -815,6 +2468,13 @@ class ComplaintGraphManager:
             "initial_stage_id": initial_stage_id,
             "stages": copy.deepcopy(stage_catalog) if isinstance(stage_catalog, list) else [],
         }
+        cfg["pipeline_version"] = payload.get("pipeline_version", "foundation_legacy")
+        if cfg["pipeline_version"] == "phase1_legacy_transition":
+            cfg["pipeline_version"] = "foundation_legacy"
+        cfg["_restoring_v3"] = payload.get("graph_schema_version") == 3
+        if not cfg["_restoring_v3"]:
+            cfg["_legacy_restore"] = True
+            cfg["_initialization_config"] = copy.deepcopy(payload_cfg or base_cfg)
         resolved_domain_state_enabled = (
             bool(payload.get("domain_state_enabled", True))
             if domain_state_enabled is None
@@ -854,8 +2514,25 @@ class ComplaintGraphManager:
             manager.pending_domain_window = copy.deepcopy(payload.get("pending_domain_window", {})) if isinstance(payload.get("pending_domain_window", {}), dict) else {}
             manager.last_domain_window_update = copy.deepcopy(payload.get("last_domain_window_update", {})) if isinstance(payload.get("last_domain_window_update", {}), dict) else {}
             manager.last_domain_window_id = str(payload.get("last_domain_window_id", "") or "")[:160]
-        manager._link_graph_edges(manager.planned_graph)
-        manager._ensure_future_window()
+        if payload.get("graph_schema_version") == 3:
+            manager._restore_v3(payload)
+        else:
+            previous_claims = []
+            for nid in manager.planned_graph[: manager.stage_index + 1]:
+                node = manager.stage_catalog[nid]
+                if not node["accepted_claims"]:
+                    node["accepted_claims"] = copy.deepcopy(previous_claims)
+                    node["evidence_refs"] = sorted(
+                        {r for c in previous_claims for r in c["evidence_refs"]}
+                    )
+                previous_claims = node["accepted_claims"]
+            manager.frozen_initialization["legacy_config_provenance"] = (
+                "inline_config" if payload_cfg else "current_file_fallback"
+            )
+        if payload.get("graph_schema_version") != 3:
+            manager._link_graph_edges(manager.planned_graph)
+            manager._ensure_future_window()
+        manager.resolve_active_claims()
         return manager
 
     def _configured_stage_ids(self) -> set:
@@ -1240,7 +2917,7 @@ class ComplaintGraphManager:
                 }
             )
         return render_prompt(
-            "depression/graph_transition_change",
+            "depression/graph_transition_change_legacy",
             {"payload_json": json.dumps(payload, ensure_ascii=False)},
         )
 
@@ -1286,7 +2963,7 @@ class ComplaintGraphManager:
             },
         }
         return render_prompt(
-            "depression/graph_transition",
+            "depression/graph_transition_legacy",
             {"payload_json": json.dumps(payload, ensure_ascii=False)},
         )
 
@@ -2091,13 +3768,17 @@ class ComplaintGraphManager:
             if not isinstance(item, dict):
                 rejected.append({"id": "", "label": "", "summary": "", "reason": "not_an_object"})
                 continue
+            if any(
+                k in item for k in ("accepted_claims", "topic_id", "source_kind", "evidence_refs")
+            ):
+                self._legacy_errors.append("LEGACY_PROTECTED_FIELD_IGNORED")
             label = str(item.get("label", item.get("name", "")) or "").strip()
             summary = str(item.get("summary", item.get("description", label)) or label).strip()
             base_stage_id = (
                 str(item.get("id", "") or "").strip()
                 or self._make_stage_id(label or summary)
             )[:80]
-            stage_id = self._unique_stage_id(base_stage_id, seen)
+            stage_id = new_id("node")
             seen.add(stage_id)
             seeds.append(
                 {
@@ -2154,6 +3835,19 @@ class ComplaintGraphManager:
         # core_belief 是病例级稳定值。即使旧 planner 或脏数据仍输出该键，
         # candidate 也只镜像初始化时锁定的值；动态认知变化由 label/summary 表达。
         merged["core_belief"] = self.core_belief
+        for key in ("accepted_claims", "topic_id", "evidence_refs", "node_kind"):
+            merged[key] = copy.deepcopy(parent.get(key))
+        merged.update(
+            source_kind="legacy_unknown",
+            migration_status="legacy_transition_unverified",
+            schema_version=3,
+            content_revision=1,
+            is_terminal_stage=False,
+        )
+        if any(
+            key in detail for key in ("accepted_claims", "topic_id", "source_kind", "evidence_refs")
+        ):
+            self._legacy_errors.append("LEGACY_PROTECTED_FIELD_IGNORED")
         return self._sanitize_stage(merged, source="llm")
 
     def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
@@ -2368,7 +4062,7 @@ class ComplaintGraphManager:
             }
         payload_json = json.dumps(payload, ensure_ascii=False)
         return render_prompt(
-            "depression/graph_planner",
+            "depression/graph_planner_legacy",
             {"payload_json": payload_json},
         )
 
@@ -2462,6 +4156,8 @@ class ComplaintGraphManager:
         payload = raw if isinstance(raw, dict) else {}
         label = str(payload.get("label", "") or "").strip() or "未命名主诉节点"
         stage_id = str(payload.get("id", "") or "").strip() or self._make_stage_id(label)
+        if len(stage_id) > 80:
+            raise ValueError("INVALID_NODE_ID_LENGTH")
         summary = str(payload.get("summary", payload.get("description", label)) or label).strip()
         core_belief = (
             self.core_belief
@@ -2505,7 +4201,42 @@ class ComplaintGraphManager:
             is_terminal_stage=self._coerce_bool(payload.get("is_terminal_stage", payload.get("terminal_recovery", False))),
             source=str(payload.get("source", source) or source)[:32],
         )
-        return normalized.to_dict()
+        result = normalized.to_dict()
+        for key in (
+            "node_kind",
+            "topic_id",
+            "source_kind",
+            "accepted_claims",
+            "evidence_refs",
+            "schema_version",
+            "content_revision",
+            "migration_status",
+        ):
+            if key in payload:
+                result[key] = copy.deepcopy(payload[key])
+        if result["node_kind"] not in CLAIM_KINDS | {"unknown", "mixed"}:
+            raise ValueError("INVALID_NODE_KIND")
+        if result["source_kind"] not in {
+            "persona_initialization",
+            "patient_utterance",
+            "legacy_unknown",
+            "behavior_event",
+        }:
+            raise ValueError("INVALID_SOURCE_KIND")
+        if result["migration_status"] not in {
+            "native_v3",
+            "legacy_config_opaque",
+            "legacy_unverified",
+            "legacy_transition_unverified",
+        }:
+            raise ValueError("INVALID_MIGRATION_STATUS")
+        if (
+            result["schema_version"] != 3
+            or type(result["content_revision"]) is not int
+            or result["content_revision"] < 1
+        ):
+            raise ValueError("INVALID_NODE_VERSION")
+        return result
 
     @staticmethod
     def _make_stage_id(label: str) -> str:

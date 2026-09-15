@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "xfh_stress_event_001",
+          "node_type": "event",
+          "subject": "许芳华",
+          "predicate": "此时",
+          "object": "因独居后的安静而感到孤单和多余",
+          "describe": "独居后的长期安静让许芳华渴望有人陪伴，同时又把这种需要理解为自己会给别人增加负担。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "xfh_stress_event_002",
+          "node_type": "event",
+          "subject": "许芳华",
+          "predicate": "此时",
+          "object": "因想去公园与人来往又临时退缩",
+          "describe": "给花浇水后站在窗边时，许芳华常想去公园和人说说话，却因担心显得唐突或多余而临时改变主意。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "xfh_stress_thought_003",
+          "node_type": "thought",
+          "subject": "许芳华",
+          "predicate": "此时",
+          "object": "我主动靠近别人，只会给人添麻烦",
+          "describe": "孤独和社交退缩强化了许芳华的自动思维：表达陪伴需要或主动靠近别人，只会成为别人的麻烦。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "xfh_stress_event_004",
+          "node_type": "event",
+          "subject": "许芳华",
+          "predicate": "此时",
+          "object": "想到联系亲友或接受陪伴就担心打扰别人",
+          "describe": "每当想给亲友发消息、邀请别人见面或接受帮助时，许芳华都会预先担心对方只是勉强回应，于是把需要藏起来。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

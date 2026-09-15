@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "tw_stress_event_001",
+          "node_type": "event",
+          "subject": "唐婉",
+          "predicate": "此时",
+          "object": "因工作提案没有立即得到肯定而压力上升",
+          "describe": "准备活动提案时，唐婉会反复核对清单；同事没有立即肯定时，她容易把不确定理解为自己的方案不够好。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "tw_stress_event_002",
+          "node_type": "event",
+          "subject": "唐婉",
+          "predicate": "此时",
+          "object": "因工作比较和反馈而怀疑自身能力",
+          "describe": "看到他人的方案或收到修改意见后，唐婉会把正常比较和反馈体验成能力不足，并担心自己给团队添麻烦。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "tw_stress_thought_003",
+          "node_type": "thought",
+          "subject": "唐婉",
+          "predicate": "此时",
+          "object": "别人没有立刻肯定我，就代表我做得不够好",
+          "describe": "工作中的比较和反馈强化了唐婉的自动思维：只有马上获得认可才说明自己胜任，否则就是做得不够好。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "tw_stress_event_004",
+          "node_type": "event",
+          "subject": "唐婉",
+          "predicate": "此时",
+          "object": "想到提交方案或征求意见就担心暴露不足",
+          "describe": "每当需要提交提案、拜访商户或向同事征求意见时，唐婉都会预先担心自己的不足被看见，因此反复修改或延迟行动。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

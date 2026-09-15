@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "sql_stress_event_001",
+          "node_type": "event",
+          "subject": "苏晴岚",
+          "predicate": "此时",
+          "object": "因家庭争执而担心关系被自己破坏",
+          "describe": "一次关于独立选择的家庭争执后，苏晴岚把不同意见理解为自己伤害了家人，并担心关系已经被自己弄坏。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "sql_stress_event_002",
+          "node_type": "event",
+          "subject": "苏晴岚",
+          "predicate": "此时",
+          "object": "因设计稿反复修改和未回复家人而自责",
+          "describe": "删改设计稿很久且迟迟没有回复家人消息时，苏晴岚会同时怀疑工作能力和处理关系的能力，并感到强烈自责。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "sql_stress_thought_003",
+          "node_type": "thought",
+          "subject": "苏晴岚",
+          "predicate": "此时",
+          "object": "如果我不能让家人满意，就是我把关系弄坏了",
+          "describe": "家庭冲突强化了苏晴岚的自动思维：只要自己的选择不能让家人满意，就说明是自己破坏了关系。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "sql_stress_event_004",
+          "node_type": "event",
+          "subject": "苏晴岚",
+          "predicate": "此时",
+          "object": "想到坚持选择或回复家人就担心再次冲突",
+          "describe": "每当需要表达独立决定、回复家人或提交设计成果时，苏晴岚都会担心再次令人失望，于是反复拖延和回避。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

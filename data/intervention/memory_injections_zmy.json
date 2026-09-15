@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "zmy_stress_event_001",
+          "node_type": "event",
+          "subject": "赵明远",
+          "predicate": "此时",
+          "object": "因退休后生活角色改变而感到失去价值",
+          "describe": "退休后的生活节奏改变让赵明远觉得自己失去了原来的位置和用处，翻看旧账本时尤其容易感到空落。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zmy_stress_event_002",
+          "node_type": "event",
+          "subject": "赵明远",
+          "predicate": "此时",
+          "object": "因收到朋友邀约而退缩不愿回复",
+          "describe": "朋友发来邀约时，赵明远既想参与又担心自己没有共同话题、会打扰别人，因此常常不作回复。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zmy_stress_thought_003",
+          "node_type": "thought",
+          "subject": "赵明远",
+          "predicate": "此时",
+          "object": "没有原来的位置和用处，我就不该再打扰别人",
+          "describe": "退休和社交退缩强化了赵明远的自动思维：失去原有角色后，自己不再值得被需要，也不该主动打扰别人。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zmy_stress_event_004",
+          "node_type": "event",
+          "subject": "赵明远",
+          "predicate": "此时",
+          "object": "想到参加聚会或主动联系就担心自己多余",
+          "describe": "每当想到参加朋友聚会、去公园与人交谈或主动联系熟人时，赵明远都会担心自己显得没有价值并被冷落。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

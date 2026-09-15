@@ -229,7 +229,7 @@ def build_ui():
             )
             model_name = gr.Textbox(
                 label="模型名称",
-                value="deepseek-chat",
+                value="", placeholder="inherit intervention.forced_llm.model",
                 interactive=True,
             )
         jsonl_file = gr.File(

@@ -123,6 +123,18 @@ def read_trace_records(path: Path) -> list[dict[str, Any]]:
 def transition_details(record: Mapping[str, Any]) -> dict[str, Any]:
     payload = prompt_payload(record.get("prompt"))
     decision = decode_json_object(record.get("response"), "推进器输出")
+    if payload.get("pipeline_version") == "v3":
+        runtime = record.get("_runtime_transition", {})
+        final = runtime.get("final_result", {})
+        committed = bool(final.get("committed") and final.get("version_after", 0) > final.get("version_before", 0))
+        return dict(llm_action=decision.get("verdict", ""), llm_candidate={},
+            commit_status="available" if final else "unavailable",
+            commit_action=("advance" if committed else "hold") if final else "",
+            commit_reason="" if final else "runtime_transition_unavailable",
+            before=runtime.get("before", {}), after=runtime.get("after", {}),
+            prompt=record.get("prompt", ""), response=record.get("response", ""),
+            context=record.get("context", {}), event_id=payload.get("event_id"),
+            proposal_id=payload.get("proposal", {}).get("proposal_id"))
     current = payload.get("current_stage", {})
     current = dict(current) if isinstance(current, Mapping) else {}
     candidates = payload.get("candidate_stages", [])
@@ -252,6 +264,10 @@ def previous_matching_planner(
 ) -> dict[str, Any] | None:
     """Find the nearest graph_planner call that planned the transition's parent stage."""
     transition_payload = prompt_payload(transition.get("prompt"))
+    if transition_payload.get("pipeline_version") == "v3":
+        event_id = transition_payload.get("event_id")
+        return next((r for r in reversed(records) if r.get("call_type") == "minimal_planner"
+            and prompt_payload(r.get("prompt")).get("event_id") == event_id), None)
     current = transition_payload.get("current_stage", {})
     parent_id = str(current.get("id", "") or "") if isinstance(current, Mapping) else ""
     transition_index = int(transition.get("_trace_index", -1))
@@ -278,6 +294,8 @@ def previous_matching_planner(
 def planner_verified_change(planner: Mapping[str, Any]) -> dict[str, Any]:
     """Return the exact verified-change view that was sent to a planner."""
     payload = prompt_payload(planner.get("prompt"))
+    if payload.get("pipeline_version") == "v3":
+        return {"observations": payload.get("observations", [])}
     value = payload.get("verified_change", {})
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -294,6 +312,10 @@ def previous_matching_change_detector(
     ``change`` / evidence-quote match with the verified payload.
     """
     planner_payload = prompt_payload(planner.get("prompt"))
+    if planner_payload.get("pipeline_version") == "v3":
+        event_id = planner_payload.get("event_id")
+        return next((r for r in reversed(records) if r.get("call_type") == "observation_detector"
+            and prompt_payload(r.get("prompt")).get("event_id") == event_id), None)
     current = planner_payload.get("current_stage", {})
     parent_id = str(current.get("id", "") or "") if isinstance(current, Mapping) else ""
     verified = planner_verified_change(planner)
@@ -490,6 +512,15 @@ def markdown_block_for_transition(
 
 
 def build_markdown(checkpoint: Path, sessions: list[Any], records: list[dict[str, Any]], requested_agent: str | None) -> str:
+    v3 = [r for r in records if r.get("pipeline_version") == "v3" or r.get("call_type") in
+          {"observation_detector", "minimal_planner", "commit_validator"}]
+    if v3:
+        report = build_v3_markdown(checkpoint, sessions, v3, requested_agent)
+        legacy = [r for r in records if r not in v3 and r.get("call_type") in
+                  {"graph_transition", "graph_planner", "graph_transition_change"}]
+        if legacy:
+            report += "\n\n" + build_markdown(checkpoint, sessions, legacy, requested_agent)
+        return report
     lines = [
         "# 医生 session 的最终主诉图变化与前置 Planner",
         "",
@@ -529,6 +560,38 @@ def build_markdown(checkpoint: Path, sessions: list[Any], records: list[dict[str
         reflection_detector = previous_matching_change_detector(records, reflection_planner) if reflection_planner else None
         lines.extend(markdown_block_for_transition("最后一个对话节点变化", last_chat, chat_planner, chat_detector))
         lines.extend(markdown_block_for_transition("最后一个反思节点变化", reflection, reflection_planner, reflection_detector))
+    return "\n".join(lines)
+
+
+def build_v3_markdown(checkpoint, sessions, records, requested_agent=None):
+    """Align V3 by opaque event ID; a validator reply alone never proves commit."""
+    runtime = {}
+    for session in sessions:
+        for turn in session.get("turns", []):
+            trace = turn.get("complaint_graph", {})
+            if trace.get("event_id"):
+                runtime[trace["event_id"]] = trace
+        reflection = session.get("complaint_graph", {}).get("reflection", {})
+        if reflection.get("event_id"):
+            runtime[reflection["event_id"]] = reflection
+    groups = {}
+    for record in records:
+        if requested_agent and record.get("agent") != requested_agent:
+            continue
+        payload = prompt_payload(record.get("prompt"))
+        groups.setdefault(payload.get("event_id"), []).append(record)
+    lines = ["# V3 主诉图更新链", "", f"checkpoint：{checkpoint}", "",
+             "按 event ID 对齐 Observation / 单 proposal / Validator；实际推进仅由 committed 与版本变化确认。", ""]
+    for eid, calls in groups.items():
+        lines += [f"## Event {eid}", "", f"图模型调用数：{len(calls)}", ""]
+        final = runtime.get(eid, {}).get("final_result", {})
+        if final:
+            lines += ["最终结果：", "```json", json.dumps(final, ensure_ascii=False, indent=2), "```", ""]
+        else:
+            lines += ["最终 code commit 记录不可用；不能从模型 verdict 推断推进。", ""]
+        for call in calls:
+            lines += [f"### {call.get('call_type')}", "", "```text", str(call.get("prompt", "")),
+                      "```", "", "```json", str(call.get("response", "")), "```", ""]
     return "\n".join(lines)
 
 

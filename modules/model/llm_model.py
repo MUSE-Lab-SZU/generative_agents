@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from modules.model.endpoint_pool import next_endpoint, resolve_endpoint_urls
+from modules.model.forced_config import resolve_deepseek_config
 from modules.model.api_cost import record_call_event
 
 
@@ -766,6 +767,8 @@ class OllamaLLMModel(LLMModel):
 
 def create_llm_model(llm_config):
     """Create llm model"""
+
+    llm_config = resolve_deepseek_config(llm_config)
 
     if llm_config["provider"] == "ollama":
         return OllamaLLMModel(llm_config)

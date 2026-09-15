@@ -162,7 +162,15 @@ def calculate_cost(
 ) -> dict[str, Any]:
     config = dict(pricing or load_pricing_config())
     tier = pricing_tier(request_started_at, config)
-    priced_model, model_config = _resolve_model_price(model, config)
+    billing_model = str(model or "").strip().lower()
+    redirect = (config.get("model_redirects", {}) or {}).get(billing_model)
+    if redirect:
+        timezone = ZoneInfo(str(config.get("timezone") or "Asia/Shanghai"))
+        if _as_datetime(request_started_at, timezone) >= _as_datetime(
+            redirect["effective_from"], timezone
+        ):
+            billing_model = redirect["model"]
+    priced_model, model_config = _resolve_model_price(billing_model, config)
     result: dict[str, Any] = {
         "pricing_version": str(config.get("pricing_version", "")),
         "pricing_model": priced_model,

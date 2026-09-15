@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "zyh_stress_event_001",
+          "node_type": "event",
+          "subject": "周远航",
+          "predicate": "此时",
+          "object": "因家庭居住空间紧张而感到责任压力",
+          "describe": "家庭成员争抢有限空间时，周远航会把持续的居住压力归因于自己没有尽到责任，并在餐桌旁沉默下来。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zyh_stress_event_002",
+          "node_type": "event",
+          "subject": "周远航",
+          "predicate": "此时",
+          "object": "因核对家庭开支而担心无法改善生活条件",
+          "describe": "核对家庭开支时，周远航会反复计算仍然不足的部分，担心自己无法尽快给家人提供更宽裕稳定的生活。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zyh_stress_thought_003",
+          "node_type": "thought",
+          "subject": "周远航",
+          "predicate": "此时",
+          "object": "没能立刻给家人更好的条件，就说明我不够可靠",
+          "describe": "居住和经济压力强化了周远航的自动思维：如果不能马上改善家庭条件，就说明自己不是可靠的家人。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "zyh_stress_event_004",
+          "node_type": "event",
+          "subject": "周远航",
+          "predicate": "此时",
+          "object": "想到讨论开支或未来安排就担心让家人失望",
+          "describe": "每当需要和家人讨论开支、空间或未来安排时，周远航都会担心暴露自己的无力感，因而回避表达并独自承担压力。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

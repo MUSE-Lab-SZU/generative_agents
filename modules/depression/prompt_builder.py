@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from .generation_view import context_view, project, STYLE_KEYS, EXPRESSION_KEYS, semantic_claim_view
+
 from typing import Any, Dict, List, Optional
 
 from .prompt_templates import load_prompt_json, render_prompt_section
@@ -109,68 +112,31 @@ class DynamicPromptBuilder:
         )
 
     def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
-        current_stage = current_stage if isinstance(current_stage, dict) else {}
-        graph_snapshot = graph_snapshot if isinstance(graph_snapshot, dict) else {}
-
-        # 这些字段都直接来自 complaint_graph 配置中的单个 stage。
-        label = str(current_stage.get("label", "未命名主诉节点") or "未命名主诉节点").strip()
-        summary = str(current_stage.get("summary", "") or "").strip()
-        core_belief = str(current_stage.get("core_belief", "") or "").strip()
-        narrative_focus = [str(item) for item in current_stage.get("narrative_focus", [])[:6]] if isinstance(current_stage.get("narrative_focus", []), list) else []
-        speaking_style = current_stage.get("speaking_style", {}) if isinstance(current_stage.get("speaking_style", {}), dict) else {}
-
-        optional_sections = []
-        if summary:
-            optional_sections.append(
-                self._render_block(
-                    "dynamic_stage_summary_section",
-                    {"summary": summary},
-                )
+        stage = current_stage if isinstance(current_stage, dict) else {}
+        sections = ["=== 当前主诉节点层 ===", "当前主题：" + str(stage.get("topic", "初始主诉"))]
+        claims = [semantic_claim_view(c) for c in stage.get("current_claims", [])]
+        sections.append("当前可用报告（保留原时点；未提及不等于正常）：")
+        sections.append(
+            json.dumps(claims, ensure_ascii=False) if claims else "暂无可用的具体已接受报告。"
+        )
+        background = stage.get("initialization_background", [])
+        if background:
+            sections.append("初始化病例背景（历史/初始化设定，不代表本轮仍成立）：")
+            sections.extend(str(x) for x in background)
+        if stage.get("core_belief"):
+            sections.append(
+                "固定核心信念（病例背景，不是本轮确信度）：" + str(stage["core_belief"])
             )
-        domain_state_section = self._build_domain_state_section(graph_snapshot)
-        if domain_state_section:
-            optional_sections.append(domain_state_section)
-        if core_belief:
-            optional_sections.append(
-                self._render_block(
-                    "dynamic_stage_core_belief_section",
-                    {"core_belief": core_belief},
-                )
-            )
-        if narrative_focus:
-            # narrative_focus 不是“必须逐字复述的关键词”，
-            # 更像给 LLM 的“优先围绕哪些痛点组织表达”的提醒。
-            optional_sections.append(
-                self._render_block(
-                    "dynamic_stage_narrative_focus_section",
-                    {"narrative_focus": "、".join(narrative_focus)},
-                )
-            )
-
-        if speaking_style:
-            # 这里把结构化风格字段翻译回自然语言提示，
-            # 让 LLM 更容易在输出中体现节奏/语气/修正模式。
-            optional_sections.append(
-                self._render_block(
-                    "dynamic_stage_speaking_style_section",
-                    {
-                        "tempo": speaking_style.get("tempo", "slow"),
-                        "disclosure": speaking_style.get("disclosure", "guarded"),
-                        "tone": speaking_style.get("tone", "flat"),
-                        "repair_pattern": speaking_style.get("repair_pattern", "说一点、收一点"),
-                    },
-                )
-            )
-
+        sections.append(
+            "表达风格："
+            + json.dumps(project(stage.get("speaking_style"), STYLE_KEYS), ensure_ascii=False)
+        )
+        sections.append("中性表达提示：围绕当前主题和有时间限定的报告自然表达。")
         return self._with_trailing_newline(
             render_prompt_section(
                 "depression/dynamic_prompt_layers",
                 "stage_layer",
-                {
-                    "label": label,
-                    "optional_sections": "".join(optional_sections),
-                    "graph_window_section": "",
-                },
+                {"fact_sections": "\n".join(sections[1:])},
             ).strip()
         )
 
@@ -223,7 +189,7 @@ class DynamicPromptBuilder:
         )
 
     def _build_context_layer(self, session_context: Dict[str, Any]) -> str:
-        session_context = session_context if isinstance(session_context, dict) else {}
+        session_context = context_view(session_context)
         scene = session_context.get("scene", {}) if isinstance(session_context.get("scene", {}), dict) else {}
         participants = session_context.get("participants", {}) if isinstance(session_context.get("participants", {}), dict) else {}
         semantic = session_context.get("semantic_cues", {}) if isinstance(session_context.get("semantic_cues", {}), dict) else {}
@@ -315,7 +281,7 @@ class DynamicPromptBuilder:
         activated_memories: List[Dict[str, Any]],
     ) -> str:
         current_stage = current_stage if isinstance(current_stage, dict) else {}
-        emotion = emotion if isinstance(emotion, dict) else {}
+        emotion = project(emotion, EXPRESSION_KEYS)
         speaking_style = current_stage.get("speaking_style", {}) if isinstance(current_stage.get("speaking_style", {}), dict) else {}
 
         disclosure_level = float(emotion.get("disclosure_level", 0.3) or 0.3)

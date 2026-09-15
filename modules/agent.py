@@ -10,6 +10,7 @@ import hashlib
 from contextlib import contextmanager
 
 from modules import memory, prompt, utils
+from modules.depression.evidence import new_id
 from modules.depression import DepressionSimulationEngine
 from modules.model.llm_model import create_llm_model
 from modules.memory.associate import Concept
@@ -152,6 +153,9 @@ class Agent:
             **config["associate"]
         )
         self.concepts, self.chats = [], config.get("chats", [])
+        self._chat_session_instance_id = config.get("chat_session_instance_id", "")
+        self._session_message_refs = copy.deepcopy(config.get("session_message_refs", {}))
+        self._depression_attempt = None
 
         # prompt
         self.scratch = prompt.Scratch(self.name, config["currently"], config["scratch"])
@@ -243,6 +247,8 @@ class Agent:
         forced_prompt_trace = prompt_kwargs.pop("_forced_prompt_trace", None)
         explicit_local_only = bool(prompt_kwargs.pop("_force_local", False))
         depression_chat_ctx = None
+        if func_hint == "generate_chat":
+            self._depression_attempt = None
         if func_hint == "generate_chat":
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
                 args=args,
@@ -499,8 +505,12 @@ class Agent:
                 )
             )
         self.logger.debug(utils.block_msg(title, msg))
-        if func_hint == "generate_chat" and depression_chat_ctx:
-            self._commit_depression_generate_chat(depression_chat_ctx, output)
+        if func_hint == "generate_chat":
+            self._depression_attempt = (
+                {"context": depression_chat_ctx, "text": str(output or "")}
+                if depression_chat_ctx
+                else None
+            )
         return output
 
     def think(self, status, agents):
@@ -1809,6 +1819,16 @@ class Agent:
             )
         )
         start, chats = utils.get_timer().get_date(), []
+        session_instance_id = new_id("session")
+        for participant in (self, other):
+            participant._chat_in_progress = True
+            participant._depression_attempt = None
+            participant._chat_session_instance_id = session_instance_id
+            if not hasattr(participant, "_session_message_refs"):
+                participant._session_message_refs = {}
+            participant._session_message_refs[session_instance_id] = []
+            if getattr(participant, "depression_dynamic", None):
+                participant.depression_dynamic.graph_manager.start_session(session_instance_id)
         relations = [
             self.completion("summarize_relation", self, other.name),
             other.completion("summarize_relation", other, self.name),
@@ -2058,7 +2078,8 @@ class Agent:
                         break
 
                 # 对于发起对话的Agent，从第2轮对话开始，检查话题是否结束
-                chats.append((self.name, text))
+                if not self._accept_chat_utterance(self, other, text, chats):
+                    continue
                 track_accepted_utterance(self, other, text, turn_no)
                 if not dialog_judge_enabled:
                     terminate_end = False
@@ -2117,7 +2138,8 @@ class Agent:
                             )
                             break
             else:
-                chats.append((self.name, text))
+                if not self._accept_chat_utterance(self, other, text, chats):
+                    continue
                 track_accepted_utterance(self, other, text, turn_no)
 
             if dialog_judge_enabled and self_is_doctor_turn:
@@ -2288,7 +2310,8 @@ class Agent:
                         )
                         break
 
-            chats.append((other.name, text))
+            if not self._accept_chat_utterance(other, self, text, chats):
+                continue
             track_accepted_utterance(other, self, text, turn_no)
 
             # 对于响应对话的Agent，从第1轮开始，检查话题是否结束
@@ -2552,6 +2575,8 @@ class Agent:
             except Exception:
                 interaction_record = None
         self._restore_chat_route_ctx(other, prev_self_ctx, prev_other_ctx)
+        self._chat_in_progress = False
+        other._chat_in_progress = False
         if self.intervention:
             self.intervention.after_chat(
                 self,
@@ -3525,11 +3550,15 @@ class Agent:
         return self._llm.is_available()
 
     def to_dict(self, with_action=True):
+        if getattr(self, "_chat_in_progress", False):
+            raise RuntimeError("CHECKPOINT_REQUIRES_COMPLETED_CHAT_SESSION")
         info = {
             "status": self.status,
             "schedule": self.schedule.to_dict(),
             "associate": self.associate.to_dict(),
             "chats": self.chats,
+            "chat_session_instance_id": getattr(self, "_chat_session_instance_id", ""),
+            "session_message_refs": copy.deepcopy(getattr(self, "_session_message_refs", {})),
             "currently": self.scratch.currently,
         }
         if self.depression_dynamic:
@@ -3599,6 +3628,14 @@ class Agent:
             if isinstance(state_payload, dict) and state_payload:
                 engine.load_state(copy.deepcopy(state_payload))
                 engine.set_base_prompt(self._build_depression_base_prompt())
+                if engine.graph_manager.session_records and "session_message_refs" not in config:
+                    raise ValueError("MISSING_AGENT_SESSION_REFS")
+                for sid, refs in self._session_message_refs.items():
+                    if (
+                        engine.graph_manager.session_records.get(sid, {}).get("message_refs")
+                        != refs
+                    ):
+                        raise ValueError("AGENT_SESSION_REFS_MISMATCH")
             if self.logger:
                 self.logger.info(
                     "[DEPRESSION_DYNAMIC] agent={} enabled config={}".format(
@@ -3607,6 +3644,13 @@ class Agent:
                 )
             return engine
         except Exception as exc:
+            if (
+                config.get("depression_dynamic_state", {})
+                .get("complaint_graph_manager", {})
+                .get("graph_schema_version")
+                == 3
+            ):
+                raise
             if self.logger:
                 self.logger.info(
                     "[DEPRESSION_DYNAMIC] agent={} init failed: {}".format(
@@ -3625,6 +3669,7 @@ class Agent:
         if not self.depression_dynamic or not self.llm_available():
             return None
         try:
+            self.depression_dynamic.resume_pending_events(self._depression_llm_completion)
             self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
             location = self._dynamic_location()
             time_of_day = self._dynamic_time_of_day()
@@ -3654,8 +3699,6 @@ class Agent:
 
     def _prepare_depression_generate_chat(self, args, kwargs):
         if not self.depression_dynamic:
-            return kwargs, None
-        if "depression_chat_block" in kwargs and str(kwargs.get("depression_chat_block", "")).strip():
             return kwargs, None
         if len(args) < 4:
             return kwargs, None
@@ -3691,6 +3734,8 @@ class Agent:
                 roadmap_completion_func=self._depression_llm_completion,
                 emotion_completion_func=self._depression_llm_completion,
             )
+        context.update(copy.deepcopy(self.depression_dynamic.generation_snapshot))
+        context["generation_prompt"] = preview_prompt
         next_kwargs = dict(kwargs)
         next_kwargs["depression_chat_block"] = preview_prompt
         return next_kwargs, context
@@ -3722,8 +3767,8 @@ class Agent:
         event_source = str(source or "").strip()
         if event_source not in {"chat", "reflection"}:
             return None
-        event_content = str(content or "").strip()
-        if not event_content:
+        event_content = str(content or "")
+        if not event_content.strip() and not (metadata or {}).get("message_refs"):
             return None
 
         self.depression_dynamic.set_base_prompt(self._build_depression_base_prompt())
@@ -3739,6 +3784,15 @@ class Agent:
             with self._depression_trace_scope(
                 {
                     "source": event_source,
+                    **{
+                        k: copy.deepcopy((metadata or {}).get(k))
+                        for k in (
+                            "event_id",
+                            "message_refs",
+                            "generation_snapshot_ref",
+                            "session_instance_id",
+                        )
+                    },
                     "location": location,
                     "time_of_day": time_of_day,
                     "other_agent": other_agent,
@@ -3803,46 +3857,14 @@ class Agent:
         trigger_context=None,
     ):
         trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
-        del focus  # 反思问题是上游 LLM 的关注点，不作为患者状态推进证据。
-        evidence_ids = []
-        for entry in entries or []:
-            if not isinstance(entry, dict):
-                continue
-            evidence_ids.extend(
-                self._normalize_depression_text_list(entry.get("evidence", []), limit=20)
-            )
-
-        evidence_ids = self._dedupe_depression_texts(evidence_ids, limit=20)
-        patient_utterances = self._extract_depression_patient_utterances(
-            trigger_context.get("chat_transcript", ""),
-            patient_name=self.name,
-        )
-        behavior_events = self._normalize_depression_text_list(
-            trigger_context.get("behavior_events", []), limit=5
-        )
-        if not patient_utterances and not behavior_events:
-            behavior_events = self._resolve_depression_reflection_events(evidence_ids)
-
-        reflection_evidence = {
-            "interaction_background": self._depression_reflection_background(
-                trigger_source=trigger_source,
-                trigger_context=trigger_context,
-            ),
-            "patient_key_utterances": patient_utterances,
-            "behavior_or_life_events": behavior_events,
+        del focus, entries
+        metadata = {
+            "message_refs": copy.deepcopy(trigger_context.get("message_refs", [])),
+            "session_instance_id": trigger_context.get("session_instance_id"),
+            "event_id": new_id("event"),
+            "trigger_context": {"meeting_id": trigger_context.get("meeting_id", "")},
         }
-        rows = ["会话背景：" + reflection_evidence["interaction_background"]]
-        if patient_utterances:
-            rows.append("患者关键表达：")
-            rows.extend("- " + item for item in patient_utterances)
-        if behavior_events:
-            rows.append("行为或生活事件：")
-            rows.extend("- " + item for item in behavior_events)
-        if not patient_utterances and not behavior_events:
-            rows.append("本次没有可核验的患者原话或实际事件。")
-
-        metadata = {"reflection_evidence": reflection_evidence}
-        return "\n".join(rows), metadata
+        return "会后反思：读取本次触发会话授权的完整原消息。", metadata
 
     def _extract_depression_patient_utterances(self, transcript, patient_name=""):
         """从真实会话文本中按说话人抽取患者原话，并覆盖互动前后。"""
@@ -3927,13 +3949,119 @@ class Agent:
                 break
         return results
 
+    def _accept_chat_utterance(self, speaker, other, text, chats):
+        """Append and register atomically; only then run graph and outer D tracking."""
+        if not isinstance(text, str) or not text.strip():
+            speaker._depression_attempt = None
+            return None
+        sid = getattr(speaker, "_chat_session_instance_id", "") or new_id("session")
+        mid = new_id("message")
+        attempt = getattr(speaker, "_depression_attempt", None)
+        speaker._depression_attempt = None
+        context = (
+            copy.deepcopy(attempt["context"])
+            if attempt and attempt["text"] == text and attempt.get("context")
+            else None
+        )
+        speaker_engine = getattr(speaker, "depression_dynamic", None)
+        metadata = None
+        if speaker_engine:
+            context = context or speaker._build_depression_chat_context(other, "", chats)
+            metadata = dict(
+                event_id=new_id("event"),
+                message_refs=[mid],
+                session_instance_id=sid,
+                generation_attempt_id=context.get("generation_attempt_id"),
+                generation_snapshot_ref=context.get("generation_snapshot_ref"),
+            )
+            context["accepted_metadata"] = metadata
+        backups = []
+        chats.append((speaker.name, text))
+        try:
+            for participant in (speaker, other):
+                participant._chat_session_instance_id = sid
+                if not hasattr(participant, "_session_message_refs"):
+                    participant._session_message_refs = {}
+                refs = participant._session_message_refs.setdefault(sid, [])
+                engine = getattr(participant, "depression_dynamic", None)
+                if engine:
+                    manager = engine.graph_manager
+                    backups.append(
+                        (
+                            manager,
+                            copy.deepcopy(manager.evidence_ledger),
+                            copy.deepcopy(manager.session_records),
+                            copy.deepcopy(manager.pending_events),
+                        )
+                    )
+                    manager.start_session(sid)
+                    engine.register_accepted_message(
+                        text=text,
+                        speaker_id=speaker.name,
+                        session_instance_id=sid,
+                        speaker_role="patient" if participant is speaker else "counterpart",
+                        message_id=mid,
+                        generation_attempt_id=(
+                            (context or {}).get("generation_attempt_id")
+                            if participant is speaker
+                            else None
+                        ),
+                        generation_snapshot_ref=(
+                            (context or {}).get("generation_snapshot_ref")
+                            if participant is speaker
+                            else None
+                        ),
+                    )
+                    if participant is speaker:
+                        # Complete pending envelope is part of the same registration region.
+                        pending_context = engine.context_builder.build_context(
+                            location=context["location"],
+                            time_of_day=context["time_of_day"],
+                            other_agent=context["other_agent"],
+                            relationship=context["relationship"],
+                            interaction_type=context["interaction_type"],
+                            conversation_content=text,
+                        )
+                        pending_context["runtime_event"] = {
+                            "source": "chat",
+                            "metadata": copy.deepcopy(metadata),
+                        }
+                        manager.pending_events[metadata["event_id"]] = dict(
+                            source="chat",
+                            metadata=copy.deepcopy(metadata),
+                            base_node_id=manager.get_current_stage_id(),
+                            base_state_version=manager.graph_state_version,
+                            content=text,
+                            session_context=pending_context,
+                            counterpart_utterance=context.get("counterpart_utterance", ""),
+                        )
+                refs.append(mid)
+        except Exception:
+            chats.pop()
+            for manager, ledger, sessions, pending in backups:
+                manager.evidence_ledger, manager.session_records, manager.pending_events = (
+                    ledger,
+                    sessions,
+                    pending,
+                )
+            for participant in (speaker, other):
+                refs = participant._session_message_refs.get(sid, [])
+                if refs and refs[-1] == mid:
+                    refs.pop()
+            raise
+        if speaker_engine:
+            speaker._last_accepted_message_id = mid
+            speaker._last_accepted_event_id = metadata["event_id"]
+            speaker._commit_depression_generate_chat(context, text)
+        return mid
+
     def _commit_depression_generate_chat(self, context, output):
         if not self.depression_dynamic:
             return
-        utterance = str(output or "").strip()
-        if not utterance:
+        utterance = str(output or "")
+        if not utterance.strip():
             return
-        self._commit_depression_event(
+        return self._commit_depression_event(
             source="chat",
             location=context["location"],
             time_of_day=context["time_of_day"],
@@ -3941,7 +4069,7 @@ class Agent:
             relationship=context["relationship"],
             interaction_type=context["interaction_type"],
             content=utterance,
-            metadata={"origin": "generate_chat", "evidence_ids": []},
+            metadata=copy.deepcopy(context.get("accepted_metadata", {})),
             counterpart_utterance=context.get("counterpart_utterance", ""),
         )
 
@@ -4196,18 +4324,24 @@ class Agent:
             else {}
         )
         return {
+            **{
+                k: copy.deepcopy(context[k])
+                for k in (
+                    "event_id",
+                    "message_refs",
+                    "generation_snapshot_ref",
+                    "session_instance_id",
+                )
+                if k in context
+            },
             "source": str(context.get("source", "") or "").strip(),
             "location": str(context.get("location", "") or "").strip(),
             "time_of_day": str(context.get("time_of_day", "") or "").strip(),
             "other_agent": str(context.get("other_agent", "") or "").strip(),
             "relationship": str(context.get("relationship", "") or "").strip(),
-            "interaction_type": str(
-                context.get("interaction_type", "") or ""
-            ).strip(),
+            "interaction_type": str(context.get("interaction_type", "") or "").strip(),
             "dialogue": {
-                "patient_utterance": str(
-                    dialogue.get("patient_utterance", "") or ""
-                ).strip(),
+                "patient_utterance": str(dialogue.get("patient_utterance", "") or "").strip(),
                 "counterpart_utterance": str(
                     dialogue.get("counterpart_utterance", "") or ""
                 ).strip(),
@@ -4217,6 +4351,12 @@ class Agent:
     @staticmethod
     def _classify_depression_llm_call(prompt):
         text = str(prompt or "").lstrip()
+        if text.startswith("你是患者主诉图的 Observation Detector。"):
+            return "observation_detector"
+        if text.startswith("你是患者主诉图的 Minimal Planner。"):
+            return "minimal_planner"
+        if text.startswith("你是患者主诉图的 Commit Validator。"):
+            return "commit_validator"
         if text.startswith(
             ("你是患者主诉图的变化检测器。", "你是患者主诉状态变化提取器。")
         ):
@@ -4258,6 +4398,14 @@ class Agent:
             "response": response_text,
             "success": bool(response_text.strip()),
         }
+        try:
+            payload = json.loads(str(prompt).rsplit("输入：", 1)[-1])
+            if payload.get("pipeline_version") == "v3":
+                record.update({k: payload.get(k) for k in
+                    ("pipeline_version", "prompt_key", "event_id", "mode", "task")})
+                record["proposal_id"] = payload.get("proposal", {}).get("proposal_id")
+        except (ValueError, TypeError, AttributeError):
+            pass
         try:
             trace_dir = os.path.dirname(
                 os.path.abspath(self._depression_trace_path)

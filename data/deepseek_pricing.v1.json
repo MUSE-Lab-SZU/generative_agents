@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "pricing_version": "2026-08-31",
+  "pricing_version": "2026-09-10",
   "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
   "currency": "CNY",
   "unit_tokens": 1000000,
@@ -24,6 +24,29 @@
         "prompt_cache_miss": 1.5,
         "completion": 4.5
       }
+    },
+    "deepseek-flash": {
+      "peak": {
+        "prompt_cache_hit": 0.04,
+        "prompt_cache_miss": 2.0,
+        "completion": 8.0
+      },
+      "off_peak": {
+        "prompt_cache_hit": 0.02,
+        "prompt_cache_miss": 1.0,
+        "completion": 4.0
+      }
     }
-  }
+  },
+  "model_redirects": {
+    "deepseek-v4-flash": {
+      "model": "deepseek-flash",
+      "effective_from": "2026-09-10T00:00:00+08:00"
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "model": "deepseek-flash",
+      "effective_from": "2026-09-10T00:00:00+08:00"
+    }
+  },
+  "effective_date_note": "旧 Flash 名称按 2026-09-10（北京时间）作为本地计费切换日；官网未给出当日精确切换时刻。此前调用保留旧费率。"
 }

@@ -17,6 +17,7 @@ from string import Template
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, List
 
+from modules.model.forced_config import is_official_deepseek, load_forced_llm_config
 from modules import utils
 from modules.complaint_graph_trace import (
     capture_runtime_chat_trace,
@@ -986,7 +987,19 @@ class InterventionManager:
                     chat_node_id = self._resolve_latest_chat_node_id(target)
                 except Exception:
                     chat_node_id = ""
+                engine = getattr(target, "depression_dynamic", None)
+                session_id = getattr(target, "_chat_session_instance_id", "")
+                message_refs = []
+                if engine and session_id in engine.graph_manager.session_records:
+                    message_refs = [
+                        ref
+                        for ref in engine.graph_manager.session_records[session_id]["message_refs"]
+                        if engine.graph_manager.evidence_ledger[ref].get("speaker_role")
+                        == "patient"
+                    ]
                 context = {
+                    "message_refs": message_refs,
+                    "session_instance_id": session_id,
                     "event": "after_chat",
                     "meeting_kind": str(meeting_kind or ""),
                     "meeting_id": str(meeting_id or ""),
@@ -1780,6 +1793,8 @@ class InterventionManager:
     def get_forced_llm_runtime_config(self) -> Optional[Dict[str, Any]]:
         intervention_cfg = self.config.get("intervention", {}) or {}
         forced_llm = intervention_cfg.get("forced_llm", {}) or {}
+        if isinstance(forced_llm, dict) and is_official_deepseek(forced_llm.get("base_url")):
+            forced_llm = load_forced_llm_config()
         if not isinstance(forced_llm, dict) or not forced_llm:
             self._log_highlight("[FORCED_LLM] config_missing_or_invalid")
             return None
@@ -1847,6 +1862,8 @@ class InterventionManager:
 
         intervention_cfg = self.config.get("intervention", {}) or {}
         forced_llm = intervention_cfg.get("forced_llm", {}) or {}
+        if isinstance(forced_llm, dict) and is_official_deepseek(forced_llm.get("base_url")):
+            forced_llm = load_forced_llm_config()
         if not isinstance(forced_llm, dict):
             policy["notes"].append("forced_llm_not_dict")
             self._log_highlight(
@@ -2422,7 +2439,6 @@ class InterventionManager:
             self._cbt_term_glossary_cache_path = path
         return self._cbt_term_glossary_cache
 
-
     def _is_progressive_d_configured(self) -> bool:
         return bool(self.get_progressive_d_runtime_policy().get("enabled", False))
 
@@ -2446,7 +2462,6 @@ class InterventionManager:
             self._cbt_stage_subgoals_cache = load_stage_subgoal_map(path_text)
             self._cbt_stage_subgoals_cache_path = path_text
         return self._cbt_stage_subgoals_cache
-
 
     def _progressive_d_progress_state_for_pair(
         self,
@@ -2503,7 +2518,6 @@ class InterventionManager:
                 current["soft_step_back"] = copy_soft_step_back_default()
         pairs[pair_key_text] = current
         return current, stage_item
-
 
     def _apply_progressive_d_control_result(
         self,
@@ -3509,7 +3523,6 @@ class InterventionManager:
             },
         )
         return copy.deepcopy(record)
-
 
     def build_doctor_reply_guidance(self, judge: Any) -> str:
         if not isinstance(judge, dict):
@@ -4606,6 +4619,8 @@ class InterventionManager:
 
         intervention_cfg = self.config.get("intervention", {}) or {}
         forced_llm = intervention_cfg.get("forced_llm", {}) or {}
+        if isinstance(forced_llm, dict) and is_official_deepseek(forced_llm.get("base_url")):
+            forced_llm = load_forced_llm_config()
         enabled = self._safe_bool(forced_llm.get("enabled", False), False)
         if not enabled:
             self._log_highlight(
@@ -5240,7 +5255,6 @@ class InterventionManager:
                     last_item["stage_transition_adapter"] = copy.deepcopy(
                         payload.get("stage_transition_adapter", {})
                     )
-
 
     def _get_session_eval_reason_for_judge(self, pair_key: str, current_session: str) -> str:
         self._ensure_session_eval_state_schema()

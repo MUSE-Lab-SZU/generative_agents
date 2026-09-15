@@ -12,25 +12,20 @@ ${base_prompt}
 
 @@ stage_layer
 === 当前主诉节点层 ===
-当前节点：${label}
-${optional_sections}推进原则：
-- 你应围绕当前节点说话，不要突然跳到完全无关的远端好转。
-- 即使出现一点松动，也应表现为试探性的、会反复的变化。
-- 只根据当前处境自然回应，不要猜测或迎合系统预设的后续状态。
-${graph_window_section}
+${fact_sections}
 
 @@ dynamic_stage_summary_section
-节点概述：${summary}
+已接受报告（保留来源与时间）：${summary}
 
 @@ dynamic_stage_domain_state_section
 === 持续症状状态 ===
 ${domain_lines}
 
 @@ dynamic_stage_core_belief_section
-核心信念：${core_belief}
+固定核心信念（病例背景，不代表本轮确信度）：${core_belief}
 
 @@ dynamic_stage_narrative_focus_section
-当前最容易围绕这些问题组织表达：${narrative_focus}
+中性表达提示：${narrative_focus}
 
 @@ dynamic_stage_speaking_style_section
 当前节点下的表达方式：

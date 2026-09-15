@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "lrn_stress_event_001",
+          "node_type": "event",
+          "subject": "林若宁",
+          "predicate": "此时",
+          "object": "因协作关系中的误会感到被排除",
+          "describe": "校园协作中出现关系误会后，林若宁在消息框前反复删改，担心同伴的沉默意味着自己正在被排除。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "lrn_stress_event_002",
+          "node_type": "event",
+          "subject": "林若宁",
+          "predicate": "此时",
+          "object": "因主动消息没有及时回应而反复自我怀疑",
+          "describe": "同伴没有及时回应协作消息时，林若宁会把普通的等待理解为别人不愿接近自己，并逐渐不敢继续表达。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "lrn_stress_thought_003",
+          "node_type": "thought",
+          "subject": "林若宁",
+          "predicate": "此时",
+          "object": "如果我主动却没人回应，就说明我没有被喜欢的理由",
+          "describe": "关系误会和同伴沉默强化了林若宁的自动思维：如果主动后没有回应，就说明自己没有被喜欢和接近的理由。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "lrn_stress_event_004",
+          "node_type": "event",
+          "subject": "林若宁",
+          "predicate": "此时",
+          "object": "想到再次参与同伴协作就担心被拒绝",
+          "describe": "每当想到在课堂或协作中再次主动发言、发消息时，林若宁都会预先担心自己显得多余并再次被拒绝。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

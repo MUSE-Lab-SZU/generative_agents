@@ -304,6 +304,9 @@ def score_worker_tracking_args(
     intervention = source_config.get("intervention", {}) if isinstance(source_config, dict) else {}
     forced_llm = intervention.get("forced_llm", {}) if isinstance(intervention, dict) else {}
     forced_llm = forced_llm if isinstance(forced_llm, dict) else {}
+    from modules.model.forced_config import is_official_deepseek, load_forced_llm_config
+    if is_official_deepseek(forced_llm.get("base_url")):
+        forced_llm = load_forced_llm_config()
     args = api_cost_tracking_args(
         run_name=run_name,
         phase=phase,

@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-09-10
+> 更新时间：2026-09-15
 
 ## 关键测试结果速查
 
@@ -28,6 +28,14 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+
+- 2026-09-15：将主诉图 v3 的 LLM 推进重构为封闭三段式管线：Observation Detector 只从完整患者原话提取未验证 observations，Minimal Planner 只提交一个最小 claim diff，Commit Validator 独立逐项核对来源、新颖性、主体/否定/时间、基线可比性、当前修订、topic 准入与整包原子性。仅明确的评价、实际行为、可比症状/功能变化、焦点转移或实质纠正可建点；计划、互动、细节补充、同义重述及独立变化拼包均拒绝或保留为 observation。v3 保留审计级 trace 与 consumed-update 防重，旧分支式 Prompt 迁入 legacy 资产以维持兼容。
+- 2026-09-15：新增 `scripts/replay_complaint_graph_v3_phase2.py`，可对固定语料和多轮反馈分别回放 legacy 与 v3 管线，逐事件保存完整 trace、输入前态和人工审计槽位；仅在模型可用时运行，报告明确禁止以 advance 率推断疗效或漂移改善，须人工核对不支持断言、抽象扩写、同义节点、类型/时间错误和误拒绝。
+- 2026-09-15：将动态抑郁主诉图升级为 v3 证据账本与版本化 claim 链：仅实际被聊天循环接受的非空原话才会先原子登记，再触发图推进；每条消息、会话、事件和生成快照以稳定 ID 关联，拒绝/重复生成不再污染状态。患者报告被归为带来源证据的类型化 claim，以修订与 `supersedes` 解析当前有效事实；待提交事件支持幂等恢复，checkpoint 恢复会校验证据、会话引用、快照与图结构，拒绝不完整或不一致的 v3 边界。
+- 2026-09-15：新增患者生成/情绪/记忆的纯事实投影层：提示词只使用当前有效 claim、必要的初始化病例背景与当前关系表达，隔离显示标题、候选分支、审计字段、已被替代事实和未访问未来节点；Emotion Inferencer 不再由图推进或理解变化推断症状改善。默认运行链同时停用旧的数值 domain reducer，保留其显式兼容接口；补充 accepted-utterance、证据账本、generation view 与稀疏 checkpoint 续跑回归测试。
+- 2026-09-13：新增 Qwen3.5 部署前快测工具链：`benchmark_qwen35.sh` 在单张空闲 4090 上以同一 vLLM 版本顺序部署 Qwen3-8B 与 Qwen3.5-9B，测量固定短负载的并发 1/4 吞吐，并用项目实际 prompt/think 清理函数校验 JSON 输出与关闭思考；工具仅清理自己创建的进程。另提供已有 LLM 服务的三请求接入检查，以及三副本 embedding 的批量、向量空间一致性和检索冒烟检查；均不改写业务配置、模型服务或既有索引，完整下载、运行和恢复说明已补入 RUNBOOK。
+- 2026-09-11：新增两套不接入仿真、只读已结束 checkpoint 的本地 think-LLM 离线评估，并提供 Python/Bash 入口、并发重试、逐项原子缓存和身份一致性续跑校验。`psi_bench_eval` 从完整会谈 transcript 的每条患者原话分别标注 PSI-Bench 风格 P/T/C/F 与 Plutchik 八情绪/neutral，严格隔离未来信息并输出轮次、会谈及分组汇总；`static_profile_recovery` 以静态人设资产中的 Root Complaint Anchor、Core Belief 为 GT，在匿名化的“四选一（GT + 三干扰项）”任务中要求患者原话证据，支持全疗程和单会谈两种口径及跨 run 汇总。`PSI-Bench/` 与 `patient-psi/` 仅作为已核对的方法参考，不构成运行时依赖。
+- 2026-09-10：统一官方 DeepSeek API 的运行时配置与计费口径：主仿真、量表/独立评分 worker、ExpertLLM 界面、模型工厂与诊断脚本均以工作区 `intervention.forced_llm` 为唯一权威，官方端点不再沿用归档快照、旧 CLI 参数或 `EXPERT_LLM_*` 环境变量中的模型设置；`enabled=false` 会拒绝创建官方客户端，第三方及本地端点保持原有配置。默认模型切换为 DeepSeek-V4.1-Flash（`deepseek-flash`），价格表新增其高低峰费率，并按 2026-09-10 生效的旧 Flash 名称重定向计费，既有调用仍保留旧费率。
 - 2026-09-10：根据 Progressive D forced prompt trace 收紧轮内控制：`terminate=true` 的代码门禁仅为动态终止检查已开启；Planner 的“准备收尾”保留为非强制节奏建议，并在第 50 轮后明显转向巩固、总结与安排下一步，第 55 轮起原则上建议收尾。未开启检查时 Judge Prompt 不再保留提前终止提示或 `true` 示例。Session Task Planner Prompt 同时明确只允许由患者最新回复触发 `none → partial/completed` 或 `partial → completed`，禁止重复输出同级状态和已完成目标。Progressive D 常规完成门迁入 `intervention.progressive_d.completion_threshold_ratio` 并设为 60%，由逐轮终止检查和会后 Session 推进共用；40 分钟时间门、3 场会谈 40% 兜底及整体架构不变。
 - 2026-09-10：`runshells/backfill_0908_session12_long_scales.py` 新增 `--max-condition-parallel`（默认 4），可在每个 condition 内既有量表任务并行之外并发补跑多个 condition；单项失败会汇总报错但不取消其他补跑，使用相同命令即可断点续跑。
 - 2026-09-09：统一 72-step 批次的阶段评估与量表边界协议：G2、G10–G12 的 step 间隔由 24 改为 12，使最终节点对齐 `session_12`；报告生成和归档复评均以实际首末 staged 节点为准，强制使用 PHQ-9 / BDI-II 长量表，中间节点保留短量表及“长量表 10 次／中间短量表 5 次”的完整复评口径，分析加载器同步识别双重复次数。新增 `runshells/backfill_0908_session12_long_scales.py`，可补跑 0908 批次的 `session_12` 长量表、重建报告，并仅在严格核验 step=72 最终冻结快照后将旧 G2 的 `session_6` 无损别名为 `session_12`；`docs/town_method/` 七篇文档同步更新。
@@ -390,17 +398,17 @@ data/config.json
 
 ## 2. 代码目录结构
 
-| 路径          | 说明                                                              |
-| ------------- | ----------------------------------------------------------------- |
-| `start.py`    | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
-| `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
-| `replay.py`   | 回放 Web 服务入口（Flask）                                        |
-| `runshells/`  | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
-| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9/g10/g11/g12）      |
-| `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
-| `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
-| `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
-| `results/`    | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
+| 路径           | 说明                                                              |
+| -------------- | ----------------------------------------------------------------- |
+| `start.py`     | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
+| `compress.py`  | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
+| `replay.py`    | 回放 Web 服务入口（Flask）                                        |
+| `runshells/`   | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
+| `experiments/` | 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9/g10/g11/g12）      |
+| `modules/`     | 核心逻辑模块（agent、intervention、memory、depression 等）        |
+| `data/`        | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
+| `frontend/`    | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
+| `results/`     | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
 
 ## 3. 快速使用说明
 
@@ -742,16 +750,16 @@ flowchart TD
 
 #### 5.3.1 强制对话里的 LLM 分工速查
 
-| 环节                                  | 主要模型路由                                                      | 主要输入                                                                                                             | 主要输出 / 作用                           |
-| ------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                             | 给 judge 用的 `patient_state_summary`     |
-| 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                               | `terminate`、`advice`                     |
-| 医患历史摘要 `consult_history`        | gate 与默认 summary 均走本地 `think.llm`；可显式设为 `forced_llm` 兼容旧配置 | 最新一轮对方发言、当前对话历史、Top-K 命中的 `chat_summary`（仅缺失项附受限 transcript 片段） | `consult_history_memory`                  |
-| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
-| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                              | 患者自然语言回复                          |
-| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                             | 是否出现复读，用于提前结束                |
-| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`           | 当前对话历史                                                                                                         | 是否结束对话                              |
-| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`         | session prompt、历史 eval reason、usage log、完整对话                                                                | `efficacy_score`、`session_end`、`reason` |
+| 环节                                  | 主要模型路由                                                                 | 主要输入                                                                                                                                       | 主要输出 / 作用                           |
+| ------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 患者状态摘要                          | 医生侧 `think.llm`                                                           | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                                                       | 给 judge 用的 `patient_state_summary`     |
+| 会话中判断 `dialog_judge`             | `forced_llm`                                                                 | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                                                         | `terminate`、`advice`                     |
+| 医患历史摘要 `consult_history`        | gate 与默认 summary 均走本地 `think.llm`；可显式设为 `forced_llm` 兼容旧配置 | 最新一轮对方发言、当前对话历史、Top-K 命中的 `chat_summary`（仅缺失项附受限 transcript 片段）                                                  | `consult_history_memory`                  |
+| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm`            | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
+| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm`            | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                                                         | 患者自然语言回复                          |
+| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                                | 当前对话历史、当前轮回复                                                                                                                       | 是否出现复读，用于提前结束                |
+| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`                      | 当前对话历史                                                                                                                                   | 是否结束对话                              |
+| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`                    | session prompt、历史 eval reason、usage log、完整对话                                                                                          | `efficacy_score`、`session_end`、`reason` |
 
 #### 5.3.2 关于模型路由，最容易混淆的点
 

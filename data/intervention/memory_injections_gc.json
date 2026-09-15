@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "gc_stress_event_001",
+          "node_type": "event",
+          "subject": "顾晨",
+          "predicate": "此时",
+          "object": "因进入陌生校园而持续感到难以适应",
+          "describe": "进入全新校园后，顾晨对尚未熟悉的环境和关系感到持续压力，并把暂时的陌生体验成自己难以适应的证据。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "gc_stress_event_002",
+          "node_type": "event",
+          "subject": "顾晨",
+          "predicate": "此时",
+          "object": "因室友沉默而迟迟不愿出门",
+          "describe": "整理宿舍书桌时想起室友的沉默，顾晨会反复猜测自己是否不受欢迎，并因此推迟出门和接触同学。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "gc_stress_thought_003",
+          "node_type": "thought",
+          "subject": "顾晨",
+          "predicate": "此时",
+          "object": "我如果不能马上合群，就说明我哪里有问题",
+          "describe": "新环境中的不确定强化了顾晨的自动思维：如果不能很快融入同学和室友，就说明自己存在问题。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "gc_stress_event_004",
+          "node_type": "event",
+          "subject": "顾晨",
+          "predicate": "此时",
+          "object": "想到进入公共空间就担心再次显得格格不入",
+          "describe": "每当想到去上课、在杂货店遇见同学或加入校园活动时，顾晨都会担心自己无法自然回应并显得格格不入。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

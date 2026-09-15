@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any, Callable, Dict, Optional
 
+from .generation_view import build_emotion_input_view, context_view, project, EXPRESSION_KEYS
 from .prompt_templates import render_prompt
 
 
@@ -44,9 +45,8 @@ class EmotionInferencer:
         return self._sanitize(parsed, fallback, payload)
 
     def build_prompt(self, payload: Dict[str, Any]) -> str:
-        current_stage = json.dumps(
-            self._current_stage_view(payload.get("current_stage", {})), ensure_ascii=False
-        )
+        payload = self._restricted_payload(payload)
+        current_stage = json.dumps(payload.get("current_stage", {}), ensure_ascii=False)
         graph_snapshot = json.dumps(
             self._slim_graph_snapshot(payload.get("graph_snapshot", {})), ensure_ascii=False
         )
@@ -67,11 +67,17 @@ class EmotionInferencer:
     @staticmethod
     def _current_stage_view(current_stage: Any) -> Dict[str, Any]:
         """返回 emotion prompt 使用的当前节点视图，不透传未来候选 ID。"""
-        stage = current_stage if isinstance(current_stage, dict) else {}
+        return build_emotion_input_view(current_stage)
+
+    @staticmethod
+    def _restricted_payload(payload):
+        context = context_view(payload.get("session_context"))
         return {
-            str(key): value
-            for key, value in stage.items()
-            if str(key) != "next_candidates"
+            "current_stage": build_emotion_input_view(payload.get("current_stage", {}), context),
+            "session_context": context,
+            "previous_emotion": project(payload.get("previous_emotion"), EXPRESSION_KEYS),
+            "conversation_content": str(payload.get("conversation_content", "") or ""),
+            "turn_key": str(payload.get("turn_key", "") or ""),
         }
 
     @staticmethod
@@ -82,6 +88,7 @@ class EmotionInferencer:
 
     def build_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """基于 stage + relationship + flags 的规则化情绪兜底。"""
+        payload = self._restricted_payload(payload)
         stage = payload.get("current_stage", {}) if isinstance(payload.get("current_stage", {}), dict) else {}
         session_context = payload.get("session_context", {}) if isinstance(payload.get("session_context", {}), dict) else {}
         previous = payload.get("previous_emotion", {}) if isinstance(payload.get("previous_emotion", {}), dict) else {}

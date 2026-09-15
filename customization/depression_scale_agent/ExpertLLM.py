@@ -1,6 +1,6 @@
 import os
-import json
 from datetime import datetime, timezone
+from modules.model.forced_config import load_forced_llm_config, resolve_deepseek_config
 
 from dotenv import find_dotenv, load_dotenv
 from modules.model.llm_model import (
@@ -24,47 +24,61 @@ class ExpertLLM:
     ):
         from openai import OpenAI
 
-        resolved_key = (
-            api_key
-            or os.getenv("EXPERT_LLM_API_KEY")
-            or os.getenv("DEEPSEEK_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
+        defaults = load_forced_llm_config()
+        config = resolve_deepseek_config({
+            **defaults,
+            "model": model or defaults["model"],
+            "base_url": base_url or defaults["base_url"],
+            "api_key": api_key or defaults.get("api_key") or os.getenv(defaults.get("api_key_env") or "DEEPSEEK_API_KEY"),
+            "thinking": thinking if thinking is not None else defaults.get("thinking"),
+            "reasoning_effort": reasoning_effort if reasoning_effort is not None else defaults.get("reasoning_effort"),
+        })
+        resolved_key = config.get("api_key")
         if not resolved_key:
-            raise ValueError("Missing API key. Set DEEPSEEK_API_KEY/OPENAI_API_KEY or pass api_key.")
-
-        resolved_model = model or os.getenv("EXPERT_LLM_MODEL") or "deepseek-v4-flash"
-        resolved_base_url = base_url or os.getenv("EXPERT_LLM_BASE_URL") or "https://api.deepseek.com"
-
-        if thinking is None and os.getenv("EXPERT_LLM_THINKING_JSON"):
-            thinking = json.loads(os.environ["EXPERT_LLM_THINKING_JSON"])
-        if reasoning_effort is None:
-            reasoning_effort = os.getenv("EXPERT_LLM_REASONING_EFFORT") or None
+            raise ValueError("Missing API key configured by forced_llm.api_key_env")
+        resolved_model = config["model"]
+        resolved_base_url = config["base_url"]
+        thinking = config.get("thinking")
+        reasoning_effort = config.get("reasoning_effort", config.get("reasoning-effort"))
+        self._temperature = config.get("temperature", 0.2)
+        self._caller_overrides = config.get("caller_overrides") or {}
+        self._retry = config.get("retry", 2)
 
         self._model = resolved_model
         self._base_url = resolved_base_url
         self._thinking = thinking
         self._reasoning_effort = reasoning_effort
-        self._client = OpenAI(api_key=resolved_key, base_url=resolved_base_url, timeout=timeout)
+        self._client = OpenAI(
+            api_key=resolved_key,
+            base_url=resolved_base_url,
+            timeout=config.get("timeout", timeout),
+            max_retries=self._retry,
+        )
 
     def _request(self, *, messages, temperature, caller, **kwargs):
         request_kwargs = dict(kwargs)
-        if self._thinking is not None:
-            thinking = self._thinking
+        override = self._caller_overrides.get(caller, {})
+        thinking = override.get("thinking", self._thinking)
+        reasoning_effort = override.get(
+            "reasoning_effort", override.get("reasoning-effort", self._reasoning_effort)
+        )
+        if thinking is not None:
             if isinstance(thinking, str):
                 thinking = {"type": thinking}
             extra_body = dict(request_kwargs.pop("extra_body", {}) or {})
             extra_body["thinking"] = thinking
             request_kwargs["extra_body"] = extra_body
-        if self._reasoning_effort is not None:
-            request_kwargs["reasoning_effort"] = self._reasoning_effort
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            reasoning_effort = None
+        if reasoning_effort is not None:
+            request_kwargs["reasoning_effort"] = reasoning_effort
 
         request_started_at = datetime.now(timezone.utc)
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                temperature=temperature,
+                temperature=self._temperature if temperature is None else temperature,
                 **request_kwargs,
             )
         except Exception as exc:
@@ -92,7 +106,7 @@ class ExpertLLM:
         self,
         user_prompt,
         system_prompt=None,
-        temperature=0.2,
+        temperature=None,
         caller="expert_generate",
         **kwargs
     ):
@@ -115,7 +129,7 @@ class ExpertLLM:
         self,
         messages,
         system_prompt=None,
-        temperature=0.2,
+        temperature=None,
         caller="expert_chat",
         **kwargs
     ):

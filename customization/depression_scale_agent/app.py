@@ -1046,7 +1046,7 @@ def build_ui():
             )
             expert_model = gr.Textbox(
                 label="模型名称",
-                value="deepseek-chat",
+                value="", placeholder="inherit intervention.forced_llm.model",
                 interactive=True,
             )
         expert_button = gr.Button("调用专家模型")

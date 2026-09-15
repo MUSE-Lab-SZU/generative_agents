@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "rule": "init_kabuda_depression_stress",
+      "items": [
+        {
+          "item_id": "cy_stress_event_001",
+          "node_type": "event",
+          "subject": "陈屿",
+          "predicate": "此时",
+          "object": "因亲密关系结束而怀疑自己能否独立生活",
+          "describe": "亲密关系结束后，陈屿在独处时反复感到失落，并怀疑自己是否有能力靠自己维持稳定生活。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "cy_stress_event_002",
+          "node_type": "event",
+          "subject": "陈屿",
+          "predicate": "此时",
+          "object": "因课程任务受阻而加重失败感",
+          "describe": "把吉他靠在墙边并打开课程页面后，陈屿常因难以开始任务而再次关闭页面，把这种停滞理解为自己越来越做不好事情。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "cy_stress_thought_003",
+          "node_type": "thought",
+          "subject": "陈屿",
+          "predicate": "此时",
+          "object": "连一段关系都留不住，说明我很难靠自己过好生活",
+          "describe": "关系结束和学习受阻共同强化了陈屿的自动思维：自己既不值得被喜欢，也很难独立把生活过好。",
+          "poignancy": 8,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        },
+        {
+          "item_id": "cy_stress_event_004",
+          "node_type": "event",
+          "subject": "陈屿",
+          "predicate": "此时",
+          "object": "想到重新投入学习或关系就担心再次失败",
+          "describe": "每当想到完成课程、恢复社交或建立新的亲密关系时，陈屿都会担心自己坚持不住并再次证明自己不值得被选择。",
+          "poignancy": 9,
+          "expire_days": 45,
+          "tags": [
+            "depression",
+            "stress",
+            "bootstrap"
+          ]
+        }
+      ]
+    }
+  ]
+}

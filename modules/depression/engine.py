@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Union
 
+from .generation_view import build_patient_generation_view, build_emotion_input_view, context_view
+from .evidence import new_id, json_safe, validate_event_sources
 from .context_analyzer import SessionContextBuilder
 from .emotion_inferencer import EmotionInferencer
 from .memory_system import TraumaMemorySystem
@@ -53,12 +55,15 @@ class DepressionSimulationEngine:
 
         self.enabled = bool(resolved.get("enabled", True))
         # This switch belongs to the global runtime config, not the persona file.
-        # Missing means enabled so existing experiment configs keep their behavior.
+        # Phase 1 deliberately disables runtime numeric-domain updates.
         self._domain_state_enabled_override = domain_state_enabled
-        self.domain_state_enabled = (
-            True if domain_state_enabled is None else bool(domain_state_enabled)
-        )
+        if domain_state_enabled is True and resolved.get("complaint_graph", {}).get("pipeline_version", "v3") == "v3":
+            raise ValueError("V3_DOMAIN_STATE_INCOMPATIBLE")
+        self.domain_state_enabled = False  # V3 never writes numeric domains.
+        self.generation_snapshot = {}
+        self.engine_event_results = {}
         self.base_prompt = ""
+        self._commit_in_progress = False
         self.interaction_count = 0
         self.last_emotion: Dict[str, Any] = {}
         self.last_session_context: Dict[str, Any] = {}
@@ -128,10 +133,22 @@ class DepressionSimulationEngine:
             conversation_content=conversation_content,
         )
         # 第 2 步：直接读取真实状态机的当前节点，不克隆、不评估、不提交。
-        current_stage = self.graph_manager.get_current_stage()
-        graph_snapshot = self.graph_manager.get_graph_snapshot()
+        view = build_patient_generation_view(self.graph_manager, session_context)
+        snapshot = view["snapshot"]
+        snapshot.update(
+            generation_attempt_id=new_id("attempt"), generation_snapshot_ref=new_id("snapshot")
+        )
+        self.generation_snapshot = copy.deepcopy(snapshot)
+        self.graph_manager.generation_snapshots[snapshot["generation_snapshot_ref"]] = (
+            copy.deepcopy(snapshot)
+        )
+        current_stage = view["payload"]["current_stage"]
+        graph_snapshot = {}
+        session_context = view["payload"]["session_context"]
         # 第 3 步：在当前节点上推断本轮瞬时情绪（只读，不碰主诉图）。
-        memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
+        memory_context = self.memory_system.prepare_memory_context(
+            current_stage, context_view(session_context), conversation_content
+        )
         emotion = self._infer_emotion(
             current_stage=current_stage,
             graph_snapshot=graph_snapshot,
@@ -176,9 +193,19 @@ class DepressionSimulationEngine:
             return self._disabled_runtime()
 
         event_source = str(source or "").strip()
-        event_content = str(content or "").strip()
-        if not event_source or not event_content:
+        event_content = str(content or "")
+        if not event_source or (not event_content.strip() and not (metadata or {}).get("message_refs")):
             return self._current_runtime(enabled=True)
+
+        event_metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
+        eid = event_metadata.setdefault("event_id", new_id("event"))
+        if eid in self.engine_event_results:
+            return copy.deepcopy(self.engine_event_results[eid])
+        if eid in self.graph_manager.processed_event_results:
+            result = self._current_runtime()
+            result["graph"] = copy.deepcopy(self.graph_manager.processed_event_results[eid])
+            result["final_verdict"] = result["graph"].get("final_verdict")
+            return result
 
         session_context = self.context_builder.build_context(
             location=location,
@@ -191,16 +218,58 @@ class DepressionSimulationEngine:
         self._attach_runtime_event(
             session_context=session_context,
             source=event_source,
-            metadata=metadata,
+            metadata=event_metadata,
         )
-        return self._commit_context(
-            session_context=session_context,
-            conversation_content=event_content,
-            counterpart_utterance=counterpart_utterance,
-            roadmap_completion_func=roadmap_completion_func,
-            roadmap_llm_cfg=roadmap_llm_cfg,
-            emotion_completion_func=emotion_completion_func,
-        )
+        self._commit_in_progress = True
+        try:
+            result = self._commit_context(
+                session_context=session_context,
+                conversation_content=event_content,
+                counterpart_utterance=counterpart_utterance,
+                roadmap_completion_func=roadmap_completion_func,
+                roadmap_llm_cfg=roadmap_llm_cfg,
+                emotion_completion_func=emotion_completion_func,
+            )
+            result = json_safe(result)
+            self.engine_event_results[eid] = copy.deepcopy(result)
+        finally:
+            self._commit_in_progress = False
+        return result
+
+    def register_accepted_message(self, **kwargs):
+        return self.graph_manager.register_accepted_message(**kwargs)
+
+    def resume_pending_events(self, roadmap_completion_func=None):
+        """Replay saved accepted envelopes, preserving their original semantic base."""
+        results = []
+        for event in list(self.graph_manager.pending_events.values()):
+            context = event["session_context"]
+            eid = event["metadata"]["event_id"]
+            self._commit_in_progress = True
+            try:
+                evaluation = self.graph_manager.evaluate_turn(
+                    context,
+                    event["content"],
+                    event.get("counterpart_utterance", ""),
+                    roadmap_completion_func,
+                )
+                evaluation.update(
+                    base_node_id=event["base_node_id"],
+                    base_state_version=event["base_state_version"],
+                )
+                result = self._commit_context(
+                    context,
+                    event["content"],
+                    event.get("counterpart_utterance", ""),
+                    roadmap_completion_func=roadmap_completion_func,
+                    evaluation=evaluation,
+                )
+                result = json_safe(result)
+                self.engine_event_results[eid] = copy.deepcopy(result)
+                results.append(result)
+            finally:
+                self._commit_in_progress = False
+        return results
 
     def _commit_context(
         self,
@@ -210,6 +279,7 @@ class DepressionSimulationEngine:
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         roadmap_llm_cfg: Optional[Dict[str, Any]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """执行提交流水线：评估主诉图、落盘状态、推断记忆和情绪。"""
         if not self.enabled:
@@ -217,17 +287,35 @@ class DepressionSimulationEngine:
 
         session_context = session_context if isinstance(session_context, dict) else {}
         conversation_content = str(conversation_content or "")
-        evaluation = self.graph_manager.evaluate_turn(
-            session_context=session_context,
-            conversation_content=conversation_content,
-            counterpart_utterance=counterpart_utterance,
-            completion_func=roadmap_completion_func,
-            llm_cfg=roadmap_llm_cfg,
-        )
+        eid = session_context.get("runtime_event", {}).get("metadata", {}).get("event_id")
+        if eid in self.graph_manager.processed_event_results:
+            runtime = self._current_runtime()
+            runtime["graph"] = copy.deepcopy(self.graph_manager.processed_event_results[eid])
+            runtime["final_verdict"] = runtime["graph"].get("final_verdict")
+            return runtime
+        if evaluation is None:
+            evaluation = self.graph_manager.evaluate_turn(
+                session_context=session_context,
+                conversation_content=conversation_content,
+                counterpart_utterance=counterpart_utterance,
+                completion_func=roadmap_completion_func,
+                llm_cfg=roadmap_llm_cfg,
+            )
         graph_snapshot = self.graph_manager.commit_turn(evaluation)
-        current_stage = self.graph_manager.get_current_stage()
+        try:
+            validate_event_sources(self.graph_manager, session_context.get("runtime_event", {}))
+        except ValueError:
+            # Invalid/provisional sources receive an audit outcome, not interaction effects.
+            runtime = self._current_runtime()
+            runtime.update(graph=graph_snapshot, evaluation=copy.deepcopy(evaluation))
+            return runtime
+        current_stage = build_patient_generation_view(self.graph_manager, session_context)[
+            "payload"
+        ]["current_stage"]
 
-        memory_context = self.memory_system.prepare_memory_context(current_stage, session_context, conversation_content)
+        memory_context = self.memory_system.prepare_memory_context(
+            current_stage, context_view(session_context), conversation_content
+        )
         emotion = self._infer_emotion(
             current_stage=current_stage,
             graph_snapshot=graph_snapshot,
@@ -235,7 +323,9 @@ class DepressionSimulationEngine:
             conversation_content=conversation_content,
             completion_func=emotion_completion_func or roadmap_completion_func,
         )
-        self.memory_system.commit_turn(current_stage=current_stage, session_context=session_context)
+        self.memory_system.commit_turn(
+            current_stage=current_stage, session_context=context_view(session_context)
+        )
 
         self.last_emotion = copy.deepcopy(emotion)
         self.last_session_context = copy.deepcopy(session_context)
@@ -244,8 +334,9 @@ class DepressionSimulationEngine:
 
         return {
             "enabled": True,
-            "current_stage": current_stage,
+            "current_stage": self.graph_manager.get_current_stage(),
             "graph": graph_snapshot,
+            "final_verdict": graph_snapshot.get("final_verdict"),
             "evaluation": copy.deepcopy(evaluation),
             "session_context": session_context,
             "emotion": emotion,
@@ -362,7 +453,7 @@ class DepressionSimulationEngine:
             if not text or text in seen:
                 continue
             seen.add(text)
-            normalized_evidence.append(text[:80])
+            normalized_evidence.append(text)
             if len(normalized_evidence) >= 20:
                 break
         meta["evidence_ids"] = normalized_evidence
@@ -384,9 +475,9 @@ class DepressionSimulationEngine:
         # 情绪推断刻意使用“上一轮情绪 + 本轮上下文”的组合，
         # 目的是让说话状态连续变化，而不是每轮都从头随机生成。
         payload = {
-            "current_stage": copy.deepcopy(current_stage),
-            "graph_snapshot": copy.deepcopy(graph_snapshot),
-            "session_context": copy.deepcopy(session_context),
+            "current_stage": build_emotion_input_view(current_stage, session_context),
+            "graph_snapshot": {},
+            "session_context": context_view(session_context),
             "conversation_content": str(conversation_content or ""),
             "previous_emotion": copy.deepcopy(self.last_emotion),
             "turn_key": f"{self.interaction_count}|{session_context.get('scene', {}).get('time_of_day', '')}",
@@ -399,8 +490,10 @@ class DepressionSimulationEngine:
             return self.base_prompt
         return self.prompt_builder.build_simple_prompt(
             base_prompt=self.base_prompt,
-            current_stage=self.graph_manager.get_current_stage(),
-            graph_snapshot=self.graph_manager.get_graph_snapshot(),
+            current_stage=build_patient_generation_view(self.graph_manager)["payload"][
+                "current_stage"
+            ],
+            graph_snapshot={},
         )
 
     def get_current_state_info(self) -> Dict[str, Any]:
@@ -419,8 +512,12 @@ class DepressionSimulationEngine:
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化引擎配置引用和各子系统运行态，用于存档或迁移。"""
+        if self._commit_in_progress:
+            raise RuntimeError("CHECKPOINT_REQUIRES_COMPLETED_ENGINE_EVENT")
         config_reference = self._state_config_reference()
         payload = {
+            "generation_snapshot": copy.deepcopy(self.generation_snapshot),
+            "engine_event_results": copy.deepcopy(self.engine_event_results),
             "config_reference": copy.deepcopy(config_reference),
             "enabled": bool(self.enabled),
             "domain_state_enabled": bool(self.domain_state_enabled),
@@ -435,7 +532,7 @@ class DepressionSimulationEngine:
         memory_payload = self.memory_system.to_dict()
         if memory_payload.get("memory_context"):
             payload["memory_system"] = memory_payload
-        return payload
+        return json_safe(payload)
 
     def load_state(self, payload: Dict[str, Any]) -> None:
         """从序列化结果恢复引擎状态。
@@ -452,11 +549,10 @@ class DepressionSimulationEngine:
         self.config_path = str(refreshed.get("_config_path", "") or "")
         self.agent_dir = str(refreshed.get("_agent_dir", "") or "")
         self.enabled = bool(payload.get("enabled", refreshed.get("enabled", True)))
-        self.domain_state_enabled = (
-            bool(payload.get("domain_state_enabled", True))
-            if self._domain_state_enabled_override is None
-            else bool(self._domain_state_enabled_override)
-        )
+        self.domain_state_enabled = False
+        self._commit_in_progress = False
+        self.generation_snapshot = copy.deepcopy(payload.get("generation_snapshot", {}))
+        self.engine_event_results = copy.deepcopy(payload.get("engine_event_results", {}))
         self.base_prompt = str(payload.get("base_prompt", self.base_prompt or "") or "")
         try:
             self.interaction_count = int(payload.get("interaction_count", 0) or 0)
