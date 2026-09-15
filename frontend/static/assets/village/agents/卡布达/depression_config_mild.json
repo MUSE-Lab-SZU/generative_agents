@@ -78,7 +78,8 @@
     "volatility_limit": 0.1
   },
   "memory": {
-    "enabled": false
+    "enabled": false,
+    "initial_memories_file": "initial_dynamic_memories.json"
   },
   "prompt": {
     "include_graph_window": true,

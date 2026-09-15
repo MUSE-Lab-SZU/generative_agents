@@ -552,6 +552,10 @@ class Associate:
             return "direct"
         return mode
 
+    def _visible_ids(self, node_ids):
+        policy = getattr(self, "visibility_filter", None)
+        return [node_id for node_id in node_ids if policy(node_id)] if policy else node_ids
+
     def _retrieve_nodes(
         self, node_type, text=None, limit=None, similarity_top_k=None, node_ids=None
     ):

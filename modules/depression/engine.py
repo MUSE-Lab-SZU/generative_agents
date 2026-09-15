@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -113,6 +114,8 @@ class DepressionSimulationEngine:
         conversation_content: str = "",
         roadmap_completion_func: Optional[Callable[[str], str]] = None,
         emotion_completion_func: Optional[Callable[[str], str]] = None,
+        turn_id: str = "",
+        counterpart_utterance: str = "",
     ) -> str:
         """预览一轮互动会生成的动态 prompt：只读当前主诉节点，不判 advance/hold、不写状态。
 
@@ -124,7 +127,7 @@ class DepressionSimulationEngine:
             return self.base_prompt
 
         # 第 1 步：把调用方传来的碎片信息整理成统一的 session_context。
-        session_context = self.context_builder.build_context(
+        session_context = copy.deepcopy(self.context_builder).build_context(
             location=location,
             time_of_day=time_of_day,
             other_agent=other_agent,
@@ -165,6 +168,38 @@ class DepressionSimulationEngine:
             activated_memories=memory_context,
             emotion=emotion,
         )
+        if self.memory_system.enabled:
+            result += "\n【本轮可披露记忆】\n" + json.dumps(memory_context, ensure_ascii=False)
+            result += "\n【话题边界】\n" + json.dumps(decision["blocked_signal"], ensure_ascii=False)
+            result += "\n只能引用公开人设、当前会话和上述可披露内容；不要编造未提供的经历或隐藏原因。已说过的事实无需否认，但可以拒绝继续展开。\n"
+        return result
+
+    def public_base_prompt(self):
+        if not self.memory_system.enabled:
+            return self.base_prompt
+        return str(self.memory_system.config.get("public_persona") or ("你是" + self._infer_agent_name(self.raw_config) + "，小镇居民。"))
+
+    def _public_stage(self, stage):
+        # Keep numeric mood and categorical delivery, never narrative facts,
+        # beliefs, future graph branches or free-form repair patterns.
+        style = stage.get("speaking_style", {})
+        public_style = {}
+        choices = {"tempo": {"slow", "normal", "fast"},
+                   "disclosure": {"sealed", "guarded", "cautious", "partial", "open"},
+                   "tone": {"flat", "flat_shame", "sad", "hesitant", "defensive"}}
+        for key, values in choices.items():
+            if style.get(key) in values:
+                public_style[key] = style[key]
+        public = {"id": "current", "label": "当前情绪与表达状态",
+                  "emotion_vector": {k: v for k, v in stage.get("emotion_vector", {}).items()
+                                     if k in {"valence", "arousal", "defensiveness", "shame", "hopelessness", "trust"}
+                                     and isinstance(v, (int, float))},
+                  "speaking_style": public_style}
+        return public, {}
+
+    def _memory_turn_id(self, other, content):
+        payload = [self.interaction_count, other, content, self._now().isoformat()]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
     def commit_event(
         self,
@@ -317,8 +352,8 @@ class DepressionSimulationEngine:
             current_stage, context_view(session_context), conversation_content
         )
         emotion = self._infer_emotion(
-            current_stage=current_stage,
-            graph_snapshot=graph_snapshot,
+            current_stage=current_stage_for_emotion,
+            graph_snapshot=graph_for_emotion,
             session_context=session_context,
             conversation_content=conversation_content,
             completion_func=emotion_completion_func or roadmap_completion_func,
@@ -482,12 +517,25 @@ class DepressionSimulationEngine:
             "previous_emotion": copy.deepcopy(self.last_emotion),
             "turn_key": f"{self.interaction_count}|{session_context.get('scene', {}).get('time_of_day', '')}",
         }
-        return self.emotion_inferencer.infer(payload, completion_func=completion_func)
+        if self.memory_system.enabled:
+            payload["previous_emotion"] = {k: v for k, v in self.last_emotion.items() if isinstance(v, (int, float))}
+        emotion = self.emotion_inferencer.infer(payload, completion_func=completion_func)
+        if self.memory_system.enabled:
+            other = session_context.get("participants", {}).get("other_agent", "")
+            emotion["trust"] = self.memory_system.trust_for(other)
+            if session_context.get("memory_signal", {}).get("present"):
+                emotion["defensiveness"] = min(1.0, float(emotion.get("defensiveness", 0.5)) + 0.1)
+                emotion["disclosure_level"] = min(0.3, float(emotion.get("disclosure_level", 0.3)))
+        return emotion
 
     def get_simple_prompt(self) -> str:
         """生成只包含基础 prompt、当前主诉节点和主诉图摘要的简版 prompt。"""
         if not self.enabled:
             return self.base_prompt
+        stage = self.graph_manager.get_current_stage()
+        graph = self.graph_manager.get_graph_snapshot()
+        if self.memory_system.enabled:
+            stage, graph = self._public_stage(stage)
         return self.prompt_builder.build_simple_prompt(
             base_prompt=self.base_prompt,
             current_stage=build_patient_generation_view(self.graph_manager)["payload"][
@@ -530,7 +578,7 @@ class DepressionSimulationEngine:
         if not (config_reference.get("config_path") or config_reference.get("agent_dir")) and isinstance(self.raw_config, dict) and self.raw_config:
             payload["inline_config"] = copy.deepcopy(self.raw_config)
         memory_payload = self.memory_system.to_dict()
-        if memory_payload.get("memory_context"):
+        if self.memory_system.enabled or memory_payload.get("memory_context"):
             payload["memory_system"] = memory_payload
         return json_safe(payload)
 
@@ -591,12 +639,14 @@ class DepressionSimulationEngine:
         self.context_analyzer = self.context_builder
 
         memory_payload = payload.get("memory_system", {}) if isinstance(payload.get("memory_system", {}), dict) else {}
-        self.memory_system = TraumaMemorySystem(refreshed.get("memory", {}))
-        memory_context = memory_payload.get("memory_context", [])
-        if isinstance(memory_context, list):
-            self.memory_system.memory_context = [
-                copy.deepcopy(item) for item in memory_context if isinstance(item, dict)
-            ]
+        previous_memory = self.memory_system
+        self.memory_system = TraumaMemorySystem(
+            refreshed.get("memory", {}), self._infer_agent_name(refreshed),
+            self._clock_provider, agent_dir=self.agent_dir)
+        self.memory_system.load_state(memory_payload)
+        self._memory_previews = {}
+        if previous_memory.path:
+            self.memory_system.bind(previous_memory.path, previous_memory.embedder, previous_memory.embedding_key)
 
         self.emotion_inferencer = EmotionInferencer(refreshed.get("emotion", {}))
         self.prompt_builder = DynamicPromptBuilder(

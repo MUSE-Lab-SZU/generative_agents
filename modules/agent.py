@@ -2846,6 +2846,11 @@ class Agent:
         meeting_id="",
     ):
         self.chats.extend(chats)
+        if self.dynamic_memory_enabled():
+            self.depression_dynamic.memory_system.add_memory({
+                "content": chats_summary, "source_type": "conversation_summary",
+                "disclosure_threshold": 1.0})
+            chats_summary = "与{}聊了近况".format(other.name)
         event = memory.Event(
             self.name,
             "对话",
@@ -3165,6 +3170,16 @@ class Agent:
             poignancy = self.completion("poignancy_chat", event)
         else:
             poignancy = self.completion("poignancy_event", event)
+        if dynamic and (e_type in {"chat", "thought"} or event.predicate == "对话"):
+            dynamic.add_memory({
+                "content": event.get_describe(), "source_type": "associate_" + e_type,
+                "kind": "subjective_reflection" if e_type == "thought" else "conversation_summary",
+                "source_ids": list(filling or []), "disclosure_threshold": 1.0,
+                "importance": min(1.0, max(0.0, float(poignancy) / 10.0))})
+            event = copy.deepcopy(event)
+            event._describe = "进行了一次反思" if e_type == "thought" else "进行了一次对话"
+            if e_type == "thought":
+                event.object = "反思"
         self.logger.debug("{} add associate {}".format(self.name, event))
         event_for_memory = event
         if e_type == "chat":
@@ -3216,6 +3231,9 @@ class Agent:
             expire=expire,
             filling=filling,
         )
+        if dynamic:
+            dynamic.public_node_ids.add(concept.node_id)
+        return concept
 
     def get_tile(self):
         return self.maze.tile_at(self.coord)
@@ -3658,6 +3676,17 @@ class Agent:
                     )
                 )
             return None
+
+    def dynamic_memory_enabled(self):
+        engine = getattr(self, "depression_dynamic", None)
+        return bool(engine and getattr(engine, "enabled", False)
+                    and getattr(getattr(engine, "memory_system", None), "enabled", False))
+
+    def public_memory_nodes(self, nodes):
+        if not self.dynamic_memory_enabled():
+            return nodes
+        allowed = self.depression_dynamic.memory_system.public_node_ids
+        return [node for node in nodes if node.node_id in allowed]
 
     def _build_depression_base_prompt(self):
         try:

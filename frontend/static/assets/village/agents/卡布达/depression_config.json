@@ -30,7 +30,13 @@
         "label": "把失业理解成自己彻底失败",
         "summary": "被辞退不再只是事件，而是整个人不行的证明。",
         "core_belief": "如果我不能胜任工作，就说明我能力不足、没有多少价值。",
-        "narrative_focus": ["失业", "羞耻", "怕被问近况", "不想见人", "失败"],
+        "narrative_focus": [
+          "失业",
+          "羞耻",
+          "怕被问近况",
+          "不想见人",
+          "失败"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
@@ -77,7 +83,17 @@
     "volatility_limit": 0.12
   },
   "memory": {
-    "enabled": false
+    "enabled": true,
+    "public_persona": "你是卡布达，23岁，小镇居民。敏感、内省、善良，喜欢绘图、散步和安静的休闲活动。按当前情绪自然交谈。",
+    "initial_trust": 0.3,
+    "initial_trust_by_partner": {
+      "蜻蜓队长": 0.4
+    },
+    "min_similarity": 0.5,
+    "max_items": 4,
+    "max_context_chars": 2400,
+    "runtime_threshold": 0.8,
+    "initial_memories_file": "initial_dynamic_memories.json"
   },
   "prompt": {
     "include_graph_window": true,
