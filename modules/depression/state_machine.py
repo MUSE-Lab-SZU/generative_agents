@@ -1411,7 +1411,7 @@ class ComplaintGraphManager:
                 e["reason_codes"] = ["EMPTY_OBSERVATIONS"]
                 return e
             history = self._historical_observations(obs, rows)
-            from .generation_view import select_relevant_claims
+            from .generation_view import select_relevant_claims, validator_source_evidence
 
             relevant = select_relevant_claims(
                 "planner",
@@ -1466,14 +1466,13 @@ class ComplaintGraphManager:
                 p,
                 {"topic_id": self.get_current_stage()["topic_id"]},
             )
-            evidence = {r for c in relevant for r in c["evidence_refs"]}
             validation_input = dict(
                 task="commit_validation",
                 proposal=p,
                 active_claims=relevant,
-                active_source_evidence=[
-                    copy.deepcopy(self.evidence_ledger[r]) for r in evidence
-                ],
+                active_source_evidence=validator_source_evidence(
+                    self.evidence_ledger, relevant
+                ),
                 observations=obs,
                 historical_observations=history,
                 source_messages=rows,

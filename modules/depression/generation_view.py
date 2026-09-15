@@ -69,9 +69,34 @@ def select_relevant_claims(
             for c in active_claims
             if (c["claim_id"], c["revision"]) in refs
             or (task != "validator" and (not topic or c["topic_id"] == topic))
+            or (task in {"patient", "emotion"} and c.get("actuality") == "ongoing")
             or (c["subject"], c["kind"]) in pairs
         ]
     )
+
+
+def validator_source_evidence(ledger, claims):
+    """Project configured sources; keep the full raw configuration audit-only."""
+    records = []
+    for ref in sorted({r for c in claims for r in c["evidence_refs"]}):
+        source = ledger[ref]
+        if source.get("record_kind") != "persona_fragment":
+            records.append(copy.deepcopy(source))
+            continue
+        record = project(
+            source,
+            ("evidence_id", "record_kind", "case_id", "config_fingerprint",
+             "config_path", "json_pointer", "captured_at"),
+        )
+        record["raw_fragment"] = {
+            "accepted_claims": [
+                {**claim_view(c), **project(c, ("claim_id", "revision", "topic_id"))}
+                for c in claims
+                if ref in c["evidence_refs"] and c.get("kind") != "unknown"
+            ]
+        }
+        records.append(record)
+    return records
 
 
 def semantic_claim_view(c):

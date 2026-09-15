@@ -12,7 +12,7 @@
     "think": {
       "llm": {
         "provider": "openai",
-        "model": "qwen3-8b-vllm",
+        "model": "qwen3.5-9b-vllm",
         "base_url": "http://127.0.0.1:18000/v1",
         "api_key": "EMPTY",
         "retry": 3,

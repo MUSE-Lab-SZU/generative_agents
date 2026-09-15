@@ -20,9 +20,7 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18000,
-            18002,
-            18003
+            18000
           ]
         }
       },
@@ -74,9 +72,7 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18001,
-            18004,
-            18005
+            18001
           ]
         }
       },
