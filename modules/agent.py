@@ -5,6 +5,8 @@ import math
 import random
 import datetime
 import copy
+import hashlib
+import json
 
 from modules import memory, prompt, utils
 from modules.depression import DepressionSimulationEngine
@@ -150,6 +152,7 @@ class Agent:
             self.scratch, "prompt_" + func_hint
         ), "Can not find func prompt_{} from scratch".format(func_hint)
         prompt_kwargs = dict(kwargs)
+        defer_depression_commit = bool(prompt_kwargs.pop("_defer_depression_commit", False))
         depression_chat_ctx = None
         if func_hint == "generate_chat":
             # 对话生成是动态抑郁模块最重要的挂载点：
@@ -184,7 +187,10 @@ class Agent:
             msg.update({"response": output})
         self.logger.debug(utils.block_msg(title, msg))
         if func_hint == "generate_chat" and depression_chat_ctx:
-            self._commit_depression_generate_chat(depression_chat_ctx, output)
+            if defer_depression_commit:
+                self._pending_depression_chat = (depression_chat_ctx, output)
+            else:
+                self._commit_depression_generate_chat(depression_chat_ctx, output)
         return output
 
     def think(self, status, agents):
@@ -660,7 +666,8 @@ class Agent:
             # 发起方先说。此处的 `generate_chat` 会经过 completion()，
             # 因而可能被动态抑郁模块注入额外的“说话约束层”。
             text = self.completion(
-                "generate_chat", self, other, relations[0], chats
+                "generate_chat", self, other, relations[0], chats,
+                _defer_depression_commit=True,
             )
 
             if i > 0:
@@ -669,9 +676,11 @@ class Agent:
                     "generate_chat_check_repeat", self, chats, text
                 )
                 if end:
+                    self._finish_depression_chat(False)
                     break
 
                 # 对于发起对话的Agent，从第2轮对话开始，检查话题是否结束
+                self._finish_depression_chat(True)
                 chats.append((self.name, text))
                 end = self.completion(
                     "decide_chat_terminate", self, other, chats
@@ -679,10 +688,12 @@ class Agent:
                 if end:
                     break
             else :
+                self._finish_depression_chat(True)
                 chats.append((self.name, text))
 
             text = other.completion(
-                "generate_chat", other, self, relations[1], chats
+                "generate_chat", other, self, relations[1], chats,
+                _defer_depression_commit=True,
             )
             if i > 0:
                 # 对于响应对话的Agent，从第2轮开始，检查是否出现“复读”现象
@@ -690,8 +701,10 @@ class Agent:
                     "generate_chat_check_repeat", other, chats, text
                 )
                 if end:
+                    other._finish_depression_chat(False)
                     break
 
+            other._finish_depression_chat(True)
             chats.append((other.name, text))
 
             # 对于响应对话的Agent，从第1轮开始，检查话题是否结束
@@ -749,6 +762,11 @@ class Agent:
     def schedule_chat(self, chats, chats_summary, start, duration, other, address=None):
         """把一次对话写入短期聊天缓存，并安排成当前行动。"""
         self.chats.extend(chats)
+        if self.dynamic_memory_enabled():
+            self.depression_dynamic.memory_system.add_memory({
+                "content": chats_summary, "source_type": "conversation_summary",
+                "disclosure_threshold": 1.0})
+            chats_summary = "与{}聊了近况".format(other.name)
         event = memory.Event(
             self.name,
             "对话",
@@ -768,6 +786,7 @@ class Agent:
         filling=None,
     ):
         """计算事件重要性并把事件、想法或聊天写入联想记忆。"""
+        dynamic = self.depression_dynamic.memory_system if self.dynamic_memory_enabled() else None
         if event.fit(None, "is", "idle"):
             poignancy = 1
         elif event.fit(None, "此时", "空闲"):
@@ -776,8 +795,18 @@ class Agent:
             poignancy = self.completion("poignancy_chat", event)
         else:
             poignancy = self.completion("poignancy_event", event)
+        if dynamic and (e_type in {"chat", "thought"} or event.predicate == "对话"):
+            dynamic.add_memory({
+                "content": event.get_describe(), "source_type": "associate_" + e_type,
+                "kind": "subjective_reflection" if e_type == "thought" else "conversation_summary",
+                "source_ids": list(filling or []), "disclosure_threshold": 1.0,
+                "importance": min(1.0, max(0.0, float(poignancy) / 10.0))})
+            event = copy.deepcopy(event)
+            event._describe = "进行了一次反思" if e_type == "thought" else "进行了一次对话"
+            if e_type == "thought":
+                event.object = "反思"
         self.logger.debug("{} add associate {}".format(self.name, event))
-        return self.associate.add_node(
+        concept = self.associate.add_node(
             e_type,
             event,
             poignancy,
@@ -785,6 +814,9 @@ class Agent:
             expire=expire,
             filling=filling,
         )
+        if dynamic:
+            dynamic.public_node_ids.add(concept.node_id)
+        return concept
 
     def get_tile(self):
         """返回 Agent 当前所在坐标对应的地图 tile。"""
@@ -880,6 +912,22 @@ class Agent:
             if isinstance(state_payload, dict) and state_payload:
                 engine.load_state(copy.deepcopy(state_payload))
                 engine.set_base_prompt(self._build_depression_base_prompt())
+            if engine.enabled and engine.memory_system.enabled:
+                embedding = config["associate"]["embedding"]
+                model_key = json.dumps({k: embedding.get(k) for k in ("provider", "model", "base_url")}, sort_keys=True)
+                engine.memory_system.bind(
+                    os.path.join(config["storage_root"], "depression_memory"),
+                    self.associate.index.embedding_model, model_key)
+                # Quarantine legacy records whose disclosure level is unknown.
+                # Existing Associate data stays intact, but cannot bypass the gate.
+                for node in self.associate.index.get_nodes():
+                    if node.id_ not in engine.memory_system.public_node_ids:
+                        engine.memory_system.add_memory({
+                            "memory_id": "legacy_" + node.id_, "content": node.text,
+                            "source_type": "legacy_associate", "source_ids": [node.id_],
+                            "disclosure_threshold": 1.0})
+                self.associate.visibility_filter = lambda node_id: node_id in engine.memory_system.public_node_ids
+                self.scratch.public_persona = engine.public_base_prompt()
             if self.logger:
                 self.logger.info(
                     "[DEPRESSION_DYNAMIC] agent={} enabled config={}".format(
@@ -888,6 +936,10 @@ class Agent:
                 )
             return engine
         except Exception as exc:
+            with open(config_path, encoding="utf-8") as config_file:
+                requested = json.load(config_file)
+            if requested.get("enabled", True) and requested.get("memory", {}).get("enabled", False):
+                raise RuntimeError("Failed to initialize isolated dynamic memory for " + self.name) from exc
             if self.logger:
                 self.logger.info(
                     "[DEPRESSION_DYNAMIC] agent={} init failed: {}".format(
@@ -895,6 +947,17 @@ class Agent:
                     )
                 )
             return None
+
+    def dynamic_memory_enabled(self):
+        engine = getattr(self, "depression_dynamic", None)
+        return bool(engine and getattr(engine, "enabled", False)
+                    and getattr(getattr(engine, "memory_system", None), "enabled", False))
+
+    def public_memory_nodes(self, nodes):
+        if not self.dynamic_memory_enabled():
+            return nodes
+        allowed = self.depression_dynamic.memory_system.public_node_ids
+        return [node for node in nodes if node.node_id in allowed]
 
     def _build_depression_base_prompt(self):
         """构造动态抑郁模块使用的基础角色描述。"""
@@ -943,7 +1006,15 @@ class Agent:
             relation_summary=relation_summary,
             chats=chats,
         )
+        memory_kwargs = {}
+        if self.dynamic_memory_enabled():
+            context["turn_id"] = hashlib.sha256(json.dumps(
+                [self.name, context["other_agent"], utils.get_timer().get_date().isoformat(), chats],
+                ensure_ascii=False).encode()).hexdigest()
+            memory_kwargs = {"turn_id": context["turn_id"],
+                             "counterpart_utterance": context["counterpart_utterance"]}
         preview_prompt = self.depression_dynamic.preview_interaction_prompt(
+            **memory_kwargs,
             location=context["location"],
             time_of_day=context["time_of_day"],
             other_agent=context["other_agent"],
@@ -1091,6 +1162,17 @@ class Agent:
                 break
         return results
 
+    def _finish_depression_chat(self, accepted):
+        pending = getattr(self, "_pending_depression_chat", None)
+        self._pending_depression_chat = None
+        if not pending:
+            return
+        context, output = pending
+        if accepted:
+            self._commit_depression_generate_chat(context, output)
+        elif self.dynamic_memory_enabled():
+            self.depression_dynamic._memory_previews.pop(context.get("turn_id"), None)
+
     def _commit_depression_generate_chat(self, context, output):
         """在生成出本轮话语后，把“实际说出的内容”提交给动态引擎。
 
@@ -1112,7 +1194,7 @@ class Agent:
             relationship=context["relationship"],
             interaction_type=context["interaction_type"],
             content=utterance,
-            metadata={"origin": "generate_chat", "evidence_ids": []},
+            metadata={"origin": "generate_chat", "evidence_ids": [], "turn_id": context.get("turn_id", "")},
             counterpart_utterance=context.get("counterpart_utterance", ""),
         )
 

@@ -167,5 +167,10 @@ class LlamaIndex:
         utils.save_dict(self._config, os.path.join(path, "index_config.json"))
 
     @property
+    def embedding_model(self):
+        """The model bound to this index (not the process-global Settings)."""
+        return self._index._embed_model
+
+    @property
     def nodes_num(self):
         return len(self._index.docstore.docs)

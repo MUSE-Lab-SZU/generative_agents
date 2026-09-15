@@ -43,6 +43,8 @@ class Scratch:
 
     def _base_desc(self):
         """生成角色基础描述块，作为多数 prompt 的共同人设上下文。"""
+        if getattr(self, "public_persona", None):
+            return self.public_persona
         return self.build_prompt(
             "base_desc",
             {
@@ -714,6 +716,8 @@ class Scratch:
             focus_retrieve_max,
             retrieval_profile=retrieval_profile,
         )
+        if hasattr(agent, "public_memory_nodes"):
+            nodes = agent.public_memory_nodes(nodes)
         memory = "\n- " + "\n- ".join([n.describe for n in nodes])
         chat_history_target_name = (
             str(chat_history_target_name or other.name or "").strip() or other.name
@@ -725,6 +729,8 @@ class Scratch:
             chat_history_target_name,
             limit=max_read_items,
         )
+        if hasattr(agent, "public_memory_nodes"):
+            chat_nodes = agent.public_memory_nodes(chat_nodes)
         summary_window_minutes = 480
         if hasattr(agent, "get_chat_summary_window_minutes"):
             summary_window_minutes = agent.get_chat_summary_window_minutes()
@@ -760,6 +766,9 @@ class Scratch:
         curr_context = (
             f"{agent.name} {agent.get_event().get_describe(False)} 时，看到 {other.name} {other.get_event().get_describe(False)}。"
         )
+
+        if hasattr(agent, "dynamic_memory_enabled") and agent.dynamic_memory_enabled():
+            curr_context = f"{agent.name} 正在与 {other.name} 交谈。"
 
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
         conversation = (

@@ -185,6 +185,7 @@ class Associate:
         chat_retrieve=None,
     ):
         self._index = LlamaIndex(embedding, path)
+        self.visibility_filter = None
         base_memory = {"event": [], "thought": [], "chat": []}
         if isinstance(memory, dict):
             for key in base_memory.keys():
@@ -318,10 +319,16 @@ class Associate:
             return "direct"
         return mode
 
+    def _visible_ids(self, node_ids):
+        policy = getattr(self, "visibility_filter", None)
+        return [node_id for node_id in node_ids if policy(node_id)] if policy else node_ids
+
     def _retrieve_nodes(
         self, node_type, text=None, limit=None, similarity_top_k=None
     ):
-        node_ids = self._valid_memory_ids(node_type)
+        node_ids = self._visible_ids(self._valid_memory_ids(node_type))
+        if not node_ids:
+            return []
         final_limit = self._normalize_limit(
             self.retention if limit is None else limit,
             default=self.retention,
@@ -355,7 +362,7 @@ class Associate:
 
     def _retrieve_chats_direct(self, name=None, limit=None):
         selected = []
-        for node_id in self._valid_memory_ids("chat"):
+        for node_id in self._visible_ids(self._valid_memory_ids("chat")):
             concept = self.find_concept(node_id)
             if name:
                 if (
@@ -399,7 +406,9 @@ class Associate:
             return AssociateRetriever(retrieve_cfg, *args, **kwargs)
 
         retrieved = {}
-        node_ids = self.memory["event"] + self.memory["thought"]
+        node_ids = self._visible_ids(self.memory["event"] + self.memory["thought"])
+        if not node_ids:
+            return [] if reduce_all else {text: [] for text in focus}
         for text in focus:
             nodes = self._index.retrieve(
                 text,

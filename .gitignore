@@ -51,7 +51,9 @@ results/compressed/
 
 docs/*
 !docs/主诉图_catalog与分支Prompt字段说明.md
-tests/
+!docs/trust_gated_dynamic_memory.md
+tests/*
+!tests/test_trust_gated_memory.py
 
 results/
 results/*
