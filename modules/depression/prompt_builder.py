@@ -306,8 +306,7 @@ class DynamicPromptBuilder:
             )
 
         if activated_memories:
-            # 当前 memory_system 还是占位实现，所以这条一般不会出现；
-            # 但接口预留好了，未来启用记忆激活时这里能直接承接。
+            # 具体正文由引擎在门控后单独提供；这里只添加表达指导。
             instruction_sections.append(self._render_block("dynamic_emotion_memory_section"))
 
         return self._with_trailing_newline(

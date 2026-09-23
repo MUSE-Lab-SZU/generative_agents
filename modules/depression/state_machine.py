@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from .prompt_templates import render_prompt
+from .complaint_context import normalize_units
 
 
 def _simulation_now() -> datetime:
@@ -40,6 +41,7 @@ class ComplaintStage:
     next_candidates: List[str] = field(default_factory=list)
     is_terminal_stage: bool = False
     source: str = "config"
+    disclosure_units: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -461,6 +463,7 @@ class ComplaintGraphManager:
                 stage_id not in static_stage_ids
                 or str(stage.get("source", "") or "") != "config"
                 or self._runtime_candidates_changed(stage_id, stage)
+                or stage.get("disclosure_units") is not None
             )
         ]
         return {
@@ -1050,6 +1053,13 @@ class ComplaintGraphManager:
         seed_id = str((seed if isinstance(seed, dict) else {}).get("id", "") or "").strip()
         if seed_id:
             merged["id"] = seed_id
+        merged["source"] = "llm"
+        if merged.get("disclosure_units") is not None:
+            try:
+                merged["disclosure_units"] = normalize_units(merged["disclosure_units"], generated=True)
+            except (ValueError, TypeError):
+                # Invalid model output must neither expose content nor abort a committed turn.
+                merged["disclosure_units"] = []
         return self._sanitize_stage(merged, source="llm")
 
     def _materialize_branch_plan(self, parent_id: str, child_stages: List[Dict[str, Any]]) -> List[str]:
@@ -1325,6 +1335,8 @@ class ComplaintGraphManager:
             next_candidates=[str(item)[:80] for item in self._to_list(payload.get("next_candidates", [])) if str(item).strip()][:8],
             is_terminal_stage=self._coerce_bool(payload.get("is_terminal_stage", payload.get("terminal_recovery", False))),
             source=str(payload.get("source", source) or source)[:32],
+            disclosure_units=(normalize_units(payload["disclosure_units"], generated=source == "llm")
+                              if payload.get("disclosure_units") is not None else None),
         )
         return normalized.to_dict()
 

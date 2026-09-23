@@ -125,6 +125,7 @@ class DepressionSimulationEngine:
             decision = self._memory_previews.get(turn_id)
             if decision is None:
                 decision = self.memory_system.prepare(query, other_agent or "", turn_id)
+                self.memory_system.prepare_complaint(decision, current_stage)
                 self._memory_previews[turn_id] = decision
                 if len(self._memory_previews) > 32:
                     self._memory_previews.pop(next(iter(self._memory_previews)))
@@ -155,6 +156,10 @@ class DepressionSimulationEngine:
         )
         if self.memory_system.enabled:
             result += "\n【本轮可披露记忆】\n" + json.dumps(memory_context, ensure_ascii=False)
+            complaint = [{"memory_id": u["memory_id"], "content": u["content"]}
+                         for u in decision.get("allowed_complaint", [])]
+            result += "\n【本轮可表达的当前主诉】\n" + json.dumps(complaint, ensure_ascii=False)
+            result += "\n这些是当前主观感受与自我解释，不是客观事实或必须复述的台词。结合话题自然表达，无关时不主动展开；不能据此补写经历。\n"
             result += "\n【话题边界】\n" + json.dumps(decision["blocked_signal"], ensure_ascii=False)
             result += "\n只能引用公开人设、当前会话和上述可披露内容；不要编造未提供的经历或隐藏原因。已说过的事实无需否认，但可以拒绝继续展开。\n"
         return result

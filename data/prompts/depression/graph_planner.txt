@@ -58,5 +58,6 @@ mode = "branch_detail" 时，补全 candidate_seed 指定的单个子节点：
 9. emotion_vector 每个数值必须在 0 到 1 之间。
 10. label、summary、core_belief、narrative_focus、advance_signals、hold_signals 都应服务于“进一步自我认识”这一主线，避免只罗列症状、外部事件或治疗建议。
 11. 输出必须能被 JSON.parse 直接解析。
+12. 可选 disclosure_units 是可独立表达的当前主诉单元数组，每项包含 id、content、disclosure_threshold；只描述主观感受，不创造传记经历。动态生成的单元由程序强制采用保守阈值 1.0，不能自行降低；省略时程序从当前节点文本派生单元。
 
 输入：${payload_json}

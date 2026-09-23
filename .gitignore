@@ -54,6 +54,7 @@ docs/*
 !docs/trust_gated_dynamic_memory.md
 tests/*
 !tests/test_trust_gated_memory.py
+!tests/test_complaint_context.py
 
 results/
 results/*

@@ -29,5 +29,6 @@
 6. hold 适用于这些情况：只有礼貌回应或短促应答；只是泛泛低落；重复 current_stage 已有痛点但没有新方向；内容仍停留在当前节点的 hold_signals；本轮信息不足以判断。
 7. advance 不能自己创造新节点。若证据看似更适合非候选节点，仍然 hold。
 8. 最终应基于 current_stage、candidate_stages、conversation_content，并结合 counterpart_utterance 独立判断。
+9. 复述 current_stage 或 disclosure_units 中已有的信念不构成新的自我认识，不能仅因患者表达了提示中已有内容就 advance；推进必须有超出当前节点认识的新证据。
 
 输入：${payload_json}
