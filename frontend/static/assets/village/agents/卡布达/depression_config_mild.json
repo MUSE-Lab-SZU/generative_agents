@@ -69,7 +69,24 @@
           }
         },
         "next_candidates": [],
-        "is_terminal_stage": false
+        "is_terminal_stage": false,
+        "disclosure_units": [
+          {
+            "id": "surface",
+            "content": "最近工作上的事让我有些难受。",
+            "disclosure_threshold": 0.25
+          },
+          {
+            "id": "avoidance",
+            "content": "我有些怕别人问起近况，最近也睡得不太稳。",
+            "disclosure_threshold": 0.45
+          },
+          {
+            "id": "core_belief",
+            "content": "工作上的失败常让我觉得自己能力不够，也不值得别人认可。",
+            "disclosure_threshold": 0.7
+          }
+        ]
       }
     ]
   },

@@ -68,7 +68,24 @@
           }
         },
         "next_candidates": [],
-        "is_terminal_stage": false
+        "is_terminal_stage": false,
+        "disclosure_units": [
+          {
+            "id": "surface",
+            "content": "最近工作上的事让我有些难受。",
+            "disclosure_threshold": 0.25
+          },
+          {
+            "id": "avoidance",
+            "content": "我有些怕别人问起我的近况，不太想见人。",
+            "disclosure_threshold": 0.45
+          },
+          {
+            "id": "core_belief",
+            "content": "如果我连工作都无法胜任，就说明我这个人没有能力，也不值得被认可。",
+            "disclosure_threshold": 0.7
+          }
+        ]
       }
     ]
   },

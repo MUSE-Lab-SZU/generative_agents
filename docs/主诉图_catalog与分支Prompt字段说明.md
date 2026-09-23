@@ -30,6 +30,7 @@
 | `next_candidates` | `List[str]` | 当前节点可直接进入的子节点 ID 列表，而非完整节点对象。清洗后最多 8 项，实际规划窗口通常由 `window_size` 限制。 |
 | `is_terminal_stage` | `bool` | 是否终止节点。为 `true` 时不再调用分支规划器补子分支。 |
 | `source` | `str` | 节点来源，通常为 `config`、`llm` 或 `fallback`。 |
+| `disclosure_units` | `List[dict]` 或 `null` | 动态记忆开启时用于对话的主诉披露视图。每项含节点内唯一 `id`、`content`、`disclosure_threshold`。显式列表替代原始叙述字段的注入；空列表不注入。旧节点的 null 从 summary/core_belief/narrative_focus 派生阈值 1.0 的单元。动态生成单元也由程序强制阈值 1.0，配置节点可逐项设置。详见 `trust_gated_dynamic_memory.md`。 |
 
 ## 共享的 Prompt 图快照字段
 

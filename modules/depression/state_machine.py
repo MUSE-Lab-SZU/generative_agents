@@ -29,6 +29,7 @@ from .evidence import (
 )
 from .prompt_builder import DynamicPromptBuilder
 from .prompt_templates import render_prompt
+from .complaint_context import normalize_units
 
 
 def _simulation_now() -> datetime:
@@ -66,6 +67,7 @@ class ComplaintStage:
     schema_version: int = 3
     content_revision: int = 1
     migration_status: str = "legacy_unverified"
+    disclosure_units: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2992,9 +2994,17 @@ class ComplaintGraphManager:
         # core_belief 是病例级稳定值。即使旧 planner 或脏数据仍输出该键，
         # candidate 也只镜像初始化时锁定的值；动态认知变化由 label/summary 表达。
         merged["core_belief"] = self.core_belief
-        for key in ("accepted_claims", "topic_id", "evidence_refs", "node_kind"):
-            merged[key] = copy.deepcopy(parent.get(key))
+        if merged.get("disclosure_units") is not None:
+            try:
+                merged["disclosure_units"] = normalize_units(merged["disclosure_units"], generated=True)
+            except (TypeError, ValueError):
+                merged["disclosure_units"] = []
+        protected_defaults = {
+            "accepted_claims": [], "topic_id": "", "evidence_refs": [], "node_kind": "unknown"}
+        for key, default in protected_defaults.items():
+            merged[key] = copy.deepcopy(parent.get(key, default))
         merged.update(
+            source="llm",
             source_kind="legacy_unknown",
             migration_status="legacy_transition_unverified",
             schema_version=3,
@@ -3357,6 +3367,8 @@ class ComplaintGraphManager:
             next_candidates=[str(item)[:80] for item in self._to_list(payload.get("next_candidates", [])) if str(item).strip()][:8],
             is_terminal_stage=self._coerce_bool(payload.get("is_terminal_stage", payload.get("terminal_recovery", False))),
             source=str(payload.get("source", source) or source)[:32],
+            disclosure_units=(normalize_units(payload["disclosure_units"], generated=source == "llm")
+                              if payload.get("disclosure_units") is not None else None),
         )
         result = normalized.to_dict()
         for key in (
