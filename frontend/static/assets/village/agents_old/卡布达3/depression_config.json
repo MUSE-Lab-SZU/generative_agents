@@ -1,12 +1,25 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "卡布达3",
   "complaint_graph": {
     "initial_stage_id": "moderate_social_shame_withdrawal",
+    "root_complaint_anchor": "一次社交误会后，卡布达将他人的沉默和眼神理解为排斥；他因此认为别人会觉得自己很糟糕，并担心关系已经断裂。",
+    "initial_domain_state": {
+      "mood_anhedonia": 45,
+      "sleep": 45,
+      "appetite": 45,
+      "energy": 40,
+      "attention": 45,
+      "function": 45,
+      "avoidance": 40
+    },
     "planner": {
       "window_size": 3,
       "llm_enabled": true,
+      "prompt_recent_path_limit": 4,
+      "prompt_semantic_guard_limit": 20,
+      "prompt_known_stage_id_limit": 512,
       "min_match_confidence": 0.6,
       "allow_replan": true,
       "max_dialog_history": 16
@@ -15,9 +28,15 @@
       {
         "id": "moderate_social_shame_withdrawal",
         "label": "把社交误会体验成持续羞耻和关系断裂",
-        "summary": "卡布达3把误会后的沉默和眼神都理解成排斥，开始明显减少外出和社交。",
-        "core_belief": "只要他们想到那件事，就会觉得我很糟糕，所以我最好别再出现。",
-        "narrative_focus": ["公开指责", "羞耻", "回避熟人", "反复检查消息", "关系断裂"],
+        "summary": "卡布达把误会后的沉默和眼神都理解成排斥，开始明显减少外出和社交。",
+        "core_belief": "如果别人对我失望或疏远，往往说明我很糟糕、不值得被接纳。",
+        "narrative_focus": [
+          "公开指责",
+          "羞耻",
+          "回避熟人",
+          "反复检查消息",
+          "关系断裂"
+        ],
         "speaking_style": {
           "tempo": "slow",
           "disclosure": "guarded",
