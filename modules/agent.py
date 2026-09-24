@@ -248,6 +248,9 @@ class Agent:
         explicit_local_only = bool(prompt_kwargs.pop("_force_local", False))
         depression_chat_ctx = None
         if func_hint == "generate_chat":
+            previous = getattr(self, "_depression_attempt", None)
+            if previous and self.dynamic_memory_enabled():
+                self.depression_dynamic.discard_memory_preview(previous["context"].get("turn_id"))
             self._depression_attempt = None
         if func_hint == "generate_chat":
             prompt_kwargs, depression_chat_ctx = self._prepare_depression_generate_chat(
@@ -1004,6 +1007,10 @@ class Agent:
     def reflect(self, trigger_source="legacy_poignancy", trigger_context=None):
         trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
         trigger_source = str(trigger_source or "legacy_poignancy").strip() or "legacy_poignancy"
+        if trigger_source == "after_chat" and trigger_context.get("meeting_id"):
+            if self.has_reflected_for_meeting(trigger_context["meeting_id"]):
+                return {"triggered": False, "reason": "already_reflected"}
+            self._mark_reflection_triggered(trigger_source, trigger_context)
         if trigger_source == "legacy_poignancy":
             if not self._legacy_reflection_enabled():
                 self._log_reflection_skip(trigger_source, "legacy_disabled", trigger_context)
@@ -1102,6 +1109,7 @@ class Agent:
                     node = _add_thought(thought, evidence)
                     reflection_entries.append(
                         {
+                            "entry_type": "insight",
                             "thought": thought,
                             "evidence": evidence,
                             "node_id": getattr(node, "node_id", ""),
@@ -1123,6 +1131,7 @@ class Agent:
             node = _add_thought(plan_thought, evidence)
             reflection_entries.append(
                 {
+                    "entry_type": "plan",
                     "thought": plan_thought,
                     "evidence": evidence,
                     "node_id": getattr(node, "node_id", ""),
@@ -1133,6 +1142,7 @@ class Agent:
             node = _add_thought(memory_thought, evidence)
             reflection_entries.append(
                 {
+                    "entry_type": "memory_thought",
                     "thought": memory_thought,
                     "evidence": evidence,
                     "node_id": getattr(node, "node_id", ""),
@@ -2738,7 +2748,7 @@ class Agent:
                 )
             )
         bridge = getattr(self, "external_memory_bridge", None)
-        if bridge and bridge.enabled_for_chat_read():
+        if bridge and bridge.enabled_for_chat_read() and not self.dynamic_memory_enabled():
             retrieval = bridge.retrieve_chat_context(
                 chats=chats,
                 other_name=getattr(other, "name", ""),
@@ -3106,7 +3116,8 @@ class Agent:
         return marker_fingerprint == self._build_self_percept_dedup_fingerprint(event)
 
     def _memory_write_blocked(self, node_type):
-        cfg = self.memory_write_control_config if isinstance(self.memory_write_control_config, dict) else {}
+        cfg = getattr(self, "memory_write_control_config", {})
+        cfg = cfg if isinstance(cfg, dict) else {}
         if not bool(cfg.get("enabled", False)):
             return False
         target_agents = cfg.get("target_agents", [])
@@ -3162,6 +3173,7 @@ class Agent:
                 )
             )
             return node
+        dynamic = self.depression_dynamic.memory_system if self.dynamic_memory_enabled() else None
         if event.fit(None, "is", "idle"):
             poignancy = 1
         elif event.fit(None, "此时", "空闲"):
@@ -3223,7 +3235,7 @@ class Agent:
                         event,
                         current_tile_address,
                     )
-        return self.associate.add_node(
+        concept = self.associate.add_node(
             e_type,
             event_for_memory,
             poignancy,
@@ -3233,6 +3245,7 @@ class Agent:
         )
         if dynamic:
             dynamic.public_node_ids.add(concept.node_id)
+            dynamic.save()
         return concept
 
     def get_tile(self):
@@ -3595,7 +3608,7 @@ class Agent:
     def _init_depression_dynamic(self, config):
         global_cfg = (
             self.depression_dynamic_global
-            if isinstance(self.depression_dynamic_global, dict)
+            if isinstance(getattr(self, "depression_dynamic_global", None), dict)
             else {}
         )
         if global_cfg and not bool(global_cfg.get("enabled", True)):
@@ -3639,7 +3652,9 @@ class Agent:
                     "agent_name": self.name,
                 },
                 clock_provider=utils.get_timer().get_date,
-                domain_state_enabled=domain_state_cfg.get("enabled", True),
+                domain_state_enabled=domain_state_cfg.get("enabled", False),
+                memory_state=config.get("depression_dynamic_state", {}).get("memory_system"),
+                memory_write_control=getattr(self, "memory_write_control_config", {}),
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
             state_payload = config.get("depression_dynamic_state", {})
@@ -3649,11 +3664,44 @@ class Agent:
                 if engine.graph_manager.session_records and "session_message_refs" not in config:
                     raise ValueError("MISSING_AGENT_SESSION_REFS")
                 for sid, refs in self._session_message_refs.items():
-                    if (
-                        engine.graph_manager.session_records.get(sid, {}).get("message_refs")
-                        != refs
-                    ):
-                        raise ValueError("AGENT_SESSION_REFS_MISMATCH")
+                    manager_refs = engine.graph_manager.session_records.get(sid, {}).get(
+                        "message_refs", []
+                    )
+                    if manager_refs == refs:
+                        continue
+                    extra_refs = manager_refs[len(refs):]
+                    reflection_tail_only = (
+                        manager_refs[:len(refs)] == refs
+                        and bool(extra_refs)
+                        and all(
+                            engine.graph_manager.evidence_ledger.get(message_id, {}).get(
+                                "event_source"
+                            )
+                            == "reflection"
+                            for message_id in extra_refs
+                        )
+                    )
+                    if reflection_tail_only:
+                        self._session_message_refs[sid] = copy.deepcopy(manager_refs)
+                        continue
+                    raise ValueError("AGENT_SESSION_REFS_MISMATCH")
+            if engine.enabled and engine.memory_system.enabled:
+                embedding = config["associate"]["embedding"]
+                model_key = json.dumps({k: embedding.get(k) for k in
+                    ("provider", "model", "base_url", "base_urls")}, sort_keys=True)
+                engine.memory_system.bind(
+                    os.path.join(config["storage_root"], "depression_memory"),
+                    self.associate.index.embedding_model, model_key,
+                    restore_mode="checkpoint" if state_payload else "new")
+                for node in self.associate.index.get_nodes():
+                    if node.id_ not in engine.memory_system.public_node_ids and node.text.strip():
+                        engine.memory_system.add_memory({
+                            "memory_id": "legacy_" + node.id_, "content": node.text,
+                            "source_type": "legacy_associate", "source_ids": [node.id_],
+                            "disclosure_threshold": 1.0})
+                self.associate.visibility_filter = lambda node_id: node_id in engine.memory_system.public_node_ids
+                self.scratch.public_persona = engine.public_base_prompt()
+                engine.save_memory()
             if self.logger:
                 self.logger.info(
                     "[DEPRESSION_DYNAMIC] agent={} enabled config={}".format(
@@ -3662,6 +3710,11 @@ class Agent:
                 )
             return engine
         except Exception as exc:
+            with open(config_path, encoding="utf-8") as config_file:
+                requested = json.load(config_file)
+            requested = requested.get("depression_simulation", requested)
+            if requested.get("enabled", True) and requested.get("memory", {}).get("enabled", False):
+                raise RuntimeError("Failed to initialize isolated dynamic memory for " + self.name) from exc
             if (
                 config.get("depression_dynamic_state", {})
                 .get("complaint_graph_manager", {})
@@ -3739,6 +3792,14 @@ class Agent:
             relation_summary=relation_summary,
             chats=chats,
         )
+        # Reuse already-built earlier-session memory and bounded session summary/recent
+        # dialogue. No retrieval, summarization or extra LLM call at the evidence boundary.
+        context["detector_context_only"] = "\n".join(
+            str(value) for value in (
+                kwargs.get("consult_history_memory", ""),
+                kwargs.get("conversation_prompt_text") or context["detector_context_only"],
+            ) if value
+        )
         with self._depression_trace_scope(
             {
                 "source": "chat_preview",
@@ -3762,8 +3823,13 @@ class Agent:
                 conversation_content=context["conversation_content"],
                 roadmap_completion_func=self._depression_llm_completion,
                 emotion_completion_func=self._depression_llm_completion,
+                counterpart_utterance=context.get("counterpart_utterance", ""),
             )
         context.update(copy.deepcopy(self.depression_dynamic.generation_snapshot))
+        if self.dynamic_memory_enabled():
+            context["turn_id"] = context["generation_attempt_id"]
+            context["memory_decision"] = copy.deepcopy(
+                self.depression_dynamic._memory_previews.get(context["turn_id"]))
         context["generation_prompt"] = preview_prompt
         next_kwargs = dict(kwargs)
         next_kwargs["depression_chat_block"] = preview_prompt
@@ -3809,6 +3875,11 @@ class Agent:
                 else ""
             ),
         }
+        event_id = (metadata or {}).get("event_id")
+        manager = getattr(self.depression_dynamic, "graph_manager", None)
+        graph_already_processed = bool(
+            event_id and event_id in getattr(manager, "processed_event_results", {})
+        )
         try:
             with self._depression_trace_scope(
                 {
@@ -3830,7 +3901,7 @@ class Agent:
                     "dialogue": trace_dialogue,
                 }
             ):
-                return self.depression_dynamic.commit_event(
+                result = self.depression_dynamic.commit_event(
                     source=event_source,
                     location=location,
                     time_of_day=time_of_day,
@@ -3843,6 +3914,7 @@ class Agent:
                     roadmap_completion_func=self._depression_llm_completion,
                     emotion_completion_func=self._depression_llm_completion,
                 )
+                return result
         except Exception as exc:
             if self.logger:
                 self.logger.info(
@@ -3850,6 +3922,9 @@ class Agent:
                         self.name, event_source, exc
                     )
                 )
+        finally:
+            if not graph_already_processed:
+                self._append_depression_graph_trace(event_id)
         return None
 
     def _commit_depression_reflection(
@@ -3859,7 +3934,7 @@ class Agent:
         trigger_source="legacy_poignancy",
         trigger_context=None,
     ):
-        if not entries:
+        if not entries or not self.depression_dynamic:
             return None
         content, metadata = self._build_depression_reflection_payload(
             focus,
@@ -3886,14 +3961,49 @@ class Agent:
         trigger_context=None,
     ):
         trigger_context = trigger_context if isinstance(trigger_context, dict) else {}
-        del focus, entries
+        del focus
+        labels = {"insight": "洞察", "plan": "计划", "memory_thought": "记忆想法"}
+        lines = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            thought = str(entry.get("thought", "")).strip()
+            if not thought:
+                continue
+            kind = entry.get("entry_type", "insight")
+            if kind not in labels:
+                kind = "insight"
+            lines.append("【{}】{}".format(labels[kind], thought))
+        content = "\n".join(lines)
+        if not content:
+            return "", {}
+        manager = self.depression_dynamic.graph_manager
+        session_id = trigger_context.get("session_instance_id")
+        if session_id not in manager.session_records:
+            session_id = manager.start_session()
+        message_id = manager.register_accepted_message(
+            content, self.name, session_id, speaker_role="patient",
+            meeting_id=trigger_context.get("meeting_id"),
+            event_source="reflection",
+        )
+        if not hasattr(self, "_session_message_refs"):
+            self._session_message_refs = {}
+        session_refs = self._session_message_refs.setdefault(session_id, [])
+        if message_id not in session_refs:
+            session_refs.append(message_id)
         metadata = {
-            "message_refs": copy.deepcopy(trigger_context.get("message_refs", [])),
-            "session_instance_id": trigger_context.get("session_instance_id"),
+            "message_refs": [message_id],
+            "session_instance_id": session_id,
             "event_id": new_id("event"),
             "trigger_context": {"meeting_id": trigger_context.get("meeting_id", "")},
+            "reflection_entries": copy.deepcopy(entries),
+            "consultation_message_refs": copy.deepcopy(trigger_context.get("message_refs", [])),
         }
-        return "会后反思：读取本次触发会话授权的完整原消息。", metadata
+        if self.dynamic_memory_enabled():
+            metadata["memory_response"] = "\n".join(
+                str(entry.get("thought", "")).strip() for entry in entries
+                if isinstance(entry, dict) and str(entry.get("thought", "")).strip())
+        return content, metadata
 
     def _extract_depression_patient_utterances(self, transcript, patient_name=""):
         """从真实会话文本中按说话人抽取患者原话，并覆盖互动前后。"""
@@ -4003,6 +4113,9 @@ class Agent:
                 generation_attempt_id=context.get("generation_attempt_id"),
                 generation_snapshot_ref=context.get("generation_snapshot_ref"),
             )
+            if speaker.dynamic_memory_enabled():
+                metadata["turn_id"] = context.get("turn_id") or metadata["event_id"]
+                metadata["memory_decision"] = copy.deepcopy(context.get("memory_decision"))
             context["accepted_metadata"] = metadata
         backups = []
         chats.append((speaker.name, text))
@@ -4021,6 +4134,7 @@ class Agent:
                             copy.deepcopy(manager.evidence_ledger),
                             copy.deepcopy(manager.session_records),
                             copy.deepcopy(manager.pending_events),
+                            engine, copy.deepcopy(engine.pending_memory_events),
                         )
                     )
                     manager.start_session(sid)
@@ -4051,11 +4165,12 @@ class Agent:
                             interaction_type=context["interaction_type"],
                             conversation_content=text,
                         )
+                        metadata["detector_context_only"] = context.get("detector_context_only", "")
                         pending_context["runtime_event"] = {
                             "source": "chat",
                             "metadata": copy.deepcopy(metadata),
                         }
-                        manager.pending_events[metadata["event_id"]] = dict(
+                        envelope = dict(
                             source="chat",
                             metadata=copy.deepcopy(metadata),
                             base_node_id=manager.get_current_stage_id(),
@@ -4064,10 +4179,16 @@ class Agent:
                             session_context=pending_context,
                             counterpart_utterance=context.get("counterpart_utterance", ""),
                         )
+                        if engine.memory_system.enabled:
+                            engine.pending_memory_events[metadata["event_id"]] = copy.deepcopy(envelope)
+                        envelope["metadata"] = engine.graph_metadata(envelope["metadata"])
+                        envelope["session_context"] = engine.graph_context(envelope["session_context"])
+                        manager.pending_events[metadata["event_id"]] = envelope
                 refs.append(mid)
         except Exception:
             chats.pop()
-            for manager, ledger, sessions, pending in backups:
+            for manager, ledger, sessions, pending, engine, memory_pending in backups:
+                engine.pending_memory_events = memory_pending
                 manager.evidence_ledger, manager.session_records, manager.pending_events = (
                     ledger,
                     sessions,
@@ -4098,7 +4219,8 @@ class Agent:
             relationship=context["relationship"],
             interaction_type=context["interaction_type"],
             content=utterance,
-            metadata=copy.deepcopy(context.get("accepted_metadata", {})),
+            metadata=dict(copy.deepcopy(context.get("accepted_metadata", {})),
+                          detector_context_only=context.get("detector_context_only", "")),
             counterpart_utterance=context.get("counterpart_utterance", ""),
         )
 
@@ -4208,7 +4330,11 @@ class Agent:
         conversation_content = "\n".join(
             ["{}: {}".format(name, text) for name, text in (chats or [])]
         )
+        from modules.intervention_consult_record import split_recent_exchanges, to_conversation_text
+        _, recent = split_recent_exchanges(chats, max(1, getattr(self, "chat_recent_turn_focus_n", 4)))
+        detector_context = to_conversation_text(recent)
         return {
+            "detector_context_only": detector_context,
             "location": location,
             "time_of_day": self._dynamic_time_of_day(),
             "other_agent": getattr(other, "name", ""),
@@ -4322,11 +4448,11 @@ class Agent:
     def _depression_trace_enabled(self):
         cfg = (
             self.depression_dynamic_global
-            if isinstance(self.depression_dynamic_global, dict)
+            if isinstance(getattr(self, "depression_dynamic_global", None), dict)
             else {}
         )
         return bool(cfg.get("log_enabled", False)) and bool(
-            self._depression_trace_path
+            getattr(self, "_depression_trace_path", "")
         )
 
     @contextmanager
@@ -4380,6 +4506,12 @@ class Agent:
     @staticmethod
     def _classify_depression_llm_call(prompt):
         text = str(prompt or "").lstrip()
+        if text.startswith("你是患者主诉图的 Change Detector。"):
+            return "change_detector"
+        if text.startswith("你是患者主诉图的 Stage Planner。"):
+            return "stage_planner"
+        if text.startswith("你是患者主诉图的独立 Stage Validator。"):
+            return "stage_validator"
         if text.startswith("你是患者主诉图的 Observation Detector。"):
             return "observation_detector"
         if text.startswith("你是患者主诉图的 Minimal Planner。"):
@@ -4403,6 +4535,10 @@ class Agent:
     def _append_depression_llm_trace(self, prompt, response):
         if not self._depression_trace_enabled():
             return
+        if self._classify_depression_llm_call(prompt) in {
+            "change_detector", "stage_planner", "stage_validator"
+        }:
+            return  # Write after commit so every call carries its final gate.
         try:
             now_value = utils.get_timer().get_date()
             sim_time = (
@@ -4429,6 +4565,12 @@ class Agent:
         }
         try:
             payload = json.loads(str(prompt).rsplit("输入：", 1)[-1])
+            if record["call_type"] in {"observation_detector", "minimal_planner", "commit_validator"}:
+                record.update(pipeline_version="v3", event_id=trace_context.get("event_id"),
+                              prompt_key={"observation_detector": "graph_transition_change",
+                                          "minimal_planner": "graph_planner",
+                                          "commit_validator": "graph_transition"}[record["call_type"]],
+                              mode=payload.get("mode"), task=payload.get("task"))
             if payload.get("pipeline_version") == "v3":
                 record.update({k: payload.get(k) for k in
                     ("pipeline_version", "prompt_key", "event_id", "mode", "task")})
@@ -4463,6 +4605,42 @@ class Agent:
                         exc,
                     )
                 )
+
+    def _append_depression_graph_trace(self, event_id):
+        if not self._depression_trace_enabled() or not event_id or not self.depression_dynamic:
+            return
+        manager = getattr(self.depression_dynamic, "graph_manager", None)
+        if manager is None:
+            return
+        trace = manager.transition_traces.get(event_id, {})
+        if trace.get("pipeline_version") != "v25":
+            return
+        try:
+            trace_dir = os.path.dirname(os.path.abspath(self._depression_trace_path))
+            os.makedirs(trace_dir, exist_ok=True)
+            with open(self._depression_trace_path, "a", encoding="utf-8") as output:
+                for call in trace.get("calls", []):
+                    row = {
+                        "schema_version": 2,
+                        "pipeline_version": "v25",
+                        "agent": str(self.name or ""),
+                        "event_id": event_id,
+                        "call_type": call["call_type"],
+                        "prompt_key": call["prompt_key"],
+                        "wire_input": call["wire_input"],
+                        "wire_prompt": call["wire_prompt"],
+                        "wire_prompt_chars": call["wire_prompt_chars"],
+                        "raw_output": call.get("raw_output"),
+                        "normalized_result": call.get("normalized_result"),
+                        "evidence_quotes_audit": call.get("evidence_quotes_audit"),
+                        "audit_warnings": call.get("audit_warnings", []),
+                        "final_reason": call.get("final_reason"),
+                        "gate_result": call.get("gate_result"),
+                    }
+                    output.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            if self.logger and hasattr(self.logger, "warning"):
+                self.logger.warning("[DEPRESSION_DYNAMIC_TRACE_WRITE_FAIL] event={} error={}".format(event_id, exc))
 
     def _log_depression_llm_call(self, prompt, response):
         """记录动态抑郁模块内部 LLM 调用的完整 prompt 和 response。"""

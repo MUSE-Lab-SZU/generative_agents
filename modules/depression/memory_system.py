@@ -56,7 +56,12 @@ class DynamicMemorySystem:
         self.path = self.embedder = None
         self.embedding_key, self.last_error = "", ""
         self.vectors = {}
+        self.restored_record_ids = set()
         self.restored = False
+        self.allow_authored_extensions = bool(self.config.get("allow_authored_extensions", False))
+        self.extension_policy_origin = "configured"
+        self.save_pending = False
+        self.initialization_origin = "seeds"
         if self.enabled:
             _score(self.config.get("initial_trust", 0.3))
             _score(self.config.get("min_similarity", 0.5))
@@ -100,26 +105,70 @@ class DynamicMemorySystem:
             seen.add(identifier)
         return items
 
-    def bind(self, path, embedder, embedding_key):
+    def bind(self, path, embedder, embedding_key, *, restore_mode="new"):
         """Reuse an embedding MODEL, never another memory's index or records."""
+        if restore_mode not in {"new", "checkpoint", "disk"}:
+            raise ValueError("Invalid memory restore mode")
         if not self.enabled:
             return
         self.path, self.embedder = Path(path), embedder
         self.embedding_key = str(embedding_key)
         state = self.path / "state.json"
-        if not self.restored and state.exists():
+        if not self.restored and state.exists() and restore_mode == "new":
+            raise ValueError("RESIDUAL_MEMORY_STATE: use an isolated run directory")
+        if not self.restored and state.exists() and restore_mode == "disk":
             self.load_state(json.loads(state.read_text(encoding="utf-8")))
         cache = self.path / "index" / "vectors.json"
         if cache.exists():
             try:
                 self.vectors = json.loads(cache.read_text(encoding="utf-8"))
+                if not isinstance(self.vectors, dict):
+                    self.vectors = {}
             except (ValueError, OSError):
                 self.vectors = {}
+
+    def write_blocked(self, source):
+        cfg = self.config.get("write_control", {})
+        if not cfg.get("enabled", False):
+            return False
+        targets = cfg.get("target_agents", [])
+        targets = [targets] if isinstance(targets, str) else targets
+        if targets and self.owner_id not in targets:
+            return False
+        types = cfg.get("blocked_node_types", [])
+        types = [types] if isinstance(types, str) else types
+        types = {str(t).strip().lower() for t in types} or {"event", "thought", "chat"}
+        kind = ("thought" if source in {"reflection", "associate_thought"}
+                else "chat" if source in {"chat", "conversation_summary", "associate_chat"}
+                else "event")
+        return kind in types
 
     def add_memory(self, item):
         if not self.enabled:
             return ""
+        source = item.get("source_type", "persona_seed")
+        if source != "persona_seed" and self.write_blocked(source):
+            return ""
+        record = self._normalize_record(item)
+        identifier, content = record["memory_id"], record["content"]
+        if identifier in self.records:
+            if self.records[identifier]["content"] != content:
+                raise ValueError("Use a new memory ID for revised facts")
+            return identifier
+        for source_id in record["source_ids"]:
+            parent = self.records.get(source_id)
+            if parent:
+                record["disclosure_threshold"] = max(record["disclosure_threshold"], parent["disclosure_threshold"])
+        self.records[identifier] = record
+        return identifier
+
+    def _normalize_record(self, item):
+        if not isinstance(item, dict):
+            raise ValueError("Memory record must be an object")
         record = copy.deepcopy(item)
+        for key in ("content", "memory_id", "source_type", "provenance", "retrieval_text"):
+            if key in record and not isinstance(record[key], str):
+                raise ValueError("Invalid record " + key)
         if record.get("owner_id", self.owner_id) != self.owner_id:
             raise ValueError("Dynamic memory belongs to another resident")
         content = str(record.get("content", "")).strip()
@@ -144,16 +193,45 @@ class DynamicMemorySystem:
         identifier = str(record.get("memory_id") or "dm_" + hashlib.sha256(
             (record["source_type"] + content).encode()).hexdigest()[:20])
         record["memory_id"] = identifier
-        if identifier in self.records:
-            if self.records[identifier]["content"] != content:
-                raise ValueError("Use a new memory ID for revised facts")
-            return identifier
-        for source_id in record["source_ids"]:
-            parent = self.records.get(source_id)
-            if parent:
-                record["disclosure_threshold"] = max(record["disclosure_threshold"], parent["disclosure_threshold"])
-        self.records[identifier] = record
-        return identifier
+        for key in ("created_at", "expires_at", "last_access"):
+            if record.get(key) is not None:
+                datetime.fromisoformat(record[key])
+        if not isinstance(record["disclosed_to"], dict):
+            raise ValueError("disclosed_to must be an object")
+        for partner, timestamp in record["disclosed_to"].items():
+            if not isinstance(partner, str):
+                raise ValueError("Invalid disclosure partner")
+            datetime.fromisoformat(timestamp)
+        for key in ("version", "access_count"):
+            if type(record[key]) is not int or record[key] < 0:
+                raise ValueError("Invalid " + key)
+        if not isinstance(record.get("claim_refs", []), list):
+            raise ValueError("claim_refs must be a list")
+        record.setdefault("provenance", "unknown")
+        return record
+
+    def excluded_extension_ids(self):
+        if self.allow_authored_extensions:
+            return set()
+        excluded = {mid for mid, r in self.records.items()
+                    if r.get("provenance") == "authored_extension"}
+        while True:
+            expanded = excluded | {mid for mid, r in self.records.items()
+                                   if excluded.intersection(r.get("source_ids", []))}
+            if expanded == excluded:
+                return excluded
+            excluded = expanded
+
+    def filter_decision(self, decision):
+        decision = copy.deepcopy(decision)
+        excluded = self.excluded_extension_ids()
+        decision["allowed_memories"] = [m for m in decision.get("allowed_memories", [])
+            if m.get("memory_id") not in excluded and
+            (self.allow_authored_extensions or m.get("provenance") != "authored_extension")]
+        decision["blocked_ids"] = [mid for mid in decision.get("blocked_ids", []) if mid not in excluded]
+        if not decision["blocked_ids"]:
+            decision["blocked_signal"] = {"present": False}
+        return decision
 
     def trust_for(self, other):
         initial = self.config.get("initial_trust_by_partner", {}).get(
@@ -168,7 +246,11 @@ class DynamicMemorySystem:
         key = hashlib.sha256((self.embedding_key + "\0" + text).encode()).hexdigest()
         if key not in self.vectors:
             self.vectors[key] = _unit(self.embedder.get_text_embedding(text))
-        return _unit(self.vectors[key])
+        try:
+            return _unit(self.vectors[key])
+        except (ValueError, TypeError):
+            self.vectors.pop(key, None)
+            return self._embedding(text)
 
     def prepare(self, query, other, turn_id):
         """Exact cosine search with independent allowed and blocked budgets."""
@@ -182,14 +264,20 @@ class DynamicMemorySystem:
             q = self._embedding(query, query=True)
             allowed, blocked = [], []
             now = self.clock()
+            excluded = self.excluded_extension_ids()
             for record in self.records.values():
+                if record["memory_id"] in excluded:
+                    continue
                 if datetime.fromisoformat(record["created_at"]) > now:
                     continue
                 if record["expires_at"] and datetime.fromisoformat(record["expires_at"]) <= now:
                     continue
                 vector = self._embedding(record["retrieval_text"])
                 if len(vector) != len(q):
-                    raise ValueError("Embedding dimension mismatch")
+                    self.vectors.clear()
+                    vector = self._embedding(record["retrieval_text"])
+                    if len(vector) != len(q):
+                        raise ValueError("Embedding dimension mismatch")
                 similarity = sum(a * b for a, b in zip(q, vector))
                 if similarity < self.config.get("min_similarity", 0.5):
                     continue
@@ -204,7 +292,12 @@ class DynamicMemorySystem:
             decision["allowed_memories"] = [
                 {"memory_id": r["memory_id"], "content": r["content"],
                  "previously_disclosed": other in r["disclosed_to"],
-                 "already_shared_only": decision["trust"] < r["disclosure_threshold"]}
+                 "already_shared_only": decision["trust"] < r["disclosure_threshold"],
+                 "provenance": r.get("provenance", "unknown"),
+                 "source_type": r["source_type"], "kind": r.get("kind", ""),
+                 "created_at": r["created_at"], "claim_refs": copy.deepcopy(r.get("claim_refs", [])),
+                 "temporal_note": "初始化背景，不代表本轮仍成立" if r["source_type"] == "persona_seed"
+                                  else "历史原话或记录，不代表本轮再次确认"}
                 for _, r in allowed[:limit]]
             remaining = max(1, int(self.config.get("max_context_chars", 2400)))
             selected = []
@@ -250,19 +343,48 @@ class DynamicMemorySystem:
             direction = result.get("direction", "unchanged")
             evidence = str(result.get("evidence", "")).strip()
             if direction not in self.TRUST_DELTAS or not evidence or evidence not in counterpart:
-                direction = "unchanged"
+                return empty
             ids = result.get("disclosed_ids", [])
             return {"direction": direction, "disclosed_ids": ids if isinstance(ids, list) else []}
         except Exception:
             return empty
 
     def commit_turn(self, decision=None, response="", counterpart="", source="chat", completion_func=None, **kwargs):
-        if not self.enabled or not decision or not response.strip():
+        # All mutable effects are staged, including the completion marker.
+        staged = copy.copy(self)
+        for key in ("records", "trust", "committed_turns", "memory_context"):
+            setattr(staged, key, copy.deepcopy(getattr(self, key)))
+        result = staged._commit_turn(decision=decision, response=response, counterpart=counterpart, source=source, completion_func=completion_func, **kwargs)
+        if result:
+            for key in ("records", "trust", "committed_turns", "memory_context"):
+                setattr(self, key, getattr(staged, key))
+        return result
+
+    def _commit_turn(self, decision=None, response="", counterpart="", source="chat", completion_func=None, **kwargs):
+        if not self.enabled:
+            return None
+        if self.write_blocked(source) or not decision or not response.strip():
             return False
         turn_id = decision["turn_id"]
-        if not turn_id or turn_id in self.committed_turns:
+        if not turn_id:
             return False
         other = decision["other_agent"]
+        decision = self.filter_decision(decision)
+        event_id = kwargs.get("event_id")
+        source_ids = list(kwargs.get("source_ids", []))
+        for prior_turn, prior in self.committed_turns.items():
+            same_event = event_id and prior.get("event_id") == event_id
+            same_message = (source == "chat" and prior.get("source", "chat") == "chat"
+                            and set(source_ids).intersection(prior.get("source_ids", [])))
+            if prior_turn == turn_id or same_event or same_message:
+                if prior["other_agent"] != other or (prior_turn == turn_id and
+                        prior.get("event_id") and event_id and prior["event_id"] != event_id):
+                    raise ValueError("MEMORY_IDENTITY_CONFLICT")
+                return False
+        if source == "chat" and source_ids:
+            for record in self.records.values():
+                if record["source_type"] == "chat" and set(source_ids).intersection(record["source_ids"]):
+                    return False
         evaluation = self.evaluate_exchange(decision, counterpart, response, completion_func) if source == "chat" and other else {"direction": "unchanged", "disclosed_ids": []}
         now = self.clock().isoformat()
         for item in decision["allowed_memories"]:
@@ -274,18 +396,26 @@ class DynamicMemorySystem:
                     record["disclosed_to"][other] = now
         if source == "chat" and other:
             self.trust[other] = max(0.0, min(1.0, self.trust_for(other) + self.TRUST_DELTAS[evaluation["direction"]]))
-        self.add_memory({"memory_id": "turn_" + hashlib.sha256(turn_id.encode()).hexdigest()[:20],
+        written = self.add_memory({"memory_id": "turn_" + hashlib.sha256(turn_id.encode()).hexdigest()[:20],
                          "content": response, "source_type": source,
                          "kind": "subjective_reflection" if source == "reflection" else "utterance",
-                         "source_ids": [m["memory_id"] for m in decision["allowed_memories"]],
+                         "source_ids": list(dict.fromkeys([m["memory_id"] for m in decision["allowed_memories"]]
+                                                          + list(kwargs.get("source_ids", [])))),
                          "disclosure_threshold": self.config.get("runtime_threshold", 0.8),
                          "disclosed_to": {other: now} if source == "chat" and other else {}})
+        if not written:
+            raise ValueError("MEMORY_RECORD_NOT_WRITTEN")
         self.memory_context = copy.deepcopy(decision["allowed_memories"])
-        self.committed_turns[turn_id] = {"other_agent": other, "time": now}
+        self.committed_turns[turn_id] = {
+            "other_agent": other, "time": now, "event_id": kwargs.get("event_id"), "source_ids": source_ids, "source": source}
+
         return True
 
     def to_dict(self):
         return {"schema_version": 1, "owner_id": self.owner_id,
+                "allow_authored_extensions": self.allow_authored_extensions,
+                "extension_policy_origin": self.extension_policy_origin,
+                "initialization_origin": self.initialization_origin,
                 "records": copy.deepcopy(list(self.records.values())),
                 "public_node_ids": sorted(self.public_node_ids),
                 "trust": copy.deepcopy(self.trust),
@@ -293,22 +423,61 @@ class DynamicMemorySystem:
                 "memory_context": copy.deepcopy(self.memory_context)}
 
     def load_state(self, payload):
+        if not isinstance(payload, dict) or payload.get("schema_version", 1) != 1:
+            raise ValueError("Unsupported memory state schema")
         if payload.get("owner_id", self.owner_id) != self.owner_id:
             raise ValueError("Cannot restore another resident's dynamic memory")
+        records = copy.deepcopy(self.records)
         if "records" in payload:
-            self.records = {}
+            if not isinstance(payload["records"], list):
+                raise ValueError("records must be a list")
+            records = {}
             for item in payload["records"]:
-                self.add_memory(item)
-        self.trust = {str(k): _score(v) for k, v in payload.get("trust", {}).items()}
-        self.committed_turns = copy.deepcopy(payload.get("committed_turns", {}))
-        self.memory_context = copy.deepcopy(payload.get("memory_context", []))
-        self.public_node_ids = set(payload.get("public_node_ids", []))
+                record = self._normalize_record(item)
+                mid = record["memory_id"]
+                if mid in records and records[mid] != record:
+                    raise ValueError("Conflicting duplicate memory ID: " + mid)
+                records[mid] = record
+        for key, typ in (("trust", dict), ("committed_turns", dict),
+                         ("memory_context", list), ("public_node_ids", list)):
+            if key in payload and not isinstance(payload[key], typ):
+                raise ValueError("Invalid memory state " + key)
+        if any(not isinstance(k, str) for k in payload.get("trust", {})):
+            raise ValueError("Invalid trust partner")
+        trust = {k: _score(v) for k, v in payload.get("trust", {}).items()}
+        turns = copy.deepcopy(payload.get("committed_turns", {}))
+        for key, value in turns.items():
+            if not isinstance(key, str) or not isinstance(value, dict) or not isinstance(value.get("other_agent"), str):
+                raise ValueError("Invalid committed turn")
+            if "time" in value:
+                datetime.fromisoformat(value["time"])
+            if value.get("event_id") is not None and not isinstance(value["event_id"], str):
+                raise ValueError("Invalid committed event_id")
+            if not isinstance(value.get("source_ids", []), list):
+                raise ValueError("Invalid committed source_ids")
+        context = copy.deepcopy(payload.get("memory_context", []))
+        if any(not isinstance(m, dict) for m in context):
+            raise ValueError("Invalid memory context")
+        ids = payload.get("public_node_ids", [])
+        if any(not isinstance(mid, str) for mid in ids):
+            raise ValueError("Invalid public node ID")
+        policy = payload.get("allow_authored_extensions", True)
+        if type(policy) is not bool:
+            raise ValueError("Invalid extension policy")
+        self.records, self.trust, self.committed_turns = records, trust, turns
+        self.memory_context, self.public_node_ids = context, set(ids)
+        self.allow_authored_extensions = policy
+        self.extension_policy_origin = payload.get("extension_policy_origin", "legacy_checkpoint")
+        self.initialization_origin = payload.get("initialization_origin", "legacy_memory_checkpoint")
+        self.restored_record_ids = set(records)
         self.restored = True
 
-    def save(self):
+    def save(self, payload=None):
         if self.enabled and self.path:
-            _atomic_json(self.path / "state.json", self.to_dict())
+            self.save_pending = True
+            _atomic_json(self.path / "state.json", self.to_dict() if payload is None else payload)
             _atomic_json(self.path / "index" / "vectors.json", self.vectors)
+            self.save_pending = False
 
 
 TraumaMemorySystem = DynamicMemorySystem

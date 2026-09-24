@@ -21,6 +21,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # ============================================================
 # ↓↓↓ 实验参数在此修改 ↓↓↓
@@ -37,26 +38,27 @@ CBT_CONTROLLER="progressive"
 CBT_CONTROLLER_EXPLICIT=false
 PROGRESSIVE_STAGE="D"
 PROGRESSIVE_STAGE_EXPLICIT=false
-BASE_CONFIG=""
-OUTPUT_TAG=""
+BASE_CONFIG="${BASE_CONFIG:-data/config智算中心版_qwen35.json}"
+OUTPUT_TAG="${OUTPUT_TAG:-pilot-session12}"
 DRY_RUN=false
 CLEANUP_COMPLETED_ARTIFACTS=true
 
 SIM_NAME="batch-${EXP_DATE}"
 SIM_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
-SIM_TARGET_STEP=72
+# 每 6 步一次会谈，72 步覆盖 12 次会谈；session_12 是会谈计数节点。
+SIM_TARGET_STEP="${SIM_TARGET_STEP:-72}"
 SIM_STRIDE=720
 SIM_MAX_PARALLEL=1
-SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1}"
+SIM_EMBEDDING_BASE_URLS="${BATCH_EMBEDDING_BASE_URLS:-http://127.0.0.1:18001/v1,http://127.0.0.1:18004/v1}"
 SIM_LOG="results/batch-${EXP_DATE}-${KBD}-${GROUP}-${SEVERITY}_run.log"
 
 EVAL_ARCHIVE_RESULTS_ROOT="results"
 EVAL_CONDITION="Counsel-${KBD}-${GROUP}-${SEVERITY}"
 EVAL_LABELS="auto"
 # T0 / 实际末次 PHQ-9、BDI-II 的固定完整复评次数（不是独立患者样本数）
-EVAL_REPEAT=10
+EVAL_REPEAT="${EVAL_REPEAT:-10}"
 # 中间两个短量表的固定完整复评次数
-EVAL_INTERMEDIATE_SCALE_REPEATS=5
+EVAL_INTERMEDIATE_SCALE_REPEATS="${EVAL_INTERMEDIATE_SCALE_REPEATS:-5}"
 EVAL_NAME="repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}"
 EVAL_MAX_PARALLEL=6
 EVAL_LOG="results/repeat-${KBD}-${GROUP}-${SEVERITY}-${EXP_DATE}.log"
@@ -72,7 +74,7 @@ FOLLOWUP_MAX_PARALLEL=1
 # ↑↑↑ 实验参数在此修改 ↑↑↑
 # ============================================================
 
-REPEAT_COUNT=2
+REPEAT_COUNT=1
 MAX_PARALLEL_REPEATS=""
 
 usage() {
@@ -84,9 +86,9 @@ usage() {
   -n, --repeat-count N       要运行的独立实验轮数，默认使用脚本顶部配置
   -j, --max-parallel N       同时运行的实验轮数，默认等于重复次数（全部并行）
       --counsel-room         使用咨询室模式（固定 G4，并透传给批量实验脚本）
-      --cbt-controller MODE  legacy|minimal|progressive；默认 progressive，G10/G11/G12 自动使用 legacy
+      --cbt-controller MODE  legacy|minimal|progressive；默认 progressive，G9/G10/G11/G12 自动使用 legacy
       --progressive-stage D  兼容旧命令的可选参数；progressive 自动使用 D
-      --config PATH          base config JSON；默认 data/config.json
+      --config PATH          base config JSON；默认 data/config智算中心版_qwen35.json
       --output-tag NAME      controller identity 后的附加输出标签
       --followup             仿真后并行运行无干预回访与原仿真复评；随后复评回访节点
       --no-followup          不运行回访阶段（默认）
@@ -207,11 +209,11 @@ case "$KBD" in
     ;;
 esac
 
-# G10/G11/G12 不运行 CBT 强制会谈，overlay 会关闭 intervention.enabled，
+# G9 居民会谈关闭 Session Prompt；G10/G11/G12 关闭 intervention.enabled，
 # 因而只能使用 legacy controller identity；minimal/progressive 会被入口校验拒绝。
 if [[ "$COUNSEL_ROOM" != true ]]; then
   case "$GROUP" in
-    G10|G11|G12)
+    G9|G10|G11|G12)
       if [[ "$CBT_CONTROLLER_EXPLICIT" == true && "$CBT_CONTROLLER" != "legacy" ]]; then
         echo "错误: $GROUP 不运行 CBT 强制会谈，只能使用 --cbt-controller legacy。" >&2
         exit 2

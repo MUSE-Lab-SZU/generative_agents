@@ -62,6 +62,8 @@ class Scratch:
             return file_content
 
     def _base_desc(self):
+        if getattr(self, "public_persona", None):
+            return self.public_persona
         return self.build_prompt(
             "base_desc",
             {
@@ -744,6 +746,7 @@ class Scratch:
         focus_retrieve_max = 15
         if hasattr(agent, "get_chat_focus_retrieve_max"):
             focus_retrieve_max = agent.get_chat_focus_retrieve_max()
+        isolated_memory = bool(getattr(agent, "dynamic_memory_enabled", lambda: False)())
         memory_mode = str(memory_source or "local").strip().lower()
         if memory_mode == "external":
             memory = str(external_memory_context or "")
@@ -754,6 +757,8 @@ class Scratch:
                 retrieval_profile=retrieval_profile,
             )
             memory_lines, seen_memory_lines = [], set()
+            if isolated_memory:
+                nodes = agent.public_memory_nodes(nodes)
             for n in nodes:
                 normalized_line = _normalize_prompt_text(getattr(n, "describe", ""))
                 if not normalized_line or normalized_line in seen_memory_lines:
@@ -784,6 +789,8 @@ class Scratch:
             pass_context = ""
             kept_context_num = 0
             seen_chat_context = set()
+            if isolated_memory:
+                chat_nodes = agent.public_memory_nodes(chat_nodes)
             for n in chat_nodes:
                 delta = utils.get_timer().get_delta(n.create)
                 if summary_window_minutes != -1 and delta > summary_window_minutes:
@@ -826,7 +833,9 @@ class Scratch:
             conversation or "[对话尚未开始]"
         )
 
-        base_desc = self._base_desc()
+        if isolated_memory:
+            curr_context = ""
+        base_desc = self._base_desc() if not str(depression_chat_block or "").strip() else ""
         base_desc_block = ""
         if not str(depression_chat_block or "").strip():
             base_desc_block = "以下是对 {} 的简要描述：\n{}\n\n".format(

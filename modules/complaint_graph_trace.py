@@ -118,6 +118,22 @@ def build_transition_trace(
     }
 
 
+def compact_event_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep the event's Code Result, never a cumulative graph/history snapshot.
+
+    Full current state remains available through get_graph_snapshot().  Both old
+    snapshot results and new compact results are accepted by audit readers.
+    """
+    snapshot_fields = {
+        "stages", "current_stage", "current_graph_window", "planned_graph",
+        "stage_history", "dialogue_history", "last_session_context",
+        "last_evaluation", "domain_state", "pending_domain_window",
+        "last_domain_window_update",
+    }
+    return {key: copy.deepcopy(value) for key, value in result.items()
+            if key not in snapshot_fields}
+
+
 def capture_runtime_chat_trace(
     patient: Any,
     patient_text: str,
@@ -146,7 +162,7 @@ def capture_runtime_chat_trace(
             result.update(message_refs=[mid], trace_id=event_id)
             if trace.get("pipeline_version") == "v3":
                 result["pipeline_version"] = "v3"
-                result["final_result"] = copy.deepcopy(trace["final_result"])
+                result["final_result"] = compact_event_result(trace["final_result"])
                 result["stages"] = {key: copy.deepcopy(trace[key]) for key in
                     ("extraction", "gate", "proposal", "validation")}
             return result
@@ -208,7 +224,7 @@ def capture_runtime_reflection_trace(patient: Any, meeting_id: str) -> Dict[str,
                 )
                 if trace.get("pipeline_version") == "v3":
                     result["pipeline_version"] = "v3"
-                    result["final_result"] = copy.deepcopy(trace["final_result"])
+                    result["final_result"] = compact_event_result(trace["final_result"])
                     result["stages"] = {key: copy.deepcopy(trace[key]) for key in
                         ("extraction", "gate", "proposal", "validation")}
                 return result

@@ -102,7 +102,7 @@
       "write_mode": "hybrid"
     },
     "memory_write_control": {
-      "enabled": false,
+      "enabled": true,
       "target_agents": [],
       "blocked_node_types": []
     },

@@ -83,7 +83,7 @@
     "volatility_limit": 0.12
   },
   "memory": {
-    "enabled": true,
+    "enabled": false,
     "public_persona": "你是卡布达，23岁，小镇居民。敏感、内省、善良，喜欢绘图、散步和安静的休闲活动。按当前情绪自然交谈。",
     "initial_trust": 0.3,
     "initial_trust_by_partner": {

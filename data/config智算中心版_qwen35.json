@@ -20,7 +20,9 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18000
+            18000,
+            18002,
+            18003
           ]
         }
       },
@@ -72,7 +74,9 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18001
+            18001,
+            18004,
+            18005
           ]
         }
       },
@@ -98,7 +102,7 @@
       "write_mode": "hybrid"
     },
     "memory_write_control": {
-      "enabled": false,
+      "enabled": true,
       "target_agents": [],
       "blocked_node_types": []
     },

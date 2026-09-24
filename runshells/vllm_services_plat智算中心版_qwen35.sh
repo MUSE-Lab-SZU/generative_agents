@@ -17,10 +17,10 @@ EMBED_PORT="${EMBED_PORT:-18001}"
 # When set, these comma-separated values create one vLLM process per item.
 # They are deliberately separate from QWEN_GPUS/EMBED_GPUS, whose comma list
 # continues to mean tensor parallelism for the legacy single-service mode.
-QWEN_SERVICE_GPUS="${QWEN_SERVICE_GPUS:-}"
-EMBED_SERVICE_GPUS="${EMBED_SERVICE_GPUS:-}"
-QWEN_PORTS="${QWEN_PORTS:-}"
-EMBED_PORTS="${EMBED_PORTS:-}"
+QWEN_SERVICE_GPUS="${QWEN_SERVICE_GPUS-0,1,2}"
+EMBED_SERVICE_GPUS="${EMBED_SERVICE_GPUS-3,3,3}"
+QWEN_PORTS="${QWEN_PORTS-18000,18002,18003}"
+EMBED_PORTS="${EMBED_PORTS-18001,18004,18005}"
 
 QWEN_NAME="${QWEN_NAME:-qwen3.5-9b-vllm}"
 EMBED_NAME="${EMBED_NAME:-bge-m3-vllm}"
@@ -38,9 +38,9 @@ QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.90}"
 # If several BGE replicas are placed on one GPU, the default is set after the
 # service list is parsed so their KV-cache reservations can coexist.
 EMBED_GPU_MEMORY_UTILIZATION="${EMBED_GPU_MEMORY_UTILIZATION:-}"
-QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-4096}"
+QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-16384}"
 QWEN_MAX_NUM_SEQS="${QWEN_MAX_NUM_SEQS:-4}"
-QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-4096}"
+QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-16384}"
 EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
 QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-}"
 EMBED_TENSOR_PARALLEL_SIZE="${EMBED_TENSOR_PARALLEL_SIZE:-}"
@@ -369,8 +369,8 @@ print_usage() {
 用法: $0 [start|stop|restart|status|print-config]
 
 默认规划：
-  Qwen3  -> GPUs $QWEN_GPUS, port $QWEN_PORT, model $QWEN_MODEL_DIR
-  BGE-M3 -> GPUs $EMBED_GPUS, port $EMBED_PORT, model $EMBED_MODEL_DIR
+  Qwen3.5 -> 服务 GPUs ${QWEN_SERVICE_GPU_LIST[*]}, ports ${QWEN_SERVICE_PORT_LIST[*]}, model $QWEN_MODEL_DIR
+  BGE-M3  -> 服务 GPUs ${EMBED_SERVICE_GPU_LIST[*]}, ports ${EMBED_SERVICE_PORT_LIST[*]}, model $EMBED_MODEL_DIR
 
 可覆盖环境变量：
   MODEL_ROOT, QWEN_MODEL_DIR, EMBED_MODEL_DIR
@@ -381,7 +381,8 @@ print_usage() {
   QWEN_MAX_MODEL_LEN, QWEN_MAX_NUM_SEQS, QWEN_MAX_NUM_BATCHED_TOKENS
   VLLM_BIN, PYTHON_BIN
 
-多卡示例：
+多卡示例（1/2/8 卡单服务模式需先清空默认服务池）：
+  export QWEN_SERVICE_GPUS= QWEN_PORTS= EMBED_SERVICE_GPUS= EMBED_PORTS=
   1 卡: QWEN_GPUS=0 EMBED_GPUS=0 bash runshells/vllm_services_plat智算中心版_qwen35.sh start
   2 卡: QWEN_GPUS=0 EMBED_GPUS=1 bash runshells/vllm_services_plat智算中心版_qwen35.sh start
   4 卡（3 个 Qwen、3 个 BGE）:

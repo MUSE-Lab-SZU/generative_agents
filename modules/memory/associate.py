@@ -201,6 +201,7 @@ class Associate:
         self._index = LlamaIndex(embedding, path)
         self.logger = logger
         self._external_write_hook = external_write_hook
+        self.visibility_filter = None
         base_memory = {"event": [], "thought": [], "chat": []}
         if isinstance(memory, dict):
             for key in base_memory.keys():
@@ -559,7 +560,9 @@ class Associate:
     def _retrieve_nodes(
         self, node_type, text=None, limit=None, similarity_top_k=None, node_ids=None
     ):
-        node_ids = list(node_ids) if node_ids is not None else self._valid_memory_ids(node_type)
+        node_ids = self._visible_ids(list(node_ids) if node_ids is not None else self._valid_memory_ids(node_type))
+        if not node_ids:
+            return []
         final_limit = self._normalize_limit(
             self.retention if limit is None else limit,
             default=self.retention,
@@ -625,7 +628,7 @@ class Associate:
 
     def _chat_candidate_concepts(self, name=None):
         selected = []
-        for node_id in self._valid_memory_ids("chat"):
+        for node_id in self._visible_ids(self._valid_memory_ids("chat")):
             concept = self.find_concept(node_id)
             if not self._chat_matches_name(concept, name=name):
                 continue
@@ -705,7 +708,7 @@ class Associate:
             return AssociateRetriever(retrieve_cfg, *args, **kwargs)
 
         retrieved = {}
-        node_ids = self.memory["event"] + self.memory["thought"]
+        node_ids = self._visible_ids(self.memory["event"] + self.memory["thought"])
         if not node_ids:
             return [] if reduce_all else {text: [] for text in focus}
         try:

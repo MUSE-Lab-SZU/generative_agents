@@ -12,7 +12,7 @@
     "think": {
       "llm": {
         "provider": "openai",
-        "model": "qwen3.5-9b-vllm",
+        "model": "qwen3-8b-vllm",
         "base_url": "http://127.0.0.1:18000/v1",
         "api_key": "EMPTY",
         "retry": 3,
@@ -20,8 +20,7 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18000,
-            18002
+            18000
           ]
         }
       },
@@ -100,7 +99,7 @@
       "write_mode": "hybrid"
     },
     "memory_write_control": {
-      "enabled": false,
+      "enabled": true,
       "target_agents": [],
       "blocked_node_types": []
     },

@@ -917,8 +917,9 @@ class InterventionManager:
     ) -> None:
         if not str(meeting_id or "").strip():
             return
+        consult = str(meeting_kind or "").strip() == "doctor_consult"
         cfg = self._reflection_conditional_cfg()
-        if not self._safe_bool(cfg.get("enabled", True), True):
+        if not consult and not self._safe_bool(cfg.get("enabled", True), True):
             self._log_highlight(
                 "REFLECTION_AFTER_CHAT_SKIP meeting_id={} reason=conditional_disabled".format(
                     str(meeting_id or "")
@@ -928,7 +929,9 @@ class InterventionManager:
         rules = cfg.get("rules", [])
         if not isinstance(rules, list):
             rules = []
-        if not rules:
+        if consult:
+            rules = [self._default_after_chat_reflection_rule()]
+        elif not rules:
             rules = [self._default_after_chat_reflection_rule()]
 
         if not (doctor and patient):

@@ -1,6 +1,7 @@
 """Pure, explicit projections. Audit metadata never enters generation payloads."""
 
 import copy
+import re
 from .evidence import digest
 
 STYLE_KEYS = ("tempo", "disclosure", "tone", "repair_pattern")
@@ -52,7 +53,6 @@ def select_relevant_claims(
 ):
     """Read-only selection; unselected heads are always inherited by code commit."""
     topic = (context or {}).get("topic_id")
-    pairs = {(o.get("subject"), o.get("kind")) for o in observations or []}
     refs = set()
     if proposal:
         raw_refs = list(proposal.get("admission", {}).get("baseline_claim_refs", []))
@@ -63,16 +63,37 @@ def select_relevant_claims(
         ]
         raw_refs += proposal.get("focus_claim_refs", [])
         refs = {(r.get("claim_id"), r.get("revision")) for r in raw_refs}
-    return copy.deepcopy(
-        [
-            c
-            for c in active_claims
-            if (c["claim_id"], c["revision"]) in refs
-            or (task != "validator" and (not topic or c["topic_id"] == topic))
-            or (task in {"patient", "emotion"} and c.get("actuality") == "ongoing")
-            or (c["subject"], c["kind"]) in pairs
-        ]
-    )
+    query = " ".join(o.get("reported_content", "") for o in observations or [])
+    query += " " + str((context or {}).get("query", ""))
+    def units(text):
+        for phrase in ("睡不着", "失眠", "入睡困难", "难以入睡"):
+            text = text.replace(phrase, "睡眠障碍")
+        text = re.sub(r"[^\w\u4e00-\u9fff]", "", text.lower())
+        return {text[i:i+2] for i in range(len(text)-1)} - {
+            "就是", "然后", "觉得", "有点", "没有", "不是", "这个", "那个",
+            "一下", "还是", "可能", "现在", "刚才", "时候", "一会", "会儿", "一点", "自己"}
+    q = units(query)
+    ranked = []
+    subjects = {o.get("subject") for o in observations or []}
+    for index, c in enumerate(active_claims):
+        score = len(q & units(c["text"]))
+        if task in {"planner", "validator"}:
+            symptom_match = ("睡眠" in query and "睡眠障碍" in
+                             re.sub("睡不着|失眠|入睡困难|难以入睡", "睡眠障碍", c["text"]))
+            eligible = (score >= 2 or ("纠正" in query and score >= 1) or symptom_match)
+            eligible = eligible and c["subject"] in subjects
+        else:
+            eligible = (score >= 2 or not q) and (not topic or c["topic_id"] == topic
+                                                   or c.get("actuality") == "ongoing")
+        if eligible or (c["claim_id"], c["revision"]) in refs:
+            ranked.append((score, index, c))
+    limit = 6 if task in {"planner", "validator"} else 3
+    chosen = sorted(ranked, key=lambda row: (row[0], row[1]), reverse=True)[:limit]
+    # Required revision/baseline/focus references cannot be dropped by the cap.
+    indexes = {row[1] for row in chosen}
+    chosen.extend(row for row in ranked if row[1] not in indexes
+                  and (row[2]["claim_id"], row[2]["revision"]) in refs)
+    return copy.deepcopy([row[2] for row in sorted(chosen, key=lambda row: row[1])])
 
 
 def validator_source_evidence(ledger, claims):
@@ -153,9 +174,7 @@ def expression_stage(stage):
 def build_patient_generation_view(manager, context=None):
     node = manager.get_current_stage()
     resolved = manager.resolve_active_claims()
-    claims = select_relevant_claims(
-        "patient", resolved["active_claims"], context={"topic_id": node["topic_id"]}
-    )
+    claims = []
     stage = expression_stage(node)
     stage.update(
         topic=manager.topic_registry[node["topic_id"]]["neutral_name"],
@@ -165,6 +184,16 @@ def build_patient_generation_view(manager, context=None):
             c["text"] for c in resolved["initialization_background"]
         ],
     )
+    stage.update(manager.complaint_stage_view())
+    stage["root_complaint_anchor"] = manager.root_complaint_anchor
+    recent = []
+    for event in reversed(manager.stage_history):
+        trace = manager.transition_traces.get(event.get("event_id"), {})
+        if trace.get("gate_result") == "commit" and trace.get("verified_change"):
+            recent.append(trace["verified_change"])
+        if len(recent) == 3:
+            break
+    stage["recent_experiences"] = recent
     # Only the currently applicable relationship adjustment crosses this boundary.
     relationship = (context or {}).get("participants", {}).get("relationship", "")
     stage["relation_modifiers"] = {
@@ -204,9 +233,24 @@ def build_patient_generation_view(manager, context=None):
     }
 
 
+def render_claim(c):
+    """Render report scope; never infer a psychological trajectory from facts."""
+    time = c.get("time", {}).get("reported_time_text") or "发生时间未明确"
+    certainty = {"uncertain": "不确定报告", "denied": "否认性报告",
+                 "unknown": "立场未明"}.get(c.get("assertion_status"), "报告")
+    actuality = {"intended": "计划，尚未实施", "hypothetical": "假设，非既成事实",
+                 "unknown": "实际性未明"}.get(c.get("actuality"), "保留原时点")
+    source = "初始化设定" if c.get("acceptance_basis") == "configured" else "此前报告，不代表本轮再次确认"
+    return f"{source}（{time}；{certainty}；{actuality}）：{c['text']}"
+
+
 def build_emotion_input_view(stage, context=None):
     result = expression_stage(stage if isinstance(stage, dict) else {})
     stage = stage if isinstance(stage, dict) else {}
+    # Only the generation projection carries authorized stage semantics. Raw
+    # node display fields are intentionally not a shortcut around that boundary.
+    if "accepted_claims" not in stage:
+        result.update(project(stage, ("label", "summary", "narrative_focus", "recent_experiences")))
     result["topic"] = stage.get("topic", "初始主诉")
     result["current_claims"] = [
         semantic_claim_view(c) for c in stage.get("current_claims", [])
