@@ -2,9 +2,10 @@
 """从动态抑郁 JSONL 中提取每轮对话前后的主诉图节点。
 
 输入为某次实验的 checkpoint 目录（或直接指定
-``depression_dynamic_llm_trace.jsonl`` 文件）。脚本只处理 ``source=chat``
-的主诉图推进判定，因此会同时覆盖强制治疗对话和居民对话，但会排除会后
-内在反思、图规划、情绪推断等非对话记录。
+``depression_dynamic_llm_trace.jsonl`` 文件）。旧版从 ``graph_transition``
+trace 提取；V3 若无旧版记录，则从最终快照的 ``stage_history`` 提取实际
+判定与提交状态。两种格式都只处理 ``source=chat``，覆盖强制治疗对话和
+居民对话，并排除会后内在反思等非对话记录。
 
 示例：
     python scripts/extract_dialogue_complaint_graphs.py \
@@ -207,15 +208,80 @@ def extract(trace_path: Path, strict: bool) -> tuple[list[dict[str, Any]], list[
     return dialogues, warnings, skipped_non_dialogues
 
 
+def extract_v3(checkpoint_dir: Path, strict: bool) -> tuple[list[dict[str, Any]], list[str], int, Path] | None:
+    """Read V3 chat decisions from the final checkpoint's committed graph history."""
+    snapshots = sorted(checkpoint_dir.glob("simulate-*.json"))
+    if not snapshots:
+        return None
+    snapshot_path = snapshots[-1]
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    agents = snapshot.get("agents", {})
+    if not isinstance(agents, Mapping):
+        return None
+    matches = []
+    for agent_name, agent_state in agents.items():
+        if not isinstance(agent_state, Mapping):
+            continue
+        dynamic = agent_state.get("depression_dynamic_state", {})
+        graph = dynamic.get("complaint_graph_manager", {}) if isinstance(dynamic, Mapping) else {}
+        if isinstance(graph, Mapping) and graph.get("graph_schema_version") == 3:
+            matches.append((agent_name, graph))
+    if not matches:
+        return None
+
+    dialogues: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    skipped_non_dialogues = 0
+    for agent_name, graph in matches:
+        stages = {stage.get("id"): stage for stage in graph.get("runtime_stages", [])
+                  if isinstance(stage, Mapping) and stage.get("id")}
+        fields = ("id", "label", "summary", "core_belief", "node_kind", "topic_id", "source_kind")
+        for record in graph.get("stage_history", []):
+            if not isinstance(record, Mapping):
+                continue
+            if record.get("source") != "chat":
+                skipped_non_dialogues += 1
+                continue
+            before_id = record.get("from_node_id") or record.get("from_stage_id")
+            after_id = record.get("to_node_id") or record.get("to_stage_id")
+            before, after = stages.get(before_id), stages.get(after_id)
+            if before is None or after is None:
+                message = "V3 对话事件 {} 缺少节点 {} → {}".format(record.get("event_id", ""), before_id, after_id)
+                if strict:
+                    raise ExtractionError(message)
+                warnings.append(message)
+                continue
+            dialogues.append({
+                "order": len(dialogues) + 1,
+                "sim_time": str(record.get("timestamp", "") or ""),
+                "agent": agent_name,
+                "event_id": str(record.get("event_id", "") or ""),
+                "action": str(record.get("graph_action", "") or ""),
+                "committed": record.get("committed") is True,
+                "version_before": record.get("version_before"),
+                "version_after": record.get("version_after"),
+                "before_graph": {"current_stage": {k: before[k] for k in fields if k in before}, "candidate_stages": []},
+                "after_graph": {"current_stage": {k: after[k] for k in fields if k in after}, "candidate_stages": []},
+            })
+    return dialogues, warnings, skipped_non_dialogues, snapshot_path
+
+
 def main() -> int:
     args = parse_args()
     trace_path, checkpoint_dir = resolve_trace_path(args.archive)
     output_path = args.output or (checkpoint_dir / "judge_traces" / OUTPUT_FILENAME)
     dialogues, warnings, skipped_non_dialogues = extract(trace_path, args.strict)
+    v3_source = None
+    if not dialogues:
+        v3_result = extract_v3(checkpoint_dir, args.strict)
+        if v3_result is not None:
+            dialogues, warnings, skipped_non_dialogues, v3_source = v3_result
 
     payload = {
-        "schema_version": 1,
-        "source_trace": str(trace_path),
+        "schema_version": 2 if v3_source else 1,
+        "source_trace": str(trace_path) if not v3_source else None,
+        "source_checkpoint": str(v3_source) if v3_source else None,
+        "extraction_basis": "V3 stage_history; committed and version fields are authoritative" if v3_source else "legacy graph_transition trace",
         "dialogue_count": len(dialogues),
         "excluded_non_dialogue_transition_count": skipped_non_dialogues,
         "skipped_malformed_dialogue_count": len(warnings),

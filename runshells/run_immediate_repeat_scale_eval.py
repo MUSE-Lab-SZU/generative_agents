@@ -94,7 +94,7 @@ OUTPUT_GROUP = ""
 # agent.associate.embedding 从存档里的 Ollama 改为 vLLM/OpenAI-compatible。
 USE_VLLM_MODELS = False
 
-# 下面四项参照 runshells/vllm_services.sh。
+# 下面四项参照 runshells/services/vllm/vllm_services.sh。
 VLLM_THINK_MODEL = "qwen3-8b-vllm"
 VLLM_THINK_BASE_URL = "http://127.0.0.1:18000/v1"
 VLLM_EMBED_MODEL = "bge-m3-vllm"

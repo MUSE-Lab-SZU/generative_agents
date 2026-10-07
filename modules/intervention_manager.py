@@ -1209,7 +1209,7 @@ class InterventionManager:
         raw = intervention_cfg.get("current_session_context", {}) or {}
         if not isinstance(raw, dict):
             raw = {}
-        recent_exchanges = self._safe_int(raw.get("recent_exchange_count", 5), 5)
+        recent_exchanges = self._safe_int(raw.get("recent_exchange_count", 3), 3)
         summary_max_chars = self._safe_int(raw.get("summary_max_chars", 300), 300)
         return {
             "enabled": self._safe_bool(raw.get("enabled", False), False),
@@ -1402,7 +1402,7 @@ class InterventionManager:
 
         older_chats, recent_chats = split_recent_exchanges(
             items,
-            int(context_policy.get("recent_exchange_count", 5) or 5),
+            int(context_policy.get("recent_exchange_count", 3) or 3),
         )
         meeting_id = str((meeting or {}).get("meeting_id", "") or "") if isinstance(meeting, dict) else ""
         pair_key = build_pair_key(
@@ -9004,7 +9004,7 @@ class InterventionManager:
         )
         memory_block = ""
         if text:
-            memory_block = "<consult_history_memory>\n{}\n</consult_history_memory>".format(text)
+            memory_block = "<既往咨询摘要>\n{}\n</既往咨询摘要>".format(text)
         return {
             "prompt_text": str(prompt_text or ""),
             "summary_output": text,

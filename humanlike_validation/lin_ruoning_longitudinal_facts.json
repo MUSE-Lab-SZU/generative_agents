@@ -1,0 +1,17 @@
+{
+  "patient": "林若宁",
+  "scope": "已审阅的初始稳定病例事实；不将短期症状、PHQ 或治疗后的信念变化冻结。",
+  "facts": [
+    {"id": "F01", "kind": "stable", "topic": "identity", "fact": "林若宁在病例开始时为18岁。", "match_terms": ["岁", "年龄", "18"], "source": "agent_config", "pointer": "/scratch/age", "source_quote": 18},
+    {"id": "F02", "kind": "stable", "topic": "education", "fact": "林若宁在病例开始时仍上课，并有练习稿要整理；具体学籍和学校没有写明。", "match_terms": ["上课", "学生", "学校", "练习稿", "班级"], "source": "agent_config", "pointer": "/scratch/daily_plan", "source_quote": "上午上课，下午整理练习稿，傍晚去公园画速写。"},
+    {"id": "F04", "kind": "stable", "topic": "activity_habit", "fact": "绘画是林若宁持续的普通习惯，有时用它让自己慢下来。", "match_terms": ["画", "绘", "速写"], "source": "agent_config", "pointer": "/scratch/lifestyle", "source_quote": "在小镇里保持规律活动，绘画是能让自己慢下来的普通习惯。"},
+    {"id": "F05", "kind": "stable", "topic": "significant_event", "fact": "病例开始前，林若宁在校园关系中经历过误会。是否有具体同学、日期和责任方未写明。", "match_terms": ["误会", "校园", "同学", "同伴"], "source": "depression_config", "pointer": "/complaint_graph/root_complaint_anchor", "source_quote": "校园里的关系误会让她害怕被同伴排除，并把安静理解为自己不值得被接近。"},
+    {"id": "F06", "kind": "baseline_belief", "topic": "belief_history", "fact": "治疗起点，林若宁持有‘若我主动却没人回应，就说明我没有被喜欢的理由’的核心信念；这是基线设定，允许治疗中变化。", "match_terms": ["没人回应", "无人回应", "喜欢的理由", "不值得"], "source": "depression_config", "pointer": "/complaint_graph/stages/0/core_belief", "source_quote": "若我主动却没人回应，就说明我没有被喜欢的理由。"}
+  ],
+  "intentionally_not_frozen": [
+    "当前主诉强度、情绪向量、睡眠食欲、PHQ/BDI、治疗后信念和行动计划",
+    "亲属关系和长期住处：没有明确亲属设定；G4 runtime 将活动地址设为蜻蜓队长的心理咨询室，不能把该场所当成家庭住址",
+    "共病和既往医疗史：当前配置没有可核实的稳定条目",
+    "initial_dynamic_memories.json 中 provenance=authored_extension 的补充细节"
+  ]
+}

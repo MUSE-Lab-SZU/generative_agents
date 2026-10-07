@@ -1,12 +1,15 @@
 {
   "name": "赵明远",
-  "portrait": "assets/village/agents/卡布达2/portrait.png",
+  "portrait": "assets/village/agents/赵明远/portrait.png",
   "coord": [
     4,
     22
   ],
   "currently": "在书架前翻看旧账本，收到朋友邀约后没有回复。",
   "chat_iter": 4,
+  "external_memory": {
+    "user_id": "agent_zhao_mingyuan"
+  },
   "scratch": {
     "age": 60,
     "innate": "细腻、责任感强、会反复思量",

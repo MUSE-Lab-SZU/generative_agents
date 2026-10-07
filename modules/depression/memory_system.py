@@ -236,6 +236,10 @@ class DynamicMemorySystem:
             decision["blocked_signal"] = {"present": False}
         return decision
 
+    def allows_partner(self, other):
+        partners = self.config.get("trust_partners")
+        return partners is None or other in partners
+
     def trust_for(self, other):
         initial = self.config.get("initial_trust_by_partner", {}).get(
             other, self.config.get("initial_trust", 0.3))
@@ -261,7 +265,7 @@ class DynamicMemorySystem:
                     "trust": self.trust_for(other), "allowed_memories": [],
                     "blocked_ids": [], "blocked_signal": {"present": False},
                     "retrieval_error": False}
-        if not self.enabled or not query.strip() or not other or not self.records:
+        if not self.enabled or not self.allows_partner(other) or not query.strip() or not other or not self.records:
             return decision
         try:
             q = self._embedding(query, query=True)
@@ -410,6 +414,8 @@ class DynamicMemorySystem:
         if not turn_id:
             return False
         other = decision["other_agent"]
+        if other and not self.allows_partner(other):
+            return False
         decision = self.filter_decision(decision)
         event_id = kwargs.get("event_id")
         source_ids = list(kwargs.get("source_ids", []))
@@ -481,9 +487,22 @@ class DynamicMemorySystem:
             raise ValueError("Unsupported memory state schema")
         if payload.get("owner_id", self.owner_id) != self.owner_id:
             raise ValueError("Cannot restore another resident's dynamic memory")
-        self.complaint_sources = copy.deepcopy(payload.get("complaint_sources", {}))
-        for source in self.complaint_sources.values():
+        complaint_sources = copy.deepcopy(payload.get("complaint_sources", {}))
+        if not isinstance(complaint_sources, dict):
+            raise ValueError("Invalid complaint sources")
+        for identifier, source in complaint_sources.items():
+            if not isinstance(identifier, str) or not isinstance(source, dict):
+                raise ValueError("Invalid complaint source")
+            if not isinstance(source.get("stage_id"), str) or not isinstance(source.get("unit_id"), str):
+                raise ValueError("Invalid complaint source identity")
             source["disclosure_threshold"] = _score(source["disclosure_threshold"])
+            disclosed_to = source.get("disclosed_to", {})
+            if not isinstance(disclosed_to, dict):
+                raise ValueError("Invalid complaint disclosures")
+            for partner, timestamp in disclosed_to.items():
+                if not isinstance(partner, str) or not isinstance(timestamp, str):
+                    raise ValueError("Invalid complaint disclosure")
+                datetime.fromisoformat(timestamp)
         records = copy.deepcopy(self.records)
         if "records" in payload:
             if not isinstance(payload["records"], list):
@@ -521,6 +540,7 @@ class DynamicMemorySystem:
         policy = payload.get("allow_authored_extensions", True)
         if type(policy) is not bool:
             raise ValueError("Invalid extension policy")
+        self.complaint_sources = complaint_sources
         self.records, self.trust, self.committed_turns = records, trust, turns
         self.memory_context, self.public_node_ids = context, set(ids)
         self.allow_authored_extensions = policy

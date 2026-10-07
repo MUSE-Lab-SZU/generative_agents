@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from modules.model.state_transition_evidence_audit import (
+from humanlike_validation.state_transition_evidence_audit import (
     digest, parse_rating, prepare, read_json, score, summarize,
 )
 from runshells.run_psi_bench_eval import add_judge_arguments, load_judge_settings, make_judge_call

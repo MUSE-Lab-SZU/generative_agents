@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+
 from .generation_view import context_view, project, STYLE_KEYS, EXPRESSION_KEYS
 
 from typing import Any, Dict, List, Optional
@@ -78,7 +80,7 @@ class DynamicPromptBuilder:
             self._build_base_layer(base_prompt),
             (self._build_root_complaint_anchor_layer(root_complaint_anchor)
              if not current_stage.get("root_complaint_anchor") else ""),
-            self._build_stage_layer(current_stage, graph_snapshot),
+            self._build_stage_layer(current_stage, graph_snapshot, markdown_style=True),
             self._build_context_layer(session_context),
         ]
         if self.include_emotion_layer:
@@ -112,19 +114,20 @@ class DynamicPromptBuilder:
             ).strip()
         )
 
-    def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any]) -> str:
+    def _build_stage_layer(self, current_stage: Dict[str, Any], graph_snapshot: Dict[str, Any], markdown_style: bool = False) -> str:
         stage = current_stage if isinstance(current_stage, dict) else {}
         sections = ["=== 当前主诉节点层 ===", "【当前主诉阶段】"]
         sections.append("阶段名称：" + str(stage.get("label", stage.get("topic", "初始主诉"))))
         sections.append("阶段描述：" + str(stage.get("summary", "沿用病例背景，尚无经审核的新主诉阶段。")))
-        focus = stage.get("narrative_focus", [])
-        sections.append("当前主要关注点：" + ("；".join(focus) if focus else "沿用当前主要困扰"))
         sections.append("【近期相关经历】")
         from .generation_view import render_claim
         experiences = stage.get("recent_experiences")
         if experiences is None:
             experiences = [render_claim(c) for c in stage.get("current_claims", [])[:3]]
-        sections.extend(experiences or ["暂无与当前主诉直接相关的已接受经历。"])
+        sections.extend(
+            re.sub(r"^\s*相比\s+current_stage\s*[，,：:]?\s*", "", str(item), count=1)
+            for item in (experiences or ["暂无与当前主诉直接相关的已接受经历。"])
+        )
         sections.append("【稳定背景】")
         if stage.get("root_complaint_anchor"):
             sections.append("根主诉：" + stage["root_complaint_anchor"])
@@ -134,10 +137,15 @@ class DynamicPromptBuilder:
         if stage.get("core_belief"):
             sections.append("固定核心信念（不是本轮确信度）：" + str(stage["core_belief"]))
         sections.append("围绕当前阶段自然回应；原有困扰可与新变化共存。一次行动不等于稳定恢复，旧经历不自动表示现在仍成立。")
-        sections.append(
-            "表达风格："
-            + json.dumps(project(stage.get("speaking_style"), STYLE_KEYS), ensure_ascii=False)
-        )
+        style = project(stage.get("speaking_style"), STYLE_KEYS)
+        if markdown_style:
+            style_labels = {"tempo": "语速与节奏", "disclosure": "披露倾向",
+                            "tone": "语气", "repair_pattern": "自我修正方式"}
+            sections.append("表达风格：")
+            sections.extend("- " + style_labels[key] + "：" + str(style[key])
+                            for key in STYLE_KEYS if key in style)
+        else:
+            sections.append("表达风格：" + json.dumps(style, ensure_ascii=False))
         sections.append("表达提示：优先表现当前主诉阶段，相关经历只作有时间限定的补充。")
         return self._with_trailing_newline(
             render_prompt_section(

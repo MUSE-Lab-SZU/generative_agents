@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "persona": "林若宁",
+  "severity": "moderate",
+  "asset": "frontend/static/assets/village/agents/林若宁/agent.json",
+  "asset_hash": "631bb19a0a36558f842b7aefc3ac8b5a6a365f0e5cb509ad7701d7b84c246751",
+  "facts": [
+    {
+      "id": "age_18",
+      "type": "stable_identity",
+      "proposition": "林若宁在固定人设中为18岁。",
+      "source_pointer": "scratch.age",
+      "source_quote": "18"
+    },
+    {
+      "id": "attends_classes",
+      "type": "education",
+      "proposition": "林若宁在病例起点仍上课；原资产没有明确学校、学籍或专业。",
+      "source_pointer": "scratch.daily_plan",
+      "source_quote": "上课"
+    }
+  ],
+  "excluded": ["currently 中的即时协作消息", "scratch.learned 中的当前治疗目标", "scratch.daily_plan 的具体日程及练习稿安排", "scratch.lifestyle 中的绘画习惯"]
+}

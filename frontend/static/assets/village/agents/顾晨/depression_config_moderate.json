@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "顾晨",
   "complaint_graph": {
@@ -57,7 +57,24 @@
           }
         },
         "next_candidates": [],
-        "is_terminal_stage": false
+        "is_terminal_stage": false,
+        "disclosure_units": [
+          {
+            "id": "surface",
+            "content": "到了新校园以后，我有时不知道该怎么和别人熟起来。",
+            "disclosure_threshold": 0.3
+          },
+          {
+            "id": "avoidance",
+            "content": "想出门参加活动时，我会因为怕尴尬而拖很久。",
+            "disclosure_threshold": 0.45
+          },
+          {
+            "id": "core_belief",
+            "content": "如果我不能马上合群，我就会觉得自己哪里有问题。",
+            "disclosure_threshold": 0.7
+          }
+        ]
       }
     ]
   },
@@ -66,7 +83,19 @@
     "volatility_limit": 0.12
   },
   "memory": {
-    "enabled": false
+    "enabled": true,
+    "public_persona": "你是顾晨，18岁，小镇居民。细腻、有责任感，喜欢跑步。按当前情绪自然交谈。",
+    "initial_trust": 0.3,
+    "initial_trust_by_partner": {
+      "蜻蜓队长": 0.4
+    },
+    "min_similarity": 0.5,
+    "max_items": 4,
+    "max_context_chars": 2400,
+    "runtime_threshold": 0.8,
+    "initial_memories_file": "initial_dynamic_memories.json",
+    "trust_partners": ["蜻蜓队长"],
+    "allow_authored_extensions": true
   },
   "prompt": {
     "include_graph_window": true,

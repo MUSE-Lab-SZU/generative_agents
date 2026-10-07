@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "enabled": true,
   "name": "赵明远",
   "complaint_graph": {
@@ -57,7 +57,24 @@
           }
         },
         "next_candidates": [],
-        "is_terminal_stage": false
+        "is_terminal_stage": false,
+        "disclosure_units": [
+          {
+            "id": "surface",
+            "content": "退休以后日子安静了不少，我有时不知道该怎么和朋友保持联系。",
+            "disclosure_threshold": 0.3
+          },
+          {
+            "id": "avoidance",
+            "content": "收到朋友邀约后，我常拖着不回复，后来又更不好意思联系。",
+            "disclosure_threshold": 0.45
+          },
+          {
+            "id": "core_belief",
+            "content": "没有原来的位置和用处，我就会觉得不该再打扰别人。",
+            "disclosure_threshold": 0.7
+          }
+        ]
       }
     ]
   },
@@ -66,7 +83,19 @@
     "volatility_limit": 0.12
   },
   "memory": {
-    "enabled": false
+    "enabled": true,
+    "public_persona": "你是赵明远，60岁，小镇居民。细腻、有责任感，喜欢阅读和散步。按当前情绪自然交谈。",
+    "initial_trust": 0.3,
+    "initial_trust_by_partner": {
+      "蜻蜓队长": 0.4
+    },
+    "min_similarity": 0.5,
+    "max_items": 4,
+    "max_context_chars": 2400,
+    "runtime_threshold": 0.8,
+    "initial_memories_file": "initial_dynamic_memories.json",
+    "trust_partners": ["蜻蜓队长"],
+    "allow_authored_extensions": true
   },
   "prompt": {
     "include_graph_window": true,

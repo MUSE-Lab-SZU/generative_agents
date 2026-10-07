@@ -1,12 +1,15 @@
 {
   "name": "许芳华",
-  "portrait": "assets/village/agents/卡布达2/portrait.png",
+  "portrait": "assets/village/agents/许芳华/portrait.png",
   "coord": [
     20,
     7
   ],
   "currently": "给阳台的花浇水后站在窗边，想去公园又临时改了主意。",
   "chat_iter": 4,
+  "external_memory": {
+    "user_id": "agent_xu_fanghua"
+  },
   "scratch": {
     "age": 66,
     "innate": "细腻、责任感强、会反复思量",

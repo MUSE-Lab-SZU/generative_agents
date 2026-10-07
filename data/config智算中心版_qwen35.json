@@ -427,7 +427,7 @@
     },
     "current_session_context": {
       "enabled": true,
-      "recent_exchange_count": 5,
+      "recent_exchange_count": 3,
       "summary_route": "think_llm",
       "summary_prompt_file": "data/prompts/intervention/current_session_context_summary.txt",
       "summary_retry": 2,

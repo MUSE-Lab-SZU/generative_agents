@@ -1,6 +1,6 @@
 # 基于斯坦福小镇的抑郁症干预仿真系统 GenerativeAgentsCN
 
-> 更新时间：2026-09-10
+> 更新时间：2026-10-07
 
 ## 关键测试结果速查
 
@@ -28,6 +28,19 @@
 ## 更新日志（近期）
 
 以下为 README 内维护的近期更新摘要：
+
+- 2026-10-07：新增 PatientSim 风格的纵向病例事实一致性评估：以患者陈述为原子样本，对照冻结病例事实及既往陈述，区分有依据、合理延伸、无依据和矛盾，并汇总跨会话、跨场景指标；配套 0929 林若宁八组 × 五次重复批处理、来源审计覆盖及事实目录。
+- 2026-10-07：新增静态人设恢复 v6 离线评估，覆盖林若宁 G1/G4/G7 的 5 次重复、每次 12 个完整会谈，聚焦核心信念与主诉根源锚点，并要求原文证据；另新增心理状态表达审计，核对 V3 会谈前状态是否在患者后续发言中得到表达，并验证引文与负向对照。
+- 2026-10-07：重构 PSI/Emotion 评估的可复用提示、患者轮次合并和 JS 距离分析；新增 0929 的 PTC/Emotion 聚类比较，按重复/会话层级进行 bootstrap，比较 G1/G4/G7 与 ESC 真人、PatientPSI、RoleplayDoh。扩展本地 Qwen 与 embedding 默认端点轮询池，并补充相关运行脚本和文档索引。
+- 2026-10-07：新增 LRN 0929 八组 × 五次独立外层运行报告绘图工作流，固定输出五张核心图，并在 manifest 中说明统计口径及未生成的冗余图表；补充 PatientHub 参考实现与评估资料。
+- 2026-09-29：收窄动态记忆的信任作用范围：八位居民的人设配置将 `蜻蜓队长` 设为 `trust_partners`，非信任对象不接收历史记忆/话题边界提示，也不写入对话摘要记忆或更新信任；其普通社交记录仍保留。对话提示中的暂缓话题改为中文说明，不再暴露内部 JSON 状态。`data/config.json` 关闭统一的 chat/thought/event 记忆写入拦截，并将 `focus_retrieve_max` 从 10 降至 7。
+- 2026-09-29：主诉图对话提取脚本在旧 trace 无结果时支持从 V3 checkpoint 的 `stage_history` 导出，并保留提交状态与版本字段；Change Detector 提示词要求直接描述患者理解、体验或应对的变化。新增 0928 绘图脚本，为 LRN/SQL × G1/G2/G5/G9 输出五张核心图、CSV 和图表选择 manifest，明确快照内重复的统计边界及未生成图表；新增按日期归档 `results/` 内容的工具，遇到目标冲突会停止移动。
+- 2026-09-29：将当前主诉阶段接入信任门控记忆披露：阶段可定义带阈值的 disclosure units，运行时按互动对象的信任分数和上下文额度选择性披露，并将披露来源写入记忆状态供后续追溯；模型生成阶段的披露阈值强制为 1。同步调整患者提示的 Markdown 表达风格，要求主诉变化直接描述患者的理解、体验或应对，不输出字段名或模板式比较语句。
+- 2026-09-29：为八位居民新增并启用标准及 moderate 抑郁配置、分阶段披露单元和个性化初始动态记忆，同时补齐各自 portrait/texture 资源与 external-memory 身份。`kabuda_variant_runtime` 会为变体准备并校验初始记忆文件。默认 `data/config.json` 扩展 Qwen 与 embedding 端点轮询池；三套运行配置的当前会话上下文窗口由 5 轮调整为 3 轮。
+- 2026-09-28：新增 Session × Domain 主诉图证据审计，按咨询内与咨询间窗口核对图节点变化和患者可观察材料，覆盖自我价值、心境、睡眠、食欲、精力、注意力、日常功能及回避/社会参与八个领域。证据评审与图节点编码分开执行，校验引用原文，并汇总方向一致率、加权 κ、支持度和不可判读项；提供单 checkpoint 运行、断点续跑及对应测试。
+- 2026-09-28：Static Profile Recovery 扩展为四字段评估，新增长期生活方式；过滤被误作长期背景的当前目标，并优先抽取相同严重程度、来源 persona 互不重复的干扰项，输出目录版本升至 v5。PTC/Emotion 对比改为单 checkpoint 输入，以 Eeyore Profile 汇总的 ESC、HOPE、AnnoMI 真实对话池作为基线，并保留 PSI-Bench 的 patientpsi/roleplaydoh 合成组；新增本地语料链接。
+- 2026-09-28：按用途重组项目文档与脚本目录。方法材料迁入 `docs/03_汇报与论文/town_method/`，类人验证说明归入 `docs/02_实验分析与评估/类人验证/`；新增 `docs/README.md`、`runshells/README.md` 作为分类索引。服务、仿真、类人验证、维护和历史 shell 分别归档到 `runshells/` 对应子目录，并更新忽略规则与历史文档中的脚本路径。
+- 2026-09-28：将 PSI-Bench、Static Profile Recovery 和状态转移证据审计实现从 `modules/model/` 移至独立的 `humanlike_validation/`，同步调整 Python 入口、测试导入和项目上下文索引。Docker 镜像改为递归设置嵌套 shell 脚本执行权限；实验绘图默认文档输出路径更新至新的评估文档目录。
 - 2026-09-24：新增主诉图状态变化证据审计，对完整结束的 V3 checkpoint 逐项提取 chat/reflection 决策，证据盲审只使用可回溯的患者原话与受限近期行为记录，另行编码更新前后节点语义，并校验逐字引文。输出逐项 JSONL、指标汇总和可续跑 manifest，报告方向一致率、加权 κ、未获充分支持的状态变化率及引文覆盖率。单份 0922 模拟存档审计覆盖 216 次决策、99 次已提交变化，其中 6 次获支持；66 次证据不足，不能据此当作明确矛盾或推广到其他实验。
 - 2026-09-24：新增逐轮 PTC/Emotion 对比脚本，将本项目中文咨询会话与 ESConv、AnnoMI、PSI-Bench PsyCoPref 中的 patientpsi/roleplaydoh 会话按患者轮数匹配抽样，沿用同一 PTC/Emotion 标签体系与 Judge 流程并计算轮级 Jensen–Shannon 距离，输出逐轮结果、汇总、图表和输入指纹；补充 AnnoMI、Emotional-Support-Conversation、PsyCoPref 外部语料目录链接及审计实现/汇报文档和回归测试。
 - 2026-09-23：主诉图切换为 V2.5 阶段流程：Change Detector 提出相对当前阶段的最小变化，Stage Planner 只生成承接父阶段主轴的 label/summary，Stage Validator 独立核验原话变化与候选阶段忠实度；三步调用顺序、完整输入及结果进入 trace，只有三步均成功且两项核验通过才提交。患者生成视图改以受审阶段和最多三条已验证经历为依据；会后反思按洞察、计划、记忆想法标记为 reflection 来源，并对重复触发和 checkpoint 消息引用做一致性处理。同步更新 V2.5 只读 trace 审查和回归测试。
@@ -44,7 +57,7 @@
 - 2026-09-17：重构卡布达可选的信任门控动态记忆（默认及 mild/moderate/severe 人设仍保持关闭）：主诉图 v3 的病例事实与患者生成视图始终独立于 memory，信任仅过滤单独的非权威历史记忆层，检索异常自动降级为空，不改变 v3 语义。图事件完成后才提交记忆副作用；记忆失败会记录审计并标记状态，但不阻断已接受话语或主诉图推进。`authored_extension` 默认不披露，旧 checkpoint 缺字段按历史策略恢复，checkpoint 优先于磁盘镜像；向量可重建。三套默认配置现开启 `agent.memory_write_control`：空 target/type 阻断全部运行时 chat/thought/event 写入（persona seed 不受影响），可显式配置放开。
 - 2026-09-17：压缩主诉图 v3 checkpoint：事件结果保留规范化 Code Result 并以引用复用，移除 state machine、engine 与 trace 中的累计重复快照；兼容旧 checkpoint 与旧审计读取，恢复时校验版本和引用一致性并拒绝损坏数据。新增离线存储基准脚本和回归测试，用于比较旧/新 checkpoint 体积及图、trace 语义摘要。
 - 2026-09-17：新增 0915 六实体（LRN-G1/G2/G5、SQL-G1、TW-G1、ZYH-G1）报告导向绘图脚本，固定输出人格组别箱线图、长/短量表稳定性、条目变化和双轴轨迹 5 组核心图，以及可复核的 CSV、manifest 与说明；单次重复运行，不生成不具解释价值的组内 ICC。
-- 2026-09-15：默认 think-LLM 切换为 `qwen3.5-9b-vllm`，新增 `runshells/vllm_services_plat智算中心版_qwen35.sh` 与两卡配置 `data/config智算中心版_qwen35_2gpu.json`：默认在 GPU 0 部署一个 Qwen3.5、GPU 1 部署一个 BGE-M3，按独立 PID/日志管理启动、停止、重启、状态和配置打印，模型、GPU、端口和并行方式均可由环境变量覆盖。Qwen 服务固定为 BF16、文本仅语言组件、16K 上下文／4 并发、禁用前缀缓存及默认关闭思考；专用配置只改模型与单端口池，保留原业务参数，并配套启动后预检和恢复说明。
+- 2026-09-15：默认 think-LLM 切换为 `qwen3.5-9b-vllm`，新增 `runshells/services/vllm/vllm_services_plat智算中心版_qwen35.sh` 与两卡配置 `data/config智算中心版_qwen35_2gpu.json`：默认在 GPU 0 部署一个 Qwen3.5、GPU 1 部署一个 BGE-M3，按独立 PID/日志管理启动、停止、重启、状态和配置打印，模型、GPU、端口和并行方式均可由环境变量覆盖。Qwen 服务固定为 BF16、文本仅语言组件、16K 上下文／4 并发、禁用前缀缓存及默认关闭思考；专用配置只改模型与单端口池，保留原业务参数，并配套启动后预检和恢复说明。
 - 2026-09-15：完善主诉图 v3 的事实投影边界：患者与 Emotion 视图除当前 topic 外纳入仍在持续的跨 topic 有效 claim，同时保持其原始报告时间与“此前报告”语义；Commit Validator 对配置型 persona fragment 仅接收被选中类型化 claim 的最小投影，不再暴露整段原始配置或未选/unknown 内容，患者原话来源仍保留完整审计文本。
 - 2026-09-15：将主诉图 v3 的 LLM 推进重构为封闭三段式管线：Observation Detector 只从完整患者原话提取未验证 observations，Minimal Planner 只提交一个最小 claim diff，Commit Validator 独立逐项核对来源、新颖性、主体/否定/时间、基线可比性、当前修订、topic 准入与整包原子性。仅明确的评价、实际行为、可比症状/功能变化、焦点转移或实质纠正可建点；计划、互动、细节补充、同义重述及独立变化拼包均拒绝或保留为 observation。v3 保留审计级 trace 与 consumed-update 防重，旧分支式 Prompt 迁入 legacy 资产以维持兼容。
 - 2026-09-15：新增 `scripts/replay_complaint_graph_v3_phase2.py`，可对固定语料和多轮反馈分别回放 legacy 与 v3 管线，逐事件保存完整 trace、输入前态和人工审计槽位；仅在模型可用时运行，报告明确禁止以 advance 率推断疗效或漂移改善，须人工核对不支持断言、抽象扩写、同义节点、类型/时间错误和误拒绝。
@@ -141,7 +154,7 @@
 - 2026-08-08：调整 `runshells/run_batch_then_repeat_eval.sh --followup` 流程：无干预回访与原仿真 repeat eval 并行执行，回访完成后再以独立名称、报告和日志运行回访节点复评；dry-run 输出同步展示并行关系，避免两阶段产物互相覆盖。
 - 2026-08-08：增强 `runshells/run_resume_batch_then_repeat_eval.sh` 的恢复能力：原仿真和回访复评均使用独立源 summary 与标签，已完整报告自动跳过，未完成报告通过 `--resume-partial` 续跑；脚本会等待并校验回访 summary，复评失败时终止关联回访任务并保留对应错误日志。
 - 2026-08-08：为 OpenAI 兼容的对话与 embedding 模型新增进程内 round-robin 端点池。`load_balancing.ports` 复用既有 `base_url` 的协议、主机和 API 路径，仅轮换端口；对话请求会选择独立 OpenAI client，LlamaIndex embedding 同步/异步请求亦通过独立 client 池轮换，避免并发请求改写彼此端点。默认配置现启用 3 个 Qwen 与 3 个 BGE 端口。
-- 2026-08-08：新增 `runshells/vllm_services_plat.sh`，支持远程智算平台按 GPU/端口列表启动、停止和查看多实例 vLLM 服务；可在 3 张卡各运行一个 Qwen，并在第 4 张卡上运行 3 个 BGE 副本且自动降低同卡显存占用。`docs/RUNBOOK.md` 补充对应启动命令与六端点预检流程。
+- 2026-08-08：新增 `runshells/services/vllm/vllm_services_plat.sh`，支持远程智算平台按 GPU/端口列表启动、停止和查看多实例 vLLM 服务；可在 3 张卡各运行一个 Qwen，并在第 4 张卡上运行 3 个 BGE 副本且自动降低同卡显存占用。`docs/RUNBOOK.md` 补充对应启动命令与六端点预检流程。
 - 2026-08-08：新增默认启用、可配置的 `simulation_events.jsonl` 仿真可观测日志（schema `simulation_events_v1`）：每步记录各 Agent 的位置、活动/行动、会谈标识和规划路径长度，并在对话完成后记录双方、物理地点、时间及强制会谈元数据。记录采用只追加、best-effort 写入，故障仅告警而不参与 LLM 调用或仿真控制；事件日志会随单次实验收集，并由 `experiment_eval.prune_archive` 保留在评估归档中。
 - 2026-08-08：收紧 Progressive D 会后小目标完成审计的默认达标比例，由 60% 提升至 80%；同时将对应评估 Prompt 的角色名称泛化为“会后小目标评估器”。
 - 2026-08-06：扩展量表可靠性评估：`experiment_eval` 在既有总分 ICC 之外新增 PHQ-9/BDI-II 0–3 有序条目的 repeat-pair Weighted Cohen’s Kappa（quadratic 为主、linear 为敏感性分析），严格以 `snapshot_id × scale × item` 配对；输出可追溯条目长表、总体/分层/逐条目 CSV、统计说明和 Kappa 热图/forest 图，并在加载阶段校验各 repeat 的条目数一致。
@@ -177,7 +190,7 @@
 - 2026-07-19：新增稀疏 checkpoint 安全恢复流水线：通过精确 batch state 定位原 run，从最新通过 runtime/storage bundle、SHA-256、文件集合和 trace sidecar 校验的 staged-eval 时间点回退，恢复前检查活跃进程、LLM/embedding 服务与必需密钥，并将较新 live 产物备份到 `results/recovery_backups/`；批量续跑现按目标总步数扣除已完成步数，达标时直接跳过，且可用新脚本 dry-run、并行恢复多个重复实验，再衔接原 summary 后处理和支持断点续跑的存档重复量表复评。
 - 2026-07-19：补强实验运行可观测性与本机服务默认配置：`depression_dynamic` 内部 LLM 正常调用会在 debug 日志中记录完整 prompt/response，便于追溯动态主诉链路。
 - 2026-07-19：统一增强 LLM、Ollama、embedding 与重复量表评分 worker 的失败诊断：错误日志新增调用方、阶段、模型、脱敏 endpoint、重试次数、耗时、异常分类、HTTP 状态/request ID 和有限 cause chain，区分限流/并发、鉴权、超时、连接、服务端及输出解析错误；日志会移除 URL 凭据、查询参数、API key、Authorization 和提示词/回答正文，同时保持原有重试、failsafe、最终抛错或空检索结果语义，并新增对应回归测试。
-- 2026-07-19：新增仅管理 Qwen chat 的多卡张量并行脚本 `runshells/vllm_chat_tp.sh`，可在不影响既有 embedding 服务的情况下执行 `start/stop/restart/status/logs/print-config`，支持 GPU、并行度、显存利用率、上下文长度等环境变量覆盖，并提供逐卡显存预检、PID 归属校验、端口冲突检测、API 健康检查和启动超时诊断；`docs/RUNBOOK.md`同步补充部署示例与显存说明。
+- 2026-07-19：新增仅管理 Qwen chat 的多卡张量并行脚本 `runshells/services/vllm/vllm_chat_tp.sh`，可在不影响既有 embedding 服务的情况下执行 `start/stop/restart/status/logs/print-config`，支持 GPU、并行度、显存利用率、上下文长度等环境变量覆盖，并提供逐卡显存预检、PID 归属校验、端口冲突检测、API 健康检查和启动超时诊断；`docs/RUNBOOK.md`同步补充部署示例与显存说明。
 - 2026-07-19：修正批量评估轨迹的基线语义：`delta_from_baseline`只使用具有有效量表分数的 T0，T0 仅快照而未评分时不再把后续首个评估点误当基线；同时将“批量仿真→重复复评”脚本的日期、KBD、居民聊天组和严重程度提取为统一参数并据此生成 condition、任务名和日志名，减少切换实验组合时的漏改风险。
 - 2026-07-18：新增严格的分阶段评估时间点快照：`staged_eval.execution_mode`默认改为`capture_only`，在 T0、session 等触发点冻结当时的完整本地 storage、runtime config 与对话上下文并生成带 SHA-256、文件数和大小校验的 snapshot bundle，不再在仿真过程中启动量表 worker；存档重复复评会校验 bundle 路径、清单、内容摘要及文件集合，拒绝损坏快照、外置记忆读取和默认复用最终 storage，旧存档仅可通过`--allow-legacy-final-storage`显式降级并在 JSON/Markdown 报告中标记为未验证，同时批量汇总会区分“仅快照”与“已执行评估”。
 - 2026-07-18：重构存档与即时重复量表复评：对每个 agent×评估点固定执行 K 次完整 PHQ-9 / BDI-II（默认 K=10），仅在 K 次结果齐全时生成主结果；每次评估区分“评分 LLM 自报总分”“LLM 条目分之和”和“患者明确且无歧义的 0-3 分回答覆盖冲突条目后的复核总分”，主分采用 K 次复核总分均值。评分 JSON 会严格拒绝非整数、重复、缺失、错序或错号条目；报告继续提供样本 SD、t 分布 95% CI、类别分布/翻转、首轮与中位数等敏感性分析以及 ICC(1,1)/ICC(1,K)，不恢复不稳定条目自适应补跑及投票重构主分逻辑。
@@ -189,7 +202,7 @@
 - 2026-07-12：修复回访对话未正确计入staged_eval计数问题。
 - 2026-07-10：合并学长更新
 - 2026-07-08：增强 Docker 镜像对 Ollama/Clash 一体化运行的支持：`docker/Dockerfile.txt`默认镜像标签改为`generative-agents-cn-vllm-ollama`，支持 Linux host proxy 构建、Miniconda/conda 清华镜像下载、可选安装 Mihomo/Clash 和 Ollama，并新增`/workspace/ollama-models`、`/workspace/clash`、`.ollama/.clash`日志目录及`7890/9090/11434`端口暴露；`docker/Dockerfile-0708.txt`保留原vLLM镜像模板快照便于回退对照。
-- 2026-07-08：新增 Ollama 与 Clash/Mihomo 服务脚本：`runshells/ollama_services.sh`可从`data/config.json`读取chat/embedding模型和端口，支持`start/stop/restart/status/print-config`、GPU绑定、模型预加载和本地OpenAI兼容端点提示；`runshells/download_ollama_models.sh`可按配置拉取Ollama模型并支持`PROXY_URL`；`runshells/clash_services.sh`可启动代理、下载订阅配置、输出代理环境变量，并串联`download-ollama`下载模型。
+- 2026-07-08：新增 Ollama 与 Clash/Mihomo 服务脚本：`runshells/services/ollama/ollama_services.sh`可从`data/config.json`读取chat/embedding模型和端口，支持`start/stop/restart/status/print-config`、GPU绑定、模型预加载和本地OpenAI兼容端点提示；`runshells/services/ollama/download_ollama_models.sh`可按配置拉取Ollama模型并支持`PROXY_URL`；`runshells/services/network/clash_services.sh`可启动代理、下载订阅配置、输出代理环境变量，并串联`download-ollama`下载模型。
 - 2026-07-08：新增未完成实验的即时重复量表复评入口：`runshells/run_immediate_repeat_scale_eval.py`可基于指定checkpoint的最新`simulate-*.json`和`storage/`即时生成`NOW`评估点，刷新runtime_config中的本地记忆索引，自动合成缺失的原始summary，并委托`run_archived_repeat_scale_eval.py`执行重复量表、稳定性补跑和报告汇总；支持`--labels auto`、`--include-now`、`--report-only`、`--reset-target-depression-state`、`--output-group`和`--use-vllm-models`。
 - 2026-07-07：新增 CBT prompt 完成后的固定回访提示词会谈：`session_prompt_injection.post_treatment_followup` 默认启用并使用 `data/prompts/intervention/post_treatment_followup.txt`；这些会谈仍由强制医患咨询触发，只是不再推进新的 session prompt，因此属于治疗后固定提示词观察阶段，不是真正的无干预延迟随访。
 - 2026-07-07：补齐会谈完成计数状态：`modules/intervention_manager.py`新增`completed_meeting_state`，在强制医患会谈闭环时按医患pair记录完成次数、meeting_id和结束时间；`modules/staged_eval_manager.py`新增`intervention_completed_meeting`计数来源，使阶段评估在缺少咨询历史或跳过部分会后产物时仍能基于真实完成会谈数触发。
@@ -226,13 +239,13 @@
 - 2026-06-28：同步下调卡布达2/卡布达3运行时聊天轮数：`frontend/static/assets/village/agents/卡布达2/agent.json`和`卡布达3/agent.json`的`chat_iter`从18改为4，和当前较短对话实验节奏保持一致。
 - 2026-06-27：修复判断LLM读取“上次会话后评估结论”时跨阶段串用的问题：`modules/intervention_manager.py`会记录并校验`current_session`，只有同一阶段才复用历史评估结论；新阶段会显式注入“当前阶段刚开始/第一次对话”的状态说明，避免上一阶段结论被误判为当前阶段已完成步骤。
 - 2026-06-27：调整批量实验收尾逻辑：`runshells/run_batch_experiment.py`默认并行数改回1；`POST`评估排序固定放到最后；外置记忆审计失败时不再中断整个condition，而是记录`external_memory_audit_optional_failed`状态并继续保留前面实验结果。
-- 2026-06-27：更新容器/数据盘同步脚本：`runshells/sync_project_from_disk.sh`默认不删除目标目录额外文件，只有设置`PROJECT_SYNC_DELETE=1`才做严格镜像；新增`runshells/sync_results_to_disk_loop.sh`，可按固定间隔把容器内`results/`持续同步到数据盘，支持`RESULTS_SYNC_INTERVAL`、`RESULTS_SYNC_ONCE`、`RESULTS_SYNC_DRY_RUN`和`RESULTS_SYNC_DELETE`。
-- 2026-06-27：调整vLLM默认资源配置：`runshells/vllm_services.sh`默认将embedding服务放到GPU 1，Qwen和embedding的显存利用率默认均为0.90，并将Qwen默认上下文长度提升到32768；同时新增`data/prompts/intervention/dialog_judge-0627备份.txt`保存判断LLM提示词备份。
+- 2026-06-27：更新容器/数据盘同步脚本：`runshells/maintenance/sync_project_from_disk.sh`默认不删除目标目录额外文件，只有设置`PROJECT_SYNC_DELETE=1`才做严格镜像；新增`runshells/maintenance/sync_results_to_disk_loop.sh`，可按固定间隔把容器内`results/`持续同步到数据盘，支持`RESULTS_SYNC_INTERVAL`、`RESULTS_SYNC_ONCE`、`RESULTS_SYNC_DRY_RUN`和`RESULTS_SYNC_DELETE`。
+- 2026-06-27：调整vLLM默认资源配置：`runshells/services/vllm/vllm_services.sh`默认将embedding服务放到GPU 1，Qwen和embedding的显存利用率默认均为0.90，并将Qwen默认上下文长度提升到32768；同时新增`data/prompts/intervention/dialog_judge-0627备份.txt`保存判断LLM提示词备份。
 - 2026-06-22：新增卡布达 variant 批量替换能力：`runshells/run_batch_experiment.py`的condition扩展为`Counsel-KBD1/KBD2/KBD3-Gx-SEV`格式，并支持`Counsel-ALL-G1-MILD`等通配选择；新增`runshells/kabuda_variant_runtime.py`按condition生成归一化运行时人设文件，运行时目标名仍保持`卡布达`，同时新增`memory_injections_kabuda2.json`和`memory_injections_kabuda3.json`匹配“被比较”“社交误会”两套压力源，并修复resume/post-scale读取checkpoint时覆盖自定义`config_path`的问题。
 - 2026-06-22：调整实验默认节奏与检索开销：`data/config.json`中将`chat_iter`降为3，chat记忆检索改为`direct`模式且`similarity_top_k`降为3，医患历史读取和focus检索数量下调；定期医患对话间隔从14步改为6步、单次持续时间改为2881分钟，普通居民聊天最小间隔改为2880分钟。
 - 2026-06-22：同步调整随机居民聊天实验组配置：`g3_random_resident_chat.json`和`g5_negative_resident_chat.json`的触发间隔从14步改为6步，便于在较短实验步数内完成更多对话触发与阶段评估观察。
 - 2026-06-22：增强批量实验脚本`runshells/run_batch_experiment.py`：默认仿真步数改为120，`--condition`支持重复传入并自动去重，可配合`--max-parallel`并行运行多个实验条件；新增`BATCH_EMBEDDING_BASE_URLS`配置，运行时按并行槽位把不同condition的embedding请求分流到多个BGE endpoint。
-- 2026-06-22：升级分阶段vLLM启动脚本`runshells/vllm_services_staged.sh`：默认将Qwen部署在GPU 0-1，将两个BGE-M3 embedding endpoint分别部署在GPU 2和GPU 3，新增`EMBED2_*`、`ENABLE_SECOND_EMBED`等配置，并补齐双embedding服务的启动、等待、状态、日志和停止逻辑。
+- 2026-06-22：升级分阶段vLLM启动脚本`runshells/services/vllm/vllm_services_staged.sh`：默认将Qwen部署在GPU 0-1，将两个BGE-M3 embedding endpoint分别部署在GPU 2和GPU 3，新增`EMBED2_*`、`ENABLE_SECOND_EMBED`等配置，并补齐双embedding服务的启动、等待、状态、日志和停止逻辑。
 - 2026-06-22：优化本地记忆检索与对话控制：`modules/memory/associate.py`在无event/thought节点时直接返回，并按`retrieve_max`限制候选召回规模，避免每次全量检索；`modules/agent.py`修复聊天反思证据收集未记录已处理对象的问题，并让强制对话轮数预算至少为1，减少异常配置造成的轮数边界问题。
 - 2026-06-17：合并学长关于动态抑郁人设的更新
 - 2026-06-17：新增`runshells/recover_staged_eval_scores.py`脚本，作用是给中断实验的staged_eval补上score评分以及report，避免之前的实验浪费。
@@ -248,7 +261,7 @@
 - 2026-06-09：新增实验脚本`runshells/run_batch_experiment.py`功能：显示运行时间和防磁盘空间不足。修改`config.json`的"max_completed_sessions"配置值，避免staged_eval只有3个的情况。
 - 2026-06-08：修复`staged_eval`在G1组触发失败的bug，触发原因是0603的判断条件修改
 - 2026-06-07：优化`experiments/config/groups`配置、修复`runshells/run_batch_experiment.py`中断时可能导致`config.json`文件错乱问题
-- 2026-06-07：新增vllm部署相关脚本，使用`bash runshells/vllm_services.sh start`命令启动vllm，使用`bash runshells/stop_vllm_services.sh`命令关闭vllm，同时修改了`config.json`和相关llm调用函数，新增`test/live_vllm_preflight.py`运行前vllm健康检查脚本
+- 2026-06-07：新增vllm部署相关脚本，使用`bash runshells/services/vllm/vllm_services.sh start`命令启动vllm，使用`bash runshells/services/vllm/stop_vllm_services.sh`命令关闭vllm，同时修改了`config.json`和相关llm调用函数，新增`test/live_vllm_preflight.py`运行前vllm健康检查脚本
 - 2026-06-05：新增运行前ollama健康检查脚本`test/live_ollama_preflight.py`。新增embedding请求超时机制，之前只设置了chat-llm请求超时。
 - 2026-06-04：修改`staged_eval`的实施逻辑，从仿真内改成外挂子进程，避免影响仿真实验的内部状态
 - 2026-06-03：修改`staged_eval`的判断条件，统一为对话次数。
@@ -415,17 +428,17 @@ data/config.json
 
 ## 2. 代码目录结构
 
-| 路径          | 说明                                                              |
-| ------------- | ----------------------------------------------------------------- |
-| `start.py`    | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
-| `compress.py` | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
-| `replay.py`   | 回放 Web 服务入口（Flask）                                        |
-| `runshells/`  | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
-| `experiments/`| 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9/g10/g11/g12）      |
-| `modules/`    | 核心逻辑模块（agent、intervention、memory、depression 等）        |
-| `data/`       | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
-| `frontend/`   | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
-| `results/`    | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
+| 路径           | 说明                                                              |
+| -------------- | ----------------------------------------------------------------- |
+| `start.py`     | 仿真主入口（按 step 推进，写 checkpoint 与对话日志）              |
+| `compress.py`  | 将 checkpoint 压缩为回放数据（`movement.json`、`simulation.md`）  |
+| `replay.py`    | 回放 Web 服务入口（Flask）                                        |
+| `runshells/`   | 单次实验、批量实验、量表补跑与结果后处理脚本                      |
+| `experiments/` | 分组实验 overlay 配置（如 g1/g2/g3/g5/g6/g7/g9/g10/g11/g12）      |
+| `modules/`     | 核心逻辑模块（agent、intervention、memory、depression 等）        |
+| `data/`        | 配置与提示词（`data/config.json`、`data/prompts/...`）            |
+| `frontend/`    | 回放前端资源与静态资产、动态抑郁人设`depression_config.json`      |
+| `results/`     | 仿真输出目录（`checkpoints/`、`experiment_data/`、`compressed/`） |
 
 ## 3. 快速使用说明
 
@@ -767,16 +780,16 @@ flowchart TD
 
 #### 5.3.1 强制对话里的 LLM 分工速查
 
-| 环节                                  | 主要模型路由                                                      | 主要输入                                                                                                             | 主要输出 / 作用                           |
-| ------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 患者状态摘要                          | 医生侧 `think.llm`                                                | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                             | 给 judge 用的 `patient_state_summary`     |
-| 会话中判断 `dialog_judge`             | `forced_llm`                                                      | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                               | `terminate`、`advice`                     |
-| 医患历史摘要 `consult_history`        | gate 与默认 summary 均走本地 `think.llm`；可显式设为 `forced_llm` 兼容旧配置 | 最新一轮对方发言、当前对话历史、Top-K 命中的 `chat_summary`（仅缺失项附受限 transcript 片段） | `consult_history_memory`                  |
-| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm` | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
-| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm` | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                              | 患者自然语言回复                          |
-| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                     | 当前对话历史、当前轮回复                                                                                             | 是否出现复读，用于提前结束                |
-| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`           | 当前对话历史                                                                                                         | 是否结束对话                              |
-| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`         | session prompt、历史 eval reason、usage log、完整对话                                                                | `efficacy_score`、`session_end`、`reason` |
+| 环节                                  | 主要模型路由                                                                 | 主要输入                                                                                                                                       | 主要输出 / 作用                           |
+| ------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 患者状态摘要                          | 医生侧 `think.llm`                                                           | 患者最近一次 `generate_chat` Prompt 缓存中的动态状态文本                                                                                       | 给 judge 用的 `patient_state_summary`     |
+| 会话中判断 `dialog_judge`             | `forced_llm`                                                                 | `patient_state_summary`、当前对话历史、当前 session prompt、上一次 session eval reason                                                         | `terminate`、`advice`                     |
+| 医患历史摘要 `consult_history`        | gate 与默认 summary 均走本地 `think.llm`；可显式设为 `forced_llm` 兼容旧配置 | 最新一轮对方发言、当前对话历史、Top-K 命中的 `chat_summary`（仅缺失项附受限 transcript 片段）                                                  | `consult_history_memory`                  |
+| 医生回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退医生自己的 `think.llm`            | relation、chats、医生 session prompt、consult record 注入、judge advice、depression block、`external_memory_context`、`consult_history_memory` | 医生自然语言回复                          |
+| 患者回复生成 `generate_chat`          | 强制链路里**优先** `forced_llm`，失败则回退患者自己的 `think.llm`            | relation、chats、depression block、`external_memory_context`、`consult_history_memory`                                                         | 患者自然语言回复                          |
+| 复读检测 `generate_chat_check_repeat` | 与 `Agent.completion(...)` 相同的强制路由规则                                | 当前对话历史、当前轮回复                                                                                                                       | 是否出现复读，用于提前结束                |
+| 终止检测 `decide_chat_terminate`      | 仅在未启用 `dialog_judge` 时参与；同样优先 `forced_llm`                      | 当前对话历史                                                                                                                                   | 是否结束对话                              |
+| 会后评估 `session_eval`               | 由 `session_eval.route` 决定：`forced_llm` 或 `think_llm`                    | session prompt、历史 eval reason、usage log、完整对话                                                                                          | `efficacy_score`、`session_end`、`reason` |
 
 #### 5.3.2 关于模型路由，最容易混淆的点
 

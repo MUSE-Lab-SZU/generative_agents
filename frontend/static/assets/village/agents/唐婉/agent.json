@@ -1,12 +1,15 @@
 {
   "name": "唐婉",
-  "portrait": "assets/village/agents/卡布达2/portrait.png",
+  "portrait": "assets/village/agents/唐婉/portrait.png",
   "coord": [
     45,
     9
   ],
   "currently": "在杂货店门口核对活动清单，担心自己的提案不够好。",
   "chat_iter": 4,
+  "external_memory": {
+    "user_id": "agent_tang_wan"
+  },
   "scratch": {
     "age": 28,
     "innate": "细腻、责任感强、会反复思量",

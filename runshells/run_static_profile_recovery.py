@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from modules.model.static_profile_recovery import build_pool, prepare, evaluate, read_json, summarize, atomic_json
+from humanlike_validation.static_profile_recovery import build_pool, prepare, evaluate, read_json, summarize, atomic_json
 from runshells.run_psi_bench_eval import (
     add_judge_arguments, add_run_arguments, select_run_dirs,
     load_judge_settings, make_judge_call,
@@ -52,8 +52,8 @@ def main():
         parser.error(str(exc))
     print(f'Selected {len(runs)} checkpoint run(s):', *[path.name for path in runs], sep='\n  ')
     selected_backend = args.backend
-    output_subdir = (f'static_profile_recovery_v3_consult_{selected_backend}' if args.source == 'consult' else
-                     f'static_profile_recovery_v3_resident_{args.chat_kind}_{selected_backend}')
+    output_subdir = (f'static_profile_recovery_v5_consult_{selected_backend}' if args.source == 'consult' else
+                     f'static_profile_recovery_v5_resident_{args.chat_kind}_{selected_backend}')
     pool = build_pool(args.agents_dir)
     mapping = read_json(args.profile_map) if args.profile_map else {}
     modes = ('all-session', 'single-session') if args.mode == 'both' else (args.mode,)
