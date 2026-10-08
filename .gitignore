@@ -38,8 +38,23 @@ results/compressed/
 
 docs/*
 !docs/主诉图_catalog与分支Prompt字段说明.md
-!docs/town_method/
-!docs/town_method/**
+!docs/03_汇报与论文/
+!docs/03_汇报与论文/town_method/
+!docs/03_汇报与论文/town_method/**
+
+# Writing branch: text sources only; heavy figure assets stay local
+!writing/
+!writing/**
+writing/figure/
+writing/latex/**/*.aux
+writing/latex/**/*.bbl
+writing/latex/**/*.blg
+writing/latex/**/*.fls
+writing/latex/**/*.log
+writing/latex/**/*.out
+nul
+kambeitz_tmp.html
+yosef_tmp.html
 tests/
 
 # Experiment outputs and large artifacts

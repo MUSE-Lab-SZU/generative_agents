@@ -1,0 +1,274 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%  NMH 论文中文检查版
+%%
+%%  用途：供作者检查中文内容是否准确反映论文结构与论证
+%%  编译：xelatex nmh-manuscript-zh.tex（需 ctex 宏包）
+%%  说明：本文件为内容对照版，不用于投稿；投稿用英文版 nmh-manuscript.tex
+%%
+%%  占位符说明：
+%%    [ModelName]  = 平台名称（待命名）
+%%    [X.X]/[XX%]/[N]/[X.XX] = 待目标批次核验后填入
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8,heading=false,fontset=windows]{ctex}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black}
+\usepackage{enumitem}
+
+% 行距与段间距
+\linespread{1.35}
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{2em}
+
+% 自定义标题格式
+\usepackage{titlesec}
+\titleformat{\section}{\Large\bfseries\color{blue!40!black}}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries\color{blue!30!black}}{\thesubsection}{1em}{}
+
+% 占位符高亮（红色），便于检查时定位
+\newcommand{\ph}[1]{\textcolor{red}{[#1]}}
+
+\title{\textbf{基于生成式智能体的抑郁症仿真治疗中\\认知重构与记忆巩固的 \emph{in silico} 分离研究}}
+\author{NMH 稿件 v2 中文检查版 \\ \small 生成日期：2026-08-12}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\rule{\textwidth}{0.5pt}\\[0.3em]
+\small\textit{英文投稿标题：In silico separation of cognitive restructuring and memory consolidation\\
+in simulated depression treatment with generative agents}\\[0.3em]
+\rule{\textwidth}{0.5pt}
+\end{center}
+
+\vspace{0.5em}
+
+%%====================================================================
+\section*{摘要（约 150 词）}
+%%====================================================================
+
+抑郁症是全球致残的主因之一，认知行为疗法（CBT）是一线治疗方案，但其特定技术相对于非特异性治疗因素的独特贡献难以分离，且记忆巩固在维持治疗效果中的作用无法在临床试验中进行伦理上的操纵。在此，我们提出 \ph{ModelName}——一个生成式智能体平台，通过主诉图状态机、带波动约束的逐轮情绪推断和四层动态提示词架构，将 Beck 认知模型操作化地嵌入虚拟社区。采用七组对照设计（包括支持性咨询 G6 和记忆写入消融 G7），我们发现结构化 CBT 产生的 PHQ-9 降幅比支持性咨询多 \ph{X.X} 分（Cohen's $d = \ph{X.XX}$），从而分离出认知重构这一有效成分。阻断记忆写入保留了急性治疗反应，但增加了治疗后的反弹率（\ph{XX}\% 对 \ph{XX}\%），这与记忆巩固在疗效持久性中的仿真内因果作用相一致。该平台在 \emph{in silico} 环境中分离了特异性与非特异性治疗成分，但仍需临床验证。
+
+\vspace{0.5em}
+\noindent\textbf{关键词：}生成式智能体；抑郁症；认知行为疗法；记忆巩固；计算精神病学；大语言模型
+
+%%====================================================================
+\section{引言}\label{sec:intro}
+%%====================================================================
+
+抑郁症是全球负担最重的精神障碍之一，影响约 2.8 亿人，预计到 2030 年将成为全球疾病负担的首要单一贡献者~\cite{who2022}。认知行为疗法（CBT）是国际临床指南中普遍推荐的一线循证治疗方案，荟萃分析显示其相对于等待列表和常规治疗对照具有中到大效应量~\cite{cuijpers2013,hofmann2012}。然而，治疗结果存在显著异质性——约 40--60\% 的患者达到临床显著改善——且 CBT 发挥作用的机制仍未完全阐明。特别是，CBT 的特定技术（认知重构、行为实验）与非特异性因素（治疗联盟、定期专业接触、共情倾听）的相对贡献一直存在争议~\cite{lambert1992}，而治疗收益在治疗结束后能否持续，取决于在真实患者身上难以直接观察的过程。
+
+两个机制层面的问题在临床研究中尤为难以回答。第一，分离 CBT 技术的特异性效应需要一个在不使用这些技术的前提下提供相同非特异性因素的对照条件——这一设计在伦理和实践中都难以在真实患者中实施，因为不能拒绝向患者提供循证的积极治疗。第二，检验记忆巩固——即治疗性洞见的内部编码和复述——是否因果性地维持治疗持久性，需要操纵记忆形成过程，这在人类身上除药物或睡眠剥夺范式（带有自身混淆因素）外无法实验性地实现。因此，CBT 机制的过程层面研究依赖于回顾性自我报告和间歇性评估，限制了技术、记忆和症状动态可被观察的时间分辨率。
+
+生成式智能体——由大语言模型（LLM）驱动、在虚拟社区中维护记忆流、进行规划、反思和对话的拟人模拟体~\cite{park2023}——提供了一种互补的研究范式。Park 等人引入了一个框架，使智能体能够大规模产生可信的社会行为；Kambeitz 和 Meyer-Lindenberg 随后提出，此类智能体可以模拟环境和社会决定因素对心理健康的影响~\cite{kambeitz2025}。然而，迄今为止，尚无研究在生成式智能体中嵌入临床级别的抑郁症精神病理学、实施结构化心理治疗协议，或使用受控的 \emph{in silico} 设计来分离特异性与非特异性治疗成分，或因果性地探究记忆巩固在治疗持久性中的作用。相关的计算精神病学建模方法已推进了机制精度~\cite{montague2012,hauser2022,zavlis2025}，但未能以自然语言——即真实心理治疗运作的媒介——来呈现治疗对话。
+
+在此，我们提出 \ph{ModelName}，一个生成式智能体平台，通过主诉图状态机、带波动约束的逐轮情绪推断和四层动态提示词架构，将 Beck 抑郁认知模型~\cite{beck1967}操作化地实现，并整合了结构化四阶段 CBT 协议和阶段性心理测量评估。采用七组对照设计，我们分离了两个长期被混淆的治疗成分：结构化 CBT 与仅支持性咨询的对比（G6——在频率和接触上匹配，但不含认知重构）将技术与非特异性因素分离；记忆写入消融（G7——与 G1 相同的 CBT，但阻断患者的记忆形成）探究记忆巩固在持久性中的作用。我们既将平台呈现为一个经过验证的抑郁状态模型，也将其呈现为一个双机制分离，同时明确 \emph{in silico} 因果声明仅指仿真的记忆写入机制，需要临床转化。
+
+%%====================================================================
+\section{结果}\label{sec:results}
+%%====================================================================
+
+\subsection*{平台有效性与抑郁状态真实性}
+
+我们从五个维度评估了抑郁状态的真实性：\textbf{状态连续性}（主诉阶段之间无不合理跳变）、\textbf{情境一致性}（同一主诉在工作、家庭和治疗情境中以不同方式表达）、\textbf{关系差异性}（在医生、朋友和家人面前调整信任度、防御性和自我袒露程度）、\textbf{主诉可解释性}（核心信念和叙事焦点可在话语中追溯）和\textbf{语言风格稳定性}（语速、袒露水平、语气）。跨 \ph{N} 个人设和 \ph{3} 个严重度等级，在专家评审中 \ph{XX}\% 的轨迹片段满足真实性标准（评分者间一致性 $\kappa = \ph{X.XX}$），其中情境一致性通过率为 \ph{XX}\%，关系差异性通过率为 \ph{XX}\%。作为基于量表的补充检验，基线 PHQ-9~\cite{kroenke2001}与分配的严重度一致（轻度 \ph{X.X$\pm$X.X}、中度 \ph{X.X$\pm$X.X}、重度 \ph{X.X$\pm$X.X}），且配置了较高神经质的人设产生了更高的基线 PHQ-9（均值差异 \ph{X.X}，Cohen's $d = \ph{X.XX}$），复制了神经质--抑郁关联。条件内跨独立 run 的一致性可接受（$\mathrm{ICC} = \ph{X.XX}$）。系统架构总结于图~\ref{fig:architecture}，人设特征见扩展数据表~1。
+
+\subsection*{总体治疗效应与社会效价梯度}
+
+跨每个条件 \ph{N} 次独立 run，结构化 CBT（G1）产生了 \ph{X.X} 分的平均 PHQ-9 降幅（较基线 \ph{XX}\%，Cohen's $d = \ph{X.XX}$，95\% CI \ph{X.X, X.X}），其中第 4 至第 8 次会谈之间的改善最为陡峭，对应认知重构阶段；BDI-II~\cite{beck1996}与 PHQ-9 趋同（$r = \ph{X.XX}$）。无干预组（G2）显示 \ph{X.X} 分的变化（\ph{XX}\%，与自然病程一致）。社会接触条件形成了一个梯度模式：积极社会接触（G9）$>$ 中性社会接触（G3）$>$ 无干预（G2）$>$ 负面社会接触（G5，使症状恶化 \ph{X.X} 分），支持了不良社会环境主动加剧而非仅仅未能改善症状的假设。咨询室条件（G4——仅含医生和患者，无其他居民）与 G1 无差异（$d = \ph{X.XX}$，$p = \ph{X.X}$），表明环境限制未产生实质性贡献。纵向轨迹见图~\ref{fig:trajectories}；基线和终点统计见表~\ref{tab:endpoints}。
+
+\subsection*{分离认知重构与非特异性因素}
+
+关键的 G1 对 G6 比较隔离了 CBT 技术的特异性贡献：两组接受了相同频率的医患接触，但 G6 仅使用非指导性、以确认为中心的沟通，不含认知重构、行为实验或结构化会谈推进。结构化 CBT 比仅支持性咨询多产生了 \ph{X.X} 分的 PHQ-9 降幅（Cohen's $d = \ph{X.XX}$，95\% CI \ph{X.X, X.X}，$p = \ph{X.X}$，Bonferroni 校正），这一优势在各人设中一致（Group$\times$Persona 交互 $p = \ph{X.X}$），在各严重度等级中也一致（Group$\times$Severity 交互 $p = \ph{X.X}$）。这表明认知重构——认知歪曲识别、证据检验和行为实验——在治疗联盟、定期接触和共情倾听之上，贡献了额外的治疗获益。终点分布和两两效应量见图~\ref{fig:endpoints}。
+
+\subsection*{分离记忆巩固在持久性中的作用}
+
+记忆写入消融（G7）接受了与 G1 相同的结构化 CBT，但阻断了患者对事件、思想和聊天记忆的写入。在治疗结束后立即评估，G7 的 PHQ-9 与 G1 无差异（$d = \ph{X.XX}$，$p = \ph{X.X}$），表明在无记忆形成的情况下急性治疗反应得以保留。在 T4 随访中——该评估在一个独立的仿真后期间内进行，期间无医患接触，且不施测任何量表以避免干扰自然轨迹——G7 显示了更高的反弹率（\ph{XX}\% 重新进入中度及以上严重度，而 G1 为 \ph{XX}\%，$\chi^2 = \ph{X.X}$，$p = \ph{X.X}$），且 Group$\times$Time 交互显著（$F = \ph{X.X}$，$p = \ph{X.X}$）。这一分离——急性反应保留但持久性受损——与记忆巩固在维持治疗收益中的仿真内因果作用相一致；这是否推广到人类记忆巩固是一个需要临床转化的推论。治疗前后的主诉图阶段转移在 G1 和 G7 之间存在差异（图~\ref{fig:complaint_graph}），G1 在向残余/恢复阶段推进方面表现更显著。
+
+\subsection*{抑郁状态模型的模块级消融}
+
+为验证抑郁认知架构各组件对真实动态的贡献，我们对单个模块进行了消融。移除主诉图（NoGraph）产生了近乎平坦的治疗反应（$\Delta$PHQ-9 $= \ph{X.X}$，不显著），与阶段锚定认知是重构所操作的基底这一解释一致。移除情绪推断（NoEmotion）在五维检查中降低了对话真实性（连续性 \ph{X.X}$\rightarrow$\ph{X.X}；情境一致性 \ph{X.X}$\rightarrow$\ph{X.X}），并削弱了阶段--情绪连贯性，而治疗效应以减小的幅度持续存在（$d = \ph{X.XX}$，对比 G2）。移除关系修饰器（NoRelation）使关系差异性坍塌（\ph{XX}\% 通过率）。这些模块级结果确认了整合架构对于产生临床意义动态的必要性（图~\ref{fig:ablation}）。
+
+%%====================================================================
+\section{讨论}\label{sec:discussion}
+%%====================================================================
+
+\ph{ModelName} 表明，一个嵌入了 Beck 认知模型的生成式智能体平台能够产生真实、临床一致的抑郁状态动态，并通过受控的 \emph{in silico} 设计，分离 CBT 中两个长期被混淆的成分：认知重构（通过 G1$>$G6 分离）和记忆巩固在持久性中的作用（通过 G7 的急性保留但持久性受损的分离来探究）。观察到的效应量级与真实世界的 CBT 荟萃分析~\cite{cuijpers2013,hofmann2012,cuijpers2023}在量级上可比，但鉴于模拟自我报告评估的性质，这一比较是量级参照而非等效（见局限性）。双分离将两个发现升级为一个框架：治疗响应具有可由不同机制决定的振幅成分和持久性成分，二者均可在 \emph{in silico} 环境中被分离。
+
+本研究将生成式智能体范式从一般社会模拟~\cite{park2023}拓展至临床导向的心理健康研究，从 Kambeitz 和 Meyer-Lindenberg 的概念性提案~\cite{kambeitz2025}走向实证演示。与依赖参数化行为规则的传统基于智能体的模型~\cite{bonabeau2002}相比，\ph{ModelName} 以自然语言——即真实心理治疗运作的媒介——来呈现主诉图锚定认知、逐轮情绪和治疗对话，在优先追求机制精度的计算精神病学模型~\cite{montague2012,friston2023,zavlis2025}旁边占据了一个互补的位置。在仿真回路中整合标准化量表使得与已发表基准的定量比较成为可能，而对 LLM 角色扮演的分析~\cite{shanahan2023}以及近期关于 LLM 在精神病学中的综述~\cite{volkmer2024,stade2024}则为这一方法的机遇与边界提供了语境。
+
+存在若干局限性。第一，该平台模拟的是与研究目的相关的抑郁表现和求助行为；它不进行诊断、风险评估或治疗决策，危机或自伤内容由独立的安全机制处理。第二，这里的 PHQ-9 和 BDI-II 是 LLM 模拟的患者自我报告，采用基于规则的评分和回答--评分一致性校验，而非临床施测工具；因此与真实荟萃分析的效应量比较是量级参照而非等效。第三，G7 是一种极端的二值操纵（完全阻断记忆写入），无直接的临床对应物；真实世界的记忆衰减是渐进的。第四，人设和严重度覆盖相对于真实临床人群仍然有限。第五，\emph{in silico} 因果声明仅指仿真的记忆写入机制——即仿真内因果——而非人类记忆巩固，后者仍是一个有待临床转化的假设。
+
+未来工作应扩展人设在年龄、性别和文化方面的多样性；引入药物治疗建模；将仿真参数与临床试验数据集进行校准；最重要的是，检验在 \emph{in silico} 中观察到的记忆巩固分离是否能预测临床队列中的复发模式。模块化架构支持面向精准精神病学 \emph{in silico} 的患者--治疗匹配的组合探索。
+
+%%====================================================================
+\section{方法}\label{sec:methods}
+%%====================================================================
+
+\subsection*{系统架构}
+
+\ph{ModelName} 扩展了 Stanford Town 生成式智能体框架~\cite{park2023}。该系统是规则编排与 LLM 生成的混合体：规则负责时间步进、地图和寻路、会面调度、实验条件分配、会谈推进和快照触发；LLM 负责日程规划、自然语言互动、反思、情绪推断和部分会谈判断。每个智能体维护一个记忆流（事件、聊天、思想），检索按新近性、重要性和相关性加权；本地向量库（BGE-M3 嵌入）与外部层级记忆服务并行运行。智能体认知使用 Qwen3-8B（本地）；治疗生成、对话判断、会谈评估和量表评分使用 DeepSeek（治疗与评分使用独立端点）。
+
+\subsection*{抑郁认知架构}
+
+五个协同模块构成了一个提示词驱动的生成式状态模型（而非临床验证的疾病机制模型）。\textbf{主诉图}将抑郁认知建模为一个 LLM 驱动的阶段有向图，每个阶段编码核心信念、叙事焦点、说话风格参数、情绪锚点、推进/保持信号和关系修饰器；阶段转移由专用提示词判断。\textbf{情绪推断器}执行逐轮 LLM 推断，受波动上限约束以防止不合理的突变，输出标签、风格、强度、袒露度和防御性。\textbf{会话上下文构建器}提取地点、时间、互动对象、关系和话题。\textbf{创伤记忆系统}维护与阶段关联的回忆，作为背景叙事浮现。\textbf{动态提示词构建器}组装四层（基础人格 $\rightarrow$ 主诉阶段 $\rightarrow$ 会话上下文 $\rightarrow$ 逐轮情绪）。每个模块遵循"动机$\rightarrow$机制$\rightarrow$证据/角色"结构，消融钩子在模块级消融结果中。
+
+\subsection*{治疗干预}
+
+一个四阶段、\ph{10} 次 CBT 会谈的协议（信息收集 $\rightarrow$ 认知概念化 $\rightarrow$ 认知重构 $\rightarrow$ 复发预防），配有自适应会谈循环。对话判断器监控每个治疗轮次（终止信号加受限的策略建议，非逐字话语）；会谈评估器评估是否推进；咨询历史模块检索 top-$k$ 条过往对话；环境任务模型模拟作业结果；治疗后随访模式在会谈完成后激活。G6（支持性咨询）提供与 G1 相同的会面频率，采用非指导性、仅确认的沟通，不推进 CBT——这是一个主动治疗对照，而非无干预对照。G7 阻断患者的事件/思想/聊天记忆写入，同时保留 G1 的 CBT。会谈推进控制器版本按批次报告；使用不同控制器的批次分开分析，不混池。
+
+\subsection*{评估}
+
+主线量表为 PHQ-9（0--27）~\cite{kroenke2001}和 BDI-II（0--63）~\cite{beck1996}；SDS 在报告批次中未启用，不纳入。在每个评估点，患者智能体逐项用自然语言作答，独立的 ExpertLLM 对回答进行评分并做回答--评分一致性校验。评估在 T0、第 4 次会谈、第 8 次会谈和治疗后随访（T4）采集；T4 在一个独立的仿真后期间内评估，期间无医患接触，且不施测任何量表以避免干扰自然轨迹——T4 分数从期末冻结的检查点恢复。对于无结构化会谈的对照组，步长间隔回退生成可比的评估点。量表为 LLM 模拟的自我报告，非临床施测。
+
+\subsection*{实验设计}
+
+七组（G1--G7）对照比较，含 \ph{N} 个人设、跨 \ph{3} 个严重度等级、每条件 \ph{N} 次独立 run。比较单位是独立仿真 run；在冻结检查点内的重复量表生成刻画的是测量不确定性，不计入独立 $N$。统计分析使用线性混合效应模型（$\Delta$PHQ-9 $\sim$ Group $+$ (1$|$Persona) $+$ (1$|$Run)），纵向分析使用 Group$\times$Time，调节分析使用 Group$\times$Severity 或 Group$\times$Persona；效应量以 Cohen's $d$~\cite{cohen1988}报告，附 95\% 置信区间；多重比较采用 Bonferroni 校正。分析脚本和统计输出在代码仓库中可用。
+
+%%====================================================================
+\section*{图表（占位）}
+%%====================================================================
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering \textcolor{red}{[\textbf{图 1 占位}]}\\[0.5em]
+系统架构：虚拟社区 $\rightarrow$ 认知架构 $\rightarrow$ 抑郁引擎 $\rightarrow$ 治疗管线 $\rightarrow$ 评估与实验设计}}
+\caption{\ph{ModelName} 的系统架构。该平台将生成式智能体虚拟社区与五模块抑郁认知架构（主诉图、情绪推断、会话上下文、创伤记忆、动态提示词构建器）、四阶段 CBT 治疗管线和阶段性心理测量评估框架相耦合。}
+\label{fig:architecture}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering \textcolor{red}{[\textbf{图 2 占位}]}\\[0.5em]
+各组 PHQ-9 纵向轨迹（T0$\rightarrow$S4$\rightarrow$S8$\rightarrow$T4），含 95\% CI 带}}
+\caption{跨治疗的纵向 PHQ-9 轨迹。结构化 CBT（G1）在第 4 至 8 次会谈（认知重构阶段）间改善最为陡峭。社会接触条件形成效价梯度（G9 $>$ G3 $>$ G2 $>$ G5）。阴影带表示跨独立 run 的 95\% 置信区间。}
+\label{fig:trajectories}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering \textcolor{red}{[\textbf{图 3 占位}]}\\[0.5em]
+终点 PHQ-9 分布，附两两 Cohen's $d$（高亮 G1 vs G6 和 G1 vs G7）}}
+\caption{各组终点 PHQ-9 分布。两两效应量高亮了认知重构分离（G1 vs G6）和记忆写入分离（G1 vs G7：急性终点相当，持久性分化）。}
+\label{fig:endpoints}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering \textcolor{red}{[\textbf{图 4 占位}]}\\[0.5em]
+模块级消融：NoGraph / NoEmotion / NoRelation 对治疗反应和真实性维度的影响}}
+\caption{抑郁认知架构的模块级消融。移除主诉图（NoGraph）使治疗反应趋平；移除情绪推断（NoEmotion）降低真实性并削弱效应；移除关系修饰器（NoRelation）使关系差异性坍塌。}
+\label{fig:ablation}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering \textcolor{red}{[\textbf{图 5 占位}]}\\[0.5em]
+治疗前后主诉图状态转移矩阵（G1 vs G7）}}
+\caption{治疗前后的主诉图状态转移。G1 比 G7 更大程度地向残余/恢复阶段推进，而 G7 被阻断的记忆写入削弱了持久的认知改变。}
+\label{fig:complaint_graph}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{各组基线特征与终点结局。PHQ-9 和 BDI-II 为 LLM 模拟的自我报告，采用基于规则的评分和回答--评分一致性校验。数值为占位符，待目标批次核验后填入。}\label{tab:endpoints}
+\small
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+组别 & 描述 & 基线 PHQ-9 & 终点 PHQ-9 & $\Delta$PHQ-9 & $\Delta$BDI-II \\
+\midrule
+G1 & 结构化 CBT & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G2 & 无干预 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G3 & 中性社会接触 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G4 & 仅咨询室环境 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G5 & 负面社会接触 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G6 & 支持性咨询 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+G7 & 记忆写入消融 & \ph{X.X} & \ph{X.X} & \ph{X.X} & \ph{X.X} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%%====================================================================
+\section*{数据可用性}
+%%====================================================================
+
+支持本研究发现的仿真输出数据——阶段性评估分数（所有时间点的 PHQ-9、BDI-II）、主诉图状态转移日志、情绪向量轨迹和对话记录——可在 \ph{Repository}（\ph{DOI/URL}）获取。图 1--5 和表 1 的源数据随稿件提供。
+
+\section*{代码可用性}
+
+\ph{ModelName} 仿真平台，包括抑郁认知架构、治疗干预管线、评估框架和批量实验编排脚本，公开发布于 \ph{GitHub URL}。仓库包含智能体配置文件、CBT 会谈提示词、评估规则和批量实验脚本。平台以 Python 实现，采用 \ph{License} 许可证。
+
+\section*{致谢}
+
+我们感谢 \ph{姓名} 的 \ph{贡献}。本工作受 \ph{资助} 支持。我们声明使用了大语言模型（DeepSeek、Qwen3-8B）作为研究基础设施；未经作者审查，无 LLM 输出被纳入稿件正文。
+
+\section*{作者贡献}
+
+\ph{Author 1} 设计了抑郁认知架构并实现了主诉图和情绪推断模块。\ph{Author 2} 开发了治疗干预管线和对话判断系统。\ph{Author 3} 设计了实验框架并进行了统计分析。\ph{Author 4} 构思了本研究、指导了项目并撰写了稿件。所有作者审查并批准了最终稿件。
+
+\section*{利益冲突}
+
+作者声明无利益冲突。
+
+%%====================================================================
+\section*{参考文献}
+%%====================================================================
+
+\renewcommand{\refname}{}
+\begin{thebibliography}{99}
+\small
+
+\bibitem{who2022} World Health Organization. \emph{World Mental Health Report: Transforming Mental Health for All}. WHO, 2022.
+
+\bibitem{cuijpers2013} Cuijpers, P. et al. The efficacy of psychotherapy and pharmacotherapy in treating depressive and anxiety disorders: a meta-analysis of direct comparisons. \emph{World Psychiatry} \textbf{12}, 137--148 (2013).
+
+\bibitem{hofmann2012} Hofmann, S. G. et al. The efficacy of cognitive behavioral therapy: a review of meta-analyses. \emph{Cogn. Ther. Res.} \textbf{36}, 427--440 (2012).
+
+\bibitem{park2023} Park, J. S. et al. Generative agents: interactive simulacra of human behavior. In \emph{Proc. 36th ACM Symp. UIST '23} (2023).
+
+\bibitem{kambeitz2025} Kambeitz, J. \& Meyer-Lindenberg, A. Modelling the impact of environmental and social determinants on mental health using generative agents. \emph{npj Digit. Med.} \textbf{8}, 36 (2025).
+
+\bibitem{beck1967} Beck, A. T. \emph{Depression: Clinical, Experimental, and Theoretical Aspects}. Harper \& Row, 1967.
+
+\bibitem{beck1996} Beck, A. T., Steer, R. A. \& Brown, G. K. \emph{Manual for the Beck Depression Inventory-II}. Psychological Corporation, 1996.
+
+\bibitem{kroenke2001} Kroenke, K., Spitzer, R. L. \& Williams, J. B. W. The PHQ-9: validity of a brief depression severity measure. \emph{J. Gen. Intern. Med.} \textbf{16}, 606--613 (2001).
+
+\bibitem{hauser2022} Hauser, T. U. et al. Computational psychiatry in practice and the promise of a model-based psychiatry. \emph{Lancet Digit. Health} \textbf{4}, e816--e828 (2022).
+
+\bibitem{friston2023} Friston, K. et al. Computational psychiatry: from synapses to sentience. \emph{Mol. Psychiatry} \textbf{28}, 256--268 (2023).
+
+\bibitem{zavlis2025} Zavlis, O. et al. Computational modelling approaches in mental health research: a systematic review. \emph{Nat. Ment. Health} (2025).
+
+\bibitem{shanahan2023} Shanahan, M. et al. Role play with large language models. \emph{Nature} \textbf{623}, 493--498 (2023).
+
+\bibitem{bonabeau2002} Bonabeau, E. Agent-based modeling: methods and techniques for simulating human systems. \emph{Proc. Natl Acad. Sci. USA} \textbf{99}, 7280--7287 (2002).
+
+\bibitem{volkmer2024} Volkmer, S. et al. Large language models in psychiatry: applications and challenges. \emph{Psychiatry Res.} \textbf{339}, 116026 (2024).
+
+\bibitem{stade2024} Stade, E. C. et al. Large language models could change the future of behavioral healthcare. \emph{npj Ment. Health Res.} \textbf{3}, 28 (2024).
+
+\bibitem{cohen1988} Cohen, J. \emph{Statistical Power Analysis for the Behavioral Sciences} 2nd edn (Lawrence Erlbaum, 1988).
+
+\bibitem{montague2012} Montague, P. R., Dolan, R. J., Friston, K. J. \& Dayan, P. Computational psychiatry. \emph{Trends Cogn. Sci.} \textbf{16}, 72--80 (2012).
+
+\bibitem{lambert1992} Lambert, M. J., Shapiro, D. A. \& Bergin, A. E. The effectiveness of psychotherapy. In \emph{Handbook of Psychotherapy and Behavior Change} 94--132 (1992).
+
+\bibitem{cuijpers2023} Cuijpers, P. et al. Psychotherapy for depression across different age groups: a systematic review and meta-analysis. \emph{JAMA Psychiatry} \textbf{77}, 694--702 (2020).
+
+\end{thebibliography}
+
+\vspace{1em}
+\hrule
+\vspace{0.5em}
+\noindent\small\textcolor{gray}{本文件为 NMH 稿件 v2 的中文内容对照检查版，用于作者审核论文结构、论证链和占位符位置。投稿请使用英文版 \texttt{nmh-manuscript.tex}（Springer Nature \texttt{sn-jnl.cls} 模板）。所有红色 \texttt{[...]} 为待填占位符。}
+
+\end{document}

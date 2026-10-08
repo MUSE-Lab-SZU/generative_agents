@@ -1,0 +1,232 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%  NMH Manuscript — In silico separation of cognitive restructuring
+%%  and memory consolidation in simulated depression treatment
+%%
+%%  Template:  Springer Nature LaTeX template (sn-jnl.cls, v2.1)
+%%  Reference style: sn-nature (Nature Portfolio numbered)
+%%  Source draft: writing/2026-08-12-NMH_manuscript_v2_重构B双机制分离.md
+%%  Skill: nature-writing (research / full / zh-to-en / nature-family)
+%%
+%%  [ModelName], [N], [X.X], [XX%], [Evidence needed: ...]
+%%    → placeholders pending target-batch verification (see v2 claim-evidence map)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% Nature Portfolio submission style — numbered references via sn-nature
+\documentclass[sn-nature,pdflatex]{sn-jnl}
+
+%%%% Standard Packages
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsthm}
+\usepackage{mathrsfs}
+\usepackage[title]{appendix}
+\usepackage{xcolor}
+\usepackage{textcomp}
+\usepackage{manyfoot}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{url}
+
+\raggedbottom
+
+\begin{document}
+
+%%====================================================================
+%%  Title
+%%====================================================================
+\title[Generative-agent separation of CBT mechanisms in silico]{In silico separation of cognitive restructuring and memory consolidation in simulated depression treatment with generative agents}
+
+%%====================================================================
+%%  Authors  (placeholders — fill before submission)
+%%====================================================================
+\author*[1]{\fnm{[Author 1]} \sur{[Surname]}}\email{author1@example.org}
+
+\author[1]{\fnm{[Author 2]} \sur{[Surname]}}\email{author2@example.org}
+
+\author[1]{\fnm{[Author 3]} \sur{[Surname]}}\email{author3@example.org}
+
+\author[1]{\fnm{[Author 4]} \sur{[Surname]}}\email{author4@example.org}
+
+\affil*[1]{\orgdiv{[Department]}, \orgname{[Institution]}, \orgaddress{\city{[City]}, \country{[Country]}}}
+
+%%====================================================================
+%%  Abstract  (~150 words, no subheadings — Nature Mental Health style)
+%%====================================================================
+\abstract{Depression is a leading global cause of disability, and cognitive behavioural therapy (CBT) is a first-line treatment, yet the specific contribution of its techniques versus non-specific therapeutic factors is difficult to isolate, and the role of memory consolidation in maintaining treatment gains cannot be ethically manipulated in clinical trials. Here we present [ModelName], a generative-agent platform that operationalises Beck's cognitive model within a virtual community through a complaint-graph state machine, per-turn emotion inference with volatility constraints, and a four-layer dynamic prompt architecture. Using a seven-group controlled design including supportive counselling (G6) and memory-writing ablation (G7), we show that structured CBT produced a [X.X]-point greater PHQ-9 reduction than supportive counselling (Cohen's $d = [X.XX]$), isolating cognitive restructuring as an active ingredient. Blocking memory writing preserved acute response but increased post-treatment rebound ([XX]\% versus [XX]\%), consistent with a within-simulation causal role of memory consolidation in durability. The platform separates specific from non-specific therapeutic components in silico, though clinical validation remains necessary.}
+
+\keywords{Generative agents, Depression, Cognitive behavioural therapy, Memory consolidation, Computational psychiatry, Large language models}
+
+\maketitle
+
+%%====================================================================
+%%  Introduction  (4-paragraph funnel: field → bottleneck → gap → study)
+%%====================================================================
+\section{Introduction}\label{sec:intro}
+
+Depression is among the most burdensome mental disorders globally, affecting an estimated 280 million people and projected to be the leading single contributor to global disease burden by 2030~\cite{who2022}. Cognitive behavioural therapy (CBT) is a first-line, evidence-based treatment recommended across international clinical guidelines, with meta-analyses indicating moderate-to-large effect sizes relative to waitlist and treatment-as-usual controls~\cite{cuijpers2013,hofmann2012}. However, treatment outcomes are heterogeneous---roughly 40--60\% of patients achieve clinically significant response---and the mechanisms through which CBT exerts its effects remain incompletely understood. In particular, the relative contribution of CBT's specific techniques (cognitive restructuring, behavioural experiments) and its non-specific factors (therapeutic alliance, regular professional contact, empathic listening) has long been contested~\cite{lambert1992}, and whether treatment gains persist after therapy ends depends on processes that are difficult to observe directly in patients.
+
+Two mechanistic questions are especially hard to answer clinically. First, isolating the specific effect of CBT techniques requires a control condition that delivers the same non-specific factors without the techniques---a design that is ethically and practically difficult to implement in real patients, who cannot be denied an evidence-based active treatment. Second, testing whether memory consolidation---the internal encoding and rehearsal of therapeutic insights---causally sustains treatment durability would require manipulating memory formation, which cannot be done experimentally in humans outside of pharmacological or sleep-deprivation paradigms that carry their own confounds. Consequently, process-level investigation of CBT mechanisms has relied on retrospective self-report and intermittent assessment, limiting the temporal resolution at which technique, memory, and symptom dynamics can be observed.
+
+Generative agents---large-language-model (LLM) powered simulacra that maintain memory streams, plan, reflect, and converse within a virtual community~\cite{park2023}---offer a complementary paradigm. Park et al.\ introduced a framework in which agents produce believable social behaviour at scale, and Kambeitz and Meyer-Lindenberg subsequently proposed that such agents could model the impact of environmental and social determinants on mental health~\cite{kambeitz2025}. However, no study to date has embedded clinical-grade depression psychopathology within generative agents, implemented a structured psychotherapy protocol, or used controlled in-silico designs to separate specific from non-specific therapeutic ingredients or to causally probe the role of memory consolidation in treatment durability. Related computational-psychiatry modelling approaches have advanced mechanistic precision~\cite{montague2012,hauser2022,zavlis2025} but do not render therapeutic dialogue in natural language, the medium through which real psychotherapy operates.
+
+Here we present [ModelName], a generative-agent platform that operationalises Beck's cognitive model of depression~\cite{beck1967} through a complaint-graph state machine, per-turn emotion inference with volatility constraints, and a four-layer dynamic prompt architecture, integrated with a structured four-stage CBT protocol and staged psychometric assessment. Using a seven-group controlled design, we isolate two long-conflated components of treatment: structured CBT versus supportive counselling alone (G6---matched in frequency and contact but without cognitive restructuring) separates technique from non-specific factors; and memory-writing ablation (G7---identical CBT but with patient memory formation blocked) probes the role of memory consolidation in durability. We present the platform both as a validated depression-state model and as a dual-mechanism separation, acknowledging that in-silico causal claims refer to the simulation's memory-writing mechanism and require clinical translation.
+
+%%====================================================================
+%%  Results  (claim-first evidence ladder)
+%%====================================================================
+\section{Results}\label{sec:results}
+
+\subsection*{Platform validity and depression-state authenticity}
+
+We assessed depression-state authenticity across five dimensions: state continuity (no implausible jumps between complaint stages), situational consistency (the same complaint expressed differently across work, family, and therapy contexts), relational differentiation (adjusted trust, defensiveness, and disclosure across doctor, friend, and family), complaint interpretability (core belief and narrative focus traceable in utterances), and speech-style stability (tempo, disclosure level, tone). Across [N] personas and [3] severity tiers, [XX]\% of trajectory segments met the authenticity criteria on expert review (inter-rater agreement $\kappa = [X.XX]$), with [XX]\% situational-consistency passes and [XX]\% relational-differentiation passes. As a supplementary scale-based check, baseline PHQ-9~\cite{kroenke2001} aligned with assigned severity (mild [X.X$\pm$X.X], moderate [X.X$\pm$X.X], severe [X.X$\pm$X.X]), and personas configured with higher neuroticism produced higher baseline PHQ-9 (mean difference [X.X], Cohen's $d = [X.XX]$), replicating the neuroticism--depression association. Within-condition consistency across independent runs was acceptable ($\mathrm{ICC} = [X.XX]$). The system architecture is summarised in Figure~\ref{fig:architecture}, and persona characteristics in Extended Data Table~1.
+
+\subsection*{Overall treatment effect and social-valence gradient}
+
+Across [N] independent runs per condition, structured CBT (G1) produced a mean PHQ-9 reduction of [X.X] points ([XX]\% from baseline, Cohen's $d = [X.XX]$, 95\% CI [X.X, X.X]), with the steepest improvement between sessions 4 and 8, corresponding to the cognitive-restructuring phase; BDI-II~\cite{beck1996} converged with PHQ-9 ($r = [X.XX]$). The no-intervention group (G2) showed a [X.X]-point change ([XX]\%, consistent with natural course). Social-contact conditions formed a graded pattern: positive social exposure (G9) $>$ neutral social contact (G3) $>$ no intervention (G2) $>$ negative social exposure (G5, which worsened symptoms by [X.X] points), supporting the hypothesis that adverse social environments actively exacerbate rather than merely fail to ameliorate symptomatology. The counselling-room condition (G4---doctor and patient only, no other residents) did not differ from G1 ($d = [X.XX]$, $p = [X.X]$), indicating that environmental restriction did not contribute appreciably. Longitudinal trajectories are shown in Figure~\ref{fig:trajectories}; baseline and endpoint statistics in Table~\ref{tab:endpoints}.
+
+\subsection*{Separating cognitive restructuring from non-specific factors}
+
+The critical G1-versus-G6 comparison isolates the specific contribution of CBT techniques: both groups received the same frequency of doctor--patient contact, but G6 used only non-directive, validation-focused communication without cognitive restructuring, behavioural experiments, or structured session progression. Structured CBT produced a [X.X]-point greater PHQ-9 reduction than supportive counselling alone (Cohen's $d = [X.XX]$, 95\% CI [X.X, X.X], $p = [X.X]$, Bonferroni-corrected), with the advantage consistent across personas (Group$\times$Persona interaction $p = [X.X]$) and severity tiers (Group$\times$Severity interaction $p = [X.X]$). This indicates that cognitive restructuring---distortion identification, evidence examination, and behavioural experimentation---contributes therapeutic benefit above and beyond therapeutic alliance, regular contact, and empathic listening. Endpoint distributions and pairwise effect sizes are shown in Figure~\ref{fig:endpoints}.
+
+\subsection*{Separating memory consolidation's role in durability}
+
+Memory-writing ablation (G7) received identical structured CBT to G1 but blocked the patient's writing of event, thought, and chat memories. Immediately post-treatment, G7 did not differ from G1 in PHQ-9 ($d = [X.XX]$, $p = [X.X]$), indicating that acute treatment response was preserved without memory formation. At the T4 follow-up---assessed after an independent post-simulation period with no doctor--patient contact, during which no scales were administered to avoid perturbing the natural trajectory---G7 showed a higher rebound rate ([XX]\% re-entering moderate-or-above severity versus [XX]\% in G1, $\chi^2 = [X.X]$, $p = [X.X]$), with a significant Group$\times$Time interaction ($F = [X.X]$, $p = [X.X]$). This dissociation---preserved acute response but impaired durability---is consistent with a within-simulation causal role of memory consolidation in maintaining treatment gains; whether this extends to human memory consolidation is an inference requiring clinical translation. Complaint-graph stage transitions before and after treatment differed between G1 and G7 (Figure~\ref{fig:complaint_graph}), with G1 showing greater progression toward residual/recovery stages.
+
+\subsection*{Module-level ablation of the depression-state model}
+
+To verify that each component of the depression cognitive architecture contributes to authentic dynamics, we ablated individual modules. Removing the complaint graph (NoGraph) produced a near-flat treatment response ($\Delta$PHQ-9 $= [X.X]$, not significant), consistent with stage-anchored cognition being the substrate on which restructuring operates. Removing emotion inference (NoEmotion) reduced conversational authenticity on the five-dimension check (continuity [X.X]$\rightarrow$[X.X]; situational consistency [X.X]$\rightarrow$[X.X]) and attenuated stage--emotion coherence, while treatment effects persisted at reduced magnitude ($d = [X.XX]$ versus G2). Removing relational modifiers (NoRelation) collapsed relational differentiation ([XX]\% passes). These module-level results confirm that the integrated architecture is necessary for clinically meaningful dynamics (Figure~\ref{fig:ablation}).
+
+%%====================================================================
+%%  Discussion  (interpretation, prior-work dialogue, limitations, future)
+%%====================================================================
+\section{Discussion}\label{sec:discussion}
+
+[ModelName] demonstrates that a generative-agent platform embedding Beck's cognitive model can produce authentic, clinically consistent depression-state dynamics and, through controlled in-silico designs, separate two long-conflated components of CBT: cognitive restructuring (isolated via G1$>$G6) and memory consolidation's role in durability (probed via G7's acute-preserved-but-durable-impaired dissociation). The observed effect magnitudes are comparable in order to real-world CBT meta-analyses~\cite{cuijpers2013,hofmann2012,cuijpers2023}, though this comparison is a magnitude reference rather than an equivalence, given the simulated self-report assessment (see limitations). The dual separation upgrades two findings into a framework: treatment response has distinct amplitude and durability components, determined by different mechanisms, both of which can be isolated in silico.
+
+This work extends the generative-agent paradigm from general social simulation~\cite{park2023} to clinically grounded mental-health research, moving from Kambeitz and Meyer-Lindenberg's conceptual proposal~\cite{kambeitz2025} to empirical demonstration. Compared with traditional agent-based models~\cite{bonabeau2002} that rely on parameterised behavioural rules, [ModelName] renders complaint-graph-anchored cognition, per-turn emotion, and therapeutic dialogue in natural language---the medium through which real psychotherapy operates---occupying a complementary position alongside computational-psychiatry models~\cite{montague2012,friston2023,zavlis2025} that prioritise mechanistic precision over interactional richness. The integration of standardised scales within the simulation loop enables quantitative comparison with published benchmarks, while role-play analyses of LLMs~\cite{shanahan2023} and recent surveys of LLMs in psychiatry~\cite{volkmer2024,stade2024} contextualise both the opportunity and the boundaries of this approach.
+
+Several limitations apply. First, the platform simulates depression-related presentation and help-seeking for research purposes; it does not perform diagnosis, risk assessment, or treatment decisions, and crisis or self-harm content is handled by independent safety mechanisms. Second, PHQ-9 and BDI-II here are LLM-simulated patient self-reports with rule-based scoring and answer--score consistency checks, not clinically administered instruments; effect-size comparison with real meta-analyses is therefore a magnitude reference, not an equivalence. Third, G7 is an extreme binary manipulation (complete blockade of memory writing) without direct clinical analogue; real-world memory attenuation is graded. Fourth, persona and severity coverage remains limited relative to real clinical populations. Fifth, in-silico causal claims refer to the simulation's memory-writing mechanism---within-simulation causation---rather than to human memory consolidation, which remains a hypothesis for clinical translation.
+
+Future work should extend persona diversity across age, gender, and culture; incorporate pharmacological treatment modelling; calibrate simulation parameters against clinical-trial datasets; and, most importantly, test whether the memory-consolidation dissociation observed in silico predicts relapse patterns in clinical cohorts. The modular architecture supports combinatorial exploration of patient--treatment matching toward precision psychiatry in silico.
+
+%%====================================================================
+%%  Methods
+%%====================================================================
+\section{Methods}\label{sec:methods}
+
+\subsection*{System architecture}
+
+[ModelName] extends the Stanford Town generative-agent framework~\cite{park2023}. The system is a hybrid of rule orchestration and LLM generation: rules govern time-stepping, map and pathfinding, meeting scheduling, experimental-condition assignment, session advance, and snapshot triggers; LLMs govern daily planning, natural-language interaction, reflection, emotion inference, and part of session judgment. Each agent maintains a memory stream (event, chat, thought) with retrieval weighted by recency, importance, and relevance; a local vector store (BGE-M3 embeddings) and an external hierarchical memory service operate in parallel. Agent cognition uses Qwen3-8B (local); treatment generation, dialog judging, session evaluation, and scale scoring use DeepSeek (separate endpoints for treatment and scoring).
+
+\subsection*{Depression cognitive architecture}
+
+Five coordinated modules form a prompt-driven generative state model (not a clinically validated disease-mechanism model). The complaint graph models depressive cognition as an LLM-driven directed graph of stages, each encoding core belief, narrative focus, speaking-style parameters, emotion anchor, advance/hold signals, and relational modifiers; stage transitions are judged by dedicated prompts. The emotion inferencer performs per-turn, LLM-based inference constrained by a volatility limit to prevent unrealistic abrupt changes, outputting label, style, intensity, disclosure, and defensiveness. The session context builder extracts location, time, partner, relationship, and topics. The trauma memory system maintains stage-linked recall that surfaces as background narrative. The dynamic prompt builder assembles four layers (base personality $\rightarrow$ complaint stage $\rightarrow$ session context $\rightarrow$ per-turn emotion). Each module follows a Motivation$\rightarrow$Mechanism$\rightarrow$Evidence/Role structure, with ablation hooks in the module-level ablation results.
+
+\subsection*{Treatment intervention}
+
+A four-stage, [10]-session CBT protocol (information gathering $\rightarrow$ cognitive conceptualisation $\rightarrow$ cognitive restructuring $\rightarrow$ relapse prevention) with adaptive session loops. A dialog judge monitors each treatment turn (termination signal plus constrained strategic advice, not verbatim utterances); a session evaluator assesses whether to advance; a consult-history module retrieves top-$k$ prior conversations; an environment task model simulates homework outcomes; post-treatment follow-up mode activates after session completion. G6 (supportive counselling) provides the same meeting frequency as G1 with non-directive, validation-only communication and no CBT progression---an active-treatment control, not a no-intervention control. G7 blocks patient event/thought/chat memory writing while retaining G1's CBT. Session-advance controller version is reported per batch; batches using different controllers are analysed separately and not pooled.
+
+\subsection*{Assessment}
+
+The mainline scales are PHQ-9 (0--27)~\cite{kroenke2001} and BDI-II (0--63)~\cite{beck1996}; SDS was not activated in the reported batches and is not included. At each assessment point, the patient agent answers each item in natural language, and an independent ExpertLLM scores responses with answer--score consistency checks. Assessments are collected at T0, session 4, session 8, and a post-treatment follow-up (T4); T4 is assessed after an independent post-simulation period with no doctor--patient contact, and no scales are administered during this period to avoid perturbing the natural trajectory---T4 scores are restored from a frozen checkpoint at period end. For control groups without structured sessions, step-interval fallback generates comparable points. Scales are LLM-simulated self-reports, not clinically administered.
+
+\subsection*{Experimental design}
+
+Seven-group (G1--G7) controlled comparison with [N] personas across [3] severity tiers and [N] independent runs per condition. The unit of comparison is the independent simulation run; repeated scale generation within a frozen checkpoint characterises measurement uncertainty and is not counted as independent $N$. Statistical analyses use linear mixed-effects models ($\Delta$PHQ-9 $\sim$ Group $+$ (1$|$Persona) $+$ (1$|$Run)), with Group$\times$Time for longitudinal analyses and Group$\times$Severity or Group$\times$Persona for moderation; effect sizes are reported as Cohen's $d$~\cite{cohen1988} with 95\% confidence intervals; Bonferroni correction is applied for multiple comparisons. Analysis scripts and statistical outputs are available in the code repository.
+
+%%====================================================================
+%%  Figures and Tables (placeholders — content from v2 display-item plan)
+%%====================================================================
+
+\begin{figure}[h]
+\centering
+%% \includegraphics[width=0.9\textwidth]{figure1_architecture.pdf}
+\fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering \emph{[Figure 1 placeholder]}\\System architecture: virtual community $\rightarrow$ cognitive architecture $\rightarrow$ depression engine $\rightarrow$ treatment pipeline $\rightarrow$ assessment and experimental design.}}
+\caption{System architecture of [ModelName]. The platform couples a generative-agent virtual community with a five-module depression cognitive architecture (complaint graph, emotion inference, session context, trauma memory, dynamic prompt builder), a four-stage CBT treatment pipeline, and a staged psychometric assessment framework.}
+\label{fig:architecture}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+%% \includegraphics[width=0.9\textwidth]{figure2_trajectories.pdf}
+\fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering \emph{[Figure 2 placeholder]}\\Longitudinal PHQ-9 trajectories (T0$\rightarrow$S4$\rightarrow$S8$\rightarrow$T4) by group, with 95\% CI bands.}}
+\caption{Longitudinal PHQ-9 trajectories across treatment. Structured CBT (G1) shows the steepest improvement between sessions 4 and 8 (cognitive-restructuring phase). Social-contact conditions form a valence gradient (G9 $>$ G3 $>$ G2 $>$ G5). Shaded bands denote 95\% confidence intervals across independent runs.}
+\label{fig:trajectories}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+%% \includegraphics[width=0.9\textwidth]{figure3_endpoints.pdf}
+\fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering \emph{[Figure 3 placeholder]}\\Endpoint PHQ-9 distributions with pairwise Cohen's $d$ (highlighting G1 vs G6 and G1 vs G7).}}
+\caption{Endpoint PHQ-9 distributions by group. Pairwise effect sizes highlight the cognitive-restructuring separation (G1 vs G6) and the memory-writing dissociation (G1 vs G7: equivalent acute endpoints, divergent durability).}
+\label{fig:endpoints}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+%% \includegraphics[width=0.9\textwidth]{figure4_ablation.pdf}
+\fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering \emph{[Figure 4 placeholder]}\\Module-level ablation: NoGraph / NoEmotion / NoRelation effect on treatment response and authenticity dimensions.}}
+\caption{Module-level ablation of the depression cognitive architecture. Removing the complaint graph (NoGraph) flattens treatment response; removing emotion inference (NoEmotion) reduces authenticity and attenuates effects; removing relational modifiers (NoRelation) collapses relational differentiation.}
+\label{fig:ablation}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+%% \includegraphics[width=0.9\textwidth]{figure5_complaint_graph.pdf}
+\fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering \emph{[Figure 5 placeholder]}\\Complaint-graph state-transition matrices before vs after treatment (G1 vs G7).}}
+\caption{Complaint-graph state transitions before and after treatment. G1 shows greater progression toward residual/recovery stages than G7, whose blocked memory writing impairs durable cognitive change.}
+\label{fig:complaint_graph}
+\end{figure}
+
+\begin{table}[h]
+\caption{Baseline characteristics and endpoint outcomes by group. PHQ-9 and BDI-II are LLM-simulated self-reports with rule-based scoring and answer--score consistency checks. Values are placeholders pending target-batch verification.}\label{tab:endpoints}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Group & Description & Baseline PHQ-9 & Endpoint PHQ-9 & $\Delta$PHQ-9 & $\Delta$BDI-II \\
+\midrule
+G1 & Structured CBT & [X.X] & [X.X] & [X.X] & [X.X] \\
+G2 & No intervention & [X.X] & [X.X] & [X.X] & [X.X] \\
+G3 & Neutral social contact & [X.X] & [X.X] & [X.X] & [X.X] \\
+G4 & Counselling-room only & [X.X] & [X.X] & [X.X] & [X.X] \\
+G5 & Negative social exposure & [X.X] & [X.X] & [X.X] & [X.X] \\
+G6 & Supportive counselling & [X.X] & [X.X] & [X.X] & [X.X] \\
+G7 & Memory-writing ablation & [X.X] & [X.X] & [X.X] & [X.X] \\
+\botrule
+\end{tabular}
+\end{table}
+
+%%====================================================================
+%%  Back matter
+%%====================================================================
+\backmatter
+
+\bmhead{Data availability}
+
+Simulation output data supporting the findings---staged evaluation scores (PHQ-9, BDI-II at all time points), complaint-graph state-transition logs, emotion-vector trajectories, and conversation transcripts---are available in the [Repository] at [DOI/URL]. Source data for Figures 1--5 and Table~1 are provided with the manuscript.
+
+\bmhead{Code availability}
+
+The [ModelName] simulation platform, including the depression cognitive architecture, treatment-intervention pipeline, assessment framework, and batch-experiment orchestration scripts, is publicly available at [GitHub URL]. The repository includes agent configuration files, CBT session prompts, evaluation rubrics, and batch-experiment scripts. The platform is implemented in Python under the [License] licence.
+
+\bmhead{Acknowledgements}
+
+We thank [names] for [contributions]. This work was supported by [funding]. We acknowledge the use of large language models (DeepSeek, Qwen3-8B) as research infrastructure; no LLM output was incorporated into the manuscript text without author review.
+
+\section*{Author contributions}
+
+[Author 1] designed the depression cognitive architecture and implemented the complaint-graph and emotion-inference modules. [Author 2] developed the treatment-intervention pipeline and dialog-judge system. [Author 3] designed the experimental framework and conducted statistical analyses. [Author 4] conceived the study, supervised the project, and wrote the manuscript. All authors reviewed and approved the final manuscript.
+
+\section*{Competing interests}
+
+The authors declare no competing interests.
+
+%%====================================================================
+%%  References  (sn-nature style, numbered)
+%%====================================================================
+\bibliography{nmh-references}
+
+\end{document}
