@@ -20,7 +20,10 @@
         "load_balancing": {
           "enabled": true,
           "ports": [
-            18000
+            18000,
+            18002,
+            18004,
+            18006
           ]
         }
       },
@@ -73,7 +76,9 @@
           "enabled": true,
           "ports": [
             18001,
-            18004
+            18003,
+            18005,
+            18007
           ]
         }
       },
@@ -91,7 +96,7 @@
     "chat_history": {
       "summary_window_minutes": 60480,
       "max_read_items": 2,
-      "focus_retrieve_max": 10,
+      "focus_retrieve_max": 7,
       "recent_turn_focus_n": 15,
       "normal_chat_min_interval_minutes": 2880
     },
@@ -99,7 +104,7 @@
       "write_mode": "hybrid"
     },
     "memory_write_control": {
-      "enabled": true,
+      "enabled": false,
       "target_agents": [],
       "blocked_node_types": []
     },
@@ -424,7 +429,7 @@
     },
     "current_session_context": {
       "enabled": true,
-      "recent_exchange_count": 5,
+      "recent_exchange_count": 3,
       "summary_route": "think_llm",
       "summary_prompt_file": "data/prompts/intervention/current_session_context_summary.txt",
       "summary_retry": 2,

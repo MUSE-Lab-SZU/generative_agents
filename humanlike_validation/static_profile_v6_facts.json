@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "persona": "卡布达",
+  "severity": "moderate",
+  "asset": "frontend/static/assets/village/agents/卡布达/agent.json",
+  "asset_hash": "4bcabe5594d6f5f1adf480af36f812cefc5afb1925133a58b63d0c56fb5d5b99",
+  "facts": [
+    {
+      "id": "age_23",
+      "type": "stable_identity",
+      "proposition": "卡布达在固定人设中为23岁。",
+      "source_pointer": "scratch.age",
+      "source_quote": "23"
+    },
+    {
+      "id": "prior_study_and_work",
+      "type": "long_term_experience",
+      "proposition": "卡布达过去有学习和工作经历；原资产没有说明具体学校、职业、雇主或年限。",
+      "source_pointer": "currently",
+      "source_quote": "过去的学习和工作经历"
+    }
+  ],
+  "excluded": ["currently 中的目前待业", "scratch.learned 的绘图偏好与空闲时间安排", "scratch.lifestyle", "scratch.daily_plan"]
+}

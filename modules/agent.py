@@ -2856,7 +2856,8 @@ class Agent:
         meeting_id="",
     ):
         self.chats.extend(chats)
-        if self.dynamic_memory_enabled():
+        if (self.dynamic_memory_enabled()
+                and self.depression_dynamic.memory_system.allows_partner(other.name)):
             self.depression_dynamic.memory_system.add_memory({
                 "content": chats_summary, "source_type": "conversation_summary",
                 "disclosure_threshold": 1.0})
@@ -3182,7 +3183,10 @@ class Agent:
             poignancy = self.completion("poignancy_chat", event)
         else:
             poignancy = self.completion("poignancy_event", event)
-        if dynamic and (e_type in {"chat", "thought"} or event.predicate == "对话"):
+        private_copy = dynamic and (e_type in {"chat", "thought"} or event.predicate == "对话")
+        if private_copy and e_type != "thought" and not dynamic.allows_partner(event.object):
+            private_copy = False
+        if private_copy:
             dynamic.add_memory({
                 "content": event.get_describe(), "source_type": "associate_" + e_type,
                 "kind": "subjective_reflection" if e_type == "thought" else "conversation_summary",

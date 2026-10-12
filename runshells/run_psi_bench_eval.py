@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from modules.model.endpoint_pool import next_endpoint, resolve_endpoint_urls
-from modules.model.psi_bench_eval import fingerprint, load_sessions, make_prompt, run_evaluation
+from humanlike_validation.psi_bench_eval import fingerprint, load_sessions, make_prompt, run_evaluation
 
 
 def add_judge_arguments(parser):
@@ -127,6 +127,45 @@ def make_judge_call(routing, key, metadata):
             raise ValueError('empty judge response')
         if response.choices[0].finish_reason == 'length':
             raise ValueError('judge response truncated by model output limit')
+        return response.choices[0].message.content.strip()
+
+    return call
+
+
+def make_psi_label_call(routing, key, metadata):
+    """Use constrained JSON and no thinking for local PTC/Emotion labels."""
+    if metadata['backend'] != 'local_vllm':
+        return make_judge_call(routing, key, metadata)
+    if not key:
+        raise ValueError('Missing local vLLM API key')
+    from openai import OpenAI
+    from humanlike_validation.psi_bench_eval import LABELS
+
+    metadata['thinking'] = 'disabled via chat_template_kwargs'
+    metadata['response_format'] = 'json_schema enum'
+    endpoints = metadata['endpoints']
+    local = threading.local()
+
+    def call(body, kind):
+        if kind not in LABELS:
+            raise ValueError(f'unsupported PSI label kind: {kind}')
+        if not hasattr(local, 'clients'):
+            local.clients = {url: OpenAI(api_key=key, base_url=url,
+                                         timeout=metadata['timeout_seconds'], max_retries=0)
+                             for url in endpoints}
+        url = next_endpoint(routing, endpoints)
+        response = local.clients[url].chat.completions.create(
+            model=metadata['model'], messages=[{'role': 'user', 'content': body}],
+            temperature=0, max_tokens=256,
+            response_format={'type': 'json_schema', 'json_schema': {
+                'name': 'label', 'schema': {'type': 'object',
+                'properties': {'label': {'type': 'string', 'enum': list(LABELS[kind])}},
+                'required': ['label'], 'additionalProperties': False}}},
+            extra_body={'chat_template_kwargs': {'enable_thinking': False}})
+        if not response.choices or not isinstance(response.choices[0].message.content, str):
+            raise ValueError('empty judge response')
+        if response.choices[0].finish_reason == 'length':
+            raise ValueError('judge response truncated')
         return response.choices[0].message.content.strip()
 
     return call

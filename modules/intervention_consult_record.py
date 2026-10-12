@@ -128,7 +128,7 @@ def conversation_content_chars(chats: Any) -> int:
     return total
 
 
-def split_recent_exchanges(chats: Any, recent_exchange_count: int = 5):
+def split_recent_exchanges(chats: Any, recent_exchange_count: int = 3):
     """Split a dialogue into older turns and about N complete recent exchanges.
 
     A chat loop contributes two alternating utterances.  When the current loop only
@@ -137,9 +137,9 @@ def split_recent_exchanges(chats: Any, recent_exchange_count: int = 5):
     """
     items = list(chats) if isinstance(chats, (list, tuple)) else []
     try:
-        exchange_count = max(1, int(recent_exchange_count or 5))
+        exchange_count = max(1, int(recent_exchange_count or 3))
     except Exception:
-        exchange_count = 5
+        exchange_count = 3
     incomplete_tail = len(items) % 2
     recent_utterance_count = exchange_count * 2 + incomplete_tail
     split_at = max(0, len(items) - recent_utterance_count)

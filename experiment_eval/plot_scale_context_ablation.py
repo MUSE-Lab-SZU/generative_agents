@@ -26,7 +26,7 @@ DEFAULT_INPUT = Path(
     "0821-all-groups-all-nodes-domain-ablation-r10/summary.json"
 )
 DEFAULT_OUTPUT_DIR = Path(
-    "docs/experiment_evaluation/0821_scale_context_ablation"
+    "docs/02_实验分析与评估/experiment_evaluation/0821_scale_context_ablation"
 )
 TIMEPOINTS = ["T0", "S4", "S8", "S12"]
 GROUPS = ["G1", "G2", "G4", "G5", "G6", "G9", "G11"]

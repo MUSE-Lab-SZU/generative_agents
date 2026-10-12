@@ -1,12 +1,15 @@
 {
   "name": "周远航",
-  "portrait": "assets/village/agents/卡布达2/portrait.png",
+  "portrait": "assets/village/agents/周远航/portrait.png",
   "coord": [
     21,
     7
   ],
   "currently": "在餐桌旁核对家庭开支，听见家人争抢空间后沉默下来。",
   "chat_iter": 4,
+  "external_memory": {
+    "user_id": "agent_zhou_yuanhang"
+  },
   "scratch": {
     "age": 34,
     "innate": "细腻、责任感强、会反复思量",

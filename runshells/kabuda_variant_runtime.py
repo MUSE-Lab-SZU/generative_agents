@@ -294,10 +294,30 @@ def prepare_kabuda_variant_runtime(
     agent_output_path = output_dir / "agent.json"
     depression_output_path = output_dir / SEVERITY_CONFIG_NAMES[severity]
     memory_injection_output_path = output_dir / "memory_injections.json"
+    seed_output_path = None
+    seed_payload = None
+    memory_config = depression_payload.get("memory", {})
+    if isinstance(memory_config, dict) and memory_config.get("enabled"):
+        seed_name = str(memory_config.get("initial_memories_file", "") or "").strip()
+        if seed_name:
+            seed_relative = Path(seed_name)
+            if seed_relative.is_absolute() or ".." in seed_relative.parts:
+                raise ValueError("initial_memories_file must stay under the persona directory")
+            seed_source_path = village_agent_dir / seed_relative
+            seed_payload = normalize_runtime_agent_name(
+                load_json_file(seed_source_path),
+                source_name=source_agent_name,
+                runtime_name=runtime_agent_name,
+            )
+            if seed_payload.get("owner_id") != runtime_agent_name:
+                raise ValueError("initial dynamic memories owner does not match runtime agent")
+            seed_output_path = output_dir / seed_relative
     if not dry_run:
         atomic_write_json(agent_output_path, agent_payload)
         atomic_write_json(depression_output_path, depression_payload)
         atomic_write_json(memory_injection_output_path, memory_injection_payload)
+        if seed_output_path is not None:
+            atomic_write_json(seed_output_path, seed_payload)
 
     return KabudaVariantRuntime(
         variant=resolved_variant,

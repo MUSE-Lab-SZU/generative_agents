@@ -1,12 +1,15 @@
 {
   "name": "林若宁",
-  "portrait": "assets/village/agents/卡布达2/portrait.png",
+  "portrait": "assets/village/agents/林若宁/portrait.png",
   "coord": [
     45,
     9
   ],
   "currently": "在协作消息框前反复删改，担心自己融不进同学。",
   "chat_iter": 4,
+  "external_memory": {
+    "user_id": "agent_lin_ruoning"
+  },
   "scratch": {
     "age": 18,
     "innate": "细腻、责任感强、会反复思量",

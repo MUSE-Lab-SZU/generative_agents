@@ -673,8 +673,8 @@ def main() -> None:
         run_external_memory_audit(cfg.name, cfg.agent, dry_run=cfg.dry_run)
 
     print("\n[Done] 单次实验流程完成")
-    print(f"- 查看状态: bash runshells/sim_status.sh {cfg.name}")
-    print(f"- 启动回放: bash runshells/sim_replay.sh {cfg.name}")
+    print(f"- 查看状态: bash runshells/simulation/sim_status.sh {cfg.name}")
+    print(f"- 启动回放: bash runshells/simulation/sim_replay.sh {cfg.name}")
 
 
 if __name__ == "__main__":
