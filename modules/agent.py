@@ -3655,6 +3655,7 @@ class Agent:
                 domain_state_enabled=domain_state_cfg.get("enabled", False),
                 memory_state=config.get("depression_dynamic_state", {}).get("memory_system"),
                 memory_write_control=getattr(self, "memory_write_control_config", {}),
+                logger=self.logger,
             )
             engine.set_base_prompt(self._build_depression_base_prompt())
             state_payload = config.get("depression_dynamic_state", {})
