@@ -29,6 +29,12 @@
 %%  [ModelName], [N], [X.X], [XX%], [Evidence needed: ...]
 %%    -> placeholders pending target-batch verification (locked gate:
 %%       independent-storage remount + single locked batch/controller)
+%%
+%%  Compile (from writing/latex/; sn-jnl.cls and bst live in
+%%  sn-article-template/, referenced via TEXINPUTS/BSTINPUTS):
+%%    TEXINPUTS=".;sn-article-template;" BSTINPUTS=".;sn-article-template;" \
+%%      latexmk -pdf nmh-manuscript.tex
+%%  Chinese reading mirror: nmh-manuscript-zh.tex (latexmk -xelatex).
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %% Nature Portfolio submission style — numbered references via sn-nature

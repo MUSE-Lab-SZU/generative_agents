@@ -49,6 +49,7 @@ writing/figure/
 writing/latex/**/*.aux
 writing/latex/**/*.bbl
 writing/latex/**/*.blg
+writing/latex/**/*.fdb_latexmk
 writing/latex/**/*.fls
 writing/latex/**/*.log
 writing/latex/**/*.out
