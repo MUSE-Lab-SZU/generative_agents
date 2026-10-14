@@ -10,8 +10,8 @@ writing/latex/
 ├── nmh-manuscript.tex                 ← NMH 英文投稿版（2026-10-08 校准至代码 3e8259d）
 ├── nmh-manuscript-zh.tex              ← NMH 中文对照审读版（不用于投稿）
 ├── nmh-references.bib                 ← NMH 参考文献（英/中两版共用）
-├── agentopia-style-manuscript.tex     ← Agentopia 风格英文版
-├── agentopia-style-manuscript-zh.tex  ← Agentopia 风格中文镜像版
+├── agentopia-manuscript.tex     ← Agentopia 风格英文版
+├── agentopia-manuscript-zh.tex  ← Agentopia 风格中文镜像版
 ├── agentopia-references.bib           ← Agentopia 参考文献
 ├── sn-article-template/               ← Springer Nature 模板（sn-jnl.cls、sn-nature.bst 等）
 │   └── （仅模板文件；nmh 主文件已提到根目录，经 TEXINPUTS 引用）
@@ -43,8 +43,8 @@ latexmk -xelatex nmh-manuscript-zh.tex
 
 ```bash
 cd writing/latex
-latexmk -pdf agentopia-style-manuscript.tex          # 英文
-latexmk -xelatex agentopia-style-manuscript-zh.tex   # 中文
+latexmk -pdf agentopia-manuscript.tex          # 英文
+latexmk -xelatex agentopia-manuscript-zh.tex   # 中文
 ```
 
 ### Overleaf
