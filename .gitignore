@@ -53,6 +53,7 @@ writing/latex/**/*.fdb_latexmk
 writing/latex/**/*.fls
 writing/latex/**/*.log
 writing/latex/**/*.out
+writing/latex/**/*.xdv
 nul
 kambeitz_tmp.html
 yosef_tmp.html
