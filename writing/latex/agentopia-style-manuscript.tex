@@ -330,10 +330,10 @@ Batches that differ in controller identity or prompt version are never pooled.
 
 \paragraph{Models.}
 The doctor, patient, and evaluation chain run on DeepSeek.
-Local Qwen3-8B serves as the think model (session task planner, selector, summarization and compression) and as the offline judge for evidence audits.
+Local Qwen3.5-9B serves as the think model (session task planner, selector, summarization and compression) and as the offline judge for evidence audits.
 Retrieval uses BGE-M3 embeddings; the compute cluster deploys 3 Qwen and 3 BGE services on 4 GPUs.
 Thinking mode is confined to doctor--patient dialogue --- in the reference batch, approximately 97.5\% of judge-call tokens were reasoning tokens.
-Model assignments are run configuration reported per batch manifest, not a fixed property of the method; the PSI-Bench annotation runs offline on the local think model (Qwen3-8B).
+Model assignments are run configuration reported per batch manifest, not a fixed property of the method; the PSI-Bench annotation runs offline on the local think model.
 
 \paragraph{Metrics.}
 Efficacy metrics ($\Delta$, $\Delta\%$, trajectories, item-level change, persona strata), reliability metrics (sample SD, 95\% $t$-CI, ICC$(1,1)$ / ICC$(1,K)$, quadratic weighted $\kappa_w$, PHQ-9/BDI-II convergence), and human-likeness metrics (PTC, emotion, profile recovery, evidence-audit pass rate).
@@ -547,7 +547,7 @@ Layer 1 (base personality): name, age, traits, living habits, daily plan, curren
 Layer 2 (complaint stage): stage label and summary, recent relevant experiences, and the stable background --- root complaint anchor, fixed core belief, expression style and hints.
 Layer 3 (session context): location, time, partner and relationship, interaction type, scene-specific additional judgments.
 Layer 4 (transient emotion): label, style, intensity, disclosure and defensiveness (0--10), volatility relative to the previous turn, self-correction mode; outputs of this layer are single-turn constraints and cannot support claims of sustained symptom improvement.
-Rendering additionally attaches the consult-history summary (cross-session accumulation), the agent memory list (event/chat/thought; writes blocked in G7), and a rolling dialogue window consisting of a progress-time estimate, an earlier-session summary, and the most recent five doctor--patient exchanges verbatim.
+Rendering additionally attaches the consult-history summary (cross-session accumulation), the agent memory list (event/chat/thought; writes blocked in G7; cross-session disclosure governed by a trust gate under which resident personas designate the therapist as a trusted partner and untrusted partners receive no historical-memory or topic-boundary disclosure), and a rolling dialogue window consisting of a progress-time estimate, an earlier-session summary, and the most recent three doctor--patient exchanges verbatim (window length is run configuration; the reported batch uses three).
 
 \subsection{Dynamic Depression State Machine}
 
@@ -745,7 +745,7 @@ DeepSeek (main) & [X.XX] & [X.X] & [X.XX] \\
 \end{table}
 
 \paragraph{PSI-Bench readout.}
-Four corpora are reported (ESConv, AnnoMI, \sys-0922, PatientPSI), 8 sessions $\times$ 8 patient replies $=$ 64 entries each, 256 entries in total; PTC distributions reach [XX]\% agreement with corpus-specific references and emotion distributions reach [XX]\% (offline Qwen3-8B judge).
+Four corpora are reported (ESConv, AnnoMI, \sys-0922, PatientPSI), 8 sessions $\times$ 8 patient replies $=$ 64 entries each, 256 entries in total; PTC distributions reach [XX]\% agreement with corpus-specific references and emotion distributions reach [XX]\% (offline Qwen think-model judge).
 A fifth downloaded corpus is absent from both reported result tables; whether it was evaluated awaits archive confirmation.
 Per-turn average JSD distances are not yet computed, and a real-human reference corpus has not been obtained --- these are open items, and no human-parity claim is made.
 
