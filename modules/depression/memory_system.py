@@ -47,11 +47,14 @@ class DynamicMemorySystem:
         "decreased_significantly": -0.16,
     }
 
-    def __init__(self, config=None, owner_id="", clock_provider=None, agent_dir=None):
+    def __init__(self, config=None, owner_id="", clock_provider=None, agent_dir=None, logger=None):
         self.config = copy.deepcopy(config or {})
         self.enabled = bool(self.config.get("enabled", False))
         self.owner_id = str(owner_id)
         self.clock = clock_provider or datetime.now
+        # The simulation supplies either its file logger or IOLogger.  Falling
+        # back to the module logger keeps this class usable on its own.
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
         self.records, self.trust, self.committed_turns = {}, {}, {}
         self.memory_context = []
         self.complaint_sources = {}
@@ -73,6 +76,14 @@ class DynamicMemorySystem:
                 _score(value)
             for item in self._initial_items(agent_dir):
                 self.add_memory(item)
+
+    def _log(self, level, message, *args):
+        """Support both stdlib Logger and the project's one-argument IOLogger."""
+        emit = getattr(self.logger, level)
+        if isinstance(self.logger, logging.Logger):
+            emit(message, *args)
+        else:
+            emit(message % args if args else message)
 
     def _initial_items(self, agent_dir):
         """Load authored seeds relative to the resident, not the working directory.
@@ -292,7 +303,7 @@ class DynamicMemorySystem:
                 previously_said = record["source_type"] == "chat" and other in record["disclosed_to"]
                 threshold_met = decision["trust"] >= record["disclosure_threshold"]
                 allowed_for_disclosure = threshold_met or previously_said
-                logging.getLogger(__name__).info(
+                self._log("info",
                     "[DYNAMIC_MEMORY_DISCLOSURE] owner=%s other=%s memory_id=%s trust=%.4f threshold=%.4f allowed=%s reason=%s",
                     self.owner_id, other, record["memory_id"], decision["trust"],
                     record["disclosure_threshold"], allowed_for_disclosure,
@@ -329,7 +340,7 @@ class DynamicMemorySystem:
                     "guidance": "被问到暂不愿展开的事情，可以简短回答或暂缓讨论；不要解释隐藏原因。"}
         except Exception as exc:
             if self.last_error != type(exc).__name__:
-                logging.getLogger(__name__).warning("Dynamic memory retrieval unavailable for %s (%s)", self.owner_id, type(exc).__name__)
+                self._log("warning", "Dynamic memory retrieval unavailable for %s (%s)", self.owner_id, type(exc).__name__)
             self.last_error = type(exc).__name__
             decision.update(retrieval_error=True, allowed_memories=[], blocked_ids=[],
                             blocked_signal={"present": False})
@@ -350,7 +361,7 @@ class DynamicMemorySystem:
         limit = max(0, int(self.config.get("complaint_max_items", 3)))
         for unit in stage_units(stage):
             allowed = decision["trust"] >= unit["disclosure_threshold"]
-            logging.getLogger(__name__).info(
+            self._log("info",
                 "[DYNAMIC_MEMORY_COMPLAINT_DISCLOSURE] owner=%s other=%s stage_id=%s unit_id=%s trust=%.4f threshold=%.4f allowed=%s",
                 self.owner_id, decision["other_agent"], unit["stage_id"], unit["unit_id"],
                 decision["trust"], unit["disclosure_threshold"], allowed,
@@ -452,7 +463,7 @@ class DynamicMemorySystem:
             delta = self.TRUST_DELTAS[evaluation["direction"]]
             updated_trust = max(0.0, min(1.0, previous_trust + delta))
             self.trust[other] = updated_trust
-            logging.getLogger(__name__).info(
+            self._log("info",
                 "[DYNAMIC_MEMORY_TRUST_UPDATE] owner=%s other=%s direction=%s delta=%+.4f trust_before=%.4f trust_after=%.4f",
                 self.owner_id, other, evaluation["direction"], delta, previous_trust, updated_trust)
         written = self.add_memory({"memory_id": "turn_" + hashlib.sha256(turn_id.encode()).hexdigest()[:20],

@@ -50,10 +50,12 @@ class DepressionSimulationEngine:
         domain_state_enabled: Optional[bool] = None,
         memory_state: Optional[Dict[str, Any]] = None,
         memory_write_control: Optional[Dict[str, Any]] = None,
+        logger=None,
     ):
         """解析配置并初始化主诉图、上下文、记忆、情绪和 prompt 子系统。"""
         resolved = self._resolve_config(config)
         self.raw_config = copy.deepcopy(resolved)
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
         self.config_path = str(resolved.get("_config_path", "") or "")
         self.agent_dir = str(resolved.get("_agent_dir", "") or "")
 
@@ -100,7 +102,8 @@ class DepressionSimulationEngine:
             memory_config.pop("initial_memories_file", None)
             memory_config["items"] = []
         self.memory_system = TraumaMemorySystem(
-            memory_config, agent_name, self._clock_provider, agent_dir=self.agent_dir)
+            memory_config, agent_name, self._clock_provider, agent_dir=self.agent_dir,
+            logger=self.logger)
         if isinstance(memory_state, dict):
             self.memory_system.load_state(memory_state)
         self._memory_previews = {}
@@ -240,7 +243,10 @@ class DepressionSimulationEngine:
     def _audit_memory_error(self, phase, exc, event_id=None):
         error = {"phase": phase, "event_id": event_id, "error": type(exc).__name__, "detail": str(exc)}
         self.memory_errors.append(error)
-        logging.getLogger(__name__).warning("Dynamic memory failure: %s", error)
+        if isinstance(self.logger, logging.Logger):
+            self.logger.warning("Dynamic memory failure: %s", error)
+        else:
+            self.logger.warning("Dynamic memory failure: %s" % error)
 
     def prepare_memory_preview(self, query, other, turn_id):
         try:
@@ -838,7 +844,7 @@ class DepressionSimulationEngine:
             memory_config["items"] = []
         self.memory_system = TraumaMemorySystem(
             memory_config, self._infer_agent_name(refreshed),
-            self._clock_provider, agent_dir=self.agent_dir)
+            self._clock_provider, agent_dir=self.agent_dir, logger=self.logger)
         if "memory_system" in payload:
             self.memory_system.load_state(memory_payload)
         else:
